@@ -126,6 +126,8 @@ func (m *Manager) startProxy(svc *storage.Service) (*runningProxy, error) {
 		return m.startHTTPProxy(ctx, cancel, svc)
 	case storage.ProtocolHTTPS, storage.ProtocolHTTP2, storage.ProtocolGRPC:
 		return m.startTLSProxy(ctx, cancel, svc)
+	case storage.ProtocolTCP:
+		return m.startTCPProxy(ctx, cancel, svc)
 	default:
 		cancel()
 		return nil, fmt.Errorf("protocol %q not yet supported", svc.Protocol)
