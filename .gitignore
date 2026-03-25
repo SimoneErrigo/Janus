@@ -34,6 +34,10 @@ backend/janus
 # Data directory
 data/
 
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
 # Editor/IDE
 # .idea/
 # .vscode/

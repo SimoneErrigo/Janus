@@ -12,4 +12,15 @@ services:
       - "8080:8080"
     volumes:
       - ./data:/data
+    network_mode: host
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - janus
     restart: unless-stopped
