@@ -7,6 +7,7 @@
 *.dll
 *.so
 *.dylib
+notes/
 
 # Test binary, built with `go test -c`
 *.test
@@ -26,6 +27,12 @@ go.work.sum
 
 # env file
 .env
+
+# Compiled binary
+backend/janus
+
+# Data directory
+data/
 
 # Editor/IDE
 # .idea/
