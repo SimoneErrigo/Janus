@@ -37,15 +37,39 @@ func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniff
 
 // Handler returns the HTTP handler for this server.
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return corsMiddleware(s.mux)
 }
 
 func (s *Server) routes() {
-	s.mux.HandleFunc("/api/services", s.handleServices)
-	s.mux.HandleFunc("/api/services/", s.handleServiceByID)
-	s.mux.HandleFunc("/api/packets", s.handlePackets)
-	s.mux.HandleFunc("/api/rules", s.handleRules)
-	s.mux.HandleFunc("/api/rules/", s.handleRuleByID)
+	// Public routes (no auth required)
+	s.mux.HandleFunc("/api/login", s.handleLogin)
+
+	// Protected routes (auth required)
+	protected := http.NewServeMux()
+	protected.HandleFunc("/api/services", s.handleServices)
+	protected.HandleFunc("/api/services/", s.handleServiceByID)
+	protected.HandleFunc("/api/packets", s.handlePackets)
+	protected.HandleFunc("/api/rules", s.handleRules)
+	protected.HandleFunc("/api/rules/", s.handleRuleByID)
+	protected.HandleFunc("/api/config", s.handleConfig)
+
+	s.mux.Handle("/api/", authMiddleware(protected))
+}
+
+// corsMiddleware adds CORS headers for the frontend.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
