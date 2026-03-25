@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"syscall"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/api"
@@ -42,7 +43,16 @@ func main() {
 		log.Fatalf("Failed to initialize rule store: %v", err)
 	}
 
-	proxyMgr := proxy.NewManager(packetStore, ruleStore)
+	// Compile flag regex for packet flagging
+	var flagRegex *regexp.Regexp
+	if cfg.FlagRegex != "" {
+		flagRegex, err = regexp.Compile(cfg.FlagRegex)
+		if err != nil {
+			log.Printf("Warning: invalid FLAG_REGEX %q: %v", cfg.FlagRegex, err)
+		}
+	}
+
+	proxyMgr := proxy.NewManager(packetStore, ruleStore, flagRegex)
 
 	// Auto-load flag regex drop rules for all existing services
 	services := store.ListServices()

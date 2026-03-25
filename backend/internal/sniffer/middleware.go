@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -17,7 +18,7 @@ import (
 const maxBodyCapture = 1 << 20 // 1 MB
 
 // HTTPMiddleware returns an http.Handler that logs requests/responses and evaluates drop rules.
-func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore, dropEngine *dropper.Engine) http.Handler {
+func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore, dropEngine *dropper.Engine, flagRegex *regexp.Regexp) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
@@ -38,40 +39,58 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 
 		// Collect request headers
 		reqHeaders := flattenHeaders(r.Header)
+		headersStr := flattenHeadersString(r.Header)
 
-		// Log request packet
-		reqPacket := &Packet{
-			ServiceID: svc.ID,
-			Timestamp: start,
-			SrcIP:     srcIP,
-			SrcPort:   srcPort,
-			DstIP:     dstIP,
-			DstPort:   dstPort,
-			Protocol:  string(svc.Protocol),
-			Direction: DirectionRequest,
-			Method:    r.Method,
-			URL:       r.URL.String(),
-			Headers:   reqHeaders,
-			Body:      reqBody,
-		}
-		if err := store.Insert(reqPacket); err != nil {
-			log.Printf("[%s] sniffer: failed to log request: %v", svc.Name, err)
-		}
-
-		// Evaluate drop rules
+		// Evaluate drop rules before inserting
+		var matchedRules []MatchedRuleInfo
+		shouldDrop := false
 		if dropEngine != nil {
-			headersStr := flattenHeadersString(r.Header)
-			result := dropEngine.Evaluate(&dropper.HTTPRequest{
+			matched := dropEngine.EvaluateAll(&dropper.HTTPRequest{
 				ServiceID: svc.ID,
 				Headers:   headersStr,
 				Body:      reqBody,
 				URL:       r.URL.String(),
 			})
-			if result.Matched {
-				log.Printf("[%s] DROP: rule %q matched request %s %s", svc.Name, result.Rule.Name, r.Method, r.URL.String())
-				http.Error(w, "Forbidden", http.StatusForbidden)
-				return
+			for _, rule := range matched {
+				matchedRules = append(matchedRules, MatchedRuleInfo{ID: rule.ID, Name: rule.Name})
 			}
+			if len(matched) > 0 {
+				shouldDrop = true
+			}
+		}
+
+		// Check flagged status
+		flagged := CheckFlagged(flagRegex, r.URL.String(), headersStr, reqBody)
+
+		// Build and insert request packet
+		reqPacket := &Packet{
+			ServiceID:    svc.ID,
+			Timestamp:    start,
+			SrcIP:        srcIP,
+			SrcPort:      srcPort,
+			DstIP:        dstIP,
+			DstPort:      dstPort,
+			Protocol:     string(svc.Protocol),
+			Direction:    DirectionRequest,
+			Method:       r.Method,
+			URL:          r.URL.String(),
+			Headers:      reqHeaders,
+			Body:         reqBody,
+			MatchedRules: matchedRules,
+			Flagged:      flagged,
+		}
+		if reqPacket.MatchedRules == nil {
+			reqPacket.MatchedRules = []MatchedRuleInfo{}
+		}
+		if err := store.Insert(reqPacket); err != nil {
+			log.Printf("[%s] sniffer: failed to log request: %v", svc.Name, err)
+		}
+
+		// Drop if rules matched
+		if shouldDrop {
+			log.Printf("[%s] DROP: %d rule(s) matched request %s %s", svc.Name, len(matchedRules), r.Method, r.URL.String())
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
 		}
 
 		// Wrap response writer to capture status and body
@@ -80,25 +99,48 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 
 		// Log response packet
 		respHeaders := flattenHeaders(rw.Header())
+		respBody := rw.body.Bytes()
+		respHeadersStr := flattenHeadersString(rw.Header())
+		respFlagged := CheckFlagged(flagRegex, r.URL.String(), respHeadersStr, respBody)
+
 		respPacket := &Packet{
-			ServiceID: svc.ID,
-			Timestamp: time.Now(),
-			SrcIP:     dstIP,
-			SrcPort:   dstPort,
-			DstIP:     srcIP,
-			DstPort:   srcPort,
-			Protocol:  string(svc.Protocol),
-			Direction: DirectionResponse,
-			Method:    r.Method,
-			URL:       r.URL.String(),
-			Status:    rw.statusCode,
-			Headers:   respHeaders,
-			Body:      rw.body.Bytes(),
+			ServiceID:    svc.ID,
+			Timestamp:    time.Now(),
+			SrcIP:        dstIP,
+			SrcPort:      dstPort,
+			DstIP:        srcIP,
+			DstPort:      srcPort,
+			Protocol:     string(svc.Protocol),
+			Direction:    DirectionResponse,
+			Method:       r.Method,
+			URL:          r.URL.String(),
+			Status:       rw.statusCode,
+			Headers:      respHeaders,
+			Body:         respBody,
+			MatchedRules: []MatchedRuleInfo{},
+			Flagged:      respFlagged,
 		}
 		if err := store.Insert(respPacket); err != nil {
 			log.Printf("[%s] sniffer: failed to log response: %v", svc.Name, err)
 		}
 	})
+}
+
+// CheckFlagged checks whether any of the packet content matches the flag regex.
+func CheckFlagged(flagRegex *regexp.Regexp, url, headers string, body []byte) bool {
+	if flagRegex == nil {
+		return false
+	}
+	if url != "" && flagRegex.MatchString(url) {
+		return true
+	}
+	if headers != "" && flagRegex.MatchString(headers) {
+		return true
+	}
+	if len(body) > 0 && flagRegex.Match(body) {
+		return true
+	}
+	return false
 }
 
 // responseCapture wraps http.ResponseWriter to capture status code and body.

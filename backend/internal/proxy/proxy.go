@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"regexp"
 	"sync"
 	"time"
 
@@ -26,6 +27,7 @@ type Manager struct {
 	proxies     map[string]*runningProxy // service ID -> running proxy
 	packetStore *sniffer.PacketStore
 	ruleStore   *dropper.RuleStore
+	flagRegex   *regexp.Regexp
 }
 
 type runningProxy struct {
@@ -36,11 +38,12 @@ type runningProxy struct {
 }
 
 // NewManager creates a new proxy manager.
-func NewManager(packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore) *Manager {
+func NewManager(packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, flagRegex *regexp.Regexp) *Manager {
 	return &Manager{
 		proxies:     make(map[string]*runningProxy),
 		packetStore: packetStore,
 		ruleStore:   ruleStore,
+		flagRegex:   flagRegex,
 	}
 }
 
@@ -166,7 +169,7 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 		if m.ruleStore != nil {
 			dropEngine = dropper.NewEngine(m.ruleStore)
 		}
-		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine)
+		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine, m.flagRegex)
 	}
 
 	server := &http.Server{
@@ -234,7 +237,7 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 		if m.ruleStore != nil {
 			dropEngine = dropper.NewEngine(m.ruleStore)
 		}
-		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine)
+		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine, m.flagRegex)
 	}
 
 	// For gRPC, support h2c (HTTP/2 cleartext) from backend if needed

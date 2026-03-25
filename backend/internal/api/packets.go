@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
@@ -25,6 +26,45 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 	params := r.URL.Query()
 
 	q.ServiceID = params.Get("service_id")
+
+	// Resolve service_name to service_id
+	if v := params.Get("service_name"); v != "" && q.ServiceID == "" {
+		for _, svc := range s.store.ListServices() {
+			if strings.EqualFold(svc.Name, v) {
+				q.ServiceID = svc.ID
+				break
+			}
+		}
+		if q.ServiceID == "" {
+			// No matching service found — return empty results
+			writeJSON(w, http.StatusOK, paginatedPackets{
+				Packets: []*sniffer.Packet{},
+				Total:   0,
+				Limit:   50,
+				Offset:  0,
+			})
+			return
+		}
+	}
+
+	q.SrcIP = params.Get("src_ip")
+	q.DstIP = params.Get("dst_ip")
+	q.Protocol = params.Get("protocol")
+	q.Contains = params.Get("contains")
+	q.Regex = params.Get("regex")
+
+	if v := params.Get("flagged"); v != "" {
+		flagged := v == "true" || v == "1"
+		q.Flagged = &flagged
+	}
+
+	if v := params.Get("sort"); v != "" {
+		if v != "asc" && v != "desc" {
+			http.Error(w, "invalid sort: use 'asc' or 'desc'", http.StatusBadRequest)
+			return
+		}
+		q.SortOrder = v
+	}
 
 	if v := params.Get("time_from"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)

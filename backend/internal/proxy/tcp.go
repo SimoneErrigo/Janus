@@ -16,6 +16,8 @@ import (
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
 
+const maxTCPCapture = 1 << 20 // 1 MB per direction per connection
+
 func (m *Manager) startTCPProxy(ctx context.Context, cancel context.CancelFunc, svc *storage.Service) (*runningProxy, error) {
 	listenAddr := fmt.Sprintf("%s:%d", svc.ListenAddr, svc.ListenPort)
 	listener, err := net.Listen("tcp", listenAddr)
@@ -64,6 +66,9 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 
 	// Read initial data from client for drop rule evaluation
 	var initialData []byte
+	var matchedRules []sniffer.MatchedRuleInfo
+	shouldDrop := false
+
 	if m.ruleStore != nil {
 		buf := make([]byte, 4096)
 		clientConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
@@ -72,22 +77,52 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 		if n > 0 {
 			initialData = buf[:n]
 
-			// Evaluate drop rules on initial data
+			// Evaluate all drop rules on initial data
 			engine := dropper.NewEngine(m.ruleStore)
-			result := engine.Evaluate(&dropper.HTTPRequest{
+			matched := engine.EvaluateAll(&dropper.HTTPRequest{
 				ServiceID: svc.ID,
 				RawBytes:  initialData,
 				Body:      initialData,
 			})
-			if result.Matched {
-				log.Printf("[%s] TCP DROP: rule %q matched", svc.Name, result.Rule.Name)
-				// TCP RST by closing without sending anything
-				if tc, ok := clientConn.(*net.TCPConn); ok {
-					tc.SetLinger(0)
-				}
-				return
+			for _, rule := range matched {
+				matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{ID: rule.ID, Name: rule.Name})
+			}
+			if len(matched) > 0 {
+				shouldDrop = true
 			}
 		}
+	}
+
+	// Check flagged and log the initial request packet
+	if len(initialData) > 0 && m.packetStore != nil {
+		flagged := sniffer.CheckFlagged(m.flagRegex, "", "", initialData)
+		if matchedRules == nil {
+			matchedRules = []sniffer.MatchedRuleInfo{}
+		}
+		pkt := &sniffer.Packet{
+			ServiceID:    svc.ID,
+			Timestamp:    time.Now(),
+			SrcIP:        srcIP,
+			SrcPort:      srcPort,
+			DstIP:        dstIP,
+			DstPort:      dstPort,
+			Protocol:     string(svc.Protocol),
+			Direction:    sniffer.DirectionRequest,
+			Body:         initialData,
+			MatchedRules: matchedRules,
+			Flagged:      flagged,
+		}
+		if err := m.packetStore.Insert(pkt); err != nil {
+			log.Printf("[%s] sniffer: failed to log TCP initial packet: %v", svc.Name, err)
+		}
+	}
+
+	if shouldDrop {
+		log.Printf("[%s] TCP DROP: %d rule(s) matched", svc.Name, len(matchedRules))
+		if tc, ok := clientConn.(*net.TCPConn); ok {
+			tc.SetLinger(0)
+		}
+		return
 	}
 
 	backendConn, err := net.DialTimeout("tcp", svc.TargetAddr, 10*time.Second)
@@ -135,8 +170,6 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 	}
 }
 
-const maxTCPCapture = 1 << 20 // 1 MB per direction per connection
-
 func (m *Manager) sniffCopy(dst io.Writer, src io.Reader, svc *storage.Service, srcIP string, srcPort int, dstIP string, dstPort int, dir sniffer.Direction) {
 	var buf bytes.Buffer
 	writer := dst
@@ -149,16 +182,20 @@ func (m *Manager) sniffCopy(dst io.Writer, src io.Reader, svc *storage.Service, 
 	io.Copy(writer, src)
 
 	if m.packetStore != nil && buf.Len() > 0 {
+		data := buf.Bytes()
+		flagged := sniffer.CheckFlagged(m.flagRegex, "", "", data)
 		pkt := &sniffer.Packet{
-			ServiceID: svc.ID,
-			Timestamp: time.Now(),
-			SrcIP:     srcIP,
-			SrcPort:   srcPort,
-			DstIP:     dstIP,
-			DstPort:   dstPort,
-			Protocol:  string(svc.Protocol),
-			Direction: dir,
-			Body:      buf.Bytes(),
+			ServiceID:    svc.ID,
+			Timestamp:    time.Now(),
+			SrcIP:        srcIP,
+			SrcPort:      srcPort,
+			DstIP:        dstIP,
+			DstPort:      dstPort,
+			Protocol:     string(svc.Protocol),
+			Direction:    dir,
+			Body:         data,
+			MatchedRules: []sniffer.MatchedRuleInfo{},
+			Flagged:      flagged,
 		}
 		if err := m.packetStore.Insert(pkt); err != nil {
 			log.Printf("[%s] sniffer: failed to log TCP packet: %v", svc.Name, err)

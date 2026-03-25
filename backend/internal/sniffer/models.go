@@ -10,6 +10,12 @@ const (
 	DirectionResponse Direction = "response"
 )
 
+// MatchedRuleInfo holds info about a rule that matched a packet.
+type MatchedRuleInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
 // Packet represents a captured request or response passing through the proxy.
 type Packet struct {
 	ID        int64     `json:"id"`
@@ -31,13 +37,25 @@ type Packet struct {
 	// Body as raw bytes (base64-encoded in JSON) and as string if valid UTF-8
 	Body       []byte `json:"body,omitempty"`
 	BodyString string `json:"body_string,omitempty"`
+
+	// Filtering metadata
+	MatchedRules []MatchedRuleInfo `json:"matched_rules"`
+	Flagged      bool              `json:"flagged"`
 }
 
 // PacketQuery defines filters for retrieving packets.
 type PacketQuery struct {
-	ServiceID string
-	TimeFrom  *time.Time
-	TimeTo    *time.Time
-	Limit     int
-	Offset    int
+	ServiceID   string
+	ServiceName string // resolved to ServiceID(s) by the API layer
+	SrcIP       string
+	DstIP       string
+	Protocol    string
+	TimeFrom    *time.Time
+	TimeTo      *time.Time
+	Contains    string // substring search across body, headers, url
+	Regex       string // regex search across body, headers, url
+	Flagged     *bool  // nil = no filter, true = only flagged, false = only unflagged
+	SortOrder   string // "asc" or "desc" (default "desc")
+	Limit       int
+	Offset      int
 }

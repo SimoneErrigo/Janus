@@ -52,6 +52,21 @@ func (e *Engine) Evaluate(req *HTTPRequest) MatchResult {
 	return MatchResult{Matched: false}
 }
 
+// EvaluateAll checks all enabled rules for the service and returns every match.
+func (e *Engine) EvaluateAll(req *HTTPRequest) []Rule {
+	rules := e.ruleStore.ListRules(req.ServiceID)
+	var matched []Rule
+	for _, rule := range rules {
+		if !rule.Enabled {
+			continue
+		}
+		if e.matches(rule, req) {
+			matched = append(matched, *rule)
+		}
+	}
+	return matched
+}
+
 func (e *Engine) matches(rule *Rule, req *HTTPRequest) bool {
 	var target string
 	var targetBytes []byte
