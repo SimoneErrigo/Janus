@@ -44,8 +44,16 @@ func main() {
 
 	proxyMgr := proxy.NewManager(packetStore, ruleStore)
 
+	// Auto-load flag regex drop rules for all existing services
+	services := store.ListServices()
+	serviceIDs := make([]string, len(services))
+	for i, svc := range services {
+		serviceIDs[i] = svc.ID
+	}
+	dropper.EnsureFlagRulesForAll(ruleStore, serviceIDs, cfg.FlagRegex)
+
 	// Auto-start enabled services
-	for _, svc := range store.ListServices() {
+	for _, svc := range services {
 		if svc.Enabled {
 			if err := proxyMgr.StartService(svc); err != nil {
 				log.Printf("Warning: failed to start service %s: %v", svc.Name, err)
