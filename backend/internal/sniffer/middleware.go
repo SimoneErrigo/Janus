@@ -7,15 +7,17 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
 
 const maxBodyCapture = 1 << 20 // 1 MB
 
-// HTTPMiddleware returns an http.Handler that logs requests and responses.
-func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore) http.Handler {
+// HTTPMiddleware returns an http.Handler that logs requests/responses and evaluates drop rules.
+func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore, dropEngine *dropper.Engine) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
@@ -54,6 +56,22 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore)
 		}
 		if err := store.Insert(reqPacket); err != nil {
 			log.Printf("[%s] sniffer: failed to log request: %v", svc.Name, err)
+		}
+
+		// Evaluate drop rules
+		if dropEngine != nil {
+			headersStr := flattenHeadersString(r.Header)
+			result := dropEngine.Evaluate(&dropper.HTTPRequest{
+				ServiceID: svc.ID,
+				Headers:   headersStr,
+				Body:      reqBody,
+				URL:       r.URL.String(),
+			})
+			if result.Matched {
+				log.Printf("[%s] DROP: rule %q matched request %s %s", svc.Name, result.Rule.Name, r.Method, r.URL.String())
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
 		}
 
 		// Wrap response writer to capture status and body
@@ -116,6 +134,19 @@ func (rc *responseCapture) Flush() {
 	if f, ok := rc.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+func flattenHeadersString(h http.Header) string {
+	var sb strings.Builder
+	for k, vals := range h {
+		for _, v := range vals {
+			sb.WriteString(k)
+			sb.WriteString(": ")
+			sb.WriteString(v)
+			sb.WriteString("\n")
+		}
+	}
+	return sb.String()
 }
 
 func flattenHeaders(h http.Header) map[string]string {

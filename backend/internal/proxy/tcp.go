@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
@@ -56,6 +57,39 @@ func (m *Manager) startTCPProxy(ctx context.Context, cancel context.CancelFunc, 
 func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clientConn net.Conn) {
 	defer clientConn.Close()
 
+	srcIP, srcPortStr, _ := net.SplitHostPort(clientConn.RemoteAddr().String())
+	srcPort, _ := strconv.Atoi(srcPortStr)
+	dstIP := svc.ListenAddr
+	dstPort := svc.ListenPort
+
+	// Read initial data from client for drop rule evaluation
+	var initialData []byte
+	if m.ruleStore != nil {
+		buf := make([]byte, 4096)
+		clientConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		n, _ := clientConn.Read(buf)
+		clientConn.SetReadDeadline(time.Time{})
+		if n > 0 {
+			initialData = buf[:n]
+
+			// Evaluate drop rules on initial data
+			engine := dropper.NewEngine(m.ruleStore)
+			result := engine.Evaluate(&dropper.HTTPRequest{
+				ServiceID: svc.ID,
+				RawBytes:  initialData,
+				Body:      initialData,
+			})
+			if result.Matched {
+				log.Printf("[%s] TCP DROP: rule %q matched", svc.Name, result.Rule.Name)
+				// TCP RST by closing without sending anything
+				if tc, ok := clientConn.(*net.TCPConn); ok {
+					tc.SetLinger(0)
+				}
+				return
+			}
+		}
+	}
+
 	backendConn, err := net.DialTimeout("tcp", svc.TargetAddr, 10*time.Second)
 	if err != nil {
 		log.Printf("[%s] TCP dial backend error: %v", svc.Name, err)
@@ -63,10 +97,10 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 	}
 	defer backendConn.Close()
 
-	srcIP, srcPortStr, _ := net.SplitHostPort(clientConn.RemoteAddr().String())
-	srcPort, _ := strconv.Atoi(srcPortStr)
-	dstIP := svc.ListenAddr
-	dstPort := svc.ListenPort
+	// Forward initial data that was already read
+	if len(initialData) > 0 {
+		backendConn.Write(initialData)
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)

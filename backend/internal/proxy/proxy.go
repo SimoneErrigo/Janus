@@ -162,7 +162,11 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 
 	var handler http.Handler = reverseProxy
 	if m.packetStore != nil {
-		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore)
+		var dropEngine *dropper.Engine
+		if m.ruleStore != nil {
+			dropEngine = dropper.NewEngine(m.ruleStore)
+		}
+		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine)
 	}
 
 	server := &http.Server{
@@ -226,7 +230,11 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 
 	var handler http.Handler = reverseProxy
 	if m.packetStore != nil {
-		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore)
+		var dropEngine *dropper.Engine
+		if m.ruleStore != nil {
+			dropEngine = dropper.NewEngine(m.ruleStore)
+		}
+		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine)
 	}
 
 	// For gRPC, support h2c (HTTP/2 cleartext) from backend if needed
