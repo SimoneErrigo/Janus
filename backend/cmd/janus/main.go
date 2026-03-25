@@ -10,6 +10,7 @@ import (
 	"github.com/SimoneErrigo/Janus/backend/internal/api"
 	"github.com/SimoneErrigo/Janus/backend/internal/config"
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
+	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
 
@@ -29,7 +30,13 @@ func main() {
 		log.Fatalf("Failed to initialize storage: %v", err)
 	}
 
-	proxyMgr := proxy.NewManager()
+	packetStore, err := sniffer.NewPacketStore(cfg.DataDir)
+	if err != nil {
+		log.Fatalf("Failed to initialize packet store: %v", err)
+	}
+	defer packetStore.Close()
+
+	proxyMgr := proxy.NewManager(packetStore)
 
 	// Auto-start enabled services
 	for _, svc := range store.ListServices() {
@@ -49,6 +56,7 @@ func main() {
 		<-sigCh
 		log.Println("Shutting down...")
 		proxyMgr.StopAll()
+		packetStore.Close()
 		os.Exit(0)
 	}()
 

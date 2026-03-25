@@ -15,13 +15,15 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
+	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
 
 // Manager manages proxy instances for configured services.
 type Manager struct {
-	mu      sync.RWMutex
-	proxies map[string]*runningProxy // service ID -> running proxy
+	mu          sync.RWMutex
+	proxies     map[string]*runningProxy // service ID -> running proxy
+	packetStore *sniffer.PacketStore
 }
 
 type runningProxy struct {
@@ -32,9 +34,10 @@ type runningProxy struct {
 }
 
 // NewManager creates a new proxy manager.
-func NewManager() *Manager {
+func NewManager(packetStore *sniffer.PacketStore) *Manager {
 	return &Manager{
-		proxies: make(map[string]*runningProxy),
+		proxies:     make(map[string]*runningProxy),
+		packetStore: packetStore,
 	}
 }
 
@@ -154,8 +157,13 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 		return nil, fmt.Errorf("listen on %s: %w", listenAddr, err)
 	}
 
+	var handler http.Handler = reverseProxy
+	if m.packetStore != nil {
+		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore)
+	}
+
 	server := &http.Server{
-		Handler:      reverseProxy,
+		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -214,11 +222,14 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 	}
 
 	var handler http.Handler = reverseProxy
+	if m.packetStore != nil {
+		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore)
+	}
 
 	// For gRPC, support h2c (HTTP/2 cleartext) from backend if needed
 	if svc.Protocol == storage.ProtocolGRPC {
 		h2s := &http2.Server{}
-		handler = h2c.NewHandler(reverseProxy, h2s)
+		handler = h2c.NewHandler(handler, h2s)
 	}
 
 	listenAddr := fmt.Sprintf("%s:%d", svc.ListenAddr, svc.ListenPort)
