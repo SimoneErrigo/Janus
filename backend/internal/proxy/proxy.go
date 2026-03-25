@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net"
@@ -10,6 +11,9 @@ import (
 	"net/url"
 	"sync"
 	"time"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
@@ -120,6 +124,8 @@ func (m *Manager) startProxy(svc *storage.Service) (*runningProxy, error) {
 	switch svc.Protocol {
 	case storage.ProtocolHTTP:
 		return m.startHTTPProxy(ctx, cancel, svc)
+	case storage.ProtocolHTTPS, storage.ProtocolHTTP2, storage.ProtocolGRPC:
+		return m.startTLSProxy(ctx, cancel, svc)
 	default:
 		cancel()
 		return nil, fmt.Errorf("protocol %q not yet supported", svc.Protocol)
@@ -163,6 +169,87 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 	go func() {
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			log.Printf("[%s] server error: %v", svc.Name, err)
+		}
+	}()
+
+	go func() {
+		<-ctx.Done()
+		server.Shutdown(context.Background())
+	}()
+
+	return rp, nil
+}
+
+func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, svc *storage.Service) (*runningProxy, error) {
+	tlsConfig, err := buildTLSConfig(svc)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("TLS config: %w", err)
+	}
+
+	// Target is the backend service (plaintext HTTP)
+	targetURL, err := url.Parse("http://" + svc.TargetAddr)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("invalid target address: %w", err)
+	}
+
+	reverseProxy := httputil.NewSingleHostReverseProxy(targetURL)
+	reverseProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("[%s] proxy error: %v", svc.Name, err)
+		w.WriteHeader(http.StatusBadGateway)
+	}
+
+	// For gRPC/HTTP2, configure HTTP/2 transport to backend
+	if svc.Protocol == storage.ProtocolGRPC || svc.Protocol == storage.ProtocolHTTP2 {
+		reverseProxy.Transport = &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				// Connect to backend over plaintext
+				return net.DialTimeout(network, addr, 10*time.Second)
+			},
+		}
+	}
+
+	var handler http.Handler = reverseProxy
+
+	// For gRPC, support h2c (HTTP/2 cleartext) from backend if needed
+	if svc.Protocol == storage.ProtocolGRPC {
+		h2s := &http2.Server{}
+		handler = h2c.NewHandler(reverseProxy, h2s)
+	}
+
+	listenAddr := fmt.Sprintf("%s:%d", svc.ListenAddr, svc.ListenPort)
+	listener, err := tls.Listen("tcp", listenAddr, tlsConfig)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("TLS listen on %s: %w", listenAddr, err)
+	}
+
+	server := &http.Server{
+		Handler:      handler,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Enable HTTP/2 on the server
+	if err := http2.ConfigureServer(server, &http2.Server{}); err != nil {
+		cancel()
+		listener.Close()
+		return nil, fmt.Errorf("configuring HTTP/2: %w", err)
+	}
+
+	rp := &runningProxy{
+		service:  svc,
+		listener: listener,
+		server:   server,
+		cancel:   cancel,
+	}
+
+	go func() {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			log.Printf("[%s] TLS server error: %v", svc.Name, err)
 		}
 	}()
 
