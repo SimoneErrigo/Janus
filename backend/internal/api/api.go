@@ -6,19 +6,22 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
 
 // Server holds the REST API dependencies.
 type Server struct {
-	store *storage.Store
-	mux   *http.ServeMux
+	store   *storage.Store
+	proxy   *proxy.Manager
+	mux     *http.ServeMux
 }
 
 // NewServer creates a new API server.
-func NewServer(store *storage.Store) *Server {
+func NewServer(store *storage.Store, proxyMgr *proxy.Manager) *Server {
 	s := &Server{
 		store: store,
+		proxy: proxyMgr,
 		mux:   http.NewServeMux(),
 	}
 	s.routes()
@@ -96,6 +99,12 @@ func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if svc.Enabled {
+		if err := s.proxy.StartService(&svc); err != nil {
+			log.Printf("Warning: service created but proxy failed to start: %v", err)
+		}
+	}
+
 	log.Printf("Service created: %s (%s)", svc.Name, svc.ID)
 	writeJSON(w, http.StatusCreated, svc)
 }
@@ -119,11 +128,22 @@ func (s *Server) updateService(w http.ResponseWriter, r *http.Request, id string
 		return
 	}
 
+	// Restart proxy if enabled, stop if disabled
+	if svc.Enabled {
+		if err := s.proxy.RestartService(&svc); err != nil {
+			log.Printf("Warning: service updated but proxy failed to restart: %v", err)
+		}
+	} else {
+		s.proxy.StopService(svc.ID)
+	}
+
 	log.Printf("Service updated: %s (%s)", svc.Name, svc.ID)
 	writeJSON(w, http.StatusOK, svc)
 }
 
 func (s *Server) deleteService(w http.ResponseWriter, r *http.Request, id string) {
+	s.proxy.StopService(id)
+
 	if err := s.store.DeleteService(id); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
