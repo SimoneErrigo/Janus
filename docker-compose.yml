@@ -1,0 +1,15 @@
+services:
+  janus:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      - DATA_DIR=/data
+      - API_PORT=8080
+      - ENV_PATH=/dev/null
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
