@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
@@ -16,15 +17,17 @@ type Server struct {
 	store       *storage.Store
 	proxy       *proxy.Manager
 	packetStore *sniffer.PacketStore
+	ruleStore   *dropper.RuleStore
 	mux         *http.ServeMux
 }
 
 // NewServer creates a new API server.
-func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore) *Server {
+func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore) *Server {
 	s := &Server{
 		store:       store,
 		proxy:       proxyMgr,
 		packetStore: packetStore,
+		ruleStore:   ruleStore,
 		mux:         http.NewServeMux(),
 	}
 	s.routes()
@@ -40,6 +43,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/services", s.handleServices)
 	s.mux.HandleFunc("/api/services/", s.handleServiceByID)
 	s.mux.HandleFunc("/api/packets", s.handlePackets)
+	s.mux.HandleFunc("/api/rules", s.handleRules)
+	s.mux.HandleFunc("/api/rules/", s.handleRuleByID)
 }
 
 func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {

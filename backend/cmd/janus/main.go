@@ -9,6 +9,7 @@ import (
 
 	"github.com/SimoneErrigo/Janus/backend/internal/api"
 	"github.com/SimoneErrigo/Janus/backend/internal/config"
+	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
@@ -36,7 +37,12 @@ func main() {
 	}
 	defer packetStore.Close()
 
-	proxyMgr := proxy.NewManager(packetStore)
+	ruleStore, err := dropper.NewRuleStore(cfg.DataDir)
+	if err != nil {
+		log.Fatalf("Failed to initialize rule store: %v", err)
+	}
+
+	proxyMgr := proxy.NewManager(packetStore, ruleStore)
 
 	// Auto-start enabled services
 	for _, svc := range store.ListServices() {
@@ -47,7 +53,7 @@ func main() {
 		}
 	}
 
-	apiServer := api.NewServer(store, proxyMgr, packetStore)
+	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore)
 
 	// Graceful shutdown
 	go func() {
