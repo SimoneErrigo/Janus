@@ -47,7 +47,7 @@ func main() {
 		}
 	}
 
-	apiServer := api.NewServer(store, proxyMgr)
+	apiServer := api.NewServer(store, proxyMgr, packetStore)
 
 	// Graceful shutdown
 	go func() {

@@ -7,22 +7,25 @@ import (
 	"strings"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
+	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
 
 // Server holds the REST API dependencies.
 type Server struct {
-	store   *storage.Store
-	proxy   *proxy.Manager
-	mux     *http.ServeMux
+	store       *storage.Store
+	proxy       *proxy.Manager
+	packetStore *sniffer.PacketStore
+	mux         *http.ServeMux
 }
 
 // NewServer creates a new API server.
-func NewServer(store *storage.Store, proxyMgr *proxy.Manager) *Server {
+func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore) *Server {
 	s := &Server{
-		store: store,
-		proxy: proxyMgr,
-		mux:   http.NewServeMux(),
+		store:       store,
+		proxy:       proxyMgr,
+		packetStore: packetStore,
+		mux:         http.NewServeMux(),
 	}
 	s.routes()
 	return s
@@ -36,6 +39,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) routes() {
 	s.mux.HandleFunc("/api/services", s.handleServices)
 	s.mux.HandleFunc("/api/services/", s.handleServiceByID)
+	s.mux.HandleFunc("/api/packets", s.handlePackets)
 }
 
 func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
