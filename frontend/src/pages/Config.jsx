@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { api } from '../api'
 
 export default function Config() {
@@ -7,8 +7,40 @@ export default function Config() {
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
 
+  // Cleanup state
+  const [cleanupConfig, setCleanupConfig] = useState(null)
+  const [cleanupForm, setCleanupForm] = useState({})
+  const [cleanupSaved, setCleanupSaved] = useState(false)
+  const [cleanupError, setCleanupError] = useState('')
+  const [cleanupResult, setCleanupResult] = useState(null)
+  const [cleanupRunning, setCleanupRunning] = useState(false)
+  const [dbSizeMB, setDbSizeMB] = useState(0)
+
   useEffect(() => {
     loadConfig()
+    loadCleanupConfig()
+  }, [])
+
+  const loadCleanupConfig = useCallback(async () => {
+    try {
+      const data = await api.getCleanupConfig()
+      setCleanupConfig(data)
+      setCleanupForm({ max_age_minutes: data.max_age_minutes, max_db_size_mb: data.max_db_size_mb })
+      setDbSizeMB(data.db_size_mb)
+    } catch (err) {
+      setCleanupError(err.message)
+    }
+  }, [])
+
+  // Refresh DB size every 30 seconds
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      try {
+        const data = await api.getCleanupConfig()
+        setDbSizeMB(data.db_size_mb)
+      } catch {}
+    }, 30000)
+    return () => clearInterval(interval)
   }, [])
 
   async function loadConfig() {
@@ -41,11 +73,43 @@ export default function Config() {
     }
   }
 
+  async function handleCleanupSave(e) {
+    e.preventDefault()
+    setCleanupError('')
+    setCleanupSaved(false)
+    try {
+      const data = await api.updateCleanupConfig({
+        max_age_minutes: parseInt(cleanupForm.max_age_minutes, 10) || 0,
+        max_db_size_mb: parseInt(cleanupForm.max_db_size_mb, 10) || 0,
+      })
+      setCleanupConfig(data)
+      setDbSizeMB(data.db_size_mb)
+      setCleanupSaved(true)
+      setTimeout(() => setCleanupSaved(false), 3000)
+    } catch (err) {
+      setCleanupError(err.message)
+    }
+  }
+
+  async function handleRunCleanup() {
+    setCleanupRunning(true)
+    setCleanupResult(null)
+    try {
+      const result = await api.runCleanup()
+      setCleanupResult(result)
+      setDbSizeMB(result.db_size_mb)
+    } catch (err) {
+      setCleanupError(err.message)
+    } finally {
+      setCleanupRunning(false)
+    }
+  }
+
   if (!config) return <div className="p-6 text-gray-500">Loading...</div>
 
   return (
-    <div className="p-6">
-      <h2 className="text-2xl font-semibold text-gray-100 mb-6">Configuration</h2>
+    <div className="p-6 space-y-6">
+      <h2 className="text-2xl font-semibold text-gray-100">Configuration</h2>
 
       <form onSubmit={handleSave} className="bg-gray-900 border border-gray-800 rounded-lg p-5 max-w-lg space-y-4">
         <div>
@@ -102,6 +166,80 @@ export default function Config() {
           Save Configuration
         </button>
       </form>
+
+      {/* Cleanup section */}
+      <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 max-w-lg space-y-4">
+        <div className="flex items-center justify-between">
+          <h3 className="text-lg font-medium text-gray-100">Database Cleanup</h3>
+          <div className="text-sm">
+            <span className="text-gray-500">DB Size: </span>
+            <span className={`font-mono font-medium ${
+              cleanupForm.max_db_size_mb > 0 && dbSizeMB >= cleanupForm.max_db_size_mb * 0.85 ? 'text-red-400' :
+              cleanupForm.max_db_size_mb > 0 && dbSizeMB >= cleanupForm.max_db_size_mb * 0.7 ? 'text-yellow-400' :
+              'text-cyan-400'
+            }`}>
+              {dbSizeMB.toFixed(1)} MB
+            </span>
+            {cleanupForm.max_db_size_mb > 0 && (
+              <span className="text-gray-600"> / {cleanupForm.max_db_size_mb} MB</span>
+            )}
+          </div>
+        </div>
+
+        <form onSubmit={handleCleanupSave} className="space-y-4">
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">Max Age (minutes)</label>
+              <input
+                type="number"
+                min="0"
+                value={cleanupForm.max_age_minutes ?? 0}
+                onChange={(e) => setCleanupForm((f) => ({ ...f, max_age_minutes: e.target.value }))}
+                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 transition-colors"
+              />
+              <p className="text-xs text-gray-600 mt-1">Delete packets older than N minutes (0 = off)</p>
+            </div>
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">Max DB Size (MB)</label>
+              <input
+                type="number"
+                min="0"
+                value={cleanupForm.max_db_size_mb ?? 0}
+                onChange={(e) => setCleanupForm((f) => ({ ...f, max_db_size_mb: e.target.value }))}
+                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 transition-colors"
+              />
+              <p className="text-xs text-gray-600 mt-1">Delete oldest when DB exceeds N MB (0 = off)</p>
+            </div>
+          </div>
+
+          {cleanupError && <div className="bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded">{cleanupError}</div>}
+          {cleanupSaved && <div className="bg-green-900/30 border border-green-800 text-green-400 text-sm px-4 py-2 rounded">Cleanup settings saved</div>}
+
+          {cleanupResult && (
+            <div className="bg-cyan-900/20 border border-cyan-800/50 text-cyan-300 text-sm px-4 py-2 rounded">
+              Deleted {cleanupResult.packets_deleted} packets, {cleanupResult.alerts_deleted} alerts in {cleanupResult.duration_ms}ms.
+              DB now {cleanupResult.db_size_mb.toFixed(1)} MB.
+            </div>
+          )}
+
+          <div className="flex gap-2">
+            <button
+              type="submit"
+              className="bg-cyan-600 hover:bg-cyan-500 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
+            >
+              Save Cleanup Settings
+            </button>
+            <button
+              type="button"
+              onClick={handleRunCleanup}
+              disabled={cleanupRunning}
+              className="bg-orange-700 hover:bg-orange-600 disabled:bg-gray-700 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
+            >
+              {cleanupRunning ? 'Running...' : 'Run Cleanup Now'}
+            </button>
+          </div>
+        </form>
+      </div>
     </div>
   )
 }

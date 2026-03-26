@@ -85,4 +85,9 @@ export const api = {
   // Config
   getConfig: () => request('/config'),
   updateConfig: (data) => request('/config', { method: 'PUT', body: data }),
+
+  // Cleanup
+  getCleanupConfig: () => request('/config/cleanup'),
+  updateCleanupConfig: (data) => request('/config/cleanup', { method: 'PUT', body: data }),
+  runCleanup: () => request('/cleanup/run', { method: 'POST' }),
 };
