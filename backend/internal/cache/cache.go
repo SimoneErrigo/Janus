@@ -274,3 +274,25 @@ func (c *Client) InvalidateAllPacketQueries() {
 		c.rdb.Del(ctx, keys...)
 	}
 }
+
+// MemoryUsageMB returns the Redis used_memory in MB, or -1 if unavailable.
+func (c *Client) MemoryUsageMB() float64 {
+	if !c.Available() {
+		return -1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	info, err := c.rdb.Info(ctx, "memory").Result()
+	if err != nil {
+		return -1
+	}
+	for _, line := range strings.Split(info, "\r\n") {
+		if strings.HasPrefix(line, "used_memory:") {
+			val := strings.TrimPrefix(line, "used_memory:")
+			var bytes float64
+			fmt.Sscanf(val, "%f", &bytes)
+			return bytes / 1024 / 1024
+		}
+	}
+	return -1
+}
