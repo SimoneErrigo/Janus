@@ -62,9 +62,14 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		// Check flagged status
 		flagged := CheckFlagged(flagRegex, r.URL.String(), headersStr, reqBody)
 
+		// Session ID: ties request + response from the same TCP connection.
+		// Even with SNAT (all traffic from same IP), src_port is unique per connection.
+		sessionID := MakeSessionID(svc.ID, srcIP, srcPort)
+
 		// Build and insert request packet
 		reqPacket := &Packet{
 			ServiceID:    svc.ID,
+			SessionID:    sessionID,
 			Timestamp:    start,
 			SrcIP:        srcIP,
 			SrcPort:      srcPort,
@@ -105,6 +110,7 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 
 		respPacket := &Packet{
 			ServiceID:    svc.ID,
+			SessionID:    sessionID,
 			Timestamp:    time.Now(),
 			SrcIP:        dstIP,
 			SrcPort:      dstPort,

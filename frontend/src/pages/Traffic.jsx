@@ -1,5 +1,40 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { api } from '../api'
+
+// Highlight matching text in a string based on contains/regex filter
+function HighlightedText({ text, contains, regex }) {
+  if (!text || (!contains && !regex)) return <>{text}</>
+
+  try {
+    let re
+    if (regex) {
+      re = new RegExp(`(${regex})`, 'gi')
+    } else if (contains) {
+      re = new RegExp(`(${contains.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi')
+    }
+    if (!re) return <>{text}</>
+
+    const parts = text.split(re)
+    return (
+      <>
+        {parts.map((part, i) =>
+          re.test(part) ? (
+            <mark key={i} className="bg-yellow-500/40 text-yellow-200 rounded px-0.5">{part}</mark>
+          ) : (
+            <span key={i}>{part}</span>
+          )
+        )}
+      </>
+    )
+  } catch {
+    return <>{text}</>
+  }
+}
+
+// Get the peer (external) IP from a packet
+function getPeerIP(pkt) {
+  return pkt.direction === 'request' ? pkt.src_ip : pkt.dst_ip
+}
 
 export default function Traffic() {
   const [services, setServices] = useState([])
@@ -7,11 +42,45 @@ export default function Traffic() {
   const [total, setTotal] = useState(0)
   const [selected, setSelected] = useState(null)
   const [loading, setLoading] = useState(false)
+  const [filtersCollapsed, setFiltersCollapsed] = useState(false)
   const [filters, setFilters] = useState({
-    service_id: '', src_ip: '', dst_ip: '', protocol: '',
-    contains: '', regex: '', flagged: '', sort: 'desc',
+    service_id: '', src_ip: '', dst_ip: '', protocol: '', method: '',
+    session_id: '', peer_ip: '', contains: '', regex: '', flagged: '', sort: 'desc',
     limit: 50, offset: 0,
   })
+
+  // Resizable detail panel
+  const [detailWidth, setDetailWidth] = useState(450)
+  const dragging = useRef(false)
+  const dragStartX = useRef(0)
+  const dragStartW = useRef(0)
+
+  useEffect(() => {
+    function onMouseMove(e) {
+      if (!dragging.current) return
+      const delta = dragStartX.current - e.clientX
+      setDetailWidth(Math.max(300, Math.min(900, dragStartW.current + delta)))
+    }
+    function onMouseUp() {
+      dragging.current = false
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+    window.addEventListener('mousemove', onMouseMove)
+    window.addEventListener('mouseup', onMouseUp)
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove)
+      window.removeEventListener('mouseup', onMouseUp)
+    }
+  }, [])
+
+  function startDrag(e) {
+    dragging.current = true
+    dragStartX.current = e.clientX
+    dragStartW.current = detailWidth
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+  }
 
   useEffect(() => {
     api.listServices().then((data) => setServices(data || []))
@@ -32,7 +101,6 @@ export default function Traffic() {
 
   useEffect(() => { loadPackets() }, [loadPackets])
 
-  // Auto-refresh every 3 seconds
   useEffect(() => {
     const interval = setInterval(loadPackets, 3000)
     return () => clearInterval(interval)
@@ -49,32 +117,82 @@ export default function Traffic() {
     setFilters((f) => ({ ...f, offset: Math.max(0, f.offset - f.limit) }))
   }
 
+  // Flow: show all packets from the same TCP connection, chronologically
+  function showFlow(pkt) {
+    setFilters((f) => ({
+      ...f,
+      session_id: pkt.session_id,
+      sort: 'asc',
+      offset: 0,
+    }))
+  }
+
+  function clearFlow() {
+    setFilters((f) => ({ ...f, session_id: '', sort: 'desc', offset: 0 }))
+  }
+
+  const isFlowActive = !!filters.session_id
+  const hasActiveFilter = filters.contains || filters.regex
+
   return (
-    <div className="p-6 flex flex-col h-full">
-      {/* Filters */}
-      <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 mb-4">
-        <div className="grid grid-cols-4 gap-3">
-          <FilterSelect label="Service" value={filters.service_id} onChange={(v) => setFilter('service_id', v)}
-            options={[{ value: '', label: 'All' }, ...services.map((s) => ({ value: s.id, label: s.name }))]}
-          />
-          <FilterInput label="Source IP" value={filters.src_ip} onChange={(v) => setFilter('src_ip', v)} placeholder="e.g. 10.10.0.5" />
-          <FilterInput label="Dest IP" value={filters.dst_ip} onChange={(v) => setFilter('dst_ip', v)} placeholder="e.g. 10.10.0.1" />
-          <FilterSelect label="Protocol" value={filters.protocol} onChange={(v) => setFilter('protocol', v)}
-            options={[{ value: '', label: 'All' }, ...['http','https','h2','grpc','tcp'].map((p) => ({ value: p, label: p.toUpperCase() }))]}
-          />
-          <FilterInput label="Contains" value={filters.contains} onChange={(v) => setFilter('contains', v)} placeholder="Text search..." />
-          <FilterInput label="Regex" value={filters.regex} onChange={(v) => setFilter('regex', v)} placeholder="Regex pattern..." />
-          <FilterSelect label="Flagged" value={filters.flagged} onChange={(v) => setFilter('flagged', v)}
-            options={[{ value: '', label: 'All' }, { value: 'true', label: 'Flagged only' }, { value: 'false', label: 'Not flagged' }]}
-          />
-          <FilterSelect label="Sort" value={filters.sort} onChange={(v) => setFilter('sort', v)}
-            options={[{ value: 'desc', label: 'Newest first' }, { value: 'asc', label: 'Oldest first' }]}
-          />
+    <div className="p-4 flex flex-col h-full">
+      {/* Flow banner */}
+      {isFlowActive && (
+        <div className="mb-2 flex items-center gap-3 bg-purple-900/30 border border-purple-700/50 rounded-lg px-3 py-2">
+          <svg className="w-4 h-4 text-purple-400 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
+          </svg>
+          <span className="text-sm text-purple-300">
+            Session: <span className="font-mono font-medium text-purple-200">{filters.session_id}</span>
+            <span className="text-purple-500 ml-2">({total} packets, chronological order)</span>
+          </span>
+          <button onClick={clearFlow} className="ml-auto text-xs bg-purple-800/50 hover:bg-purple-700/50 text-purple-300 px-2 py-1 rounded cursor-pointer">
+            Clear flow
+          </button>
         </div>
+      )}
+
+      {/* Filters — collapsible */}
+      <div className="mb-3">
+        <button
+          onClick={() => setFiltersCollapsed(!filtersCollapsed)}
+          className="flex items-center gap-2 text-xs text-gray-500 hover:text-gray-300 mb-1 cursor-pointer"
+        >
+          <svg className={`w-3 h-3 transition-transform ${filtersCollapsed ? '-rotate-90' : ''}`} viewBox="0 0 12 12" fill="currentColor">
+            <path d="M2 4l4 4 4-4z" />
+          </svg>
+          Filters {hasActiveFilter && <span className="bg-cyan-900/50 text-cyan-400 px-1.5 rounded text-[10px]">active</span>}
+        </button>
+        {!filtersCollapsed && (
+          <div className="bg-gray-900 border border-gray-800 rounded-lg p-3">
+            <div className="grid grid-cols-5 gap-3">
+              <FilterSelect label="Service" value={filters.service_id} onChange={(v) => setFilter('service_id', v)}
+                options={[{ value: '', label: 'All' }, ...services.map((s) => ({ value: s.id, label: s.name }))]}
+              />
+              <FilterInput label="Peer IP" value={filters.peer_ip} onChange={(v) => setFilter('peer_ip', v)} placeholder="Attacker IP..." />
+              <FilterInput label="Source IP" value={filters.src_ip} onChange={(v) => setFilter('src_ip', v)} placeholder="e.g. 10.10.0.5" />
+              <FilterInput label="Dest IP" value={filters.dst_ip} onChange={(v) => setFilter('dst_ip', v)} placeholder="e.g. 10.10.0.1" />
+              <FilterSelect label="Protocol" value={filters.protocol} onChange={(v) => setFilter('protocol', v)}
+                options={[{ value: '', label: 'All' }, ...['http','https','h2','grpc','tcp'].map((p) => ({ value: p, label: p.toUpperCase() }))]}
+              />
+              <FilterSelect label="Method" value={filters.method} onChange={(v) => setFilter('method', v)}
+                options={[{ value: '', label: 'All' }, ...['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS'].map((m) => ({ value: m, label: m }))]}
+              />
+              <FilterInput label="Contains" value={filters.contains} onChange={(v) => setFilter('contains', v)} placeholder="Text search..." />
+              <FilterInput label="Regex" value={filters.regex} onChange={(v) => setFilter('regex', v)} placeholder="Regex pattern..." />
+              <FilterSelect label="Flagged" value={filters.flagged} onChange={(v) => setFilter('flagged', v)}
+                options={[{ value: '', label: 'All' }, { value: 'true', label: 'Flagged only' }, { value: 'false', label: 'Not flagged' }]}
+              />
+              <FilterSelect label="Sort" value={filters.sort} onChange={(v) => setFilter('sort', v)}
+                options={[{ value: 'desc', label: 'Newest first' }, { value: 'asc', label: 'Oldest first' }]}
+              />
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Packet table + detail split */}
-      <div className="flex-1 flex gap-4 min-h-0">
+      <div className="flex-1 flex gap-0 min-h-0">
         {/* Table */}
         <div className="flex-1 flex flex-col min-h-0">
           <div className="flex-1 overflow-auto">
@@ -83,11 +201,11 @@ export default function Traffic() {
                 <tr className="text-left text-gray-500 border-b border-gray-800">
                   <th className="px-3 py-2 font-medium">Time</th>
                   <th className="px-3 py-2 font-medium">Dir</th>
-                  <th className="px-3 py-2 font-medium">Source</th>
+                  <th className="px-3 py-2 font-medium">Peer</th>
                   <th className="px-3 py-2 font-medium">Method</th>
                   <th className="px-3 py-2 font-medium">URL / Body</th>
                   <th className="px-3 py-2 font-medium">Status</th>
-                  <th className="px-3 py-2 font-medium w-8"></th>
+                  <th className="px-3 py-2 font-medium w-16"></th>
                 </tr>
               </thead>
               <tbody>
@@ -109,15 +227,24 @@ export default function Traffic() {
                         {pkt.direction === 'request' ? 'REQ' : 'RES'}
                       </span>
                     </td>
-                    <td className="px-3 py-1.5 text-gray-300 font-mono text-xs">{pkt.src_ip}</td>
+                    <td className="px-3 py-1.5 text-gray-300 font-mono text-xs">{getPeerIP(pkt)}</td>
                     <td className="px-3 py-1.5 text-gray-300 text-xs">{pkt.method}</td>
-                    <td className="px-3 py-1.5 text-gray-400 text-xs truncate max-w-xs">{pkt.url || (pkt.body_string?.slice(0, 80)) || '—'}</td>
+                    <td className="px-3 py-1.5 text-gray-400 text-xs truncate max-w-xs">{pkt.url || (pkt.body_string?.slice(0, 80)) || '\u2014'}</td>
                     <td className="px-3 py-1.5 text-xs">
                       {pkt.status > 0 && <span className={`${pkt.status < 400 ? 'text-green-400' : 'text-red-400'}`}>{pkt.status}</span>}
                     </td>
-                    <td className="px-3 py-1.5">
+                    <td className="px-3 py-1.5 flex items-center gap-1">
                       {pkt.flagged && <span className="text-yellow-400 text-xs" title="Contains flag">&#9873;</span>}
-                      {pkt.matched_rules?.length > 0 && <span className="text-red-400 text-xs ml-1" title="Rule matched">&#9888;</span>}
+                      {pkt.matched_rules?.length > 0 && <span className="text-red-400 text-xs" title="Rule matched">&#9888;</span>}
+                      <button
+                        onClick={(e) => { e.stopPropagation(); showFlow(pkt) }}
+                        className="text-gray-600 hover:text-purple-400 text-xs cursor-pointer ml-auto"
+                        title={`Show flow for ${getPeerIP(pkt)}`}
+                      >
+                        <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
+                        </svg>
+                      </button>
                     </td>
                   </tr>
                 ))}
@@ -139,58 +266,90 @@ export default function Traffic() {
           </div>
         </div>
 
-        {/* Detail panel */}
+        {/* Detail panel — resizable */}
         {selected && (
-          <div className="w-96 bg-gray-900 border border-gray-800 rounded-lg overflow-auto">
-            <div className="flex items-center justify-between p-3 border-b border-gray-800">
-              <h3 className="text-sm font-medium text-gray-100">Packet #{selected.id}</h3>
-              <button onClick={() => setSelected(null)} className="text-gray-500 hover:text-gray-300 cursor-pointer">&times;</button>
-            </div>
-            <div className="p-3 space-y-3 text-sm">
-              <DetailRow label="Service" value={selected.service_id} />
-              <DetailRow label="Time" value={new Date(selected.timestamp).toLocaleString()} />
-              <DetailRow label="Direction" value={selected.direction} />
-              <DetailRow label="Protocol" value={selected.protocol} />
-              <DetailRow label="Source" value={`${selected.src_ip}:${selected.src_port}`} />
-              <DetailRow label="Destination" value={`${selected.dst_ip}:${selected.dst_port}`} />
-              {selected.method && <DetailRow label="Method" value={selected.method} />}
-              {selected.url && <DetailRow label="URL" value={selected.url} />}
-              {selected.status > 0 && <DetailRow label="Status" value={selected.status} />}
-
-              {selected.flagged && (
-                <div className="bg-yellow-900/20 border border-yellow-800/50 rounded p-2 text-yellow-400 text-xs">
-                  Contains flag pattern
+          <>
+            {/* Drag handle */}
+            <div
+              onMouseDown={startDrag}
+              className="w-1.5 cursor-col-resize hover:bg-cyan-500/30 active:bg-cyan-500/50 transition-colors flex-shrink-0 rounded"
+            />
+            <div style={{ width: detailWidth }} className="flex-shrink-0 bg-gray-900 border border-gray-800 rounded-lg overflow-auto">
+              <div className="flex items-center justify-between p-3 border-b border-gray-800 sticky top-0 bg-gray-900 z-10">
+                <div className="flex items-center gap-2">
+                  <h3 className="text-sm font-medium text-gray-100">Packet #{selected.id}</h3>
+                  <button
+                    onClick={() => showFlow(selected)}
+                    className="text-xs text-purple-400 hover:text-purple-300 cursor-pointer"
+                    title={`Show flow for ${getPeerIP(selected)}`}
+                  >
+                    Flow
+                  </button>
                 </div>
-              )}
-
-              {selected.matched_rules?.length > 0 && (
-                <div className="bg-red-900/20 border border-red-800/50 rounded p-2">
-                  <div className="text-red-400 text-xs font-medium mb-1">Matched Rules:</div>
-                  {selected.matched_rules.map((r) => (
-                    <div key={r.id} className="text-red-300 text-xs">{r.name} ({r.id})</div>
-                  ))}
+                <button onClick={() => setSelected(null)} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
+              </div>
+              <div className="p-3 space-y-2 text-sm">
+                {/* Compact metadata grid */}
+                <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs bg-gray-800/50 rounded p-2">
+                  <div><span className="text-gray-500">Service </span><span className="text-gray-300">{selected.service_id}</span></div>
+                  <div><span className="text-gray-500">Time </span><span className="text-gray-300">{new Date(selected.timestamp).toLocaleTimeString()}</span></div>
+                  <div><span className="text-gray-500">Direction </span><span className={selected.direction === 'request' ? 'text-blue-400' : 'text-green-400'}>{selected.direction === 'request' ? 'Request' : 'Response'}</span></div>
+                  <div><span className="text-gray-500">Protocol </span><span className="text-gray-300">{selected.protocol}</span></div>
+                  <div><span className="text-gray-500">Src </span><span className="text-gray-300 font-mono">{selected.src_ip}:{selected.src_port}</span></div>
+                  <div><span className="text-gray-500">Dst </span><span className="text-gray-300 font-mono">{selected.dst_ip}:{selected.dst_port}</span></div>
+                  {selected.method && <div><span className="text-gray-500">Method </span><span className="text-gray-300">{selected.method}</span></div>}
+                  {selected.status > 0 && <div><span className="text-gray-500">Status </span><span className={selected.status < 400 ? 'text-green-400' : 'text-red-400'}>{selected.status}</span></div>}
                 </div>
-              )}
 
-              {selected.headers && Object.keys(selected.headers).length > 0 && (
-                <div>
-                  <div className="text-gray-500 text-xs mb-1">Headers</div>
-                  <div className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 max-h-40 overflow-auto">
-                    {Object.entries(selected.headers).map(([k, v]) => (
-                      <div key={k}><span className="text-cyan-400">{k}:</span> {v}</div>
+                {selected.url && (
+                  <div className="text-xs">
+                    <span className="text-gray-500">URL </span>
+                    <span className="text-gray-300 break-all font-mono">
+                      <HighlightedText text={selected.url} contains={filters.contains} regex={filters.regex} />
+                    </span>
+                  </div>
+                )}
+
+                {selected.flagged && (
+                  <div className="bg-yellow-900/20 border border-yellow-800/50 rounded px-2 py-1 text-yellow-400 text-xs">
+                    Contains flag pattern
+                  </div>
+                )}
+
+                {selected.matched_rules?.length > 0 && (
+                  <div className="bg-red-900/20 border border-red-800/50 rounded px-2 py-1">
+                    <span className="text-red-400 text-xs font-medium">Matched: </span>
+                    {selected.matched_rules.map((r, i) => (
+                      <span key={r.id} className="text-red-300 text-xs">{i > 0 && ', '}{r.name}</span>
                     ))}
                   </div>
-                </div>
-              )}
+                )}
 
-              {selected.body_string && (
-                <div>
-                  <div className="text-gray-500 text-xs mb-1">Body</div>
-                  <pre className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 max-h-60 overflow-auto whitespace-pre-wrap break-all">{selected.body_string}</pre>
-                </div>
-              )}
+                {selected.headers && Object.keys(selected.headers).length > 0 && (
+                  <div className="flex-1">
+                    <div className="text-gray-500 text-xs mb-1">Headers</div>
+                    <div className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 overflow-auto" style={{ maxHeight: '40vh' }}>
+                      {Object.entries(selected.headers).map(([k, v]) => (
+                        <div key={k}>
+                          <span className="text-cyan-400">{k}:</span>{' '}
+                          <HighlightedText text={v} contains={filters.contains} regex={filters.regex} />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {selected.body_string && (
+                  <div className="flex-1">
+                    <div className="text-gray-500 text-xs mb-1">Body</div>
+                    <pre className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 overflow-auto whitespace-pre-wrap break-all" style={{ maxHeight: '60vh' }}>
+                      <HighlightedText text={selected.body_string} contains={filters.contains} regex={filters.regex} />
+                    </pre>
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
+          </>
         )}
       </div>
 
@@ -224,15 +383,6 @@ function FilterSelect({ label, value, onChange, options }) {
       >
         {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
       </select>
-    </div>
-  )
-}
-
-function DetailRow({ label, value }) {
-  return (
-    <div className="flex">
-      <span className="text-gray-500 w-24 flex-shrink-0">{label}</span>
-      <span className="text-gray-300 break-all">{value}</span>
     </div>
   )
 }

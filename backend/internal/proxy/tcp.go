@@ -19,7 +19,7 @@ import (
 const maxTCPCapture = 1 << 20 // 1 MB per direction per connection
 
 func (m *Manager) startTCPProxy(ctx context.Context, cancel context.CancelFunc, svc *storage.Service) (*runningProxy, error) {
-	listenAddr := fmt.Sprintf("%s:%d", svc.ListenAddr, svc.ListenPort)
+	listenAddr := fmt.Sprintf("0.0.0.0:%d", svc.ListenPort)
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		cancel()
@@ -63,6 +63,7 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 	srcPort, _ := strconv.Atoi(srcPortStr)
 	dstIP := svc.ListenAddr
 	dstPort := svc.ListenPort
+	sessionID := sniffer.MakeSessionID(svc.ID, srcIP, srcPort)
 
 	// Read initial data from client for drop rule evaluation
 	var initialData []byte
@@ -101,6 +102,7 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 		}
 		pkt := &sniffer.Packet{
 			ServiceID:    svc.ID,
+			SessionID:    sessionID,
 			Timestamp:    time.Now(),
 			SrcIP:        srcIP,
 			SrcPort:      srcPort,
@@ -143,7 +145,7 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 	// Client -> Backend (request direction)
 	go func() {
 		defer wg.Done()
-		m.sniffCopy(backendConn, clientConn, svc, srcIP, srcPort, dstIP, dstPort, sniffer.DirectionRequest)
+		m.sniffCopy(backendConn, clientConn, svc, sessionID, srcIP, srcPort, dstIP, dstPort, sniffer.DirectionRequest)
 		if tc, ok := backendConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -152,7 +154,7 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 	// Backend -> Client (response direction)
 	go func() {
 		defer wg.Done()
-		m.sniffCopy(clientConn, backendConn, svc, dstIP, dstPort, srcIP, srcPort, sniffer.DirectionResponse)
+		m.sniffCopy(clientConn, backendConn, svc, sessionID, dstIP, dstPort, srcIP, srcPort, sniffer.DirectionResponse)
 		if tc, ok := clientConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -170,7 +172,7 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 	}
 }
 
-func (m *Manager) sniffCopy(dst io.Writer, src io.Reader, svc *storage.Service, srcIP string, srcPort int, dstIP string, dstPort int, dir sniffer.Direction) {
+func (m *Manager) sniffCopy(dst io.Writer, src io.Reader, svc *storage.Service, sessionID string, srcIP string, srcPort int, dstIP string, dstPort int, dir sniffer.Direction) {
 	var buf bytes.Buffer
 	writer := dst
 	if m.packetStore != nil {
@@ -186,6 +188,7 @@ func (m *Manager) sniffCopy(dst io.Writer, src io.Reader, svc *storage.Service, 
 		flagged := sniffer.CheckFlagged(m.flagRegex, "", "", data)
 		pkt := &sniffer.Packet{
 			ServiceID:    svc.ID,
+			SessionID:    sessionID,
 			Timestamp:    time.Now(),
 			SrcIP:        srcIP,
 			SrcPort:      srcPort,

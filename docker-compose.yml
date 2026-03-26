@@ -10,14 +10,23 @@ services:
       - ENV_PATH=/dev/null
     volumes:
       - ./data:/data
-    network_mode: host
+      - ./certs:/certs
+    ports:
+      - "8080:8080"
+      - "10000-10100:10000-10100"
+      - "3007:3007"
+      - "5555:5555"
+      - "5001:5001"
     restart: unless-stopped
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    network_mode: host
+    environment:
+      - API_BACKEND=janus
+    ports:
+      - "3000:3000"
     depends_on:
       - janus
     restart: unless-stopped

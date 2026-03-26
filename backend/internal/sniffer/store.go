@@ -39,6 +39,7 @@ func migrate(db *sql.DB) error {
 		CREATE TABLE IF NOT EXISTS packets (
 			id            INTEGER PRIMARY KEY AUTOINCREMENT,
 			service_id    TEXT    NOT NULL,
+			session_id    TEXT    NOT NULL DEFAULT '',
 			timestamp     TEXT    NOT NULL,
 			src_ip        TEXT    NOT NULL,
 			src_port      INTEGER NOT NULL,
@@ -70,9 +71,13 @@ func migrate(db *sql.DB) error {
 	for _, col := range []string{
 		"ALTER TABLE packets ADD COLUMN matched_rules TEXT NOT NULL DEFAULT '[]'",
 		"ALTER TABLE packets ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE packets ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
 	} {
 		db.Exec(col) // ignore "duplicate column" errors
 	}
+
+	// Create indexes for columns added by migrations (must run after ALTER TABLE)
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_session_id ON packets(session_id)")
 
 	return nil
 }
@@ -100,11 +105,11 @@ func (s *PacketStore) Insert(p *Packet) error {
 	}
 
 	res, err := s.db.Exec(`
-		INSERT INTO packets (service_id, timestamp, src_ip, src_port, dst_ip, dst_port,
+		INSERT INTO packets (service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port,
 			protocol, direction, method, url, status, headers, body, body_string,
 			matched_rules, flagged)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.ServiceID,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ServiceID, p.SessionID,
 		p.Timestamp.UTC().Format(time.RFC3339Nano),
 		p.SrcIP, p.SrcPort,
 		p.DstIP, p.DstPort,
@@ -145,7 +150,7 @@ func (s *PacketStore) Query(q PacketQuery) ([]*Packet, int, error) {
 		offset = 0
 	}
 
-	selectCols := "id, service_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged"
+	selectCols := "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged"
 
 	if hasRegex {
 		// With regex: fetch all SQL-matching rows, filter in Go, then paginate
@@ -239,7 +244,7 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 		var matchedRulesJSON string
 		var flaggedInt int
 		if err := rows.Scan(
-			&p.ID, &p.ServiceID, &ts,
+			&p.ID, &p.ServiceID, &p.SessionID, &ts,
 			&p.SrcIP, &p.SrcPort, &p.DstIP, &p.DstPort,
 			&p.Protocol, &p.Direction,
 			&p.Method, &p.URL, &p.Status,
@@ -286,6 +291,10 @@ func buildWhere(q PacketQuery) (string, []interface{}) {
 		conditions = append(conditions, "service_id = ?")
 		args = append(args, q.ServiceID)
 	}
+	if q.SessionID != "" {
+		conditions = append(conditions, "session_id = ?")
+		args = append(args, q.SessionID)
+	}
 	if q.SrcIP != "" {
 		conditions = append(conditions, "src_ip = ?")
 		args = append(args, q.SrcIP)
@@ -297,6 +306,15 @@ func buildWhere(q PacketQuery) (string, []interface{}) {
 	if q.Protocol != "" {
 		conditions = append(conditions, "protocol = ?")
 		args = append(args, q.Protocol)
+	}
+	if q.Method != "" {
+		conditions = append(conditions, "method = ?")
+		args = append(args, q.Method)
+	}
+	if q.PeerIP != "" {
+		// Peer IP: the external party — src_ip on requests, dst_ip on responses
+		conditions = append(conditions, "((direction = 'request' AND src_ip = ?) OR (direction = 'response' AND dst_ip = ?))")
+		args = append(args, q.PeerIP, q.PeerIP)
 	}
 	if q.TimeFrom != nil {
 		conditions = append(conditions, "timestamp >= ?")

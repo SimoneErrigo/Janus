@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/SimoneErrigo/Janus/backend/internal/config"
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
@@ -132,9 +131,6 @@ func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
-
-	// Auto-create flag drop rule for new service
-	dropper.EnsureFlagRule(s.ruleStore, svc.ID, config.Get().FlagRegex)
 
 	if svc.Enabled {
 		if err := s.proxy.StartService(&svc); err != nil {

@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { clearToken } from '../api'
 
@@ -10,6 +11,7 @@ const navItems = [
 
 export default function Layout() {
   const navigate = useNavigate()
+  const [collapsed, setCollapsed] = useState(false)
 
   function handleLogout() {
     clearToken()
@@ -19,35 +21,54 @@ export default function Layout() {
   return (
     <div className="flex h-screen bg-gray-950 text-gray-100">
       {/* Sidebar */}
-      <nav className="w-56 bg-gray-900 border-r border-gray-800 flex flex-col">
-        <div className="p-4 border-b border-gray-800">
-          <h1 className="text-xl font-bold text-cyan-400 tracking-wide">JANUS</h1>
-          <p className="text-xs text-gray-500 mt-1">CTF A/D Proxy</p>
+      <nav className={`${collapsed ? 'w-12' : 'w-56'} bg-gray-900 border-r border-gray-800 flex flex-col transition-all duration-200 flex-shrink-0`}>
+        <div className="p-2 border-b border-gray-800 flex items-center justify-between">
+          {!collapsed && (
+            <div className="px-2">
+              <h1 className="text-xl font-bold text-cyan-400 tracking-wide">JANUS</h1>
+              <p className="text-xs text-gray-500 mt-0.5">CTF A/D Proxy</p>
+            </div>
+          )}
+          <button
+            onClick={() => setCollapsed(!collapsed)}
+            className="p-1.5 text-gray-500 hover:text-gray-300 cursor-pointer rounded hover:bg-gray-800 flex-shrink-0"
+            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            <svg className={`w-4 h-4 transition-transform ${collapsed ? 'rotate-180' : ''}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M15 18l-6-6 6-6" />
+            </svg>
+          </button>
         </div>
         <div className="flex-1 py-2">
           {navItems.map(({ to, label, icon: Icon }) => (
             <NavLink
               key={to}
               to={to}
+              title={collapsed ? label : undefined}
               className={({ isActive }) =>
-                `flex items-center gap-3 px-4 py-2.5 text-sm transition-colors ${
+                `flex items-center ${collapsed ? 'justify-center px-0 py-2.5' : 'gap-3 px-4 py-2.5'} text-sm transition-colors ${
                   isActive
                     ? 'bg-gray-800 text-cyan-400 border-r-2 border-cyan-400'
                     : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'
                 }`
               }
             >
-              <Icon className="w-4 h-4" />
-              {label}
+              <Icon className="w-4 h-4 flex-shrink-0" />
+              {!collapsed && label}
             </NavLink>
           ))}
         </div>
-        <div className="p-4 border-t border-gray-800">
+        <div className="p-2 border-t border-gray-800">
           <button
             onClick={handleLogout}
-            className="w-full text-sm text-gray-500 hover:text-red-400 transition-colors text-left cursor-pointer"
+            title={collapsed ? 'Logout' : undefined}
+            className={`w-full text-sm text-gray-500 hover:text-red-400 transition-colors cursor-pointer ${collapsed ? 'text-center py-1' : 'text-left px-2'}`}
           >
-            Logout
+            {collapsed ? (
+              <svg className="w-4 h-4 mx-auto" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><polyline points="16 17 21 12 16 7" /><line x1="21" y1="12" x2="9" y2="12" />
+              </svg>
+            ) : 'Logout'}
           </button>
         </div>
       </nav>

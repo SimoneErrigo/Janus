@@ -156,7 +156,7 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 		w.WriteHeader(http.StatusBadGateway)
 	}
 
-	listenAddr := fmt.Sprintf("%s:%d", svc.ListenAddr, svc.ListenPort)
+	listenAddr := fmt.Sprintf("0.0.0.0:%d", svc.ListenPort)
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		cancel()
@@ -207,8 +207,12 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 		return nil, fmt.Errorf("TLS config: %w", err)
 	}
 
-	// Target is the backend service (plaintext HTTP)
-	targetURL, err := url.Parse("http://" + svc.TargetAddr)
+	// Target is the backend service
+	targetScheme := "http"
+	if svc.TargetTLS {
+		targetScheme = "https"
+	}
+	targetURL, err := url.Parse(targetScheme + "://" + svc.TargetAddr)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("invalid target address: %w", err)
@@ -222,12 +226,26 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 
 	// For gRPC/HTTP2, configure HTTP/2 transport to backend
 	if svc.Protocol == storage.ProtocolGRPC || svc.Protocol == storage.ProtocolHTTP2 {
-		reverseProxy.Transport = &http2.Transport{
-			AllowHTTP: true,
-			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-				// Connect to backend over plaintext
-				return net.DialTimeout(network, addr, 10*time.Second)
-			},
+		// Flush immediately after each write for streaming/gRPC support
+		reverseProxy.FlushInterval = -1
+		if svc.TargetTLS {
+			reverseProxy.Transport = &http2.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			}
+		} else {
+			reverseProxy.Transport = &http2.Transport{
+				AllowHTTP: true,
+				DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+					return net.DialTimeout(network, addr, 10*time.Second)
+				},
+			}
+		}
+	} else if svc.TargetTLS {
+		// For HTTPS backends with custom/self-signed certs (common in CTF), skip verification
+		reverseProxy.Transport = &http.Transport{
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			TLSHandshakeTimeout: 10 * time.Second,
+			IdleConnTimeout:     90 * time.Second,
 		}
 	}
 
@@ -246,7 +264,7 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 		handler = h2c.NewHandler(handler, h2s)
 	}
 
-	listenAddr := fmt.Sprintf("%s:%d", svc.ListenAddr, svc.ListenPort)
+	listenAddr := fmt.Sprintf("0.0.0.0:%d", svc.ListenPort)
 	listener, err := tls.Listen("tcp", listenAddr, tlsConfig)
 	if err != nil {
 		cancel()

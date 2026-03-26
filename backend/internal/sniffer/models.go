@@ -1,6 +1,9 @@
 package sniffer
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Direction indicates whether this is a request or response.
 type Direction string
@@ -20,6 +23,7 @@ type MatchedRuleInfo struct {
 type Packet struct {
 	ID        int64     `json:"id"`
 	ServiceID string    `json:"service_id"`
+	SessionID string    `json:"session_id"` // groups req+res from the same TCP connection
 	Timestamp time.Time `json:"timestamp"`
 	SrcIP     string    `json:"src_ip"`
 	SrcPort   int       `json:"src_port"`
@@ -43,6 +47,12 @@ type Packet struct {
 	Flagged      bool              `json:"flagged"`
 }
 
+// MakeSessionID builds a session identifier from the client (external) side of the connection.
+// With SNAT, src_ip is the same for all teams, but src_port is unique per TCP connection.
+func MakeSessionID(serviceID, clientIP string, clientPort int) string {
+	return fmt.Sprintf("%s/%s:%d", serviceID, clientIP, clientPort)
+}
+
 // PacketQuery defines filters for retrieving packets.
 type PacketQuery struct {
 	ServiceID   string
@@ -50,6 +60,9 @@ type PacketQuery struct {
 	SrcIP       string
 	DstIP       string
 	Protocol    string
+	Method      string
+	SessionID   string // filter by session (same TCP connection)
+	PeerIP      string // filter by peer IP (src_ip for requests, dst_ip for responses)
 	TimeFrom    *time.Time
 	TimeTo      *time.Time
 	Contains    string // substring search across body, headers, url

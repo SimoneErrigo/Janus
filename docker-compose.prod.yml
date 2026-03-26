@@ -1,0 +1,12 @@
+## Linux competition override — uses host networking for raw network access.
+## Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build
+services:
+  janus:
+    network_mode: host
+    ports: !reset []
+
+  frontend:
+    network_mode: host
+    ports: !reset []
+    environment:
+      - API_BACKEND=127.0.0.1

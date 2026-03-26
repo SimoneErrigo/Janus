@@ -31,5 +31,6 @@ type Service struct {
 	TLSMode     TLSMode  `json:"tls_mode,omitempty"`
 	CertFile    string   `json:"cert_file,omitempty"`    // path for challenge mode
 	KeyFile     string   `json:"key_file,omitempty"`     // path for challenge mode
+	TargetTLS   bool     `json:"target_tls,omitempty"`   // connect to backend with TLS
 	Enabled     bool     `json:"enabled"`
 }

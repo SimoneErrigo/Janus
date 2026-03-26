@@ -6,7 +6,8 @@ const tlsModes = ['', 'selfsigned', 'challenge']
 
 const emptyService = {
   id: '', name: '', listen_addr: '', listen_port: '', target_addr: '',
-  protocol: 'http', tls_mode: '', cert_file: '', key_file: '', enabled: true,
+  protocol: 'http', tls_mode: '', cert_file: '', key_file: '',
+  target_tls: false, enabled: true,
 }
 
 export default function Services() {
@@ -87,6 +88,7 @@ export default function Services() {
                   {svc.listen_addr}:{svc.listen_port} &rarr; {svc.target_addr}
                   <span className="ml-2 px-1.5 py-0.5 bg-gray-800 rounded text-gray-400">{svc.protocol}</span>
                   {svc.tls_mode && <span className="ml-1 px-1.5 py-0.5 bg-gray-800 rounded text-gray-400">TLS: {svc.tls_mode}</span>}
+                  {svc.target_tls && <span className="ml-1 px-1.5 py-0.5 bg-yellow-900/40 rounded text-yellow-400">Backend TLS</span>}
                 </div>
               </div>
             </div>
@@ -122,6 +124,10 @@ function ServiceForm({ service, onSave, onCancel }) {
         <Field label="Listen Address" value={form.listen_addr} onChange={(v) => set('listen_addr', v)} placeholder="e.g. 10.10.0.1" />
         <Field label="Listen Port" value={form.listen_port} onChange={(v) => set('listen_port', v)} placeholder="e.g. 8080" type="number" />
         <Field label="Target Address" value={form.target_addr} onChange={(v) => set('target_addr', v)} placeholder="e.g. 127.0.0.1:9080" />
+        <div className="flex items-center gap-2">
+          <input type="checkbox" checked={form.target_tls || false} onChange={(e) => set('target_tls', e.target.checked)} className="accent-cyan-500" id="target-tls" />
+          <label htmlFor="target-tls" className="text-sm text-gray-400">Backend uses TLS</label>
+        </div>
         <div>
           <label className="block text-sm text-gray-400 mb-1">Protocol</label>
           <select value={form.protocol} onChange={(e) => set('protocol', e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500">

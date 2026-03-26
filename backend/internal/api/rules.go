@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -60,6 +62,13 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	// Auto-generate ID if not provided
+	if rule.ID == "" {
+		b := make([]byte, 8)
+		rand.Read(b)
+		rule.ID = hex.EncodeToString(b)
 	}
 
 	if err := validateRule(&rule); err != nil {

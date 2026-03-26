@@ -50,6 +50,9 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 	q.SrcIP = params.Get("src_ip")
 	q.DstIP = params.Get("dst_ip")
 	q.Protocol = params.Get("protocol")
+	q.Method = params.Get("method")
+	q.SessionID = params.Get("session_id")
+	q.PeerIP = params.Get("peer_ip")
 	q.Contains = params.Get("contains")
 	q.Regex = params.Get("regex")
 
