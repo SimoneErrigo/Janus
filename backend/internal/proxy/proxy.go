@@ -28,6 +28,7 @@ type Manager struct {
 	packetStore *sniffer.PacketStore
 	ruleStore   *dropper.RuleStore
 	flagRegex   *regexp.Regexp
+	rulesCache  dropper.RulesCache
 }
 
 type runningProxy struct {
@@ -45,6 +46,13 @@ func NewManager(packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, 
 		ruleStore:   ruleStore,
 		flagRegex:   flagRegex,
 	}
+}
+
+// SetRulesCache sets the Redis cache for rule lookups on all new engines.
+func (m *Manager) SetRulesCache(c dropper.RulesCache) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rulesCache = c
 }
 
 // StartService starts a proxy for the given service.
@@ -168,6 +176,9 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 		var dropEngine *dropper.Engine
 		if m.ruleStore != nil {
 			dropEngine = dropper.NewEngine(m.ruleStore)
+			if m.rulesCache != nil {
+				dropEngine.SetCache(m.rulesCache)
+			}
 		}
 		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine, m.flagRegex)
 	}
@@ -254,6 +265,9 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 		var dropEngine *dropper.Engine
 		if m.ruleStore != nil {
 			dropEngine = dropper.NewEngine(m.ruleStore)
+			if m.rulesCache != nil {
+				dropEngine.SetCache(m.rulesCache)
+			}
 		}
 		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine, m.flagRegex)
 	}

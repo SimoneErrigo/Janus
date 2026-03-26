@@ -81,6 +81,9 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 
 			// Evaluate all rules on initial data
 			engine := dropper.NewEngine(m.ruleStore)
+			if m.rulesCache != nil {
+				engine.SetCache(m.rulesCache)
+			}
 			result := engine.EvaluateActions(&dropper.HTTPRequest{
 				ServiceID: svc.ID,
 				RawBytes:  initialData,

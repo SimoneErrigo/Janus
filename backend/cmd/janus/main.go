@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/api"
+	"github.com/SimoneErrigo/Janus/backend/internal/cache"
 	"github.com/SimoneErrigo/Janus/backend/internal/cleanup"
 	"github.com/SimoneErrigo/Janus/backend/internal/config"
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
@@ -45,6 +46,22 @@ func main() {
 		log.Fatalf("Failed to initialize rule store: %v", err)
 	}
 
+	// Initialize Redis cache
+	redisCache := cache.New(cfg.RedisAddr, cfg.RedisPassword)
+	defer redisCache.Close()
+
+	// Register cache invalidation on rule changes
+	ruleStore.SetOnChange(func(serviceID string) {
+		rules := ruleStore.ListRules(serviceID)
+		redisCache.SetServiceRules(serviceID, rules)
+		redisCache.InvalidatePacketQueries(serviceID)
+	})
+
+	// Register cache invalidation on new packet insertion
+	packetStore.SetOnInsert(func(serviceID string) {
+		redisCache.InvalidatePacketQueries(serviceID)
+	})
+
 	// Compile flag regex for packet flagging
 	var flagRegex *regexp.Regexp
 	if cfg.FlagRegex != "" {
@@ -55,6 +72,7 @@ func main() {
 	}
 
 	proxyMgr := proxy.NewManager(packetStore, ruleStore, flagRegex)
+	proxyMgr.SetRulesCache(redisCache)
 
 	services := store.ListServices()
 
@@ -64,6 +82,9 @@ func main() {
 		serviceIDs = append(serviceIDs, svc.ID)
 	}
 	dropper.EnsureFlagRulesForAll(ruleStore, serviceIDs, cfg.FlagRegex)
+
+	// Populate Redis rules cache on startup
+	redisCache.PopulateRules(ruleStore)
 
 	// Auto-start enabled services
 	for _, svc := range services {
@@ -82,7 +103,7 @@ func main() {
 	flagIDPoller := flagids.NewPoller(cfg.FlagIDAPIURL, cfg.OurTeamID, cfg.FlagIDPollInterval, cfg.FlagIDEnabled)
 	flagIDPoller.Start()
 
-	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller)
+	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller, redisCache)
 
 	// Graceful shutdown
 	go func() {
@@ -93,6 +114,7 @@ func main() {
 		flagIDPoller.Stop()
 		cleanupMgr.Stop()
 		proxyMgr.StopAll()
+		redisCache.Close()
 		packetStore.Close()
 		os.Exit(0)
 	}()
