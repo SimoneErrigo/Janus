@@ -49,7 +49,7 @@ docker compose up -d
 - **Frontend dashboard:** `http://<VM_IP>:3000`
 - **Backend API:** `http://<VM_IP>:8080`
 - **Redis:** `127.0.0.1:6379` (internal only, not exposed to the competition network)
-- **Dozzle (container logs):** `http://localhost:9999` (internal only, login with `janus` / `TEAM_PASSWORD`)
+- **Dozzle (container logs):** `http://localhost:9999` (internal only, bound to localhost)
 
 For production (competition VM with host networking):
 ```bash
@@ -109,7 +109,7 @@ The **Config** page lets you update:
 The sidebar has a **Logs** link that opens [Dozzle](http://localhost:9999) in a new tab. Dozzle is a lightweight, read-only container log viewer that streams Docker container logs in real time. It shows all Janus containers (backend, frontend, redis, dozzle) and any other containers running on the host.
 
 - Bound to `127.0.0.1:9999` only — not reachable from the competition network
-- Login with username `janus` and the `TEAM_PASSWORD` from `.env`
+- No authentication required (localhost access only — if an attacker has local access to the VM, they already have full control)
 
 ### 10. Redis caching
 

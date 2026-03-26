@@ -55,8 +55,6 @@ services:
     ports:
       - "127.0.0.1:9999:8080"
     environment:
-      DOZZLE_AUTH_PROVIDER: simple
-      DOZZLE_USERNAME: janus
-      DOZZLE_PASSWORD: ${TEAM_PASSWORD}
       DOZZLE_HOSTNAME: janus-logs
+      DOZZLE_NO_ANALYTICS: "true"
     restart: unless-stopped
