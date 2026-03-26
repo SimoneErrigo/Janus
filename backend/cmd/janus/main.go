@@ -17,6 +17,7 @@ import (
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
+	"github.com/SimoneErrigo/Janus/backend/internal/sysstat"
 )
 
 func main() {
@@ -103,7 +104,8 @@ func main() {
 	flagIDPoller := flagids.NewPoller(cfg.FlagIDAPIURL, cfg.OurTeamID, cfg.FlagIDPollInterval, cfg.FlagIDEnabled)
 	flagIDPoller.Start()
 
-	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller, redisCache)
+	statsCollector := sysstat.NewCollector(packetStore, redisCache, cfg.DataDir)
+	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller, redisCache, statsCollector)
 
 	// Graceful shutdown
 	go func() {

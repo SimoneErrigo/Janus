@@ -13,6 +13,7 @@ import (
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
+	"github.com/SimoneErrigo/Janus/backend/internal/sysstat"
 )
 
 // Server holds the REST API dependencies.
@@ -24,20 +25,22 @@ type Server struct {
 	cleanupMgr   *cleanup.Manager
 	flagIDPoller *flagids.Poller
 	cache        *cache.Client
+	statsCollector *sysstat.Collector
 	mux          *http.ServeMux
 }
 
 // NewServer creates a new API server.
-func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager, flagIDPoller *flagids.Poller, cacheClient *cache.Client) *Server {
+func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager, flagIDPoller *flagids.Poller, cacheClient *cache.Client, statsCollector *sysstat.Collector) *Server {
 	s := &Server{
-		store:        store,
-		proxy:        proxyMgr,
-		packetStore:  packetStore,
-		ruleStore:    ruleStore,
-		cleanupMgr:   cleanupMgr,
-		flagIDPoller: flagIDPoller,
-		cache:        cacheClient,
-		mux:          http.NewServeMux(),
+		store:          store,
+		proxy:          proxyMgr,
+		packetStore:    packetStore,
+		ruleStore:      ruleStore,
+		cleanupMgr:     cleanupMgr,
+		flagIDPoller:   flagIDPoller,
+		cache:          cacheClient,
+		statsCollector: statsCollector,
+		mux:            http.NewServeMux(),
 	}
 	s.routes()
 	return s
@@ -66,6 +69,7 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/cleanup/run", s.handleCleanupRun)
 	protected.HandleFunc("/api/flagids", s.handleFlagIDs)
 	protected.HandleFunc("/api/flagids/status", s.handleFlagIDStatus)
+	protected.HandleFunc("/api/system/stats", s.handleSystemStats)
 
 	s.mux.Handle("/api/", authMiddleware(protected))
 }
