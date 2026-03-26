@@ -5,6 +5,7 @@ import Login from './pages/Login'
 import Services from './pages/Services'
 import Traffic from './pages/Traffic'
 import Rules from './pages/Rules'
+import Alerts from './pages/Alerts'
 import Config from './pages/Config'
 
 function ProtectedRoute({ children }) {
@@ -21,6 +22,7 @@ export default function App() {
         <Route path="services" element={<Services />} />
         <Route path="traffic" element={<Traffic />} />
         <Route path="rules" element={<Rules />} />
+        <Route path="alerts" element={<Alerts />} />
         <Route path="config" element={<Config />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

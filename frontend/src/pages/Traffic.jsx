@@ -43,6 +43,8 @@ export default function Traffic() {
   const [selected, setSelected] = useState(null)
   const [loading, setLoading] = useState(false)
   const [filtersCollapsed, setFiltersCollapsed] = useState(false)
+  const [flagFilter, setFlagFilter] = useState(false)
+  const [flagRegex, setFlagRegex] = useState('')
   const [filters, setFilters] = useState({
     service_id: '', src_ip: '', dst_ip: '', protocol: '', method: '',
     session_id: '', peer_ip: '', contains: '', regex: '', flagged: '', sort: 'desc',
@@ -84,12 +86,19 @@ export default function Traffic() {
 
   useEffect(() => {
     api.listServices().then((data) => setServices(data || []))
+    api.getConfig().then((cfg) => {
+      if (cfg?.flag_regex) setFlagRegex(cfg.flag_regex)
+    }).catch(() => {})
   }, [])
 
   const loadPackets = useCallback(async () => {
     setLoading(true)
     try {
-      const data = await api.getPackets(filters)
+      const params = { ...filters }
+      if (flagFilter && flagRegex) {
+        params.regex = flagRegex
+      }
+      const data = await api.getPackets(params)
       setPackets(data.packets || [])
       setTotal(data.total)
     } catch (err) {
@@ -97,7 +106,7 @@ export default function Traffic() {
     } finally {
       setLoading(false)
     }
-  }, [filters])
+  }, [filters, flagFilter, flagRegex])
 
   useEffect(() => { loadPackets() }, [loadPackets])
 
@@ -131,8 +140,13 @@ export default function Traffic() {
     setFilters((f) => ({ ...f, session_id: '', sort: 'desc', offset: 0 }))
   }
 
+  function toggleFlagFilter() {
+    setFlagFilter((v) => !v)
+    setFilters((f) => ({ ...f, offset: 0 }))
+  }
+
   const isFlowActive = !!filters.session_id
-  const hasActiveFilter = filters.contains || filters.regex
+  const hasActiveFilter = filters.contains || filters.regex || flagFilter
 
   return (
     <div className="p-4 flex flex-col h-full">
@@ -187,6 +201,20 @@ export default function Traffic() {
                 options={[{ value: 'desc', label: 'Newest first' }, { value: 'asc', label: 'Oldest first' }]}
               />
             </div>
+            {flagRegex && (
+              <div className="mt-2 flex items-center">
+                <button
+                  onClick={toggleFlagFilter}
+                  className={`text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 ${
+                    flagFilter
+                      ? 'bg-yellow-900/50 text-yellow-300 border border-yellow-700/50'
+                      : 'bg-gray-800 text-gray-400 border border-gray-700 hover:text-gray-300'
+                  }`}
+                >
+                  <span>&#9873;</span> Contains Flag
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>

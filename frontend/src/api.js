@@ -71,6 +71,17 @@ export const api = {
   updateRule: (id, data) => request(`/rules/${id}`, { method: 'PUT', body: data }),
   deleteRule: (id) => request(`/rules/${id}`, { method: 'DELETE' }),
 
+  // Alerts
+  listAlerts: (params = {}) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '') qs.set(k, v);
+    });
+    return request(`/alerts?${qs.toString()}`);
+  },
+  getAlert: (id) => request(`/alerts/${id}`),
+  clearAlerts: () => request('/alerts', { method: 'DELETE' }),
+
   // Config
   getConfig: () => request('/config'),
   updateConfig: (data) => request('/config', { method: 'PUT', body: data }),

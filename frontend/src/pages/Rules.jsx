@@ -3,6 +3,7 @@ import { api } from '../api'
 
 const matchTypes = ['string', 'regex', 'bytes']
 const scopes = ['header', 'body', 'url', 'raw']
+const actions = ['drop', 'alert', 'both']
 
 export default function Rules() {
   const [services, setServices] = useState([])
@@ -72,7 +73,7 @@ export default function Rules() {
   return (
     <div className="p-6">
       <div className="flex items-center justify-between mb-6">
-        <h2 className="text-2xl font-semibold text-gray-100">Drop Rules</h2>
+        <h2 className="text-2xl font-semibold text-gray-100">Rules</h2>
         <div className="flex items-center gap-3">
           <select
             value={selectedService}
@@ -82,7 +83,7 @@ export default function Rules() {
             {services.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
           <button
-            onClick={() => setEditing({ _isNew: true, service_id: selectedService, name: '', type: 'string', scope: 'body', pattern: '', priority: 10, enabled: true })}
+            onClick={() => setEditing({ _isNew: true, service_id: selectedService, name: '', type: 'string', scope: 'body', pattern: '', priority: 10, enabled: true, action: 'drop' })}
             disabled={!selectedService}
             className="bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
           >
@@ -118,6 +119,12 @@ export default function Rules() {
                     {isAutoFlag(rule) && <span className="text-xs px-1.5 py-0.5 bg-yellow-900/40 text-yellow-400 rounded">Auto Flag</span>}
                   </div>
                   <div className="text-xs text-gray-500 mt-0.5 font-mono">
+                    <span className={`px-1.5 py-0.5 rounded mr-1 ${
+                      rule.action === 'drop' ? 'bg-red-900/40 text-red-400' :
+                      rule.action === 'alert' ? 'bg-orange-900/40 text-orange-400' :
+                      rule.action === 'both' ? 'bg-purple-900/40 text-purple-400' :
+                      'bg-gray-800 text-gray-400'
+                    }`}>{rule.action || 'drop'}</span>
                     <span className="px-1.5 py-0.5 bg-gray-800 rounded mr-1">{rule.type}</span>
                     <span className="px-1.5 py-0.5 bg-gray-800 rounded mr-2">{rule.scope}</span>
                     <span className="text-gray-400">{rule.pattern.length > 60 ? rule.pattern.slice(0, 60) + '...' : rule.pattern}</span>
@@ -139,7 +146,8 @@ export default function Rules() {
 }
 
 function RuleForm({ rule, onSave, onCancel }) {
-  const [form, setForm] = useState(rule)
+  const [form, setForm] = useState({ ...rule, action: rule.action || 'drop' })
+  const isFlagRule = form.id?.startsWith('flag-auto-')
 
   function set(field, value) {
     setForm((f) => ({ ...f, [field]: value }))
@@ -158,6 +166,24 @@ function RuleForm({ rule, onSave, onCancel }) {
           <label className="block text-sm text-gray-400 mb-1">Priority</label>
           <input type="number" value={form.priority} onChange={(e) => set('priority', e.target.value)} placeholder="0"
             className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500" />
+        </div>
+        <div>
+          <label className="block text-sm text-gray-400 mb-1">Action</label>
+          <div className="relative">
+            <select
+              value={form.action}
+              onChange={(e) => set('action', e.target.value)}
+              disabled={isFlagRule}
+              className={`w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 ${isFlagRule ? 'opacity-60 cursor-not-allowed' : ''}`}
+            >
+              {actions.map((a) => <option key={a} value={a}>{a}</option>)}
+            </select>
+            {isFlagRule && (
+              <div className="text-xs text-yellow-500 mt-1">
+                Flag rules must be alert-only. Dropping flags breaks the checker.
+              </div>
+            )}
+          </div>
         </div>
         <div>
           <label className="block text-sm text-gray-400 mb-1">Match Type</label>
