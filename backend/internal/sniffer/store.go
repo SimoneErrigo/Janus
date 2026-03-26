@@ -446,6 +446,76 @@ func (s *PacketStore) ClearAlerts() error {
 	return err
 }
 
+// DeleteOlderThan deletes packets and their alerts older than the given time.
+// Returns the number of rows deleted from each table.
+func (s *PacketStore) DeleteOlderThan(before time.Time) (packetsDeleted, alertsDeleted int64, err error) {
+	ts := before.UTC().Format(time.RFC3339Nano)
+
+	// Delete alerts for packets that will be removed
+	res, err := s.db.Exec("DELETE FROM alerts WHERE packet_id IN (SELECT id FROM packets WHERE timestamp < ?)", ts)
+	if err != nil {
+		return 0, 0, fmt.Errorf("deleting old alerts: %w", err)
+	}
+	alertsDeleted, _ = res.RowsAffected()
+
+	res, err = s.db.Exec("DELETE FROM packets WHERE timestamp < ?", ts)
+	if err != nil {
+		return 0, alertsDeleted, fmt.Errorf("deleting old packets: %w", err)
+	}
+	packetsDeleted, _ = res.RowsAffected()
+
+	return packetsDeleted, alertsDeleted, nil
+}
+
+// DeleteOldestUntilSize deletes the oldest packets (and their alerts) until the DB is below maxSizeBytes.
+// Returns the number of rows deleted from each table.
+func (s *PacketStore) DeleteOldestUntilSize(maxSizeBytes int64) (packetsDeleted, alertsDeleted int64, err error) {
+	for {
+		size, sizeErr := s.DBSize()
+		if sizeErr != nil {
+			return packetsDeleted, alertsDeleted, sizeErr
+		}
+		if size <= maxSizeBytes {
+			return packetsDeleted, alertsDeleted, nil
+		}
+
+		// Delete a batch of oldest packets
+		const batchSize = 1000
+		res, execErr := s.db.Exec(`
+			DELETE FROM alerts WHERE packet_id IN (
+				SELECT id FROM packets ORDER BY timestamp ASC LIMIT ?
+			)`, batchSize)
+		if execErr != nil {
+			return packetsDeleted, alertsDeleted, fmt.Errorf("batch deleting alerts: %w", execErr)
+		}
+		ad, _ := res.RowsAffected()
+		alertsDeleted += ad
+
+		res, execErr = s.db.Exec("DELETE FROM packets WHERE id IN (SELECT id FROM packets ORDER BY timestamp ASC LIMIT ?)", batchSize)
+		if execErr != nil {
+			return packetsDeleted, alertsDeleted, fmt.Errorf("batch deleting packets: %w", execErr)
+		}
+		pd, _ := res.RowsAffected()
+		packetsDeleted += pd
+
+		if pd == 0 {
+			return packetsDeleted, alertsDeleted, nil
+		}
+	}
+}
+
+// DBSize returns the current size of the database file in bytes.
+func (s *PacketStore) DBSize() (int64, error) {
+	var pageCount, pageSize int64
+	if err := s.db.QueryRow("PRAGMA page_count").Scan(&pageCount); err != nil {
+		return 0, err
+	}
+	if err := s.db.QueryRow("PRAGMA page_size").Scan(&pageSize); err != nil {
+		return 0, err
+	}
+	return pageCount * pageSize, nil
+}
+
 // Close closes the database.
 func (s *PacketStore) Close() error {
 	return s.db.Close()

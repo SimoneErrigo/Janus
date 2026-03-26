@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/SimoneErrigo/Janus/backend/internal/cleanup"
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
@@ -18,16 +19,18 @@ type Server struct {
 	proxy       *proxy.Manager
 	packetStore *sniffer.PacketStore
 	ruleStore   *dropper.RuleStore
+	cleanupMgr  *cleanup.Manager
 	mux         *http.ServeMux
 }
 
 // NewServer creates a new API server.
-func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore) *Server {
+func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager) *Server {
 	s := &Server{
 		store:       store,
 		proxy:       proxyMgr,
 		packetStore: packetStore,
 		ruleStore:   ruleStore,
+		cleanupMgr:  cleanupMgr,
 		mux:         http.NewServeMux(),
 	}
 	s.routes()
@@ -53,6 +56,8 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/alerts", s.handleAlerts)
 	protected.HandleFunc("/api/alerts/", s.handleAlertByID)
 	protected.HandleFunc("/api/config", s.handleConfig)
+	protected.HandleFunc("/api/config/cleanup", s.handleCleanupConfig)
+	protected.HandleFunc("/api/cleanup/run", s.handleCleanupRun)
 
 	s.mux.Handle("/api/", authMiddleware(protected))
 }

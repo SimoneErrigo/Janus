@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/api"
+	"github.com/SimoneErrigo/Janus/backend/internal/cleanup"
 	"github.com/SimoneErrigo/Janus/backend/internal/config"
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
@@ -72,7 +73,11 @@ func main() {
 		}
 	}
 
-	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore)
+	// Start cleanup manager
+	cleanupMgr := cleanup.NewManager(packetStore, cfg.CleanupMaxAgeMinutes, cfg.CleanupMaxDBSizeMB)
+	cleanupMgr.Start()
+
+	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr)
 
 	// Graceful shutdown
 	go func() {
@@ -80,6 +85,7 @@ func main() {
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 		log.Println("Shutting down...")
+		cleanupMgr.Stop()
 		proxyMgr.StopAll()
 		packetStore.Close()
 		os.Exit(0)

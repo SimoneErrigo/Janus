@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -16,6 +17,10 @@ type Config struct {
 	FlagRegex        string
 	DataDir          string
 	APIPort          string
+
+	// Cleanup settings
+	CleanupMaxAgeMinutes int
+	CleanupMaxDBSizeMB   int
 }
 
 var (
@@ -64,6 +69,12 @@ func Load(envPath string) (*Config, error) {
 		if v, ok := env["API_PORT"]; ok {
 			cfg.APIPort = v
 		}
+		if v, ok := env["CLEANUP_MAX_AGE_MINUTES"]; ok {
+			cfg.CleanupMaxAgeMinutes, _ = strconv.Atoi(v)
+		}
+		if v, ok := env["CLEANUP_MAX_DB_SIZE_MB"]; ok {
+			cfg.CleanupMaxDBSizeMB, _ = strconv.Atoi(v)
+		}
 
 		// Environment variables override .env file
 		if v := os.Getenv("VM_IP"); v != "" {
@@ -83,6 +94,12 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v := os.Getenv("API_PORT"); v != "" {
 			cfg.APIPort = v
+		}
+		if v := os.Getenv("CLEANUP_MAX_AGE_MINUTES"); v != "" {
+			cfg.CleanupMaxAgeMinutes, _ = strconv.Atoi(v)
+		}
+		if v := os.Getenv("CLEANUP_MAX_DB_SIZE_MB"); v != "" {
+			cfg.CleanupMaxDBSizeMB, _ = strconv.Atoi(v)
 		}
 
 		instance = cfg
