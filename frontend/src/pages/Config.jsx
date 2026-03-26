@@ -11,6 +11,8 @@ export default function Config() {
   const [flagIDStatus, setFlagIDStatus] = useState(null)
   const [flagIDMap, setFlagIDMap] = useState(null)
   const [flagIDCountdown, setFlagIDCountdown] = useState('')
+  const [flagIDSaved, setFlagIDSaved] = useState(false)
+  const [flagIDError, setFlagIDError] = useState('')
 
   // Cleanup state
   const [cleanupConfig, setCleanupConfig] = useState(null)
@@ -103,13 +105,41 @@ export default function Config() {
     setError('')
     setSaved(false)
     try {
-      const data = await api.updateConfig(form)
+      const data = await api.updateConfig({
+        vm_ip: form.vm_ip,
+        network_interface: form.network_interface,
+        team_password: form.team_password,
+        flag_regex: form.flag_regex,
+      })
       setConfig(data)
       setForm(data)
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
     } catch (err) {
       setError(err.message)
+    }
+  }
+
+  async function handleFlagIDSave(e) {
+    e.preventDefault()
+    setFlagIDError('')
+    setFlagIDSaved(false)
+    try {
+      const data = await api.updateConfig({
+        flagid_enabled: form.flagid_enabled,
+        flagid_api_url: form.flagid_api_url,
+        flagid_team_id: form.flagid_team_id,
+        flagid_poll_interval: parseInt(form.flagid_poll_interval, 10) || 30,
+        flagid_format: form.flagid_format,
+      })
+      setConfig(data)
+      setForm(data)
+      setFlagIDSaved(true)
+      setTimeout(() => setFlagIDSaved(false), 3000)
+      // Refresh status after config change
+      setTimeout(loadFlagIDData, 500)
+    } catch (err) {
+      setFlagIDError(err.message)
     }
   }
 
@@ -207,6 +237,128 @@ export default function Config() {
         </button>
       </form>
 
+      {/* Flag IDs section — configurable */}
+      <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 max-w-lg space-y-4">
+        <div className="flex items-center justify-between">
+          <h3 className="text-lg font-medium text-gray-100">Flag IDs</h3>
+          <span className={`text-xs px-2 py-0.5 rounded ${form.flagid_enabled ? 'bg-emerald-900/40 text-emerald-400' : 'bg-gray-800 text-gray-500'}`}>
+            {form.flagid_enabled ? 'Enabled' : 'Disabled'}
+          </span>
+        </div>
+
+        <form onSubmit={handleFlagIDSave} className="space-y-4">
+          <div className="flex items-center gap-3">
+            <label className="relative inline-flex items-center cursor-pointer">
+              <input
+                type="checkbox"
+                checked={form.flagid_enabled || false}
+                onChange={(e) => set('flagid_enabled', e.target.checked)}
+                className="sr-only peer"
+              />
+              <div className="w-9 h-5 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-emerald-600"></div>
+            </label>
+            <span className="text-sm text-gray-300">Enable Flag ID fetching</span>
+          </div>
+
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">API URL</label>
+            <input
+              value={form.flagid_api_url || ''}
+              onChange={(e) => set('flagid_api_url', e.target.value)}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm font-mono focus:outline-none focus:border-cyan-500 transition-colors"
+              placeholder="e.g. http://10.10.0.1:8080/api/flagids"
+            />
+            <p className="text-xs text-gray-600 mt-1">URL of the competition flag ID API endpoint</p>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">Team ID</label>
+              <input
+                value={form.flagid_team_id || ''}
+                onChange={(e) => set('flagid_team_id', e.target.value)}
+                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 transition-colors"
+                placeholder="e.g. team_1"
+              />
+            </div>
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">Poll Interval (s)</label>
+              <input
+                type="number"
+                min="5"
+                value={form.flagid_poll_interval ?? 30}
+                onChange={(e) => set('flagid_poll_interval', e.target.value)}
+                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 transition-colors"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">Competition Format</label>
+            <select
+              value={form.flagid_format || 'cyberchallenge'}
+              onChange={(e) => set('flagid_format', e.target.value)}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
+            >
+              <option value="cyberchallenge">CyberChallenge</option>
+            </select>
+            <p className="text-xs text-gray-600 mt-1">Response format of the flag ID API</p>
+          </div>
+
+          {flagIDError && <div className="bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded">{flagIDError}</div>}
+          {flagIDSaved && <div className="bg-green-900/30 border border-green-800 text-green-400 text-sm px-4 py-2 rounded">Flag ID settings saved</div>}
+
+          <button
+            type="submit"
+            className="bg-cyan-600 hover:bg-cyan-500 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
+          >
+            Save Flag ID Settings
+          </button>
+        </form>
+
+        {/* Live status & fetched flag IDs */}
+        {flagIDStatus?.enabled && (
+          <>
+            <div className="border-t border-gray-800 pt-3">
+              <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs bg-gray-800/50 rounded p-2">
+                <div>
+                  <span className="text-gray-500">Last fetch: </span>
+                  <span className="text-gray-300">
+                    {flagIDStatus.last_fetch ? new Date(flagIDStatus.last_fetch).toLocaleTimeString() : 'Never'}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-gray-500">Next refresh: </span>
+                  <span className="text-cyan-400 font-mono">{flagIDCountdown || '...'}</span>
+                </div>
+                {flagIDStatus.last_error && (
+                  <div className="col-span-2">
+                    <span className="text-red-400">Error: {flagIDStatus.last_error}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {flagIDMap && Object.keys(flagIDMap).length > 0 ? (
+              <div className="space-y-2">
+                {Object.entries(flagIDMap).map(([svcName, values]) => (
+                  <div key={svcName} className="bg-gray-800/50 rounded p-2">
+                    <div className="text-xs text-emerald-400 font-medium mb-1">{svcName}</div>
+                    <div className="flex flex-wrap gap-1">
+                      {values.map((v, i) => (
+                        <span key={i} className="text-xs bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded font-mono">{v}</span>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-gray-500">No flag IDs fetched yet.</p>
+            )}
+          </>
+        )}
+      </div>
+
       {/* Cleanup section */}
       <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 max-w-lg space-y-4">
         <div className="flex items-center justify-between">
@@ -279,67 +431,6 @@ export default function Config() {
             </button>
           </div>
         </form>
-      </div>
-
-      {/* Flag IDs section */}
-      <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 max-w-lg space-y-4">
-        <div className="flex items-center justify-between">
-          <h3 className="text-lg font-medium text-gray-100">Flag IDs</h3>
-          {flagIDStatus && (
-            <span className={`text-xs px-2 py-0.5 rounded ${flagIDStatus.enabled ? 'bg-emerald-900/40 text-emerald-400' : 'bg-gray-800 text-gray-500'}`}>
-              {flagIDStatus.enabled ? 'Enabled' : 'Disabled'}
-            </span>
-          )}
-        </div>
-
-        {flagIDStatus && !flagIDStatus.enabled && (
-          <p className="text-sm text-gray-500">
-            Flag ID fetching is disabled. Set <span className="font-mono text-gray-400">FLAGID_ENABLED=true</span> in .env to enable.
-          </p>
-        )}
-
-        {flagIDStatus?.enabled && (
-          <>
-            <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs bg-gray-800/50 rounded p-2">
-              <div>
-                <span className="text-gray-500">Last fetch: </span>
-                <span className="text-gray-300">
-                  {flagIDStatus.last_fetch ? new Date(flagIDStatus.last_fetch).toLocaleTimeString() : 'Never'}
-                </span>
-              </div>
-              <div>
-                <span className="text-gray-500">Next refresh: </span>
-                <span className="text-cyan-400 font-mono">{flagIDCountdown || '...'}</span>
-              </div>
-              <div>
-                <span className="text-gray-500">Interval: </span>
-                <span className="text-gray-300">{flagIDStatus.poll_interval_seconds}s</span>
-              </div>
-              {flagIDStatus.last_error && (
-                <div className="col-span-2">
-                  <span className="text-red-400">Error: {flagIDStatus.last_error}</span>
-                </div>
-              )}
-            </div>
-
-            {flagIDMap && Object.keys(flagIDMap).length > 0 ? (
-              <div className="space-y-2">
-                {Object.entries(flagIDMap).map(([svcName, values]) => (
-                  <div key={svcName} className="bg-gray-800/50 rounded p-2">
-                    <div className="text-xs text-emerald-400 font-medium mb-1">{svcName}</div>
-                    <div className="flex flex-wrap gap-1">
-                      {values.map((v, i) => (
-                        <span key={i} className="text-xs bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded font-mono">{v}</span>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="text-sm text-gray-500">No flag IDs fetched yet.</p>
-            )}
-          </>
-        )}
       </div>
     </div>
   )

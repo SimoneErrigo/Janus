@@ -18,22 +18,39 @@ type Poller struct {
 	teamID   string
 	interval time.Duration
 	enabled  bool
+	format   string // competition format (e.g. "cyberchallenge")
 
 	// Current flag ID map: service_name -> list of flag ID values
 	flagIDs map[string][]string
 
 	lastFetch time.Time
 	lastError string
-	stopCh    chan struct{}
+
+	// Loop lifecycle
+	loopMu  sync.Mutex
+	stopCh  chan struct{}
+	running bool
+}
+
+// PollerConfig holds the configurable fields for the poller.
+type PollerConfig struct {
+	Enabled     bool   `json:"enabled"`
+	APIURL      string `json:"api_url"`
+	TeamID      string `json:"team_id"`
+	IntervalSec int    `json:"poll_interval_seconds"`
+	Format      string `json:"format"`
 }
 
 // Status holds the poller's current state.
 type Status struct {
-	Enabled       bool      `json:"enabled"`
-	LastFetch     time.Time `json:"last_fetch"`
-	NextFetch     time.Time `json:"next_fetch"`
-	LastError     string    `json:"last_error,omitempty"`
-	PollInterval  int       `json:"poll_interval_seconds"`
+	Enabled      bool      `json:"enabled"`
+	APIURL       string    `json:"api_url"`
+	TeamID       string    `json:"team_id"`
+	Format       string    `json:"format"`
+	LastFetch    time.Time `json:"last_fetch"`
+	NextFetch    time.Time `json:"next_fetch"`
+	LastError    string    `json:"last_error,omitempty"`
+	PollInterval int       `json:"poll_interval_seconds"`
 }
 
 // NewPoller creates a flag ID poller.
@@ -46,6 +63,7 @@ func NewPoller(apiURL, teamID string, intervalSec int, enabled bool) *Poller {
 		teamID:   teamID,
 		interval: time.Duration(intervalSec) * time.Second,
 		enabled:  enabled,
+		format:   "cyberchallenge",
 		flagIDs:  make(map[string][]string),
 		stopCh:   make(chan struct{}),
 	}
@@ -57,13 +75,69 @@ func (p *Poller) Start() {
 		log.Println("Flag ID poller disabled")
 		return
 	}
+	p.loopMu.Lock()
+	p.stopCh = make(chan struct{})
+	p.running = true
+	p.loopMu.Unlock()
 	go p.loop()
-	log.Printf("Flag ID poller started (url=%s, team=%s, interval=%s)", p.apiURL, p.teamID, p.interval)
+	log.Printf("Flag ID poller started (url=%s, team=%s, interval=%s, format=%s)", p.apiURL, p.teamID, p.interval, p.format)
 }
 
 // Stop signals the poller to exit.
 func (p *Poller) Stop() {
-	close(p.stopCh)
+	p.loopMu.Lock()
+	defer p.loopMu.Unlock()
+	if p.running {
+		close(p.stopCh)
+		p.running = false
+	}
+}
+
+// Reconfigure updates the poller config and restarts if enabled.
+func (p *Poller) Reconfigure(cfg PollerConfig) {
+	p.loopMu.Lock()
+	// Stop current loop if running
+	if p.running {
+		close(p.stopCh)
+		p.running = false
+	}
+	p.loopMu.Unlock()
+
+	p.mu.Lock()
+	p.apiURL = cfg.APIURL
+	p.teamID = cfg.TeamID
+	if cfg.IntervalSec > 0 {
+		p.interval = time.Duration(cfg.IntervalSec) * time.Second
+	}
+	if cfg.Format != "" {
+		p.format = cfg.Format
+	}
+	p.enabled = cfg.Enabled
+	p.mu.Unlock()
+
+	if cfg.Enabled && cfg.APIURL != "" {
+		p.loopMu.Lock()
+		p.stopCh = make(chan struct{})
+		p.running = true
+		p.loopMu.Unlock()
+		go p.loop()
+		log.Printf("Flag ID poller reconfigured (url=%s, team=%s, interval=%s, format=%s)", cfg.APIURL, cfg.TeamID, p.interval, p.format)
+	} else {
+		log.Println("Flag ID poller disabled via reconfigure")
+	}
+}
+
+// GetConfig returns the current poller configuration.
+func (p *Poller) GetConfig() PollerConfig {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return PollerConfig{
+		Enabled:     p.enabled,
+		APIURL:      p.apiURL,
+		TeamID:      p.teamID,
+		IntervalSec: int(p.interval.Seconds()),
+		Format:      p.format,
+	}
 }
 
 // GetFlagIDs returns the current flag ID map (service_name -> values).
@@ -104,6 +178,9 @@ func (p *Poller) GetStatus() Status {
 
 	return Status{
 		Enabled:      p.enabled,
+		APIURL:       p.apiURL,
+		TeamID:       p.teamID,
+		Format:       p.format,
 		LastFetch:    p.lastFetch,
 		NextFetch:    nextFetch,
 		LastError:    p.lastError,
@@ -113,6 +190,8 @@ func (p *Poller) GetStatus() Status {
 
 // IsEnabled returns whether the poller is active.
 func (p *Poller) IsEnabled() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.enabled
 }
 
@@ -135,15 +214,24 @@ func (p *Poller) ContainsFlagID(text string) bool {
 }
 
 func (p *Poller) loop() {
+	// Capture stop channel for this loop instance
+	p.loopMu.Lock()
+	stopCh := p.stopCh
+	p.loopMu.Unlock()
+
 	// Fetch immediately on start
 	p.fetch()
 
-	ticker := time.NewTicker(p.interval)
+	p.mu.RLock()
+	interval := p.interval
+	p.mu.RUnlock()
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-p.stopCh:
+		case <-stopCh:
 			return
 		case <-ticker.C:
 			p.fetch()
@@ -152,13 +240,19 @@ func (p *Poller) loop() {
 }
 
 func (p *Poller) fetch() {
-	url := p.apiURL
-	if p.teamID != "" {
+	p.mu.RLock()
+	apiURL := p.apiURL
+	teamID := p.teamID
+	format := p.format
+	p.mu.RUnlock()
+
+	url := apiURL
+	if teamID != "" {
 		sep := "?"
 		if strings.Contains(url, "?") {
 			sep = "&"
 		}
-		url += sep + "team=" + p.teamID
+		url += sep + "team=" + teamID
 	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -190,10 +284,15 @@ func (p *Poller) fetch() {
 		return
 	}
 
-	// Parse the nested structure:
-	// { "service_name": { "team_id": { "round_number": { "desc_key": "flag_id_value" } } } }
-	var raw map[string]map[string]map[string]map[string]string
-	if err := json.Unmarshal(body, &raw); err != nil {
+	var flagIDs map[string][]string
+	switch format {
+	case "cyberchallenge":
+		flagIDs, err = parseCyberChallenge(body)
+	default:
+		flagIDs, err = parseCyberChallenge(body)
+	}
+
+	if err != nil {
 		p.mu.Lock()
 		p.lastError = fmt.Sprintf("parse error: %v", err)
 		p.lastFetch = time.Now()
@@ -202,7 +301,27 @@ func (p *Poller) fetch() {
 		return
 	}
 
-	// Flatten: for each service, collect all flag ID values across all rounds
+	p.mu.Lock()
+	p.flagIDs = flagIDs
+	p.lastFetch = time.Now()
+	p.lastError = ""
+	p.mu.Unlock()
+
+	total := 0
+	for _, v := range flagIDs {
+		total += len(v)
+	}
+	log.Printf("Flag IDs refreshed: %d services, %d values", len(flagIDs), total)
+}
+
+// parseCyberChallenge parses the CyberChallenge flag ID format:
+// { "service_name": { "team_id": { "round_number": { "desc_key": "flag_id_value" } } } }
+func parseCyberChallenge(body []byte) (map[string][]string, error) {
+	var raw map[string]map[string]map[string]map[string]string
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+
 	flagIDs := make(map[string][]string)
 	for serviceName, teams := range raw {
 		seen := make(map[string]bool)
@@ -217,16 +336,5 @@ func (p *Poller) fetch() {
 			}
 		}
 	}
-
-	p.mu.Lock()
-	p.flagIDs = flagIDs
-	p.lastFetch = time.Now()
-	p.lastError = ""
-	p.mu.Unlock()
-
-	total := 0
-	for _, v := range flagIDs {
-		total += len(v)
-	}
-	log.Printf("Flag IDs refreshed: %d services, %d values", len(flagIDs), total)
+	return flagIDs, nil
 }

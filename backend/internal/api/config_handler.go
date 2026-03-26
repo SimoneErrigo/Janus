@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/config"
+	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
 )
 
 type configResponse struct {
@@ -12,6 +13,13 @@ type configResponse struct {
 	NetworkInterface string `json:"network_interface"`
 	TeamPassword     string `json:"team_password"`
 	FlagRegex        string `json:"flag_regex"`
+
+	// Flag ID settings
+	FlagIDEnabled      bool   `json:"flagid_enabled"`
+	FlagIDAPIURL       string `json:"flagid_api_url"`
+	FlagIDTeamID       string `json:"flagid_team_id"`
+	FlagIDPollInterval int    `json:"flagid_poll_interval"`
+	FlagIDFormat       string `json:"flagid_format"`
 }
 
 type configUpdateRequest struct {
@@ -19,6 +27,13 @@ type configUpdateRequest struct {
 	NetworkInterface *string `json:"network_interface,omitempty"`
 	TeamPassword     *string `json:"team_password,omitempty"`
 	FlagRegex        *string `json:"flag_regex,omitempty"`
+
+	// Flag ID settings
+	FlagIDEnabled      *bool   `json:"flagid_enabled,omitempty"`
+	FlagIDAPIURL       *string `json:"flagid_api_url,omitempty"`
+	FlagIDTeamID       *string `json:"flagid_team_id,omitempty"`
+	FlagIDPollInterval *int    `json:"flagid_poll_interval,omitempty"`
+	FlagIDFormat       *string `json:"flagid_format,omitempty"`
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -34,11 +49,23 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := config.Get()
+
+	// Read live poller config
+	var pollerCfg flagids.PollerConfig
+	if s.flagIDPoller != nil {
+		pollerCfg = s.flagIDPoller.GetConfig()
+	}
+
 	writeJSON(w, http.StatusOK, configResponse{
-		VMIP:             cfg.VMIP,
-		NetworkInterface: cfg.NetworkInterface,
-		TeamPassword:     cfg.TeamPassword,
-		FlagRegex:        cfg.FlagRegex,
+		VMIP:               cfg.VMIP,
+		NetworkInterface:   cfg.NetworkInterface,
+		TeamPassword:       cfg.TeamPassword,
+		FlagRegex:          cfg.FlagRegex,
+		FlagIDEnabled:      pollerCfg.Enabled,
+		FlagIDAPIURL:       pollerCfg.APIURL,
+		FlagIDTeamID:       pollerCfg.TeamID,
+		FlagIDPollInterval: pollerCfg.IntervalSec,
+		FlagIDFormat:       pollerCfg.Format,
 	})
 }
 
@@ -68,10 +95,49 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 		cfg.FlagRegex = *req.FlagRegex
 	}
 
+	// Reconfigure Flag ID poller if any flagID field was provided
+	if s.flagIDPoller != nil && (req.FlagIDEnabled != nil || req.FlagIDAPIURL != nil || req.FlagIDTeamID != nil || req.FlagIDPollInterval != nil || req.FlagIDFormat != nil) {
+		current := s.flagIDPoller.GetConfig()
+		if req.FlagIDEnabled != nil {
+			current.Enabled = *req.FlagIDEnabled
+		}
+		if req.FlagIDAPIURL != nil {
+			current.APIURL = *req.FlagIDAPIURL
+		}
+		if req.FlagIDTeamID != nil {
+			current.TeamID = *req.FlagIDTeamID
+		}
+		if req.FlagIDPollInterval != nil {
+			current.IntervalSec = *req.FlagIDPollInterval
+		}
+		if req.FlagIDFormat != nil {
+			current.Format = *req.FlagIDFormat
+		}
+
+		// Also update global config
+		cfg.FlagIDEnabled = current.Enabled
+		cfg.FlagIDAPIURL = current.APIURL
+		cfg.OurTeamID = current.TeamID
+		cfg.FlagIDPollInterval = current.IntervalSec
+
+		s.flagIDPoller.Reconfigure(current)
+	}
+
+	// Read back poller config for response
+	var pollerCfg flagids.PollerConfig
+	if s.flagIDPoller != nil {
+		pollerCfg = s.flagIDPoller.GetConfig()
+	}
+
 	writeJSON(w, http.StatusOK, configResponse{
-		VMIP:             cfg.VMIP,
-		NetworkInterface: cfg.NetworkInterface,
-		TeamPassword:     cfg.TeamPassword,
-		FlagRegex:        cfg.FlagRegex,
+		VMIP:               cfg.VMIP,
+		NetworkInterface:   cfg.NetworkInterface,
+		TeamPassword:       cfg.TeamPassword,
+		FlagRegex:          cfg.FlagRegex,
+		FlagIDEnabled:      pollerCfg.Enabled,
+		FlagIDAPIURL:       pollerCfg.APIURL,
+		FlagIDTeamID:       pollerCfg.TeamID,
+		FlagIDPollInterval: pollerCfg.IntervalSec,
+		FlagIDFormat:       pollerCfg.Format,
 	})
 }

@@ -123,6 +123,25 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		respHeadersStr := flattenHeadersString(rw.Header())
 		respFlagged := CheckFlagged(flagRegex, r.URL.String(), respHeadersStr, respBody)
 
+		// Evaluate rules against response (alert-only, never drop — response already sent)
+		var respMatchedRules []MatchedRuleInfo
+		var respAlertRules []dropper.Rule
+		if dropEngine != nil {
+			respResult := dropEngine.EvaluateActions(&dropper.HTTPRequest{
+				ServiceID: svc.ID,
+				Headers:   respHeadersStr,
+				Body:      respBody,
+				URL:       r.URL.String(),
+			})
+			for _, rule := range respResult.AllMatched {
+				respMatchedRules = append(respMatchedRules, MatchedRuleInfo{ID: rule.ID, Name: rule.Name, Action: string(rule.Action)})
+			}
+			respAlertRules = respResult.AlertRules
+		}
+		if respMatchedRules == nil {
+			respMatchedRules = []MatchedRuleInfo{}
+		}
+
 		respPacket := &Packet{
 			ServiceID:    svc.ID,
 			SessionID:    sessionID,
@@ -138,11 +157,26 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 			Status:       rw.statusCode,
 			Headers:      respHeaders,
 			Body:         respBody,
-			MatchedRules: []MatchedRuleInfo{},
+			MatchedRules: respMatchedRules,
 			Flagged:      respFlagged,
 		}
 		if err := store.Insert(respPacket); err != nil {
 			log.Printf("[%s] sniffer: failed to log response: %v", svc.Name, err)
+		}
+
+		// Insert alerts for response-matched rules
+		for _, rule := range respAlertRules {
+			alert := &Alert{
+				PacketID:       respPacket.ID,
+				RuleID:         rule.ID,
+				ServiceID:      svc.ID,
+				SrcIP:          srcIP,
+				Timestamp:      time.Now(),
+				PatternMatched: rule.Pattern,
+			}
+			if err := store.InsertAlert(alert); err != nil {
+				log.Printf("[%s] sniffer: failed to log response alert: %v", svc.Name, err)
+			}
 		}
 	})
 }

@@ -49,7 +49,7 @@ export default function Traffic() {
   const [flagIDEnabled, setFlagIDEnabled] = useState(false)
   const [filters, setFilters] = useState({
     service_id: '', src_ip: '', dst_ip: '', protocol: '', method: '',
-    session_id: '', peer_ip: '', contains: '', regex: '', flagged: '', sort: 'desc',
+    session_id: '', peer_ip: '', contains: '', regex: '', sort: 'desc',
     limit: 50, offset: 0,
   })
 
@@ -90,9 +90,7 @@ export default function Traffic() {
     api.listServices().then((data) => setServices(data || []))
     api.getConfig().then((cfg) => {
       if (cfg?.flag_regex) setFlagRegex(cfg.flag_regex)
-    }).catch(() => {})
-    api.getFlagIDStatus().then((s) => {
-      if (s?.enabled) setFlagIDEnabled(true)
+      setFlagIDEnabled(!!cfg?.flagid_enabled)
     }).catch(() => {})
   }, [])
 
@@ -100,8 +98,8 @@ export default function Traffic() {
     setLoading(true)
     try {
       const params = { ...filters }
-      if (flagFilter && flagRegex) {
-        params.regex = flagRegex
+      if (flagFilter) {
+        params.flagged = 'true'
       }
       if (flagIDFilter) {
         params.contains_flagid = 'true'
@@ -114,7 +112,7 @@ export default function Traffic() {
     } finally {
       setLoading(false)
     }
-  }, [filters, flagFilter, flagRegex, flagIDFilter])
+  }, [filters, flagFilter, flagIDFilter])
 
   useEffect(() => { loadPackets() }, [loadPackets])
 
@@ -160,6 +158,9 @@ export default function Traffic() {
 
   const isFlowActive = !!filters.session_id
   const hasActiveFilter = filters.contains || filters.regex || flagFilter || flagIDFilter
+
+  // Compute effective highlight regex: combine user regex and flag regex when active
+  const highlightRegex = [filters.regex, flagFilter && flagRegex ? flagRegex : null].filter(Boolean).join('|') || ''
 
   return (
     <div className="p-4 flex flex-col h-full">
@@ -207,9 +208,6 @@ export default function Traffic() {
               />
               <FilterInput label="Contains" value={filters.contains} onChange={(v) => setFilter('contains', v)} placeholder="Text search..." />
               <FilterInput label="Regex" value={filters.regex} onChange={(v) => setFilter('regex', v)} placeholder="Regex pattern..." />
-              <FilterSelect label="Flagged" value={filters.flagged} onChange={(v) => setFilter('flagged', v)}
-                options={[{ value: '', label: 'All' }, { value: 'true', label: 'Flagged only' }, { value: 'false', label: 'Not flagged' }]}
-              />
               <FilterSelect label="Sort" value={filters.sort} onChange={(v) => setFilter('sort', v)}
                 options={[{ value: 'desc', label: 'Newest first' }, { value: 'asc', label: 'Oldest first' }]}
               />
@@ -358,7 +356,7 @@ export default function Traffic() {
                   <div className="text-xs">
                     <span className="text-gray-500">URL </span>
                     <span className="text-gray-300 break-all font-mono">
-                      <HighlightedText text={selected.url} contains={filters.contains} regex={filters.regex} />
+                      <HighlightedText text={selected.url} contains={filters.contains} regex={highlightRegex} />
                     </span>
                   </div>
                 )}
@@ -385,7 +383,7 @@ export default function Traffic() {
                       {Object.entries(selected.headers).map(([k, v]) => (
                         <div key={k}>
                           <span className="text-cyan-400">{k}:</span>{' '}
-                          <HighlightedText text={v} contains={filters.contains} regex={filters.regex} />
+                          <HighlightedText text={v} contains={filters.contains} regex={highlightRegex} />
                         </div>
                       ))}
                     </div>
@@ -396,7 +394,7 @@ export default function Traffic() {
                   <div className="flex-1">
                     <div className="text-gray-500 text-xs mb-1">Body</div>
                     <pre className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 overflow-auto whitespace-pre-wrap break-all" style={{ maxHeight: '60vh' }}>
-                      <HighlightedText text={selected.body_string} contains={filters.contains} regex={filters.regex} />
+                      <HighlightedText text={selected.body_string} contains={filters.contains} regex={highlightRegex} />
                     </pre>
                   </div>
                 )}
