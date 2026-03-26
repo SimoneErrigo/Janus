@@ -86,6 +86,10 @@ export const api = {
   getConfig: () => request('/config'),
   updateConfig: (data) => request('/config', { method: 'PUT', body: data }),
 
+  // Flag IDs
+  getFlagIDs: () => request('/flagids'),
+  getFlagIDStatus: () => request('/flagids/status'),
+
   // Cleanup
   getCleanupConfig: () => request('/config/cleanup'),
   updateCleanupConfig: (data) => request('/config/cleanup', { method: 'PUT', body: data }),

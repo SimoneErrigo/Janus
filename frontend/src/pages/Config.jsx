@@ -7,6 +7,11 @@ export default function Config() {
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
 
+  // Flag ID state
+  const [flagIDStatus, setFlagIDStatus] = useState(null)
+  const [flagIDMap, setFlagIDMap] = useState(null)
+  const [flagIDCountdown, setFlagIDCountdown] = useState('')
+
   // Cleanup state
   const [cleanupConfig, setCleanupConfig] = useState(null)
   const [cleanupForm, setCleanupForm] = useState({})
@@ -19,7 +24,42 @@ export default function Config() {
   useEffect(() => {
     loadConfig()
     loadCleanupConfig()
+    loadFlagIDData()
   }, [])
+
+  async function loadFlagIDData() {
+    try {
+      const [status, ids] = await Promise.all([api.getFlagIDStatus(), api.getFlagIDs()])
+      setFlagIDStatus(status)
+      setFlagIDMap(ids?.flag_ids || {})
+    } catch {}
+  }
+
+  // Refresh flag ID status every 10 seconds for countdown
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      try {
+        const status = await api.getFlagIDStatus()
+        setFlagIDStatus(status)
+        const ids = await api.getFlagIDs()
+        setFlagIDMap(ids?.flag_ids || {})
+      } catch {}
+    }, 10000)
+    return () => clearInterval(interval)
+  }, [])
+
+  // Update countdown timer every second
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (!flagIDStatus?.next_fetch) {
+        setFlagIDCountdown('')
+        return
+      }
+      const diff = Math.max(0, Math.floor((new Date(flagIDStatus.next_fetch) - Date.now()) / 1000))
+      setFlagIDCountdown(`${diff}s`)
+    }, 1000)
+    return () => clearInterval(interval)
+  }, [flagIDStatus])
 
   const loadCleanupConfig = useCallback(async () => {
     try {
@@ -239,6 +279,67 @@ export default function Config() {
             </button>
           </div>
         </form>
+      </div>
+
+      {/* Flag IDs section */}
+      <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 max-w-lg space-y-4">
+        <div className="flex items-center justify-between">
+          <h3 className="text-lg font-medium text-gray-100">Flag IDs</h3>
+          {flagIDStatus && (
+            <span className={`text-xs px-2 py-0.5 rounded ${flagIDStatus.enabled ? 'bg-emerald-900/40 text-emerald-400' : 'bg-gray-800 text-gray-500'}`}>
+              {flagIDStatus.enabled ? 'Enabled' : 'Disabled'}
+            </span>
+          )}
+        </div>
+
+        {flagIDStatus && !flagIDStatus.enabled && (
+          <p className="text-sm text-gray-500">
+            Flag ID fetching is disabled. Set <span className="font-mono text-gray-400">FLAGID_ENABLED=true</span> in .env to enable.
+          </p>
+        )}
+
+        {flagIDStatus?.enabled && (
+          <>
+            <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs bg-gray-800/50 rounded p-2">
+              <div>
+                <span className="text-gray-500">Last fetch: </span>
+                <span className="text-gray-300">
+                  {flagIDStatus.last_fetch ? new Date(flagIDStatus.last_fetch).toLocaleTimeString() : 'Never'}
+                </span>
+              </div>
+              <div>
+                <span className="text-gray-500">Next refresh: </span>
+                <span className="text-cyan-400 font-mono">{flagIDCountdown || '...'}</span>
+              </div>
+              <div>
+                <span className="text-gray-500">Interval: </span>
+                <span className="text-gray-300">{flagIDStatus.poll_interval_seconds}s</span>
+              </div>
+              {flagIDStatus.last_error && (
+                <div className="col-span-2">
+                  <span className="text-red-400">Error: {flagIDStatus.last_error}</span>
+                </div>
+              )}
+            </div>
+
+            {flagIDMap && Object.keys(flagIDMap).length > 0 ? (
+              <div className="space-y-2">
+                {Object.entries(flagIDMap).map(([svcName, values]) => (
+                  <div key={svcName} className="bg-gray-800/50 rounded p-2">
+                    <div className="text-xs text-emerald-400 font-medium mb-1">{svcName}</div>
+                    <div className="flex flex-wrap gap-1">
+                      {values.map((v, i) => (
+                        <span key={i} className="text-xs bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded font-mono">{v}</span>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-gray-500">No flag IDs fetched yet.</p>
+            )}
+          </>
+        )}
       </div>
     </div>
   )

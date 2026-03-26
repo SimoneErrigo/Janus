@@ -45,6 +45,8 @@ export default function Traffic() {
   const [filtersCollapsed, setFiltersCollapsed] = useState(false)
   const [flagFilter, setFlagFilter] = useState(false)
   const [flagRegex, setFlagRegex] = useState('')
+  const [flagIDFilter, setFlagIDFilter] = useState(false)
+  const [flagIDEnabled, setFlagIDEnabled] = useState(false)
   const [filters, setFilters] = useState({
     service_id: '', src_ip: '', dst_ip: '', protocol: '', method: '',
     session_id: '', peer_ip: '', contains: '', regex: '', flagged: '', sort: 'desc',
@@ -89,6 +91,9 @@ export default function Traffic() {
     api.getConfig().then((cfg) => {
       if (cfg?.flag_regex) setFlagRegex(cfg.flag_regex)
     }).catch(() => {})
+    api.getFlagIDStatus().then((s) => {
+      if (s?.enabled) setFlagIDEnabled(true)
+    }).catch(() => {})
   }, [])
 
   const loadPackets = useCallback(async () => {
@@ -98,6 +103,9 @@ export default function Traffic() {
       if (flagFilter && flagRegex) {
         params.regex = flagRegex
       }
+      if (flagIDFilter) {
+        params.contains_flagid = 'true'
+      }
       const data = await api.getPackets(params)
       setPackets(data.packets || [])
       setTotal(data.total)
@@ -106,7 +114,7 @@ export default function Traffic() {
     } finally {
       setLoading(false)
     }
-  }, [filters, flagFilter, flagRegex])
+  }, [filters, flagFilter, flagRegex, flagIDFilter])
 
   useEffect(() => { loadPackets() }, [loadPackets])
 
@@ -145,8 +153,13 @@ export default function Traffic() {
     setFilters((f) => ({ ...f, offset: 0 }))
   }
 
+  function toggleFlagIDFilter() {
+    setFlagIDFilter((v) => !v)
+    setFilters((f) => ({ ...f, offset: 0 }))
+  }
+
   const isFlowActive = !!filters.session_id
-  const hasActiveFilter = filters.contains || filters.regex || flagFilter
+  const hasActiveFilter = filters.contains || filters.regex || flagFilter || flagIDFilter
 
   return (
     <div className="p-4 flex flex-col h-full">
@@ -201,8 +214,8 @@ export default function Traffic() {
                 options={[{ value: 'desc', label: 'Newest first' }, { value: 'asc', label: 'Oldest first' }]}
               />
             </div>
-            {flagRegex && (
-              <div className="mt-2 flex items-center">
+            <div className="mt-2 flex items-center gap-2">
+              {flagRegex && (
                 <button
                   onClick={toggleFlagFilter}
                   className={`text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 ${
@@ -213,8 +226,20 @@ export default function Traffic() {
                 >
                   <span>&#9873;</span> Contains Flag
                 </button>
-              </div>
-            )}
+              )}
+              {flagIDEnabled && (
+                <button
+                  onClick={toggleFlagIDFilter}
+                  className={`text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 ${
+                    flagIDFilter
+                      ? 'bg-emerald-900/50 text-emerald-300 border border-emerald-700/50'
+                      : 'bg-gray-800 text-gray-400 border border-gray-700 hover:text-gray-300'
+                  }`}
+                >
+                  <span>&#9872;</span> Contains my Flag IDs
+                </button>
+              )}
+            </div>
           </div>
         )}
       </div>
@@ -243,7 +268,7 @@ export default function Traffic() {
                     onClick={() => setSelected(pkt)}
                     className={`border-b border-gray-800/50 cursor-pointer transition-colors ${
                       selected?.id === pkt.id ? 'bg-gray-800' : 'hover:bg-gray-900/80'
-                    } ${pkt.matched_rules?.length > 0 ? 'bg-red-950/20' : ''}`}
+                    } ${pkt.matched_rules?.length > 0 ? 'bg-red-950/20' : ''} ${flagIDFilter ? 'bg-emerald-950/20' : ''}`}
                   >
                     <td className="px-3 py-1.5 text-gray-400 whitespace-nowrap font-mono text-xs">
                       {new Date(pkt.timestamp).toLocaleTimeString()}
