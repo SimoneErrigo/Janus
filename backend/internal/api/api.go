@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/SimoneErrigo/Janus/backend/internal/cache"
 	"github.com/SimoneErrigo/Janus/backend/internal/cleanup"
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
 	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
@@ -22,11 +23,12 @@ type Server struct {
 	ruleStore    *dropper.RuleStore
 	cleanupMgr   *cleanup.Manager
 	flagIDPoller *flagids.Poller
+	cache        *cache.Client
 	mux          *http.ServeMux
 }
 
 // NewServer creates a new API server.
-func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager, flagIDPoller *flagids.Poller) *Server {
+func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager, flagIDPoller *flagids.Poller, cacheClient *cache.Client) *Server {
 	s := &Server{
 		store:        store,
 		proxy:        proxyMgr,
@@ -34,6 +36,7 @@ func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniff
 		ruleStore:    ruleStore,
 		cleanupMgr:   cleanupMgr,
 		flagIDPoller: flagIDPoller,
+		cache:        cacheClient,
 		mux:          http.NewServeMux(),
 	}
 	s.routes()

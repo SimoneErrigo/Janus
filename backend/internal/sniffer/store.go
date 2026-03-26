@@ -13,9 +13,18 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// OnInsertFunc is called after a packet is successfully inserted.
+type OnInsertFunc func(serviceID string)
+
 // PacketStore handles SQLite persistence for captured packets.
 type PacketStore struct {
-	db *sql.DB
+	db       *sql.DB
+	onInsert OnInsertFunc
+}
+
+// SetOnInsert registers a callback invoked after each packet insertion.
+func (s *PacketStore) SetOnInsert(fn OnInsertFunc) {
+	s.onInsert = fn
 }
 
 // NewPacketStore opens (or creates) the SQLite database at dataDir/packets.db.
@@ -145,6 +154,9 @@ func (s *PacketStore) Insert(p *Packet) error {
 
 	id, _ := res.LastInsertId()
 	p.ID = id
+	if s.onInsert != nil {
+		s.onInsert(p.ServiceID)
+	}
 	return nil
 }
 

@@ -1,11 +1,13 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/SimoneErrigo/Janus/backend/internal/cache"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 )
 
@@ -107,6 +109,33 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 
 	containsFlagID := params.Get("contains_flagid") == "true" || params.Get("contains_flagid") == "1"
 
+	// Build cache key from all query params
+	serviceIDForCache := q.ServiceID
+	if serviceIDForCache == "" {
+		serviceIDForCache = "_all"
+	}
+
+	// Only cache queries without contains_flagid (live data, not cacheable)
+	canCache := !containsFlagID && s.cache != nil
+	var queryHash string
+	if canCache {
+		qp := make(map[string]string)
+		for k, v := range params {
+			if len(v) > 0 {
+				qp[k] = v[0]
+			}
+		}
+		queryHash = cache.QueryHash(qp)
+
+		if cached, ok := s.cache.GetPacketQuery(serviceIDForCache, queryHash); ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Cache", "HIT")
+			w.WriteHeader(http.StatusOK)
+			w.Write(cached)
+			return
+		}
+	}
+
 	packets, total, err := s.packetStore.Query(q)
 	if err != nil {
 		http.Error(w, "query error: "+err.Error(), http.StatusInternalServerError)
@@ -138,10 +167,20 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 		limit = 50
 	}
 
-	writeJSON(w, http.StatusOK, paginatedPackets{
+	result := paginatedPackets{
 		Packets: packets,
 		Total:   total,
 		Limit:   limit,
 		Offset:  q.Offset,
-	})
+	}
+
+	// Cache the result
+	if canCache {
+		if data, err := json.Marshal(result); err == nil {
+			s.cache.SetPacketQuery(serviceIDForCache, queryHash, data)
+		}
+	}
+
+	w.Header().Set("X-Cache", "MISS")
+	writeJSON(w, http.StatusOK, result)
 }
