@@ -50,6 +50,8 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/packets", s.handlePackets)
 	protected.HandleFunc("/api/rules", s.handleRules)
 	protected.HandleFunc("/api/rules/", s.handleRuleByID)
+	protected.HandleFunc("/api/alerts", s.handleAlerts)
+	protected.HandleFunc("/api/alerts/", s.handleAlertByID)
 	protected.HandleFunc("/api/config", s.handleConfig)
 
 	s.mux.Handle("/api/", authMiddleware(protected))

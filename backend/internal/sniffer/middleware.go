@@ -41,22 +41,22 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		reqHeaders := flattenHeaders(r.Header)
 		headersStr := flattenHeadersString(r.Header)
 
-		// Evaluate drop rules before inserting
+		// Evaluate rules before inserting
 		var matchedRules []MatchedRuleInfo
 		shouldDrop := false
+		var alertRules []dropper.Rule
 		if dropEngine != nil {
-			matched := dropEngine.EvaluateAll(&dropper.HTTPRequest{
+			result := dropEngine.EvaluateActions(&dropper.HTTPRequest{
 				ServiceID: svc.ID,
 				Headers:   headersStr,
 				Body:      reqBody,
 				URL:       r.URL.String(),
 			})
-			for _, rule := range matched {
-				matchedRules = append(matchedRules, MatchedRuleInfo{ID: rule.ID, Name: rule.Name})
+			for _, rule := range result.AllMatched {
+				matchedRules = append(matchedRules, MatchedRuleInfo{ID: rule.ID, Name: rule.Name, Action: string(rule.Action)})
 			}
-			if len(matched) > 0 {
-				shouldDrop = true
-			}
+			shouldDrop = result.ShouldDrop
+			alertRules = result.AlertRules
 		}
 
 		// Check flagged status
@@ -89,6 +89,21 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		}
 		if err := store.Insert(reqPacket); err != nil {
 			log.Printf("[%s] sniffer: failed to log request: %v", svc.Name, err)
+		}
+
+		// Insert alerts for alert/both rules
+		for _, rule := range alertRules {
+			alert := &Alert{
+				PacketID:       reqPacket.ID,
+				RuleID:         rule.ID,
+				ServiceID:      svc.ID,
+				SrcIP:          srcIP,
+				Timestamp:      start,
+				PatternMatched: rule.Pattern,
+			}
+			if err := store.InsertAlert(alert); err != nil {
+				log.Printf("[%s] sniffer: failed to log alert: %v", svc.Name, err)
+			}
 		}
 
 		// Drop if rules matched

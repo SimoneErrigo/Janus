@@ -67,6 +67,40 @@ func (e *Engine) EvaluateAll(req *HTTPRequest) []Rule {
 	return matched
 }
 
+// EvalResult holds categorized rule matches.
+type EvalResult struct {
+	ShouldDrop bool   // true if any drop or both rule matched
+	DropRules  []Rule // rules with action=drop or both
+	AlertRules []Rule // rules with action=alert or both
+	AllMatched []Rule // all matched rules
+}
+
+// EvaluateActions checks all enabled rules and categorizes matches by action.
+func (e *Engine) EvaluateActions(req *HTTPRequest) EvalResult {
+	matched := e.EvaluateAll(req)
+	var result EvalResult
+	result.AllMatched = matched
+
+	for _, rule := range matched {
+		switch rule.Action {
+		case ActionDrop:
+			result.ShouldDrop = true
+			result.DropRules = append(result.DropRules, rule)
+		case ActionAlert:
+			result.AlertRules = append(result.AlertRules, rule)
+		case ActionBoth:
+			result.ShouldDrop = true
+			result.DropRules = append(result.DropRules, rule)
+			result.AlertRules = append(result.AlertRules, rule)
+		default:
+			// Legacy rules without action default to drop
+			result.ShouldDrop = true
+			result.DropRules = append(result.DropRules, rule)
+		}
+	}
+	return result
+}
+
 func (e *Engine) matches(rule *Rule, req *HTTPRequest) bool {
 	var target string
 	var targetBytes []byte

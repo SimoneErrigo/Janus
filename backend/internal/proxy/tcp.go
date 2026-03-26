@@ -65,10 +65,11 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 	dstPort := svc.ListenPort
 	sessionID := sniffer.MakeSessionID(svc.ID, srcIP, srcPort)
 
-	// Read initial data from client for drop rule evaluation
+	// Read initial data from client for rule evaluation
 	var initialData []byte
 	var matchedRules []sniffer.MatchedRuleInfo
 	shouldDrop := false
+	var alertRules []dropper.Rule
 
 	if m.ruleStore != nil {
 		buf := make([]byte, 4096)
@@ -78,23 +79,23 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 		if n > 0 {
 			initialData = buf[:n]
 
-			// Evaluate all drop rules on initial data
+			// Evaluate all rules on initial data
 			engine := dropper.NewEngine(m.ruleStore)
-			matched := engine.EvaluateAll(&dropper.HTTPRequest{
+			result := engine.EvaluateActions(&dropper.HTTPRequest{
 				ServiceID: svc.ID,
 				RawBytes:  initialData,
 				Body:      initialData,
 			})
-			for _, rule := range matched {
-				matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{ID: rule.ID, Name: rule.Name})
+			for _, rule := range result.AllMatched {
+				matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{ID: rule.ID, Name: rule.Name, Action: string(rule.Action)})
 			}
-			if len(matched) > 0 {
-				shouldDrop = true
-			}
+			shouldDrop = result.ShouldDrop
+			alertRules = result.AlertRules
 		}
 	}
 
 	// Check flagged and log the initial request packet
+	now := time.Now()
 	if len(initialData) > 0 && m.packetStore != nil {
 		flagged := sniffer.CheckFlagged(m.flagRegex, "", "", initialData)
 		if matchedRules == nil {
@@ -103,7 +104,7 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 		pkt := &sniffer.Packet{
 			ServiceID:    svc.ID,
 			SessionID:    sessionID,
-			Timestamp:    time.Now(),
+			Timestamp:    now,
 			SrcIP:        srcIP,
 			SrcPort:      srcPort,
 			DstIP:        dstIP,
@@ -116,6 +117,21 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 		}
 		if err := m.packetStore.Insert(pkt); err != nil {
 			log.Printf("[%s] sniffer: failed to log TCP initial packet: %v", svc.Name, err)
+		}
+
+		// Insert alerts for alert/both rules
+		for _, rule := range alertRules {
+			alert := &sniffer.Alert{
+				PacketID:       pkt.ID,
+				RuleID:         rule.ID,
+				ServiceID:      svc.ID,
+				SrcIP:          srcIP,
+				Timestamp:      now,
+				PatternMatched: rule.Pattern,
+			}
+			if err := m.packetStore.InsertAlert(alert); err != nil {
+				log.Printf("[%s] sniffer: failed to log TCP alert: %v", svc.Name, err)
+			}
 		}
 	}
 

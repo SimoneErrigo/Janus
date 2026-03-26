@@ -71,6 +71,11 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 		rule.ID = hex.EncodeToString(b)
 	}
 
+	// Default action to drop if not specified
+	if rule.Action == "" {
+		rule.Action = dropper.ActionDrop
+	}
+
 	if err := validateRule(&rule); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -93,6 +98,16 @@ func (s *Server) updateRule(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	rule.ID = id
+
+	// Flag rules must always remain action=alert
+	if rule.IsFlagRule() && rule.Action != dropper.ActionAlert {
+		rule.Action = dropper.ActionAlert
+	}
+
+	// Default action to drop if not specified
+	if rule.Action == "" {
+		rule.Action = dropper.ActionDrop
+	}
 
 	if err := validateRule(&rule); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -142,6 +157,12 @@ func validateRule(r *dropper.Rule) error {
 	case dropper.ScopeHeader, dropper.ScopeBody, dropper.ScopeURL, dropper.ScopeRaw:
 	default:
 		return fmt.Errorf("scope must be one of: header, body, url, raw")
+	}
+
+	switch r.Action {
+	case dropper.ActionDrop, dropper.ActionAlert, dropper.ActionBoth:
+	default:
+		return fmt.Errorf("action must be one of: drop, alert, both")
 	}
 
 	return nil

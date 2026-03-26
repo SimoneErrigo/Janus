@@ -111,6 +111,10 @@ func (s *RuleStore) load() error {
 		return fmt.Errorf("parsing rules file: %w", err)
 	}
 	for _, r := range list {
+		// Migration: existing rules without action default to "drop"
+		if r.Action == "" {
+			r.Action = ActionDrop
+		}
 		s.rules[r.ID] = r
 	}
 	return nil

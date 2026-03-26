@@ -15,8 +15,32 @@ const (
 
 // MatchedRuleInfo holds info about a rule that matched a packet.
 type MatchedRuleInfo struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Action string `json:"action"`
+}
+
+// Alert represents a triggered alert rule entry.
+type Alert struct {
+	ID             int64     `json:"id"`
+	PacketID       int64     `json:"packet_id"`
+	RuleID         string    `json:"rule_id"`
+	ServiceID      string    `json:"service_id"`
+	SrcIP          string    `json:"src_ip"`
+	Timestamp      time.Time `json:"timestamp"`
+	PatternMatched string    `json:"pattern_matched"`
+	RuleName       string    `json:"rule_name,omitempty"`
+}
+
+// AlertQuery defines filters for retrieving alerts.
+type AlertQuery struct {
+	ServiceID string
+	RuleID    string
+	SrcIP     string
+	TimeFrom  *time.Time
+	TimeTo    *time.Time
+	Limit     int
+	Offset    int
 }
 
 // Packet represents a captured request or response passing through the proxy.

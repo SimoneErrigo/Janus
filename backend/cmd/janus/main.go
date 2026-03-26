@@ -56,6 +56,13 @@ func main() {
 
 	services := store.ListServices()
 
+	// Ensure flag rules exist and are corrected to alert-only for all services
+	var serviceIDs []string
+	for _, svc := range services {
+		serviceIDs = append(serviceIDs, svc.ID)
+	}
+	dropper.EnsureFlagRulesForAll(ruleStore, serviceIDs, cfg.FlagRegex)
+
 	// Auto-start enabled services
 	for _, svc := range services {
 		if svc.Enabled {

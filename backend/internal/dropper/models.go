@@ -19,7 +19,16 @@ const (
 	ScopeRaw    Scope = "raw"
 )
 
-// Rule represents a drop rule for a service.
+// Action defines what happens when a rule matches.
+type Action string
+
+const (
+	ActionDrop  Action = "drop"
+	ActionAlert Action = "alert"
+	ActionBoth  Action = "both"
+)
+
+// Rule represents a drop/alert rule for a service.
 type Rule struct {
 	ID        string    `json:"id"`
 	ServiceID string    `json:"service_id"`
@@ -29,4 +38,12 @@ type Rule struct {
 	Pattern   string    `json:"pattern"`
 	Priority  int       `json:"priority"`
 	Enabled   bool      `json:"enabled"`
+	Action    Action    `json:"action"`
 }
+
+// IsFlagRule returns true if this rule is an auto-generated flag rule.
+func (r *Rule) IsFlagRule() bool {
+	return len(r.ID) > len(flagRulePrefix) && r.ID[:len(flagRulePrefix)] == flagRulePrefix
+}
+
+const flagRulePrefix = "flag-auto-"

@@ -79,6 +79,26 @@ func migrate(db *sql.DB) error {
 	// Create indexes for columns added by migrations (must run after ALTER TABLE)
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_session_id ON packets(session_id)")
 
+	// Step 6: alerts table
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS alerts (
+			id              INTEGER PRIMARY KEY AUTOINCREMENT,
+			packet_id       INTEGER NOT NULL,
+			rule_id         TEXT    NOT NULL,
+			service_id      TEXT    NOT NULL,
+			src_ip          TEXT    NOT NULL,
+			timestamp       TEXT    NOT NULL,
+			pattern_matched TEXT    NOT NULL DEFAULT ''
+		);
+		CREATE INDEX IF NOT EXISTS idx_alerts_service_id ON alerts(service_id);
+		CREATE INDEX IF NOT EXISTS idx_alerts_rule_id    ON alerts(rule_id);
+		CREATE INDEX IF NOT EXISTS idx_alerts_timestamp  ON alerts(timestamp);
+		CREATE INDEX IF NOT EXISTS idx_alerts_src_ip     ON alerts(src_ip);
+	`)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -276,6 +296,154 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 		return nil, err
 	}
 	return packets, nil
+}
+
+// GetPacketByID returns a single packet by its ID.
+func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
+	selectCols := "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged"
+	row := s.db.QueryRow("SELECT "+selectCols+" FROM packets WHERE id = ?", id)
+
+	p := &Packet{}
+	var ts string
+	var headersJSON string
+	var matchedRulesJSON string
+	var flaggedInt int
+	if err := row.Scan(
+		&p.ID, &p.ServiceID, &p.SessionID, &ts,
+		&p.SrcIP, &p.SrcPort, &p.DstIP, &p.DstPort,
+		&p.Protocol, &p.Direction,
+		&p.Method, &p.URL, &p.Status,
+		&headersJSON, &p.Body, &p.BodyString,
+		&matchedRulesJSON, &flaggedInt,
+	); err != nil {
+		return nil, err
+	}
+
+	p.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
+	p.Flagged = flaggedInt != 0
+
+	if headersJSON != "" && headersJSON != "{}" {
+		json.Unmarshal([]byte(headersJSON), &p.Headers)
+	}
+	if matchedRulesJSON != "" && matchedRulesJSON != "[]" {
+		json.Unmarshal([]byte(matchedRulesJSON), &p.MatchedRules)
+	}
+	if p.MatchedRules == nil {
+		p.MatchedRules = []MatchedRuleInfo{}
+	}
+
+	return p, nil
+}
+
+// InsertAlert stores an alert in the database.
+func (s *PacketStore) InsertAlert(a *Alert) error {
+	res, err := s.db.Exec(`
+		INSERT INTO alerts (packet_id, rule_id, service_id, src_ip, timestamp, pattern_matched)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		a.PacketID, a.RuleID, a.ServiceID, a.SrcIP,
+		a.Timestamp.UTC().Format(time.RFC3339Nano),
+		a.PatternMatched,
+	)
+	if err != nil {
+		return fmt.Errorf("inserting alert: %w", err)
+	}
+	id, _ := res.LastInsertId()
+	a.ID = id
+	return nil
+}
+
+// QueryAlerts retrieves alerts matching the given filters.
+func (s *PacketStore) QueryAlerts(q AlertQuery) ([]*Alert, int, error) {
+	var conditions []string
+	var args []interface{}
+
+	if q.ServiceID != "" {
+		conditions = append(conditions, "a.service_id = ?")
+		args = append(args, q.ServiceID)
+	}
+	if q.RuleID != "" {
+		conditions = append(conditions, "a.rule_id = ?")
+		args = append(args, q.RuleID)
+	}
+	if q.SrcIP != "" {
+		conditions = append(conditions, "a.src_ip = ?")
+		args = append(args, q.SrcIP)
+	}
+	if q.TimeFrom != nil {
+		conditions = append(conditions, "a.timestamp >= ?")
+		args = append(args, q.TimeFrom.UTC().Format(time.RFC3339Nano))
+	}
+	if q.TimeTo != nil {
+		conditions = append(conditions, "a.timestamp <= ?")
+		args = append(args, q.TimeTo.UTC().Format(time.RFC3339Nano))
+	}
+
+	where := ""
+	if len(conditions) > 0 {
+		where = " WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	// Count
+	var total int
+	countSQL := "SELECT COUNT(*) FROM alerts a" + where
+	if err := s.db.QueryRow(countSQL, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("counting alerts: %w", err)
+	}
+
+	limit := q.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	offset := q.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	querySQL := "SELECT a.id, a.packet_id, a.rule_id, a.service_id, a.src_ip, a.timestamp, a.pattern_matched FROM alerts a" +
+		where + " ORDER BY a.timestamp DESC LIMIT ? OFFSET ?"
+	queryArgs := append(args, limit, offset)
+
+	rows, err := s.db.Query(querySQL, queryArgs...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("querying alerts: %w", err)
+	}
+	defer rows.Close()
+
+	var alerts []*Alert
+	for rows.Next() {
+		a := &Alert{}
+		var ts string
+		if err := rows.Scan(&a.ID, &a.PacketID, &a.RuleID, &a.ServiceID, &a.SrcIP, &ts, &a.PatternMatched); err != nil {
+			return nil, 0, fmt.Errorf("scanning alert: %w", err)
+		}
+		a.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
+		alerts = append(alerts, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+
+	return alerts, total, nil
+}
+
+// GetAlert returns a single alert by ID.
+func (s *PacketStore) GetAlert(id int64) (*Alert, error) {
+	a := &Alert{}
+	var ts string
+	err := s.db.QueryRow(
+		"SELECT id, packet_id, rule_id, service_id, src_ip, timestamp, pattern_matched FROM alerts WHERE id = ?", id,
+	).Scan(&a.ID, &a.PacketID, &a.RuleID, &a.ServiceID, &a.SrcIP, &ts, &a.PatternMatched)
+	if err != nil {
+		return nil, err
+	}
+	a.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
+	return a, nil
+}
+
+// ClearAlerts deletes all alerts.
+func (s *PacketStore) ClearAlerts() error {
+	_, err := s.db.Exec("DELETE FROM alerts")
+	return err
 }
 
 // Close closes the database.
