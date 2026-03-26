@@ -278,9 +278,9 @@ export default function Traffic() {
       </div>
 
       {/* Packet table + detail split */}
-      <div className="flex-1 flex gap-0 min-h-0">
+      <div className="flex-1 flex gap-0 min-h-0 overflow-hidden">
         {/* Table */}
-        <div className="flex-1 flex flex-col min-h-0">
+        <div className="flex-1 flex flex-col min-h-0 min-w-0">
           <div className="flex-1 overflow-auto">
             <table className="w-full text-sm">
               <thead className="sticky top-0 bg-gray-900">
