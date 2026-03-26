@@ -7,9 +7,15 @@ import (
 	"sync"
 )
 
+// RulesCache is the interface the engine uses to read cached rules.
+type RulesCache interface {
+	GetServiceRules(serviceID string) ([]*Rule, bool)
+}
+
 // Engine evaluates drop rules against request data.
 type Engine struct {
 	ruleStore *RuleStore
+	cache     RulesCache
 	// Cache compiled regexes
 	mu       sync.RWMutex
 	regexMap map[string]*regexp.Regexp
@@ -21,6 +27,11 @@ func NewEngine(ruleStore *RuleStore) *Engine {
 		ruleStore: ruleStore,
 		regexMap:  make(map[string]*regexp.Regexp),
 	}
+}
+
+// SetCache sets the Redis cache for rule lookups.
+func (e *Engine) SetCache(c RulesCache) {
+	e.cache = c
 }
 
 // MatchResult holds info about which rule matched.
@@ -38,9 +49,19 @@ type HTTPRequest struct {
 	RawBytes  []byte // full raw bytes if available
 }
 
+// listRules returns rules for a service, checking the cache first.
+func (e *Engine) listRules(serviceID string) []*Rule {
+	if e.cache != nil {
+		if rules, ok := e.cache.GetServiceRules(serviceID); ok {
+			return rules
+		}
+	}
+	return e.ruleStore.ListRules(serviceID)
+}
+
 // Evaluate checks all enabled rules for the service and returns the first match (by priority).
 func (e *Engine) Evaluate(req *HTTPRequest) MatchResult {
-	rules := e.ruleStore.ListRules(req.ServiceID)
+	rules := e.listRules(req.ServiceID)
 	for _, rule := range rules {
 		if !rule.Enabled {
 			continue
@@ -54,7 +75,7 @@ func (e *Engine) Evaluate(req *HTTPRequest) MatchResult {
 
 // EvaluateAll checks all enabled rules for the service and returns every match.
 func (e *Engine) EvaluateAll(req *HTTPRequest) []Rule {
-	rules := e.ruleStore.ListRules(req.ServiceID)
+	rules := e.listRules(req.ServiceID)
 	var matched []Rule
 	for _, rule := range rules {
 		if !rule.Enabled {

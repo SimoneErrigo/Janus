@@ -9,11 +9,16 @@ import (
 	"sync"
 )
 
+// OnChangeFunc is called after a rule is created, updated, or deleted.
+// It receives the service ID whose rules changed.
+type OnChangeFunc func(serviceID string)
+
 // RuleStore provides thread-safe access to drop rules stored in a JSON file.
 type RuleStore struct {
 	mu       sync.RWMutex
 	filePath string
 	rules    map[string]*Rule // rule ID -> rule
+	onChange OnChangeFunc
 }
 
 // NewRuleStore creates a new RuleStore that persists to the given data directory.
@@ -26,6 +31,19 @@ func NewRuleStore(dataDir string) (*RuleStore, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// SetOnChange registers a callback invoked after any rule mutation.
+func (s *RuleStore) SetOnChange(fn OnChangeFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onChange = fn
+}
+
+func (s *RuleStore) notifyChange(serviceID string) {
+	if s.onChange != nil {
+		s.onChange(serviceID)
+	}
 }
 
 // ListRules returns all rules, optionally filtered by service ID, sorted by priority.
@@ -62,39 +80,56 @@ func (s *RuleStore) GetRule(id string) (*Rule, bool) {
 // CreateRule adds a new rule and persists the change.
 func (s *RuleStore) CreateRule(r *Rule) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if _, exists := s.rules[r.ID]; exists {
+		s.mu.Unlock()
 		return fmt.Errorf("rule with ID %q already exists", r.ID)
 	}
 	cp := *r
 	s.rules[r.ID] = &cp
-	return s.save()
+	err := s.save()
+	s.mu.Unlock()
+	if err == nil {
+		s.notifyChange(r.ServiceID)
+	}
+	return err
 }
 
 // UpdateRule replaces an existing rule and persists the change.
 func (s *RuleStore) UpdateRule(r *Rule) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if _, exists := s.rules[r.ID]; !exists {
+		s.mu.Unlock()
 		return fmt.Errorf("rule with ID %q not found", r.ID)
 	}
 	cp := *r
 	s.rules[r.ID] = &cp
-	return s.save()
+	err := s.save()
+	s.mu.Unlock()
+	if err == nil {
+		s.notifyChange(r.ServiceID)
+	}
+	return err
 }
 
 // DeleteRule removes a rule by ID and persists the change.
 func (s *RuleStore) DeleteRule(id string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	if _, exists := s.rules[id]; !exists {
+	r, exists := s.rules[id]
+	if !exists {
+		s.mu.Unlock()
 		return fmt.Errorf("rule with ID %q not found", id)
 	}
+	serviceID := r.ServiceID
 	delete(s.rules, id)
-	return s.save()
+	err := s.save()
+	s.mu.Unlock()
+	if err == nil {
+		s.notifyChange(serviceID)
+	}
+	return err
 }
 
 func (s *RuleStore) load() error {
