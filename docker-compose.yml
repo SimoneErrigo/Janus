@@ -8,6 +8,7 @@ services:
       - DATA_DIR=/data
       - API_PORT=8080
       - ENV_PATH=/dev/null
+      - REDIS_ADDR=redis:6379
     volumes:
       - ./data:/data
       - ./certs:/certs
@@ -17,6 +18,22 @@ services:
       - "3007:3007"
       - "5555:5555"
       - "5001:5001"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: >
+      sh -c '
+      if [ -n "$$REDIS_PASSWORD" ]; then
+        exec redis-server --bind 0.0.0.0 --requirepass "$$REDIS_PASSWORD" --save "" --appendonly no
+      else
+        exec redis-server --bind 0.0.0.0 --save "" --appendonly no
+      fi'
+    env_file: .env
+    ports:
+      - "127.0.0.1:6379:6379"
     restart: unless-stopped
 
   frontend:

@@ -27,6 +27,10 @@ type Config struct {
 	OurTeamID          string
 	FlagIDAPIURL       string
 	FlagIDPollInterval int // seconds
+
+	// Redis settings
+	RedisAddr     string
+	RedisPassword string
 }
 
 var (
@@ -93,6 +97,12 @@ func Load(envPath string) (*Config, error) {
 		if v, ok := env["FLAGID_POLL_INTERVAL"]; ok {
 			cfg.FlagIDPollInterval, _ = strconv.Atoi(v)
 		}
+		if v, ok := env["REDIS_ADDR"]; ok {
+			cfg.RedisAddr = v
+		}
+		if v, ok := env["REDIS_PASSWORD"]; ok {
+			cfg.RedisPassword = v
+		}
 
 		// Environment variables override .env file
 		if v := os.Getenv("VM_IP"); v != "" {
@@ -130,6 +140,12 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v := os.Getenv("FLAGID_POLL_INTERVAL"); v != "" {
 			cfg.FlagIDPollInterval, _ = strconv.Atoi(v)
+		}
+		if v := os.Getenv("REDIS_ADDR"); v != "" {
+			cfg.RedisAddr = v
+		}
+		if v := os.Getenv("REDIS_PASSWORD"); v != "" {
+			cfg.RedisPassword = v
 		}
 
 		instance = cfg

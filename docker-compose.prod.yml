@@ -4,6 +4,15 @@ services:
   janus:
     network_mode: host
     ports: !reset []
+    environment:
+      - DATA_DIR=/data
+      - API_PORT=8080
+      - ENV_PATH=/dev/null
+      - REDIS_ADDR=127.0.0.1:6379
+
+  redis:
+    network_mode: host
+    ports: !reset []
 
   frontend:
     network_mode: host
