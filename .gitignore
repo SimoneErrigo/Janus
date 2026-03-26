@@ -26,6 +26,7 @@ go.work.sum
 
 # env file
 .env
+.claude/
 
 # Compiled binary
 backend/janus
@@ -36,6 +37,9 @@ data/
 # Frontend
 frontend/node_modules/
 frontend/dist/
+
+# DS_Store files
+.DS_Store
 
 # Editor/IDE
 # .idea/
