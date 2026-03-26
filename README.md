@@ -25,6 +25,19 @@ VM_IP=10.10.0.1
 NETWORK_INTERFACE=eth0
 TEAM_PASSWORD=changeme
 FLAG_REGEX=[A-Z0-9]{31}=
+
+# Auto-cleanup (0 = disabled)
+CLEANUP_MAX_AGE_MINUTES=120
+CLEANUP_MAX_DB_SIZE_MB=500
+
+# Flag ID polling (set FLAGID_ENABLED=true to activate)
+FLAGID_ENABLED=false
+OUR_TEAM_ID=1
+FLAGID_API_URL=http://10.10.0.1:8081/flagIds
+FLAGID_POLL_INTERVAL=30
+
+# Redis caching (improves performance on hot paths)
+REDIS_PASSWORD=changeme_redis
 ```
 
 ### 2. Deploy
@@ -35,8 +48,12 @@ docker compose up -d
 
 - **Frontend dashboard:** `http://<VM_IP>:3000`
 - **Backend API:** `http://<VM_IP>:8080`
+- **Redis:** `127.0.0.1:6379` (internal only, not exposed to the competition network)
 
-Both containers use host networking so Janus can bind to the competition VM IP directly.
+For production (competition VM with host networking):
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build -d
+```
 
 ### 3. Login
 
@@ -72,11 +89,27 @@ From the **Drop Rules** page, create rules to block malicious requests:
 - **Regex match** — regex pattern
 - **Byte sequence** — hex-encoded bytes for raw TCP
 
-The flag regex from `.env` is automatically loaded as a drop rule for all services (prevents flag exfiltration).
+Each rule can have an action: **drop** (block), **alert** (log only), or **both**. The flag regex from `.env` is automatically loaded as an alert-only rule for all services — it highlights flag-bearing traffic without blocking it (blocking would break the checker).
 
-### 7. Configuration
+### 7. Alerts
 
-The **Config** page lets you update VM IP, network interface, team password, and flag regex at runtime without editing `.env`.
+The **Alerts** page shows real-time alerts triggered by rules with `alert` or `both` action. Each alert shows the source IP, service, matched rule, and links to the full packet detail.
+
+### 8. Configuration
+
+The **Config** page lets you update:
+- VM IP, network interface, team password, flag regex
+- Auto-cleanup policies (max age, max DB size)
+- Flag ID polling settings (API URL, team ID, poll interval)
+- A "Run cleanup now" button and current DB size display
+
+### 9. Redis caching
+
+Redis is used as a performance cache for two hot paths:
+- **Rules evaluation** — rules are cached per service, eliminating a JSON file read on every packet
+- **Packet queries** — repeated identical queries are cached for 5 seconds
+
+Redis is never the source of truth. If Redis is unreachable, Janus falls back to SQLite/JSON transparently with no loss of correctness.
 
 ## Development (without Docker)
 
@@ -105,8 +138,15 @@ All endpoints (except `/api/login`) require a `Bearer` token in the `Authorizati
 | GET | `/api/services` | List services |
 | POST | `/api/services` | Create service |
 | GET/PUT/DELETE | `/api/services/{id}` | Get/update/delete service |
-| GET | `/api/packets?...` | Query packets (filters: `service_id`, `service_name`, `src_ip`, `dst_ip`, `protocol`, `time_from`, `time_to`, `contains`, `regex`, `flagged`, `sort`, `limit`, `offset`) |
-| GET | `/api/rules?service_id=...` | List drop rules |
+| GET | `/api/packets?...` | Query packets (filters: `service_id`, `service_name`, `src_ip`, `dst_ip`, `protocol`, `time_from`, `time_to`, `contains`, `regex`, `flagged`, `contains_flagid`, `sort`, `limit`, `offset`) |
+| GET | `/api/rules?service_id=...` | List drop/alert rules |
 | POST | `/api/rules` | Create rule |
 | GET/PUT/DELETE | `/api/rules/{id}` | Get/update/delete rule |
+| GET | `/api/alerts` | List alerts (filters: `service_id`, `rule_id`, `src_ip`, `time_from`, `time_to`) |
+| GET | `/api/alerts/{id}` | Get alert detail |
+| DELETE | `/api/alerts` | Clear all alerts |
 | GET/PUT | `/api/config` | Read/update configuration |
+| GET/PUT | `/api/config/cleanup` | Read/update cleanup settings |
+| POST | `/api/cleanup/run` | Trigger immediate cleanup |
+| GET | `/api/flagids` | Current flag ID map |
+| GET | `/api/flagids/status` | Flag ID poller status |
