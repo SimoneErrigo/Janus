@@ -94,4 +94,7 @@ export const api = {
   getCleanupConfig: () => request('/config/cleanup'),
   updateCleanupConfig: (data) => request('/config/cleanup', { method: 'PUT', body: data }),
   runCleanup: () => request('/cleanup/run', { method: 'POST' }),
+
+  // System stats
+  getSystemStats: () => request('/system/stats'),
 };

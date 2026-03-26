@@ -7,6 +7,7 @@ import Traffic from './pages/Traffic'
 import Rules from './pages/Rules'
 import Alerts from './pages/Alerts'
 import Config from './pages/Config'
+import System from './pages/System'
 
 function ProtectedRoute({ children }) {
   if (!hasToken()) return <Navigate to="/login" replace />
@@ -23,6 +24,7 @@ export default function App() {
         <Route path="traffic" element={<Traffic />} />
         <Route path="rules" element={<Rules />} />
         <Route path="alerts" element={<Alerts />} />
+        <Route path="system" element={<System />} />
         <Route path="config" element={<Config />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
