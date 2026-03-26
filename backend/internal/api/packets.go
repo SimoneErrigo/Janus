@@ -105,6 +105,8 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 		q.Offset = n
 	}
 
+	containsFlagID := params.Get("contains_flagid") == "true" || params.Get("contains_flagid") == "1"
+
 	packets, total, err := s.packetStore.Query(q)
 	if err != nil {
 		http.Error(w, "query error: "+err.Error(), http.StatusInternalServerError)
@@ -113,6 +115,22 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 
 	if packets == nil {
 		packets = []*sniffer.Packet{}
+	}
+
+	// Apply contains_flagid filter in-memory using live flag ID values
+	if containsFlagID && s.flagIDPoller != nil && s.flagIDPoller.IsEnabled() {
+		var filtered []*sniffer.Packet
+		for _, pkt := range packets {
+			text := pkt.BodyString + " " + pkt.URL
+			for k, v := range pkt.Headers {
+				text += " " + k + ": " + v
+			}
+			if s.flagIDPoller.ContainsFlagID(text) {
+				filtered = append(filtered, pkt)
+			}
+		}
+		total = len(filtered)
+		packets = filtered
 	}
 
 	limit := q.Limit

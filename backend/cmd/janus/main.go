@@ -12,6 +12,7 @@ import (
 	"github.com/SimoneErrigo/Janus/backend/internal/cleanup"
 	"github.com/SimoneErrigo/Janus/backend/internal/config"
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
+	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
@@ -77,7 +78,11 @@ func main() {
 	cleanupMgr := cleanup.NewManager(packetStore, cfg.CleanupMaxAgeMinutes, cfg.CleanupMaxDBSizeMB)
 	cleanupMgr.Start()
 
-	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr)
+	// Start flag ID poller
+	flagIDPoller := flagids.NewPoller(cfg.FlagIDAPIURL, cfg.OurTeamID, cfg.FlagIDPollInterval, cfg.FlagIDEnabled)
+	flagIDPoller.Start()
+
+	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller)
 
 	// Graceful shutdown
 	go func() {
@@ -85,6 +90,7 @@ func main() {
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 		log.Println("Shutting down...")
+		flagIDPoller.Stop()
 		cleanupMgr.Stop()
 		proxyMgr.StopAll()
 		packetStore.Close()

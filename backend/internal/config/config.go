@@ -21,6 +21,12 @@ type Config struct {
 	// Cleanup settings
 	CleanupMaxAgeMinutes int
 	CleanupMaxDBSizeMB   int
+
+	// Flag ID settings
+	FlagIDEnabled      bool
+	OurTeamID          string
+	FlagIDAPIURL       string
+	FlagIDPollInterval int // seconds
 }
 
 var (
@@ -75,6 +81,18 @@ func Load(envPath string) (*Config, error) {
 		if v, ok := env["CLEANUP_MAX_DB_SIZE_MB"]; ok {
 			cfg.CleanupMaxDBSizeMB, _ = strconv.Atoi(v)
 		}
+		if v, ok := env["FLAGID_ENABLED"]; ok {
+			cfg.FlagIDEnabled = strings.EqualFold(v, "true") || v == "1"
+		}
+		if v, ok := env["OUR_TEAM_ID"]; ok {
+			cfg.OurTeamID = v
+		}
+		if v, ok := env["FLAGID_API_URL"]; ok {
+			cfg.FlagIDAPIURL = v
+		}
+		if v, ok := env["FLAGID_POLL_INTERVAL"]; ok {
+			cfg.FlagIDPollInterval, _ = strconv.Atoi(v)
+		}
 
 		// Environment variables override .env file
 		if v := os.Getenv("VM_IP"); v != "" {
@@ -100,6 +118,18 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v := os.Getenv("CLEANUP_MAX_DB_SIZE_MB"); v != "" {
 			cfg.CleanupMaxDBSizeMB, _ = strconv.Atoi(v)
+		}
+		if v := os.Getenv("FLAGID_ENABLED"); v != "" {
+			cfg.FlagIDEnabled = strings.EqualFold(v, "true") || v == "1"
+		}
+		if v := os.Getenv("OUR_TEAM_ID"); v != "" {
+			cfg.OurTeamID = v
+		}
+		if v := os.Getenv("FLAGID_API_URL"); v != "" {
+			cfg.FlagIDAPIURL = v
+		}
+		if v := os.Getenv("FLAGID_POLL_INTERVAL"); v != "" {
+			cfg.FlagIDPollInterval, _ = strconv.Atoi(v)
 		}
 
 		instance = cfg

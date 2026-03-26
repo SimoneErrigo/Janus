@@ -8,6 +8,7 @@ import (
 
 	"github.com/SimoneErrigo/Janus/backend/internal/cleanup"
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
+	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
@@ -15,23 +16,25 @@ import (
 
 // Server holds the REST API dependencies.
 type Server struct {
-	store       *storage.Store
-	proxy       *proxy.Manager
-	packetStore *sniffer.PacketStore
-	ruleStore   *dropper.RuleStore
-	cleanupMgr  *cleanup.Manager
-	mux         *http.ServeMux
+	store        *storage.Store
+	proxy        *proxy.Manager
+	packetStore  *sniffer.PacketStore
+	ruleStore    *dropper.RuleStore
+	cleanupMgr   *cleanup.Manager
+	flagIDPoller *flagids.Poller
+	mux          *http.ServeMux
 }
 
 // NewServer creates a new API server.
-func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager) *Server {
+func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager, flagIDPoller *flagids.Poller) *Server {
 	s := &Server{
-		store:       store,
-		proxy:       proxyMgr,
-		packetStore: packetStore,
-		ruleStore:   ruleStore,
-		cleanupMgr:  cleanupMgr,
-		mux:         http.NewServeMux(),
+		store:        store,
+		proxy:        proxyMgr,
+		packetStore:  packetStore,
+		ruleStore:    ruleStore,
+		cleanupMgr:   cleanupMgr,
+		flagIDPoller: flagIDPoller,
+		mux:          http.NewServeMux(),
 	}
 	s.routes()
 	return s
@@ -58,6 +61,8 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/config", s.handleConfig)
 	protected.HandleFunc("/api/config/cleanup", s.handleCleanupConfig)
 	protected.HandleFunc("/api/cleanup/run", s.handleCleanupRun)
+	protected.HandleFunc("/api/flagids", s.handleFlagIDs)
+	protected.HandleFunc("/api/flagids/status", s.handleFlagIDStatus)
 
 	s.mux.Handle("/api/", authMiddleware(protected))
 }
