@@ -49,6 +49,7 @@ docker compose up -d
 - **Frontend dashboard:** `http://<VM_IP>:3000`
 - **Backend API:** `http://<VM_IP>:8080`
 - **Redis:** `127.0.0.1:6379` (internal only, not exposed to the competition network)
+- **Dozzle (container logs):** `http://localhost:9999` (internal only, login with `janus` / `TEAM_PASSWORD`)
 
 For production (competition VM with host networking):
 ```bash
@@ -103,7 +104,14 @@ The **Config** page lets you update:
 - Flag ID polling settings (API URL, team ID, poll interval)
 - A "Run cleanup now" button and current DB size display
 
-### 9. Redis caching
+### 9. Container logs (Dozzle)
+
+The sidebar has a **Logs** link that opens [Dozzle](http://localhost:9999) in a new tab. Dozzle is a lightweight, read-only container log viewer that streams Docker container logs in real time. It shows all Janus containers (backend, frontend, redis, dozzle) and any other containers running on the host.
+
+- Bound to `127.0.0.1:9999` only — not reachable from the competition network
+- Login with username `janus` and the `TEAM_PASSWORD` from `.env`
+
+### 10. Redis caching
 
 Redis is used as a performance cache for two hot paths:
 - **Rules evaluation** — rules are cached per service, eliminating a JSON file read on every packet
@@ -150,3 +158,4 @@ All endpoints (except `/api/login`) require a `Bearer` token in the `Authorizati
 | POST | `/api/cleanup/run` | Trigger immediate cleanup |
 | GET | `/api/flagids` | Current flag ID map |
 | GET | `/api/flagids/status` | Flag ID poller status |
+| GET | `/api/system/stats` | VM resource metrics (CPU, RAM, disk, DB size, Redis) |

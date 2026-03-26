@@ -47,3 +47,16 @@ services:
     depends_on:
       - janus
     restart: unless-stopped
+
+  dozzle:
+    image: amir20/dozzle:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "127.0.0.1:9999:8080"
+    environment:
+      DOZZLE_AUTH_PROVIDER: simple
+      DOZZLE_USERNAME: janus
+      DOZZLE_PASSWORD: ${TEAM_PASSWORD}
+      DOZZLE_HOSTNAME: janus-logs
+    restart: unless-stopped
