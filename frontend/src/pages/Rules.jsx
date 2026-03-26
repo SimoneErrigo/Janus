@@ -16,21 +16,27 @@ export default function Rules() {
     api.listServices().then((data) => {
       const svcs = data || []
       setServices(svcs)
-      if (svcs.length > 0 && !selectedService) setSelectedService(svcs[0].id)
+      if (svcs.length > 0 && !selectedService) setSelectedService('_all')
     })
   }, [])
 
   useEffect(() => {
-    if (selectedService) loadRules()
+    loadRules()
   }, [selectedService])
 
   async function loadRules() {
     try {
-      const data = await api.listRules(selectedService)
+      const serviceId = selectedService === '_all' ? '' : selectedService
+      const data = await api.listRules(serviceId)
       setRules(data || [])
     } catch (err) {
       setError(err.message)
     }
+  }
+
+  const serviceName = (id) => {
+    const svc = services.find((s) => s.id === id)
+    return svc ? svc.name : id
   }
 
   async function handleSave(rule) {
@@ -80,11 +86,12 @@ export default function Rules() {
             onChange={(e) => setSelectedService(e.target.value)}
             className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
           >
+            <option value="_all">All Services</option>
             {services.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
           <button
-            onClick={() => setEditing({ _isNew: true, service_id: selectedService, name: '', type: 'string', scope: 'body', pattern: '', priority: 10, enabled: true, action: 'drop' })}
-            disabled={!selectedService}
+            onClick={() => setEditing({ _isNew: true, service_id: selectedService === '_all' ? (services[0]?.id || '') : selectedService, name: '', type: 'string', scope: 'body', pattern: '', priority: 10, enabled: true, action: 'drop' })}
+            disabled={!selectedService || services.length === 0}
             className="bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
           >
             + Add Rule
@@ -117,6 +124,7 @@ export default function Rules() {
                   <div className="flex items-center gap-2">
                     <span className="font-medium text-gray-100">{rule.name}</span>
                     {isAutoFlag(rule) && <span className="text-xs px-1.5 py-0.5 bg-yellow-900/40 text-yellow-400 rounded">Auto Flag</span>}
+                    {selectedService === '_all' && <span className="text-xs px-1.5 py-0.5 bg-cyan-900/40 text-cyan-400 rounded">{serviceName(rule.service_id)}</span>}
                   </div>
                   <div className="text-xs text-gray-500 mt-0.5 font-mono">
                     <span className={`px-1.5 py-0.5 rounded mr-1 ${

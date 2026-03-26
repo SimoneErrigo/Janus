@@ -21,6 +21,7 @@ export default function Config() {
   const [cleanupError, setCleanupError] = useState('')
   const [cleanupResult, setCleanupResult] = useState(null)
   const [cleanupRunning, setCleanupRunning] = useState(false)
+  const [purgeRunning, setPurgeRunning] = useState(false)
   const [dbSizeMB, setDbSizeMB] = useState(0)
 
   useEffect(() => {
@@ -172,6 +173,21 @@ export default function Config() {
       setCleanupError(err.message)
     } finally {
       setCleanupRunning(false)
+    }
+  }
+
+  async function handlePurgeAll() {
+    if (!confirm('Delete ALL packets and alerts? This cannot be undone.')) return
+    setPurgeRunning(true)
+    setCleanupResult(null)
+    try {
+      const result = await api.purgeAll()
+      setCleanupResult(result)
+      setDbSizeMB(result.db_size_mb)
+    } catch (err) {
+      setCleanupError(err.message)
+    } finally {
+      setPurgeRunning(false)
     }
   }
 
@@ -428,6 +444,14 @@ export default function Config() {
               className="bg-orange-700 hover:bg-orange-600 disabled:bg-gray-700 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
             >
               {cleanupRunning ? 'Running...' : 'Run Cleanup Now'}
+            </button>
+            <button
+              type="button"
+              onClick={handlePurgeAll}
+              disabled={purgeRunning}
+              className="bg-red-700 hover:bg-red-600 disabled:bg-gray-700 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
+            >
+              {purgeRunning ? 'Deleting...' : 'Delete All Data'}
             </button>
           </div>
         </form>

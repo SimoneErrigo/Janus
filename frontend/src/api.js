@@ -61,6 +61,8 @@ export const api = {
     return request(`/packets?${qs.toString()}`);
   },
 
+  getPacketFlow: (packetId) => request(`/packets/flow?packet_id=${packetId}`),
+
   // Rules
   listRules: (serviceId) => {
     const qs = serviceId ? `?service_id=${serviceId}` : '';
@@ -94,6 +96,7 @@ export const api = {
   getCleanupConfig: () => request('/config/cleanup'),
   updateCleanupConfig: (data) => request('/config/cleanup', { method: 'PUT', body: data }),
   runCleanup: () => request('/cleanup/run', { method: 'POST' }),
+  purgeAll: () => request('/cleanup/purge', { method: 'POST' }),
 
   // System stats
   getSystemStats: () => request('/system/stats'),

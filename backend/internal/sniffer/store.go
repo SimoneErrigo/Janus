@@ -458,6 +458,27 @@ func (s *PacketStore) ClearAlerts() error {
 	return err
 }
 
+// PurgeAll deletes all packets and alerts from the database.
+// Returns the number of rows deleted from each table.
+func (s *PacketStore) PurgeAll() (packetsDeleted, alertsDeleted int64, err error) {
+	res, err := s.db.Exec("DELETE FROM alerts")
+	if err != nil {
+		return 0, 0, fmt.Errorf("deleting all alerts: %w", err)
+	}
+	alertsDeleted, _ = res.RowsAffected()
+
+	res, err = s.db.Exec("DELETE FROM packets")
+	if err != nil {
+		return 0, alertsDeleted, fmt.Errorf("deleting all packets: %w", err)
+	}
+	packetsDeleted, _ = res.RowsAffected()
+
+	// Reclaim disk space
+	s.db.Exec("VACUUM")
+
+	return packetsDeleted, alertsDeleted, nil
+}
+
 // DeleteOlderThan deletes packets and their alerts older than the given time.
 // Returns the number of rows deleted from each table.
 func (s *PacketStore) DeleteOlderThan(before time.Time) (packetsDeleted, alertsDeleted int64, err error) {
@@ -531,6 +552,124 @@ func (s *PacketStore) DBSize() (int64, error) {
 // Close closes the database.
 func (s *PacketStore) Close() error {
 	return s.db.Close()
+}
+
+// QueryFlow finds all packets in the same logical flow as the given packet.
+// It extracts auth tokens (Bearer, Cookie) from packet headers, then finds all
+// packets sharing that token, collects their session_ids, and returns the union
+// of all packets from those sessions — giving a complete multi-connection flow.
+func (s *PacketStore) QueryFlow(packetID int64) ([]*Packet, error) {
+	// Step 1: get the starting packet
+	startPkt, err := s.GetPacketByID(packetID)
+	if err != nil {
+		return nil, fmt.Errorf("packet %d not found: %w", packetID, err)
+	}
+
+	// Step 2: get all packets in the same session
+	sessionPackets, err := s.scanPackets(
+		"SELECT id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged FROM packets WHERE session_id = ? ORDER BY timestamp ASC",
+		[]interface{}{startPkt.SessionID},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 3: extract auth tokens from all packets in this session
+	tokens := extractAuthTokens(sessionPackets)
+	if len(tokens) == 0 {
+		// No tokens found — return just this session's packets
+		return sessionPackets, nil
+	}
+
+	// Step 4: find all packets containing any of these tokens (scoped to same service)
+	sessionIDs := map[string]bool{startPkt.SessionID: true}
+	for _, token := range tokens {
+		if len(token) < 8 {
+			continue // skip very short tokens to avoid false matches
+		}
+		like := "%" + token + "%"
+		rows, err := s.scanPackets(
+			"SELECT id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged FROM packets WHERE service_id = ? AND (headers LIKE ? OR body_string LIKE ?) LIMIT 500",
+			[]interface{}{startPkt.ServiceID, like, like},
+		)
+		if err != nil {
+			continue
+		}
+		for _, p := range rows {
+			sessionIDs[p.SessionID] = true
+		}
+	}
+
+	// Step 5: fetch all packets from all discovered sessions
+	if len(sessionIDs) == 1 {
+		return sessionPackets, nil
+	}
+
+	var placeholders []string
+	var args []interface{}
+	for sid := range sessionIDs {
+		placeholders = append(placeholders, "?")
+		args = append(args, sid)
+	}
+
+	query := "SELECT id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged FROM packets WHERE session_id IN (" + strings.Join(placeholders, ",") + ") ORDER BY timestamp ASC LIMIT 500"
+	return s.scanPackets(query, args)
+}
+
+// extractAuthTokens extracts Bearer tokens and session cookies from packet headers and bodies.
+func extractAuthTokens(packets []*Packet) []string {
+	seen := map[string]bool{}
+	var tokens []string
+
+	for _, p := range packets {
+		// Check Authorization header
+		if auth, ok := p.Headers["Authorization"]; ok {
+			token := extractBearerToken(auth)
+			if token != "" && !seen[token] {
+				seen[token] = true
+				tokens = append(tokens, token)
+			}
+		}
+
+		// Check body for token fields in JSON responses (e.g., {"token":"xxx"})
+		if p.Direction == DirectionResponse && p.BodyString != "" {
+			bodyTokens := extractJSONTokens(p.BodyString)
+			for _, t := range bodyTokens {
+				if !seen[t] {
+					seen[t] = true
+					tokens = append(tokens, t)
+				}
+			}
+		}
+	}
+
+	return tokens
+}
+
+// extractBearerToken extracts the token from "Bearer xxx" or "Bearer: xxx" format.
+func extractBearerToken(auth string) string {
+	auth = strings.TrimSpace(auth)
+	if strings.HasPrefix(auth, "Bearer: ") {
+		return strings.TrimSpace(auth[8:])
+	}
+	if strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	return ""
+}
+
+// extractJSONTokens extracts token values from JSON body strings.
+var tokenKeyRegex = regexp.MustCompile(`"token"\s*:\s*"([^"]+)"`)
+
+func extractJSONTokens(body string) []string {
+	matches := tokenKeyRegex.FindAllStringSubmatch(body, -1)
+	var tokens []string
+	for _, m := range matches {
+		if len(m) > 1 && len(m[1]) >= 8 {
+			tokens = append(tokens, m[1])
+		}
+	}
+	return tokens
 }
 
 func buildWhere(q PacketQuery) (string, []interface{}) {

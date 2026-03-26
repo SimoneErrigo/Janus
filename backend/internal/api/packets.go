@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -183,4 +184,40 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("X-Cache", "MISS")
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handlePacketFlow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	packetIDStr := r.URL.Query().Get("packet_id")
+	if packetIDStr == "" {
+		http.Error(w, "packet_id is required", http.StatusBadRequest)
+		return
+	}
+
+	packetID, err := strconv.ParseInt(packetIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("invalid packet_id: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	packets, err := s.packetStore.QueryFlow(packetID)
+	if err != nil {
+		http.Error(w, "flow query error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if packets == nil {
+		packets = []*sniffer.Packet{}
+	}
+
+	writeJSON(w, http.StatusOK, paginatedPackets{
+		Packets: packets,
+		Total:   len(packets),
+		Limit:   len(packets),
+		Offset:  0,
+	})
 }

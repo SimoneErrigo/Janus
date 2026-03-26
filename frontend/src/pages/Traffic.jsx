@@ -42,6 +42,7 @@ export default function Traffic() {
   const [total, setTotal] = useState(0)
   const [selected, setSelected] = useState(null)
   const [loading, setLoading] = useState(false)
+  const [flowMode, setFlowMode] = useState(null) // { packetId, packets, total }
   const [filtersCollapsed, setFiltersCollapsed] = useState(false)
   const [flagFilter, setFlagFilter] = useState(false)
   const [flagRegex, setFlagRegex] = useState('')
@@ -132,17 +133,32 @@ export default function Traffic() {
     setFilters((f) => ({ ...f, offset: Math.max(0, f.offset - f.limit) }))
   }
 
-  // Flow: show all packets from the same TCP connection, chronologically
-  function showFlow(pkt) {
-    setFilters((f) => ({
-      ...f,
-      session_id: pkt.session_id,
-      sort: 'asc',
-      offset: 0,
-    }))
+  // Flow: reconstruct multi-connection flow via auth token correlation
+  async function showFlow(pkt) {
+    setLoading(true)
+    try {
+      const data = await api.getPacketFlow(pkt.id)
+      setFlowMode({
+        packetId: pkt.id,
+        packets: data.packets || [],
+        total: data.total || 0,
+      })
+    } catch (err) {
+      console.error('Flow query failed, falling back to session_id:', err)
+      // Fallback to session_id filter
+      setFilters((f) => ({
+        ...f,
+        session_id: pkt.session_id,
+        sort: 'asc',
+        offset: 0,
+      }))
+    } finally {
+      setLoading(false)
+    }
   }
 
   function clearFlow() {
+    setFlowMode(null)
     setFilters((f) => ({ ...f, session_id: '', sort: 'desc', offset: 0 }))
   }
 
@@ -156,11 +172,21 @@ export default function Traffic() {
     setFilters((f) => ({ ...f, offset: 0 }))
   }
 
-  const isFlowActive = !!filters.session_id
+  const isFlowActive = !!flowMode || !!filters.session_id
   const hasActiveFilter = filters.contains || filters.regex || flagFilter || flagIDFilter
 
   // Compute effective highlight regex: combine user regex and flag regex when active
   const highlightRegex = [filters.regex, flagFilter && flagRegex ? flagRegex : null].filter(Boolean).join('|') || ''
+
+  // Use flow mode packets when active, otherwise normal packets
+  const displayPackets = flowMode ? flowMode.packets : packets
+  const displayTotal = flowMode ? flowMode.total : total
+
+  // Resolve service_id to service name
+  const serviceName = (id) => {
+    const svc = services.find((s) => s.id === id)
+    return svc ? svc.name : id
+  }
 
   return (
     <div className="p-4 flex flex-col h-full">
@@ -171,8 +197,17 @@ export default function Traffic() {
             <path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
           </svg>
           <span className="text-sm text-purple-300">
-            Session: <span className="font-mono font-medium text-purple-200">{filters.session_id}</span>
-            <span className="text-purple-500 ml-2">({total} packets, chronological order)</span>
+            {flowMode ? (
+              <>
+                Flow from packet <span className="font-mono font-medium text-purple-200">#{flowMode.packetId}</span>
+                <span className="text-purple-500 ml-2">({flowMode.total} packets, chronological order — correlated by auth token)</span>
+              </>
+            ) : (
+              <>
+                Session: <span className="font-mono font-medium text-purple-200">{filters.session_id}</span>
+                <span className="text-purple-500 ml-2">({total} packets, chronological order)</span>
+              </>
+            )}
           </span>
           <button onClick={clearFlow} className="ml-auto text-xs bg-purple-800/50 hover:bg-purple-700/50 text-purple-300 px-2 py-1 rounded cursor-pointer">
             Clear flow
@@ -251,6 +286,7 @@ export default function Traffic() {
               <thead className="sticky top-0 bg-gray-900">
                 <tr className="text-left text-gray-500 border-b border-gray-800">
                   <th className="px-3 py-2 font-medium">Time</th>
+                  <th className="px-3 py-2 font-medium">Service</th>
                   <th className="px-3 py-2 font-medium">Dir</th>
                   <th className="px-3 py-2 font-medium">Peer</th>
                   <th className="px-3 py-2 font-medium">Method</th>
@@ -260,7 +296,7 @@ export default function Traffic() {
                 </tr>
               </thead>
               <tbody>
-                {packets.map((pkt) => (
+                {displayPackets.map((pkt) => (
                   <tr
                     key={pkt.id}
                     onClick={() => setSelected(pkt)}
@@ -270,6 +306,9 @@ export default function Traffic() {
                   >
                     <td className="px-3 py-1.5 text-gray-400 whitespace-nowrap font-mono text-xs">
                       {new Date(pkt.timestamp).toLocaleTimeString()}
+                    </td>
+                    <td className="px-3 py-1.5 text-gray-300 text-xs truncate max-w-[8rem]" title={serviceName(pkt.service_id)}>
+                      {serviceName(pkt.service_id)}
                     </td>
                     <td className="px-3 py-1.5">
                       <span className={`text-xs px-1.5 py-0.5 rounded ${
@@ -299,8 +338,8 @@ export default function Traffic() {
                     </td>
                   </tr>
                 ))}
-                {packets.length === 0 && (
-                  <tr><td colSpan="7" className="text-center py-8 text-gray-600">No packets found</td></tr>
+                {displayPackets.length === 0 && (
+                  <tr><td colSpan="8" className="text-center py-8 text-gray-600">No packets found</td></tr>
                 )}
               </tbody>
             </table>
@@ -308,12 +347,14 @@ export default function Traffic() {
 
           {/* Pagination */}
           <div className="flex items-center justify-between px-3 py-2 bg-gray-900 border-t border-gray-800 text-sm text-gray-400">
-            <span>{total} packet{total !== 1 ? 's' : ''}</span>
-            <div className="flex gap-2">
-              <button onClick={prevPage} disabled={filters.offset === 0} className="px-3 py-1 bg-gray-800 rounded hover:bg-gray-700 disabled:opacity-30 cursor-pointer disabled:cursor-default">&laquo; Prev</button>
-              <span className="px-2 py-1">{Math.floor(filters.offset / filters.limit) + 1} / {Math.max(1, Math.ceil(total / filters.limit))}</span>
-              <button onClick={nextPage} disabled={filters.offset + filters.limit >= total} className="px-3 py-1 bg-gray-800 rounded hover:bg-gray-700 disabled:opacity-30 cursor-pointer disabled:cursor-default">Next &raquo;</button>
-            </div>
+            <span>{displayTotal} packet{displayTotal !== 1 ? 's' : ''}</span>
+            {!flowMode && (
+              <div className="flex gap-2">
+                <button onClick={prevPage} disabled={filters.offset === 0} className="px-3 py-1 bg-gray-800 rounded hover:bg-gray-700 disabled:opacity-30 cursor-pointer disabled:cursor-default">&laquo; Prev</button>
+                <span className="px-2 py-1">{Math.floor(filters.offset / filters.limit) + 1} / {Math.max(1, Math.ceil(displayTotal / filters.limit))}</span>
+                <button onClick={nextPage} disabled={filters.offset + filters.limit >= displayTotal} className="px-3 py-1 bg-gray-800 rounded hover:bg-gray-700 disabled:opacity-30 cursor-pointer disabled:cursor-default">Next &raquo;</button>
+              </div>
+            )}
           </div>
         </div>
 
@@ -342,7 +383,7 @@ export default function Traffic() {
               <div className="p-3 space-y-2 text-sm">
                 {/* Compact metadata grid */}
                 <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs bg-gray-800/50 rounded p-2">
-                  <div><span className="text-gray-500">Service </span><span className="text-gray-300">{selected.service_id}</span></div>
+                  <div><span className="text-gray-500">Service </span><span className="text-gray-300">{serviceName(selected.service_id)}</span></div>
                   <div><span className="text-gray-500">Time </span><span className="text-gray-300">{new Date(selected.timestamp).toLocaleTimeString()}</span></div>
                   <div><span className="text-gray-500">Direction </span><span className={selected.direction === 'request' ? 'text-blue-400' : 'text-green-400'}>{selected.direction === 'request' ? 'Request' : 'Response'}</span></div>
                   <div><span className="text-gray-500">Protocol </span><span className="text-gray-300">{selected.protocol}</span></div>

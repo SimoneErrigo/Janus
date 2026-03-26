@@ -106,6 +106,26 @@ func (m *Manager) loop() {
 	}
 }
 
+// PurgeAll deletes all packets and alerts regardless of policies.
+func (m *Manager) PurgeAll() Result {
+	start := time.Now()
+	pkts, alerts, err := m.packetStore.PurgeAll()
+	if err != nil {
+		log.Printf("PurgeAll error: %v", err)
+		return Result{Error: err.Error()}
+	}
+	duration := time.Since(start)
+	dbSize := m.DBSizeMB()
+	log.Printf("PurgeAll: deleted %d packets, %d alerts in %dms (DB: %.1f MB)",
+		pkts, alerts, duration.Milliseconds(), dbSize)
+	return Result{
+		PacketsDeleted: pkts,
+		AlertsDeleted:  alerts,
+		DurationMs:     duration.Milliseconds(),
+		DBSizeMB:       dbSize,
+	}
+}
+
 func (m *Manager) run() Result {
 	start := time.Now()
 	var totalPkts, totalAlerts int64
