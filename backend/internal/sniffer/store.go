@@ -555,9 +555,10 @@ func (s *PacketStore) Close() error {
 }
 
 // QueryFlow finds all packets in the same logical flow as the given packet.
-// It extracts auth tokens (Bearer, Cookie) from packet headers, then finds all
-// packets sharing that token, collects their session_ids, and returns the union
-// of all packets from those sessions — giving a complete multi-connection flow.
+// It first tries auth token correlation (Bearer, Cookie, JSON "token" fields)
+// across TCP connections. If no tokens are found, it falls back to peer IP
+// correlation within a time window — grouping all connections from the same
+// attacker IP to the same service.
 func (s *PacketStore) QueryFlow(packetID int64) ([]*Packet, error) {
 	// Step 1: get the starting packet
 	startPkt, err := s.GetPacketByID(packetID)
@@ -565,7 +566,7 @@ func (s *PacketStore) QueryFlow(packetID int64) ([]*Packet, error) {
 		return nil, fmt.Errorf("packet %d not found: %w", packetID, err)
 	}
 
-	// Step 2: get all packets in the same session
+	// Step 2: get all packets in the same session (same TCP connection)
 	sessionPackets, err := s.scanPackets(
 		"SELECT id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged FROM packets WHERE session_id = ? ORDER BY timestamp ASC",
 		[]interface{}{startPkt.SessionID},
@@ -577,8 +578,9 @@ func (s *PacketStore) QueryFlow(packetID int64) ([]*Packet, error) {
 	// Step 3: extract auth tokens from all packets in this session
 	tokens := extractAuthTokens(sessionPackets)
 	if len(tokens) == 0 {
-		// No tokens found — return just this session's packets
-		return sessionPackets, nil
+		// No tokens — fallback to peer IP correlation within a time window.
+		// This handles stateless HTTP exploits that don't use auth tokens.
+		return s.flowByPeerIP(startPkt, sessionPackets)
 	}
 
 	// Step 4: find all packets containing any of these tokens (scoped to same service)
@@ -601,7 +603,91 @@ func (s *PacketStore) QueryFlow(packetID int64) ([]*Packet, error) {
 	}
 
 	// Step 5: fetch all packets from all discovered sessions
-	if len(sessionIDs) == 1 {
+	return s.fetchSessions(startPkt.SessionID, sessionIDs, sessionPackets)
+}
+
+// flowByPeerIP correlates sessions from the same source IP to the same service
+// within a time window (±30s around the session). Used when no auth tokens are
+// available to link connections.
+//
+// SNAT-aware: in competition networks with source NAT (e.g., CyberChallenge),
+// all traffic arrives from the router IP, making peer IP correlation unreliable.
+// We detect this by checking IP diversity over a wider window; if only 1 IP
+// sends all traffic, we fall back to the single TCP session.
+func (s *PacketStore) flowByPeerIP(startPkt *Packet, sessionPackets []*Packet) ([]*Packet, error) {
+	// Determine attacker (peer) IP
+	peerIP := startPkt.SrcIP
+	if startPkt.Direction == DirectionResponse {
+		peerIP = startPkt.DstIP
+	}
+	if peerIP == "" || len(sessionPackets) == 0 {
+		return sessionPackets, nil
+	}
+
+	// Time window: session range ± 30s
+	minTime := sessionPackets[0].Timestamp.Add(-30 * time.Second)
+	maxTime := sessionPackets[len(sessionPackets)-1].Timestamp.Add(30 * time.Second)
+
+	rows, err := s.db.Query(
+		`SELECT DISTINCT session_id FROM packets
+		 WHERE service_id = ? AND direction = 'request' AND src_ip = ?
+		 AND timestamp BETWEEN ? AND ?
+		 LIMIT 30`,
+		startPkt.ServiceID, peerIP,
+		minTime.UTC().Format(time.RFC3339Nano),
+		maxTime.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return sessionPackets, nil
+	}
+	defer rows.Close()
+
+	sessionIDs := map[string]bool{startPkt.SessionID: true}
+	for rows.Next() {
+		var sid string
+		if err := rows.Scan(&sid); err == nil {
+			sessionIDs[sid] = true
+		}
+	}
+
+	// SNAT detection: if multiple sessions share this peer IP, check whether
+	// the network uses source NAT (all traffic from a single gateway IP).
+	// In SNAT, peer IP correlation is unreliable — fall back to single session.
+	if len(sessionIDs) > 1 && s.looksLikeSNAT(startPkt.ServiceID, sessionPackets[0].Timestamp) {
+		return sessionPackets, nil
+	}
+
+	return s.fetchSessions(startPkt.SessionID, sessionIDs, sessionPackets)
+}
+
+// looksLikeSNAT returns true when all request traffic for a service comes from
+// a single IP, which strongly suggests the competition network performs source
+// NAT (e.g., CyberChallenge cloud router 10.254.0.1 rewrites all src addresses).
+// Uses a ±2 minute window around the reference time for a reliable sample.
+func (s *PacketStore) looksLikeSNAT(serviceID string, around time.Time) bool {
+	wideMin := around.Add(-2 * time.Minute).UTC().Format(time.RFC3339Nano)
+	wideMax := around.Add(2 * time.Minute).UTC().Format(time.RFC3339Nano)
+
+	var distinctIPs int
+	err := s.db.QueryRow(
+		`SELECT COUNT(DISTINCT src_ip) FROM packets
+		 WHERE service_id = ? AND direction = 'request'
+		 AND timestamp BETWEEN ? AND ?`,
+		serviceID, wideMin, wideMax,
+	).Scan(&distinctIPs)
+	if err != nil {
+		return false
+	}
+
+	// In SNAT, all traffic comes from 1 gateway IP.
+	// In normal environments, multiple attacker IPs are visible.
+	return distinctIPs <= 1
+}
+
+// fetchSessions returns packets from all discovered sessions, or the original
+// sessionPackets if only one session was found.
+func (s *PacketStore) fetchSessions(originalSID string, sessionIDs map[string]bool, sessionPackets []*Packet) ([]*Packet, error) {
+	if len(sessionIDs) <= 1 {
 		return sessionPackets, nil
 	}
 
@@ -616,29 +702,46 @@ func (s *PacketStore) QueryFlow(packetID int64) ([]*Packet, error) {
 	return s.scanPackets(query, args)
 }
 
-// extractAuthTokens extracts Bearer tokens and session cookies from packet headers and bodies.
+// extractAuthTokens extracts Bearer tokens, session cookies, and JSON token
+// fields from packet headers and bodies. These values are used to correlate
+// packets across TCP connections that belong to the same logical session.
 func extractAuthTokens(packets []*Packet) []string {
 	seen := map[string]bool{}
 	var tokens []string
 
+	add := func(v string) {
+		if v != "" && !seen[v] {
+			seen[v] = true
+			tokens = append(tokens, v)
+		}
+	}
+
 	for _, p := range packets {
-		// Check Authorization header
+		// Check Authorization header (Bearer tokens)
 		if auth, ok := p.Headers["Authorization"]; ok {
-			token := extractBearerToken(auth)
-			if token != "" && !seen[token] {
-				seen[token] = true
-				tokens = append(tokens, token)
+			add(extractBearerToken(auth))
+		}
+
+		// Check Cookie header (requests) — e.g., "session=abc123; csrftoken=xyz"
+		if cookie, ok := p.Headers["Cookie"]; ok {
+			for _, v := range extractCookieValues(cookie) {
+				add(v)
+			}
+		}
+
+		// Check Set-Cookie header (responses) — e.g., "session=abc123; Path=/; HttpOnly"
+		if p.Direction == DirectionResponse {
+			if sc, ok := p.Headers["Set-Cookie"]; ok {
+				for _, v := range extractSetCookieValues(sc) {
+					add(v)
+				}
 			}
 		}
 
 		// Check body for token fields in JSON responses (e.g., {"token":"xxx"})
 		if p.Direction == DirectionResponse && p.BodyString != "" {
-			bodyTokens := extractJSONTokens(p.BodyString)
-			for _, t := range bodyTokens {
-				if !seen[t] {
-					seen[t] = true
-					tokens = append(tokens, t)
-				}
+			for _, t := range extractJSONTokens(p.BodyString) {
+				add(t)
 			}
 		}
 	}
@@ -670,6 +773,44 @@ func extractJSONTokens(body string) []string {
 		}
 	}
 	return tokens
+}
+
+// extractCookieValues parses a Cookie request header and returns values ≥8 chars.
+// Format: name1=value1; name2=value2
+func extractCookieValues(header string) []string {
+	var values []string
+	for _, pair := range strings.Split(header, ";") {
+		pair = strings.TrimSpace(pair)
+		if eq := strings.IndexByte(pair, '='); eq >= 0 {
+			val := strings.TrimSpace(pair[eq+1:])
+			if len(val) >= 8 {
+				values = append(values, val)
+			}
+		}
+	}
+	return values
+}
+
+// extractSetCookieValues parses Set-Cookie response header(s) and returns values ≥8 chars.
+// Multiple Set-Cookie headers may be joined with ", " by flattenHeaders.
+// Format per cookie: name=value; Path=/; HttpOnly
+func extractSetCookieValues(header string) []string {
+	var values []string
+	for _, cookie := range strings.Split(header, ",") {
+		cookie = strings.TrimSpace(cookie)
+		// Take only the name=value part (before first ";")
+		if semi := strings.IndexByte(cookie, ';'); semi >= 0 {
+			cookie = cookie[:semi]
+		}
+		cookie = strings.TrimSpace(cookie)
+		if eq := strings.IndexByte(cookie, '='); eq >= 0 {
+			val := strings.TrimSpace(cookie[eq+1:])
+			if len(val) >= 8 {
+				values = append(values, val)
+			}
+		}
+	}
+	return values
 }
 
 func buildWhere(q PacketQuery) (string, []interface{}) {

@@ -44,6 +44,7 @@ export default function Traffic() {
   const [loading, setLoading] = useState(false)
   const [flowMode, setFlowMode] = useState(null) // { packetId, packets, total }
   const [filtersCollapsed, setFiltersCollapsed] = useState(false)
+  const [copyStatus, setCopyStatus] = useState(null) // null | 'copying' | 'copied' | 'error'
   const [flagFilter, setFlagFilter] = useState(false)
   const [flagRegex, setFlagRegex] = useState('')
   const [flagIDFilter, setFlagIDFilter] = useState(false)
@@ -167,6 +168,20 @@ export default function Traffic() {
     setFilters((f) => ({ ...f, offset: 0 }))
   }
 
+  async function copyExploit(packetId) {
+    setCopyStatus('copying')
+    try {
+      const data = await api.generateExploit(packetId)
+      await navigator.clipboard.writeText(data.code)
+      setCopyStatus('copied')
+      setTimeout(() => setCopyStatus(null), 2000)
+    } catch (err) {
+      console.error('Failed to generate exploit:', err)
+      setCopyStatus('error')
+      setTimeout(() => setCopyStatus(null), 3000)
+    }
+  }
+
   function toggleFlagIDFilter() {
     setFlagIDFilter((v) => !v)
     setFilters((f) => ({ ...f, offset: 0 }))
@@ -209,7 +224,17 @@ export default function Traffic() {
               </>
             )}
           </span>
-          <button onClick={clearFlow} className="ml-auto text-xs bg-purple-800/50 hover:bg-purple-700/50 text-purple-300 px-2 py-1 rounded cursor-pointer">
+          <button
+            onClick={() => copyExploit(flowMode ? flowMode.packetId : selected?.id)}
+            disabled={copyStatus === 'copying'}
+            className="ml-auto text-xs bg-cyan-800/50 hover:bg-cyan-700/50 text-cyan-300 px-2 py-1 rounded cursor-pointer flex items-center gap-1 disabled:opacity-50"
+          >
+            <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <polyline points="16 18 22 12 16 6" /><polyline points="8 6 2 12 8 18" />
+            </svg>
+            {copyStatus === 'copying' ? 'Generating...' : 'Copy Exploit'}
+          </button>
+          <button onClick={clearFlow} className="text-xs bg-purple-800/50 hover:bg-purple-700/50 text-purple-300 px-2 py-1 rounded cursor-pointer">
             Clear flow
           </button>
         </div>
@@ -377,6 +402,17 @@ export default function Traffic() {
                   >
                     Flow
                   </button>
+                  <button
+                    onClick={() => copyExploit(selected.id)}
+                    disabled={copyStatus === 'copying'}
+                    className="text-xs text-cyan-400 hover:text-cyan-300 cursor-pointer flex items-center gap-1 disabled:opacity-50"
+                    title="Generate exploit skeleton from this flow"
+                  >
+                    <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <polyline points="16 18 22 12 16 6" /><polyline points="8 6 2 12 8 18" />
+                    </svg>
+                    {copyStatus === 'copying' ? '...' : 'Exploit'}
+                  </button>
                 </div>
                 <button onClick={() => setSelected(null)} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
               </div>
@@ -446,6 +482,8 @@ export default function Traffic() {
       </div>
 
       {loading && <div className="fixed bottom-4 right-4 bg-gray-800 text-cyan-400 text-xs px-3 py-1.5 rounded-full">Loading...</div>}
+      {copyStatus === 'copied' && <div className="fixed bottom-4 right-4 bg-green-800 text-green-200 text-xs px-3 py-1.5 rounded-full z-50">Exploit copied to clipboard!</div>}
+      {copyStatus === 'error' && <div className="fixed bottom-4 right-4 bg-red-800 text-red-200 text-xs px-3 py-1.5 rounded-full z-50">Failed to generate exploit</div>}
     </div>
   )
 }

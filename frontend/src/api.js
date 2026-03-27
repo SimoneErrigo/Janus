@@ -62,6 +62,7 @@ export const api = {
   },
 
   getPacketFlow: (packetId) => request(`/packets/flow?packet_id=${packetId}`),
+  generateExploit: (packetId) => request(`/packets/exploit?packet_id=${packetId}`),
 
   // Rules
   listRules: (serviceId) => {

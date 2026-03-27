@@ -61,6 +61,7 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/services/", s.handleServiceByID)
 	protected.HandleFunc("/api/packets", s.handlePackets)
 	protected.HandleFunc("/api/packets/flow", s.handlePacketFlow)
+	protected.HandleFunc("/api/packets/exploit", s.handleExploitGen)
 	protected.HandleFunc("/api/rules", s.handleRules)
 	protected.HandleFunc("/api/rules/", s.handleRuleByID)
 	protected.HandleFunc("/api/alerts", s.handleAlerts)
