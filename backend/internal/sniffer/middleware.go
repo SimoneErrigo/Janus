@@ -17,8 +17,22 @@ import (
 
 const maxBodyCapture = 1 << 20 // 1 MB
 
+// CheckFlagID checks whether any of the packet content contains a current flag ID value.
+// Returns the boolean flag and the list of matched flag ID values.
+func CheckFlagID(checker FlagIDChecker, url, headers string, body []byte) (bool, []string) {
+	if checker == nil {
+		return false, nil
+	}
+	text := url + " " + headers
+	if len(body) > 0 {
+		text += " " + string(body)
+	}
+	matched := checker.FindMatchingFlagIDs(text)
+	return len(matched) > 0, matched
+}
+
 // HTTPMiddleware returns an http.Handler that logs requests/responses and evaluates drop rules.
-func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore, dropEngine *dropper.Engine, flagRegex *regexp.Regexp) http.Handler {
+func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore, dropEngine *dropper.Engine, flagRegex *regexp.Regexp, flagIDChecker FlagIDChecker) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
@@ -59,8 +73,9 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 			alertRules = result.AlertRules
 		}
 
-		// Check flagged status
+		// Check flagged status and flag ID containment
 		flagged := CheckFlagged(flagRegex, r.URL.String(), headersStr, reqBody)
+		containsFlagID, matchedFlagIDs := CheckFlagID(flagIDChecker, r.URL.String(), headersStr, reqBody)
 
 		// Session ID: ties request + response from the same TCP connection.
 		// Even with SNAT (all traffic from same IP), src_port is unique per connection.
@@ -81,8 +96,10 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 			URL:          r.URL.String(),
 			Headers:      reqHeaders,
 			Body:         reqBody,
-			MatchedRules: matchedRules,
-			Flagged:      flagged,
+			MatchedRules:   matchedRules,
+			Flagged:        flagged,
+			ContainsFlagID: containsFlagID,
+			MatchedFlagIDs: matchedFlagIDs,
 		}
 		if reqPacket.MatchedRules == nil {
 			reqPacket.MatchedRules = []MatchedRuleInfo{}
@@ -122,6 +139,7 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		respBody := rw.body.Bytes()
 		respHeadersStr := flattenHeadersString(rw.Header())
 		respFlagged := CheckFlagged(flagRegex, r.URL.String(), respHeadersStr, respBody)
+		respContainsFlagID, respMatchedFlagIDs := CheckFlagID(flagIDChecker, r.URL.String(), respHeadersStr, respBody)
 
 		// Evaluate rules against response (alert-only, never drop — response already sent)
 		var respMatchedRules []MatchedRuleInfo
@@ -157,8 +175,10 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 			Status:       rw.statusCode,
 			Headers:      respHeaders,
 			Body:         respBody,
-			MatchedRules: respMatchedRules,
-			Flagged:      respFlagged,
+			MatchedRules:   respMatchedRules,
+			Flagged:        respFlagged,
+			ContainsFlagID: respContainsFlagID,
+			MatchedFlagIDs: respMatchedFlagIDs,
 		}
 		if err := store.Insert(respPacket); err != nil {
 			log.Printf("[%s] sniffer: failed to log response: %v", svc.Name, err)

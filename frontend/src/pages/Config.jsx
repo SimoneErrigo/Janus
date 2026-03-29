@@ -14,6 +14,9 @@ export default function Config() {
   const [flagIDSaved, setFlagIDSaved] = useState(false)
   const [flagIDError, setFlagIDError] = useState('')
 
+  // Flag ID panel collapse
+  const [flagIDsCollapsed, setFlagIDsCollapsed] = useState(false)
+
   // Cleanup state
   const [cleanupConfig, setCleanupConfig] = useState(null)
   const [cleanupForm, setCleanupForm] = useState({})
@@ -356,17 +359,29 @@ export default function Config() {
             </div>
 
             {flagIDMap && Object.keys(flagIDMap).length > 0 ? (
-              <div className="space-y-2">
-                {Object.entries(flagIDMap).map(([svcName, values]) => (
-                  <div key={svcName} className="bg-gray-800/50 rounded p-2">
-                    <div className="text-xs text-emerald-400 font-medium mb-1">{svcName}</div>
-                    <div className="flex flex-wrap gap-1">
-                      {values.map((v, i) => (
-                        <span key={i} className="text-xs bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded font-mono">{v}</span>
-                      ))}
-                    </div>
+              <div>
+                <button
+                  type="button"
+                  onClick={() => setFlagIDsCollapsed(c => !c)}
+                  className="flex items-center gap-2 text-xs text-gray-400 hover:text-gray-200 mb-2 cursor-pointer"
+                >
+                  <span className={`transition-transform ${flagIDsCollapsed ? '' : 'rotate-90'}`}>&#9654;</span>
+                  <span>Fetched Flag IDs ({Object.values(flagIDMap).flat().length} values)</span>
+                </button>
+                {!flagIDsCollapsed && (
+                  <div className="space-y-2">
+                    {Object.entries(flagIDMap).map(([svcName, values]) => (
+                      <div key={svcName} className="bg-gray-800/50 rounded p-2">
+                        <div className="text-xs text-emerald-400 font-medium mb-1">{svcName}</div>
+                        <div className="flex flex-wrap gap-1">
+                          {values.map((v, i) => (
+                            <span key={i} className="text-xs bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded font-mono">{v}</span>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
                   </div>
-                ))}
+                )}
               </div>
             ) : (
               <p className="text-sm text-gray-500">No flag IDs fetched yet.</p>

@@ -13,7 +13,7 @@ services:
       - ./data:/data
       - ./certs:/certs
     ports:
-      - "10000-10100:10000-10100"
+      - "3000-3001:3000-3001"
     depends_on:
       - redis
     restart: unless-stopped
@@ -39,7 +39,7 @@ services:
     environment:
       - API_BACKEND=janus
     ports:
-      - "3000:3000"
+      - "2999:3000"
     depends_on:
       - janus
     restart: unless-stopped

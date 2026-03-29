@@ -1,14 +1,12 @@
 package api
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/SimoneErrigo/Janus/backend/internal/cache"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 )
 
@@ -108,33 +106,9 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 		q.Offset = n
 	}
 
-	containsFlagID := params.Get("contains_flagid") == "true" || params.Get("contains_flagid") == "1"
-
-	// Build cache key from all query params
-	serviceIDForCache := q.ServiceID
-	if serviceIDForCache == "" {
-		serviceIDForCache = "_all"
-	}
-
-	// Only cache queries without contains_flagid (live data, not cacheable)
-	canCache := !containsFlagID && s.cache != nil
-	var queryHash string
-	if canCache {
-		qp := make(map[string]string)
-		for k, v := range params {
-			if len(v) > 0 {
-				qp[k] = v[0]
-			}
-		}
-		queryHash = cache.QueryHash(qp)
-
-		if cached, ok := s.cache.GetPacketQuery(serviceIDForCache, queryHash); ok {
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("X-Cache", "HIT")
-			w.WriteHeader(http.StatusOK)
-			w.Write(cached)
-			return
-		}
+	if v := params.Get("contains_flagid"); v != "" {
+		b := v == "true" || v == "1"
+		q.ContainsFlagID = &b
 	}
 
 	packets, total, err := s.packetStore.Query(q)
@@ -145,22 +119,6 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 
 	if packets == nil {
 		packets = []*sniffer.Packet{}
-	}
-
-	// Apply contains_flagid filter in-memory using live flag ID values
-	if containsFlagID && s.flagIDPoller != nil && s.flagIDPoller.IsEnabled() {
-		var filtered []*sniffer.Packet
-		for _, pkt := range packets {
-			text := pkt.BodyString + " " + pkt.URL
-			for k, v := range pkt.Headers {
-				text += " " + k + ": " + v
-			}
-			if s.flagIDPoller.ContainsFlagID(text) {
-				filtered = append(filtered, pkt)
-			}
-		}
-		total = len(filtered)
-		packets = filtered
 	}
 
 	limit := q.Limit
@@ -175,14 +133,6 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 		Offset:  q.Offset,
 	}
 
-	// Cache the result
-	if canCache {
-		if data, err := json.Marshal(result); err == nil {
-			s.cache.SetPacketQuery(serviceIDForCache, queryHash, data)
-		}
-	}
-
-	w.Header().Set("X-Cache", "MISS")
 	writeJSON(w, http.StatusOK, result)
 }
 

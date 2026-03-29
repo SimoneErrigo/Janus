@@ -26,6 +26,9 @@ type Poller struct {
 	lastFetch time.Time
 	lastError string
 
+	// Callback after successful fetch (e.g. for backfilling old packets)
+	onFetch func(values []string)
+
 	// Loop lifecycle
 	loopMu  sync.Mutex
 	stopCh  chan struct{}
@@ -195,22 +198,38 @@ func (p *Poller) IsEnabled() bool {
 	return p.enabled
 }
 
+// SetOnFetch registers a callback invoked after each successful flag ID fetch
+// with the flat list of all current flag ID values.
+func (p *Poller) SetOnFetch(fn func(values []string)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.onFetch = fn
+}
+
 // ContainsFlagID checks if the given text contains any current flag ID value.
+// Values shorter than 6 characters are skipped to avoid false positives.
 func (p *Poller) ContainsFlagID(text string) bool {
+	return len(p.FindMatchingFlagIDs(text)) > 0
+}
+
+// FindMatchingFlagIDs returns all flag ID values found in the given text.
+// Values shorter than 6 characters are skipped to avoid false positives.
+func (p *Poller) FindMatchingFlagIDs(text string) []string {
 	if text == "" {
-		return false
+		return nil
 	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
+	var matched []string
 	for _, vals := range p.flagIDs {
 		for _, v := range vals {
-			if v != "" && strings.Contains(text, v) {
-				return true
+			if len(v) >= 6 && strings.Contains(text, v) {
+				matched = append(matched, v)
 			}
 		}
 	}
-	return false
+	return matched
 }
 
 func (p *Poller) loop() {
@@ -312,6 +331,18 @@ func (p *Poller) fetch() {
 		total += len(v)
 	}
 	log.Printf("Flag IDs refreshed: %d services, %d values", len(flagIDs), total)
+
+	// Notify callback (e.g. to backfill old packets with newly fetched flag IDs)
+	p.mu.RLock()
+	onFetch := p.onFetch
+	p.mu.RUnlock()
+	if onFetch != nil {
+		var allValues []string
+		for _, vals := range flagIDs {
+			allValues = append(allValues, vals...)
+		}
+		go onFetch(allValues)
+	}
 }
 
 // parseCyberChallenge parses the CyberChallenge flag ID format:

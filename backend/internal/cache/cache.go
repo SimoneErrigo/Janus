@@ -178,7 +178,7 @@ func (c *Client) PopulateRules(ruleStore *dropper.RuleStore) {
 
 const (
 	pktQueryPrefix = "pkt_query:"
-	pktQueryTTL    = 5 * time.Second
+	pktQueryTTL    = 1 * time.Second
 )
 
 // QueryHash builds a deterministic cache key for a packet query.

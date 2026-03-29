@@ -67,8 +67,16 @@ type Packet struct {
 	BodyString string `json:"body_string,omitempty"`
 
 	// Filtering metadata
-	MatchedRules []MatchedRuleInfo `json:"matched_rules"`
-	Flagged      bool              `json:"flagged"`
+	MatchedRules   []MatchedRuleInfo `json:"matched_rules"`
+	Flagged        bool              `json:"flagged"`
+	ContainsFlagID bool              `json:"contains_flagid"`
+	MatchedFlagIDs []string          `json:"matched_flagids"`
+}
+
+// FlagIDChecker checks if text contains any current flag ID value.
+type FlagIDChecker interface {
+	ContainsFlagID(text string) bool
+	FindMatchingFlagIDs(text string) []string
 }
 
 // MakeSessionID builds a session identifier from the client (external) side of the connection.
@@ -91,8 +99,9 @@ type PacketQuery struct {
 	TimeTo      *time.Time
 	Contains    string // substring search across body, headers, url
 	Regex       string // regex search across body, headers, url
-	Flagged     *bool  // nil = no filter, true = only flagged, false = only unflagged
-	SortOrder   string // "asc" or "desc" (default "desc")
+	Flagged        *bool // nil = no filter, true = only flagged, false = only unflagged
+	ContainsFlagID *bool // nil = no filter, true = only with flagID, false = only without
+	SortOrder      string // "asc" or "desc" (default "desc")
 	Limit       int
 	Offset      int
 }

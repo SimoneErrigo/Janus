@@ -101,22 +101,25 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 	now := time.Now()
 	if len(initialData) > 0 && m.packetStore != nil {
 		flagged := sniffer.CheckFlagged(m.flagRegex, "", "", initialData)
+		containsFlagID, matchedFlagIDs := sniffer.CheckFlagID(m.flagIDChecker, "", "", initialData)
 		if matchedRules == nil {
 			matchedRules = []sniffer.MatchedRuleInfo{}
 		}
 		pkt := &sniffer.Packet{
-			ServiceID:    svc.ID,
-			SessionID:    sessionID,
-			Timestamp:    now,
-			SrcIP:        srcIP,
-			SrcPort:      srcPort,
-			DstIP:        dstIP,
-			DstPort:      dstPort,
-			Protocol:     string(svc.Protocol),
-			Direction:    sniffer.DirectionRequest,
-			Body:         initialData,
-			MatchedRules: matchedRules,
-			Flagged:      flagged,
+			ServiceID:      svc.ID,
+			SessionID:      sessionID,
+			Timestamp:      now,
+			SrcIP:          srcIP,
+			SrcPort:        srcPort,
+			DstIP:          dstIP,
+			DstPort:        dstPort,
+			Protocol:       string(svc.Protocol),
+			Direction:      sniffer.DirectionRequest,
+			Body:           initialData,
+			MatchedRules:   matchedRules,
+			Flagged:        flagged,
+			ContainsFlagID: containsFlagID,
+			MatchedFlagIDs: matchedFlagIDs,
 		}
 		if err := m.packetStore.Insert(pkt); err != nil {
 			log.Printf("[%s] sniffer: failed to log TCP initial packet: %v", svc.Name, err)
@@ -205,19 +208,22 @@ func (m *Manager) sniffCopy(dst io.Writer, src io.Reader, svc *storage.Service, 
 	if m.packetStore != nil && buf.Len() > 0 {
 		data := buf.Bytes()
 		flagged := sniffer.CheckFlagged(m.flagRegex, "", "", data)
+		containsFlagID, matchedFlagIDs := sniffer.CheckFlagID(m.flagIDChecker, "", "", data)
 		pkt := &sniffer.Packet{
-			ServiceID:    svc.ID,
-			SessionID:    sessionID,
-			Timestamp:    time.Now(),
-			SrcIP:        srcIP,
-			SrcPort:      srcPort,
-			DstIP:        dstIP,
-			DstPort:      dstPort,
-			Protocol:     string(svc.Protocol),
-			Direction:    dir,
-			Body:         data,
-			MatchedRules: []sniffer.MatchedRuleInfo{},
-			Flagged:      flagged,
+			ServiceID:      svc.ID,
+			SessionID:      sessionID,
+			Timestamp:      time.Now(),
+			SrcIP:          srcIP,
+			SrcPort:        srcPort,
+			DstIP:          dstIP,
+			DstPort:        dstPort,
+			Protocol:       string(svc.Protocol),
+			Direction:      dir,
+			Body:           data,
+			MatchedRules:   []sniffer.MatchedRuleInfo{},
+			Flagged:        flagged,
+			ContainsFlagID: containsFlagID,
+			MatchedFlagIDs: matchedFlagIDs,
 		}
 		if err := m.packetStore.Insert(pkt); err != nil {
 			log.Printf("[%s] sniffer: failed to log TCP packet: %v", svc.Name, err)

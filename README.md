@@ -82,7 +82,10 @@ The **Traffic** page shows all captured packets with real-time filters:
 
 - Filter by service, source/destination IP, protocol
 - Text search (`contains`) or regex search
-- Filter flagged packets (containing the flag pattern)
+- **Contains Flag** filter — shows packets matching the flag regex (yellow highlight)
+- **Contains my Flag IDs** filter — shows packets containing your team's current flag ID values (teal highlight)
+- Packets with both a flag and a flag ID display a combined yellow-to-teal gradient
+- Flag regex matches are always highlighted in yellow in the detail panel; flag ID values in teal
 - Click a packet to see full headers, body, and matched rules
 
 ### 6. Copy Exploit
@@ -121,7 +124,7 @@ The **Config** page lets you update:
 
 - VM IP, network interface, team password, flag regex
 - Auto-cleanup policies (max age, max DB size)
-- Flag ID polling settings (API URL, team ID, poll interval)
+- Flag ID polling settings (API URL, team ID, poll interval) — when new flag IDs are fetched, old packets are retroactively scanned and marked
 - A "Run cleanup now" button and current DB size display
 
 ### 10. Container logs (Dozzle)

@@ -23,12 +23,13 @@ import (
 
 // Manager manages proxy instances for configured services.
 type Manager struct {
-	mu          sync.RWMutex
-	proxies     map[string]*runningProxy // service ID -> running proxy
-	packetStore *sniffer.PacketStore
-	ruleStore   *dropper.RuleStore
-	flagRegex   *regexp.Regexp
-	rulesCache  dropper.RulesCache
+	mu            sync.RWMutex
+	proxies       map[string]*runningProxy // service ID -> running proxy
+	packetStore   *sniffer.PacketStore
+	ruleStore     *dropper.RuleStore
+	flagRegex     *regexp.Regexp
+	rulesCache    dropper.RulesCache
+	flagIDChecker sniffer.FlagIDChecker
 }
 
 type runningProxy struct {
@@ -53,6 +54,13 @@ func (m *Manager) SetRulesCache(c dropper.RulesCache) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.rulesCache = c
+}
+
+// SetFlagIDChecker sets the flag ID checker for marking packets at ingestion time.
+func (m *Manager) SetFlagIDChecker(c sniffer.FlagIDChecker) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.flagIDChecker = c
 }
 
 // StartService starts a proxy for the given service.
@@ -180,7 +188,7 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 				dropEngine.SetCache(m.rulesCache)
 			}
 		}
-		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine, m.flagRegex)
+		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine, m.flagRegex, m.flagIDChecker)
 	}
 
 	server := &http.Server{
@@ -269,7 +277,7 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 				dropEngine.SetCache(m.rulesCache)
 			}
 		}
-		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine, m.flagRegex)
+		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine, m.flagRegex, m.flagIDChecker)
 	}
 
 	// For gRPC, support h2c (HTTP/2 cleartext) from backend if needed

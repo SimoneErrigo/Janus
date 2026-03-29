@@ -13,24 +13,15 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// OnInsertFunc is called after a packet is successfully inserted.
-type OnInsertFunc func(serviceID string)
-
 // PacketStore handles SQLite persistence for captured packets.
 type PacketStore struct {
-	db       *sql.DB
-	onInsert OnInsertFunc
-}
-
-// SetOnInsert registers a callback invoked after each packet insertion.
-func (s *PacketStore) SetOnInsert(fn OnInsertFunc) {
-	s.onInsert = fn
+	db *sql.DB
 }
 
 // NewPacketStore opens (or creates) the SQLite database at dataDir/packets.db.
 func NewPacketStore(dataDir string) (*PacketStore, error) {
 	dbPath := filepath.Join(dataDir, "packets.db")
-	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000")
+	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_cache_size=-32000")
 	if err != nil {
 		return nil, fmt.Errorf("opening sqlite: %w", err)
 	}
@@ -62,8 +53,9 @@ func migrate(db *sql.DB) error {
 			headers       TEXT    NOT NULL DEFAULT '{}',
 			body          BLOB,
 			body_string   TEXT    NOT NULL DEFAULT '',
-			matched_rules TEXT    NOT NULL DEFAULT '[]',
-			flagged       INTEGER NOT NULL DEFAULT 0
+			matched_rules    TEXT    NOT NULL DEFAULT '[]',
+			flagged          INTEGER NOT NULL DEFAULT 0,
+			contains_flagid  INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS idx_packets_service_id ON packets(service_id);
 		CREATE INDEX IF NOT EXISTS idx_packets_timestamp  ON packets(timestamp);
@@ -81,12 +73,18 @@ func migrate(db *sql.DB) error {
 		"ALTER TABLE packets ADD COLUMN matched_rules TEXT NOT NULL DEFAULT '[]'",
 		"ALTER TABLE packets ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE packets ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE packets ADD COLUMN contains_flagid INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE packets ADD COLUMN matched_flagids TEXT NOT NULL DEFAULT '[]'",
 	} {
 		db.Exec(col) // ignore "duplicate column" errors
 	}
 
 	// Create indexes for columns added by migrations (must run after ALTER TABLE)
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_session_id ON packets(session_id)")
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_contains_flagid ON packets(contains_flagid)")
+
+	// Composite index for the most common query: filter by service + sort by time
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_service_ts ON packets(service_id, timestamp DESC)")
 
 	// Step 6: alerts table
 	_, err = db.Exec(`
@@ -132,12 +130,24 @@ func (s *PacketStore) Insert(p *Packet) error {
 	if p.Flagged {
 		flaggedInt = 1
 	}
+	containsFlagIDInt := 0
+	if p.ContainsFlagID {
+		containsFlagIDInt = 1
+	}
+
+	if p.MatchedFlagIDs == nil {
+		p.MatchedFlagIDs = []string{}
+	}
+	matchedFlagIDsJSON, err := json.Marshal(p.MatchedFlagIDs)
+	if err != nil {
+		matchedFlagIDsJSON = []byte("[]")
+	}
 
 	res, err := s.db.Exec(`
 		INSERT INTO packets (service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port,
 			protocol, direction, method, url, status, headers, body, body_string,
-			matched_rules, flagged)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			matched_rules, flagged, contains_flagid, matched_flagids)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ServiceID, p.SessionID,
 		p.Timestamp.UTC().Format(time.RFC3339Nano),
 		p.SrcIP, p.SrcPort,
@@ -146,7 +156,8 @@ func (s *PacketStore) Insert(p *Packet) error {
 		p.Method, p.URL, p.Status,
 		string(headersJSON),
 		p.Body, p.BodyString,
-		string(matchedRulesJSON), flaggedInt,
+		string(matchedRulesJSON), flaggedInt, containsFlagIDInt,
+		string(matchedFlagIDsJSON),
 	)
 	if err != nil {
 		return fmt.Errorf("inserting packet: %w", err)
@@ -154,9 +165,6 @@ func (s *PacketStore) Insert(p *Packet) error {
 
 	id, _ := res.LastInsertId()
 	p.ID = id
-	if s.onInsert != nil {
-		s.onInsert(p.ServiceID)
-	}
 	return nil
 }
 
@@ -182,7 +190,7 @@ func (s *PacketStore) Query(q PacketQuery) ([]*Packet, int, error) {
 		offset = 0
 	}
 
-	selectCols := "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged"
+	selectCols := "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged, contains_flagid, matched_flagids"
 
 	if hasRegex {
 		// With regex: fetch all SQL-matching rows, filter in Go, then paginate
@@ -274,20 +282,24 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 		var ts string
 		var headersJSON string
 		var matchedRulesJSON string
+		var matchedFlagIDsJSON string
 		var flaggedInt int
+		var containsFlagIDInt int
 		if err := rows.Scan(
 			&p.ID, &p.ServiceID, &p.SessionID, &ts,
 			&p.SrcIP, &p.SrcPort, &p.DstIP, &p.DstPort,
 			&p.Protocol, &p.Direction,
 			&p.Method, &p.URL, &p.Status,
 			&headersJSON, &p.Body, &p.BodyString,
-			&matchedRulesJSON, &flaggedInt,
+			&matchedRulesJSON, &flaggedInt, &containsFlagIDInt,
+			&matchedFlagIDsJSON,
 		); err != nil {
 			return nil, fmt.Errorf("scanning packet: %w", err)
 		}
 
 		p.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
 		p.Flagged = flaggedInt != 0
+		p.ContainsFlagID = containsFlagIDInt != 0
 
 		if headersJSON != "" && headersJSON != "{}" {
 			json.Unmarshal([]byte(headersJSON), &p.Headers)
@@ -297,8 +309,15 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 			json.Unmarshal([]byte(matchedRulesJSON), &p.MatchedRules)
 		}
 
+		if matchedFlagIDsJSON != "" && matchedFlagIDsJSON != "[]" {
+			json.Unmarshal([]byte(matchedFlagIDsJSON), &p.MatchedFlagIDs)
+		}
+
 		if p.MatchedRules == nil {
 			p.MatchedRules = []MatchedRuleInfo{}
+		}
+		if p.MatchedFlagIDs == nil {
+			p.MatchedFlagIDs = []string{}
 		}
 
 		packets = append(packets, p)
@@ -312,27 +331,31 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 
 // GetPacketByID returns a single packet by its ID.
 func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
-	selectCols := "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged"
+	selectCols := "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged, contains_flagid, matched_flagids"
 	row := s.db.QueryRow("SELECT "+selectCols+" FROM packets WHERE id = ?", id)
 
 	p := &Packet{}
 	var ts string
 	var headersJSON string
 	var matchedRulesJSON string
+	var matchedFlagIDsJSON string
 	var flaggedInt int
+	var containsFlagIDInt int
 	if err := row.Scan(
 		&p.ID, &p.ServiceID, &p.SessionID, &ts,
 		&p.SrcIP, &p.SrcPort, &p.DstIP, &p.DstPort,
 		&p.Protocol, &p.Direction,
 		&p.Method, &p.URL, &p.Status,
 		&headersJSON, &p.Body, &p.BodyString,
-		&matchedRulesJSON, &flaggedInt,
+		&matchedRulesJSON, &flaggedInt, &containsFlagIDInt,
+		&matchedFlagIDsJSON,
 	); err != nil {
 		return nil, err
 	}
 
 	p.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
 	p.Flagged = flaggedInt != 0
+	p.ContainsFlagID = containsFlagIDInt != 0
 
 	if headersJSON != "" && headersJSON != "{}" {
 		json.Unmarshal([]byte(headersJSON), &p.Headers)
@@ -340,8 +363,14 @@ func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
 	if matchedRulesJSON != "" && matchedRulesJSON != "[]" {
 		json.Unmarshal([]byte(matchedRulesJSON), &p.MatchedRules)
 	}
+	if matchedFlagIDsJSON != "" && matchedFlagIDsJSON != "[]" {
+		json.Unmarshal([]byte(matchedFlagIDsJSON), &p.MatchedFlagIDs)
+	}
 	if p.MatchedRules == nil {
 		p.MatchedRules = []MatchedRuleInfo{}
+	}
+	if p.MatchedFlagIDs == nil {
+		p.MatchedFlagIDs = []string{}
 	}
 
 	return p, nil
@@ -537,6 +566,105 @@ func (s *PacketStore) DeleteOldestUntilSize(maxSizeBytes int64) (packetsDeleted,
 	}
 }
 
+// BackfillFlagIDs retroactively marks old packets that contain any of the given
+// flag ID values but weren't marked at insertion time (e.g., flag IDs weren't
+// known yet). Also stores which specific flag ID values matched.
+// Returns the number of packets updated.
+func (s *PacketStore) BackfillFlagIDs(values []string) (int64, error) {
+	if len(values) == 0 {
+		return 0, nil
+	}
+
+	// Filter to valid values (>= 6 chars)
+	var valid []string
+	for _, v := range values {
+		if len(v) >= 6 {
+			valid = append(valid, v)
+		}
+	}
+	if len(valid) == 0 {
+		return 0, nil
+	}
+
+	// Build LIKE conditions for candidate selection
+	var conditions []string
+	var args []interface{}
+	for _, v := range valid {
+		like := "%" + v + "%"
+		conditions = append(conditions, "(body_string LIKE ? OR url LIKE ? OR headers LIKE ?)")
+		args = append(args, like, like, like)
+	}
+
+	// Process in batches (SQLite max 999 params; 3 per value = 333 per batch)
+	const maxPerBatch = 333
+	var total int64
+	for i := 0; i < len(conditions); i += maxPerBatch {
+		end := i + maxPerBatch
+		if end > len(conditions) {
+			end = len(conditions)
+		}
+		batch := conditions[i:end]
+		batchArgs := args[i*3 : end*3]
+		batchValues := valid[i:end]
+
+		// SELECT candidates, compute matched values per packet, then UPDATE
+		query := "SELECT id, body_string, url, headers FROM packets WHERE contains_flagid = 0 AND (" + strings.Join(batch, " OR ") + ")"
+		rows, err := s.db.Query(query, batchArgs...)
+		if err != nil {
+			return total, fmt.Errorf("backfilling flagids select: %w", err)
+		}
+
+		type pktMatch struct {
+			id      int64
+			matched []string
+		}
+		var updates []pktMatch
+		for rows.Next() {
+			var id int64
+			var bodyStr, url, headers string
+			if err := rows.Scan(&id, &bodyStr, &url, &headers); err != nil {
+				rows.Close()
+				return total, fmt.Errorf("backfilling flagids scan: %w", err)
+			}
+			text := url + " " + headers + " " + bodyStr
+			var matched []string
+			for _, v := range batchValues {
+				if strings.Contains(text, v) {
+					matched = append(matched, v)
+				}
+			}
+			if len(matched) > 0 {
+				updates = append(updates, pktMatch{id: id, matched: matched})
+			}
+		}
+		rows.Close()
+
+		// Batch UPDATE in a single transaction (avoids per-row write-lock overhead)
+		if len(updates) > 0 {
+			tx, err := s.db.Begin()
+			if err != nil {
+				return total, fmt.Errorf("backfilling flagids begin tx: %w", err)
+			}
+			for _, u := range updates {
+				mjson, _ := json.Marshal(u.matched)
+				_, err := tx.Exec(
+					"UPDATE packets SET contains_flagid = 1, matched_flagids = ? WHERE id = ?",
+					string(mjson), u.id,
+				)
+				if err != nil {
+					tx.Rollback()
+					return total, fmt.Errorf("backfilling flagids update: %w", err)
+				}
+				total++
+			}
+			if err := tx.Commit(); err != nil {
+				return total, fmt.Errorf("backfilling flagids commit: %w", err)
+			}
+		}
+	}
+	return total, nil
+}
+
 // DBSize returns the current size of the database file in bytes.
 func (s *PacketStore) DBSize() (int64, error) {
 	var pageCount, pageSize int64
@@ -568,7 +696,7 @@ func (s *PacketStore) QueryFlow(packetID int64) ([]*Packet, error) {
 
 	// Step 2: get all packets in the same session (same TCP connection)
 	sessionPackets, err := s.scanPackets(
-		"SELECT id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged FROM packets WHERE session_id = ? ORDER BY timestamp ASC",
+		"SELECT id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged, contains_flagid, matched_flagids FROM packets WHERE session_id = ? ORDER BY timestamp ASC",
 		[]interface{}{startPkt.SessionID},
 	)
 	if err != nil {
@@ -591,7 +719,7 @@ func (s *PacketStore) QueryFlow(packetID int64) ([]*Packet, error) {
 		}
 		like := "%" + token + "%"
 		rows, err := s.scanPackets(
-			"SELECT id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged FROM packets WHERE service_id = ? AND (headers LIKE ? OR body_string LIKE ?) LIMIT 500",
+			"SELECT id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged, contains_flagid, matched_flagids FROM packets WHERE service_id = ? AND (headers LIKE ? OR body_string LIKE ?) LIMIT 500",
 			[]interface{}{startPkt.ServiceID, like, like},
 		)
 		if err != nil {
@@ -698,7 +826,7 @@ func (s *PacketStore) fetchSessions(originalSID string, sessionIDs map[string]bo
 		args = append(args, sid)
 	}
 
-	query := "SELECT id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged FROM packets WHERE session_id IN (" + strings.Join(placeholders, ",") + ") ORDER BY timestamp ASC LIMIT 500"
+	query := "SELECT id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged, contains_flagid, matched_flagids FROM packets WHERE session_id IN (" + strings.Join(placeholders, ",") + ") ORDER BY timestamp ASC LIMIT 500"
 	return s.scanPackets(query, args)
 }
 
@@ -864,6 +992,13 @@ func buildWhere(q PacketQuery) (string, []interface{}) {
 			conditions = append(conditions, "flagged = 1")
 		} else {
 			conditions = append(conditions, "flagged = 0")
+		}
+	}
+	if q.ContainsFlagID != nil {
+		if *q.ContainsFlagID {
+			conditions = append(conditions, "contains_flagid = 1")
+		} else {
+			conditions = append(conditions, "contains_flagid = 0")
 		}
 	}
 

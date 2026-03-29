@@ -58,10 +58,9 @@ func main() {
 		redisCache.InvalidatePacketQueries(serviceID)
 	})
 
-	// Register cache invalidation on new packet insertion
-	packetStore.SetOnInsert(func(serviceID string) {
-		redisCache.InvalidatePacketQueries(serviceID)
-	})
+	// NOTE: no onInsert callback — Redis packet-query cache was removed
+	// because the 1s TTL + invalidation on every insert produced ~0% hit rate
+	// while adding 2× SCAN+DEL overhead to every packet insertion.
 
 	// Compile flag regex for packet flagging
 	var flagRegex *regexp.Regexp
@@ -76,13 +75,6 @@ func main() {
 	proxyMgr.SetRulesCache(redisCache)
 
 	services := store.ListServices()
-
-	// Ensure flag rules exist and are corrected to alert-only for all services
-	var serviceIDs []string
-	for _, svc := range services {
-		serviceIDs = append(serviceIDs, svc.ID)
-	}
-	dropper.EnsureFlagRulesForAll(ruleStore, serviceIDs, cfg.FlagRegex)
 
 	// Populate Redis rules cache on startup
 	redisCache.PopulateRules(ruleStore)
@@ -102,7 +94,16 @@ func main() {
 
 	// Start flag ID poller
 	flagIDPoller := flagids.NewPoller(cfg.FlagIDAPIURL, cfg.OurTeamID, cfg.FlagIDPollInterval, cfg.FlagIDEnabled)
+	flagIDPoller.SetOnFetch(func(values []string) {
+		n, err := packetStore.BackfillFlagIDs(values)
+		if err != nil {
+			log.Printf("backfill flagids: %v", err)
+		} else if n > 0 {
+			log.Printf("backfill: marked %d old packets with flag IDs", n)
+		}
+	})
 	flagIDPoller.Start()
+	proxyMgr.SetFlagIDChecker(flagIDPoller)
 
 	statsCollector := sysstat.NewCollector(packetStore, redisCache, cfg.DataDir)
 	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller, redisCache, statsCollector)
