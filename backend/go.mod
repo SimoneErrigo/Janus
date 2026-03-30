@@ -3,6 +3,7 @@ module github.com/SimoneErrigo/Janus/backend
 go 1.25.0
 
 require (
+	github.com/petar-dambovaliev/aho-corasick v0.0.0-20250424160509-463d218d4745
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/shirou/gopsutil/v3 v3.24.5
 	golang.org/x/net v0.52.0

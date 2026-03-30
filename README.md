@@ -34,7 +34,12 @@ CLEANUP_MAX_DB_SIZE_MB=500
 FLAGID_ENABLED=false
 OUR_TEAM_ID=1
 FLAGID_API_URL=http://10.10.0.1:8081/flagIds
-FLAGID_POLL_INTERVAL=30
+FLAGID_POLL_INTERVAL=5
+
+# Competition timing
+ROUND_DURATION=120
+COMPETITION_START=2026-03-29T10:00:00Z
+KEEP_ROUNDS=5
 
 # Redis caching (improves performance on hot paths)
 REDIS_PASSWORD=changeme_redis
@@ -78,8 +83,9 @@ Enable the service and Janus will start proxying immediately.
 
 ### 5. Monitor traffic
 
-The **Traffic** page shows all captured packets with real-time filters:
+The **Traffic** page shows all captured packets with real-time updates via SSE (Server-Sent Events):
 
+- **Live streaming** — new packets appear instantly without polling; a **Pause/Resume** button lets you freeze the view while inspecting traffic
 - Filter by service, source/destination IP, protocol
 - Text search (`contains`) or regex search
 - **Contains Flag** filter — shows packets matching the flag regex (yellow highlight)
@@ -123,9 +129,10 @@ The **Alerts** page shows real-time alerts triggered by rules with `alert` or `b
 The **Config** page lets you update:
 
 - VM IP, network interface, team password, flag regex
-- Auto-cleanup policies (max age, max DB size)
-- Flag ID polling settings (API URL, team ID, poll interval) — when new flag IDs are fetched, old packets are retroactively scanned and marked
-- A "Run cleanup now" button and current DB size display
+- Auto-cleanup policies (max age, max DB size) — cleanup runs every 1 minute
+- Flag ID polling settings (API URL, team ID, poll interval, round duration, competition start, keep rounds) — with manual "Refresh" and "Backfill" buttons
+- Competition timing: round duration, competition start time, number of rounds to keep
+- A "Run cleanup now" button, "Clear Packets" button (deletes all packets but keeps config), and current DB size display
 
 ### 10. Container logs (Dozzle)
 
@@ -142,6 +149,18 @@ Redis is used as a performance cache for two hot paths:
 - **Packet queries** — repeated identical queries are cached for 5 seconds
 
 Redis is never the source of truth. If Redis is unreachable, Janus falls back to SQLite/JSON transparently with no loss of correctness.
+
+## Performance
+
+Janus is designed to handle high-throughput CTF traffic (60+ teams, 8-hour matches). Key optimizations in this version:
+
+- **SQLite WAL mode** with separate read/write connection pools — readers never block writers, writers never block readers
+- **Aho-Corasick automaton** (via `petar-dambovaliev/aho-corasick`) for O(text_length) multi-pattern flag ID matching instead of per-value `strings.Contains` loops
+- **Optimized flag scanner** — parses known CTF flag regex patterns (e.g. `[A-Z0-9]{31}=`, `FLAG{.*}`) into byte-level scanners that avoid regexp overhead on the hot path
+- **Smart backfill** — after each flag ID refresh, only re-scans packets from the last 60 seconds (the "limbo" window between round start and fetch completion), not the entire DB
+- **Round-aware flag IDs** — keeps only the last N rounds of flag IDs in memory; old rounds are pruned automatically
+- **SSE streaming** — new packets are pushed to the frontend via Server-Sent Events with 100ms batching, eliminating the 1-second polling overhead
+- **SQLITE_BUSY retry** — INSERT operations retry with exponential backoff to handle contention between proxy traffic and backfill writes
 
 ## Development (without Docker)
 
@@ -164,7 +183,7 @@ The Vite dev server proxies `/api` requests to `localhost:8080`.
 
 ## API
 
-All endpoints (except `/api/login`) require a `Bearer` token in the `Authorization` header.
+All endpoints (except `/api/login`) require a `Bearer` token in the `Authorization` header or a `?token=` query parameter (for EventSource/SSE).
 
 | Method         | Endpoint                           | Description                                                                                                                                                                                 |
 | -------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -173,6 +192,7 @@ All endpoints (except `/api/login`) require a `Bearer` token in the `Authorizati
 | POST           | `/api/services`                    | Create service                                                                                                                                                                              |
 | GET/PUT/DELETE | `/api/services/{id}`               | Get/update/delete service                                                                                                                                                                   |
 | GET            | `/api/packets?...`                 | Query packets (filters: `service_id`, `service_name`, `src_ip`, `dst_ip`, `protocol`, `time_from`, `time_to`, `contains`, `regex`, `flagged`, `contains_flagid`, `sort`, `limit`, `offset`) |
+| GET            | `/api/packets/stream`              | SSE stream of new packets and metadata-change notifications                                                                                                                                 |
 | GET            | `/api/packets/flow?packet_id=X`    | Reconstruct full attack flow from a packet                                                                                                                                                  |
 | GET            | `/api/packets/exploit?packet_id=X` | Generate Python exploit skeleton from flow                                                                                                                                                  |
 | GET            | `/api/rules?service_id=...`        | List drop/alert rules                                                                                                                                                                       |
@@ -184,6 +204,10 @@ All endpoints (except `/api/login`) require a `Bearer` token in the `Authorizati
 | GET/PUT        | `/api/config`                      | Read/update configuration                                                                                                                                                                   |
 | GET/PUT        | `/api/config/cleanup`              | Read/update cleanup settings                                                                                                                                                                |
 | POST           | `/api/cleanup/run`                 | Trigger immediate cleanup                                                                                                                                                                   |
+| POST           | `/api/cleanup/purge`               | Delete all packets and alerts                                                                                                                                                               |
+| POST           | `/api/cleanup/purge-packets`       | Delete all packets (keeps config)                                                                                                                                                           |
 | GET            | `/api/flagids`                     | Current flag ID map                                                                                                                                                                         |
-| GET            | `/api/flagids/status`              | Flag ID poller status                                                                                                                                                                       |
+| GET            | `/api/flagids/status`              | Flag ID poller status (includes current round, keep rounds)                                                                                                                                 |
+| POST           | `/api/flagids/refresh`             | Trigger immediate flag ID fetch                                                                                                                                                             |
+| POST           | `/api/flagids/backfill`            | Trigger on-demand smart backfill of flag IDs                                                                                                                                                |
 | GET            | `/api/system/stats`                | VM resource metrics (CPU, RAM, disk, DB size, Redis)                                                                                                                                        |

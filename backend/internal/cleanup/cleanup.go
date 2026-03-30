@@ -44,7 +44,7 @@ func NewManager(packetStore *sniffer.PacketStore, maxAgeMins, maxDBSizeMB int) *
 	}
 }
 
-// Start launches the background cleanup goroutine (runs every 5 minutes).
+// Start launches the background cleanup goroutine (runs every 1 minute).
 func (m *Manager) Start() {
 	go m.loop()
 	log.Printf("Cleanup goroutine started (max_age=%dm, max_db_size=%dMB)", m.maxAgeMins, m.maxDBSizeMB)
@@ -75,10 +75,16 @@ func (m *Manager) UpdateSettings(s Settings) {
 }
 
 // RunNow triggers an immediate cleanup run and returns the result.
+// Non-blocking: if the loop is busy running a cleanup, it runs directly.
 func (m *Manager) RunNow() Result {
 	resultCh := make(chan Result, 1)
-	m.runNowCh <- resultCh
-	return <-resultCh
+	select {
+	case m.runNowCh <- resultCh:
+		return <-resultCh
+	default:
+		// Loop is busy — run directly instead of blocking
+		return m.run()
+	}
 }
 
 // DBSizeMB returns the current database size in MB.
@@ -91,7 +97,7 @@ func (m *Manager) DBSizeMB() float64 {
 }
 
 func (m *Manager) loop() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -121,6 +127,25 @@ func (m *Manager) PurgeAll() Result {
 	return Result{
 		PacketsDeleted: pkts,
 		AlertsDeleted:  alerts,
+		DurationMs:     duration.Milliseconds(),
+		DBSizeMB:       dbSize,
+	}
+}
+
+// PurgePackets deletes all packets (and their linked alerts) but no other data.
+func (m *Manager) PurgePackets() Result {
+	start := time.Now()
+	pkts, err := m.packetStore.PurgePackets()
+	if err != nil {
+		log.Printf("PurgePackets error: %v", err)
+		return Result{Error: err.Error()}
+	}
+	duration := time.Since(start)
+	dbSize := m.DBSizeMB()
+	log.Printf("PurgePackets: deleted %d packets in %dms (DB: %.1f MB)",
+		pkts, duration.Milliseconds(), dbSize)
+	return Result{
+		PacketsDeleted: pkts,
 		DurationMs:     duration.Milliseconds(),
 		DBSizeMB:       dbSize,
 	}

@@ -42,6 +42,15 @@ func (s *Server) handleCleanupRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+func (s *Server) handleCleanupPurgePackets(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	result := s.cleanupMgr.PurgePackets()
+	writeJSON(w, http.StatusOK, result)
+}
+
 func (s *Server) handleCleanupPurge(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

@@ -4,6 +4,40 @@ function getToken() {
   return localStorage.getItem('janus_token');
 }
 
+/**
+ * Live packet updates (SSE). Returns unsubscribe.
+ * @param {function(Object[])} onNewPackets - called with array of new packet objects (streamed)
+ * @param {function()} onRefresh - called when a full refresh is needed (metadata change)
+ */
+export function subscribePacketStream(onNewPackets, onRefresh) {
+  const token = getToken();
+  if (!token) return () => {};
+
+  const url = `/api/packets/stream?token=${encodeURIComponent(token)}`;
+  let es;
+  try {
+    es = new EventSource(url);
+  } catch {
+    return () => {};
+  }
+  const newHandler = (e) => {
+    try {
+      const packets = JSON.parse(e.data);
+      if (Array.isArray(packets)) onNewPackets(packets);
+    } catch {}
+  };
+  const refreshHandler = () => onRefresh();
+  es.addEventListener('new-packets', newHandler);
+  es.addEventListener('packets', refreshHandler);
+  const fallback = setInterval(onRefresh, 20000);
+  return () => {
+    clearInterval(fallback);
+    es.removeEventListener('new-packets', newHandler);
+    es.removeEventListener('packets', refreshHandler);
+    es.close();
+  };
+}
+
 export function setToken(token) {
   localStorage.setItem('janus_token', token);
 }
@@ -92,12 +126,15 @@ export const api = {
   // Flag IDs
   getFlagIDs: () => request('/flagids'),
   getFlagIDStatus: () => request('/flagids/status'),
+  refreshFlagIDs: () => request('/flagids/refresh', { method: 'POST' }),
+  triggerBackfill: () => request('/flagids/backfill', { method: 'POST' }),
 
   // Cleanup
   getCleanupConfig: () => request('/config/cleanup'),
   updateCleanupConfig: (data) => request('/config/cleanup', { method: 'PUT', body: data }),
   runCleanup: () => request('/cleanup/run', { method: 'POST' }),
   purgeAll: () => request('/cleanup/purge', { method: 'POST' }),
+  purgePackets: () => request('/cleanup/purge-packets', { method: 'POST' }),
 
   // System stats
   getSystemStats: () => request('/system/stats'),

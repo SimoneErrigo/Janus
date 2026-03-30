@@ -102,7 +102,7 @@ export default function Rules() {
       {error && <div className="bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded mb-4">{error}</div>}
 
       {editing && (
-        <RuleForm rule={editing} onSave={handleSave} onCancel={() => setEditing(null)} />
+        <RuleForm rule={editing} services={services} onSave={handleSave} onCancel={() => setEditing(null)} />
       )}
 
       {services.length === 0 ? (
@@ -153,7 +153,7 @@ export default function Rules() {
   )
 }
 
-function RuleForm({ rule, onSave, onCancel }) {
+function RuleForm({ rule, services, onSave, onCancel }) {
   const [form, setForm] = useState({ ...rule, action: rule.action || 'drop' })
   const isFlagRule = form.id?.startsWith('flag-auto-')
 
@@ -165,6 +165,16 @@ function RuleForm({ rule, onSave, onCancel }) {
     <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 mb-4">
       <h3 className="text-lg font-medium text-gray-100 mb-4">{form._isNew ? 'New Rule' : 'Edit Rule'}</h3>
       <div className="grid grid-cols-2 gap-4">
+        <div>
+          <label className="block text-sm text-gray-400 mb-1">Service</label>
+          <select
+            value={form.service_id}
+            onChange={(e) => set('service_id', e.target.value)}
+            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
+          >
+            {services.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </div>
         <div>
           <label className="block text-sm text-gray-400 mb-1">Name</label>
           <input value={form.name} onChange={(e) => set('name', e.target.value)} placeholder="Rule name"

@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"regexp"
 	"syscall"
+	"time"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/api"
 	"github.com/SimoneErrigo/Janus/backend/internal/cache"
@@ -71,7 +72,13 @@ func main() {
 		}
 	}
 
-	proxyMgr := proxy.NewManager(packetStore, ruleStore, flagRegex)
+	// Build optimized flag scanner from the regex pattern
+	flagScanner := flagids.NewFlagScanner(cfg.FlagRegex)
+	if flagScanner != nil {
+		log.Printf("Flag scanner: optimized byte-level scanner active for pattern %q", cfg.FlagRegex)
+	}
+
+	proxyMgr := proxy.NewManager(packetStore, ruleStore, flagRegex, flagScanner)
 	proxyMgr.SetRulesCache(redisCache)
 
 	services := store.ListServices()
@@ -79,7 +86,44 @@ func main() {
 	// Populate Redis rules cache on startup
 	redisCache.PopulateRules(ruleStore)
 
-	// Auto-start enabled services
+	packetHub := api.NewPacketStreamHub()
+	packetStore.SetPacketChangeListener(func(kind sniffer.PacketChangeKind, pkt *sniffer.Packet) {
+		if kind == sniffer.PacketChangeInsert && pkt != nil {
+			packetHub.PushPacket(pkt)
+		} else {
+			packetHub.Notify()
+		}
+	})
+
+	// Parse competition start time if configured
+	var competitionStart time.Time
+	if cfg.CompetitionStart != "" {
+		if t, parseErr := time.Parse(time.RFC3339, cfg.CompetitionStart); parseErr == nil {
+			competitionStart = t
+			log.Printf("Competition start: %s", competitionStart.Format(time.RFC3339))
+		} else {
+			log.Printf("Warning: invalid COMPETITION_START %q: %v", cfg.CompetitionStart, parseErr)
+		}
+	}
+
+	flagIDPoller := flagids.NewPoller(
+		cfg.FlagIDAPIURL, cfg.OurTeamID, cfg.FlagIDPollInterval, cfg.FlagIDEnabled,
+		cfg.RoundDurationSec, competitionStart, cfg.KeepRounds,
+	)
+	flagIDPoller.SetOnFetch(func(currentRound int) {
+		// Smart backfill: re-scan only packets from the limbo window using AC automaton
+		n, backfillErr := packetStore.SmartBackfillFlagIDs(flagIDPoller, currentRound)
+		if backfillErr != nil {
+			log.Printf("auto-backfill error: %v", backfillErr)
+		}
+		if n > 0 {
+			log.Printf("auto-backfill: updated %d packets for round %d", n, currentRound)
+		}
+		packetHub.Notify()
+	})
+	proxyMgr.SetFlagIDChecker(flagIDPoller)
+
+	// Auto-start enabled services (flag-ID checker must be set before middleware is built)
 	for _, svc := range services {
 		if svc.Enabled {
 			if err := proxyMgr.StartService(svc); err != nil {
@@ -88,25 +132,14 @@ func main() {
 		}
 	}
 
+	flagIDPoller.Start()
+
 	// Start cleanup manager
 	cleanupMgr := cleanup.NewManager(packetStore, cfg.CleanupMaxAgeMinutes, cfg.CleanupMaxDBSizeMB)
 	cleanupMgr.Start()
 
-	// Start flag ID poller
-	flagIDPoller := flagids.NewPoller(cfg.FlagIDAPIURL, cfg.OurTeamID, cfg.FlagIDPollInterval, cfg.FlagIDEnabled)
-	flagIDPoller.SetOnFetch(func(values []string) {
-		n, err := packetStore.BackfillFlagIDs(values)
-		if err != nil {
-			log.Printf("backfill flagids: %v", err)
-		} else if n > 0 {
-			log.Printf("backfill: marked %d old packets with flag IDs", n)
-		}
-	})
-	flagIDPoller.Start()
-	proxyMgr.SetFlagIDChecker(flagIDPoller)
-
 	statsCollector := sysstat.NewCollector(packetStore, redisCache, cfg.DataDir)
-	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller, redisCache, statsCollector)
+	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller, redisCache, statsCollector, packetHub)
 
 	// Graceful shutdown
 	go func() {
@@ -114,6 +147,7 @@ func main() {
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 		log.Println("Shutting down...")
+		packetHub.Stop()
 		flagIDPoller.Stop()
 		cleanupMgr.Stop()
 		proxyMgr.StopAll()

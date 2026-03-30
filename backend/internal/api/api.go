@@ -26,11 +26,12 @@ type Server struct {
 	flagIDPoller *flagids.Poller
 	cache        *cache.Client
 	statsCollector *sysstat.Collector
-	mux          *http.ServeMux
+	packetHub      *PacketStreamHub
+	mux            *http.ServeMux
 }
 
 // NewServer creates a new API server.
-func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager, flagIDPoller *flagids.Poller, cacheClient *cache.Client, statsCollector *sysstat.Collector) *Server {
+func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager, flagIDPoller *flagids.Poller, cacheClient *cache.Client, statsCollector *sysstat.Collector, packetHub *PacketStreamHub) *Server {
 	s := &Server{
 		store:          store,
 		proxy:          proxyMgr,
@@ -40,6 +41,7 @@ func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniff
 		flagIDPoller:   flagIDPoller,
 		cache:          cacheClient,
 		statsCollector: statsCollector,
+		packetHub:      packetHub,
 		mux:            http.NewServeMux(),
 	}
 	s.routes()
@@ -59,6 +61,7 @@ func (s *Server) routes() {
 	protected := http.NewServeMux()
 	protected.HandleFunc("/api/services", s.handleServices)
 	protected.HandleFunc("/api/services/", s.handleServiceByID)
+	protected.HandleFunc("/api/packets/stream", s.handlePacketStream)
 	protected.HandleFunc("/api/packets", s.handlePackets)
 	protected.HandleFunc("/api/packets/flow", s.handlePacketFlow)
 	protected.HandleFunc("/api/packets/exploit", s.handleExploitGen)
@@ -70,8 +73,11 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/config/cleanup", s.handleCleanupConfig)
 	protected.HandleFunc("/api/cleanup/run", s.handleCleanupRun)
 	protected.HandleFunc("/api/cleanup/purge", s.handleCleanupPurge)
+	protected.HandleFunc("/api/cleanup/purge-packets", s.handleCleanupPurgePackets)
 	protected.HandleFunc("/api/flagids", s.handleFlagIDs)
 	protected.HandleFunc("/api/flagids/status", s.handleFlagIDStatus)
+	protected.HandleFunc("/api/flagids/refresh", s.handleFlagIDRefresh)
+	protected.HandleFunc("/api/flagids/backfill", s.handleFlagIDBackfill)
 	protected.HandleFunc("/api/system/stats", s.handleSystemStats)
 
 	s.mux.Handle("/api/", authMiddleware(protected))

@@ -20,6 +20,12 @@ type configResponse struct {
 	FlagIDTeamID       string `json:"flagid_team_id"`
 	FlagIDPollInterval int    `json:"flagid_poll_interval"`
 	FlagIDFormat       string `json:"flagid_format"`
+
+	// Competition timing
+	RoundDurationSec int    `json:"round_duration_seconds"`
+	CompetitionStart string `json:"competition_start,omitempty"`
+	KeepRounds       int    `json:"keep_rounds"`
+	CurrentRound     int    `json:"current_round"`
 }
 
 type configUpdateRequest struct {
@@ -34,6 +40,11 @@ type configUpdateRequest struct {
 	FlagIDTeamID       *string `json:"flagid_team_id,omitempty"`
 	FlagIDPollInterval *int    `json:"flagid_poll_interval,omitempty"`
 	FlagIDFormat       *string `json:"flagid_format,omitempty"`
+
+	// Competition timing
+	RoundDurationSec *int    `json:"round_duration_seconds,omitempty"`
+	CompetitionStart *string `json:"competition_start,omitempty"`
+	KeepRounds       *int    `json:"keep_rounds,omitempty"`
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +77,10 @@ func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 		FlagIDTeamID:       pollerCfg.TeamID,
 		FlagIDPollInterval: pollerCfg.IntervalSec,
 		FlagIDFormat:       pollerCfg.Format,
+		RoundDurationSec:   pollerCfg.RoundDurationSec,
+		CompetitionStart:   pollerCfg.CompetitionStart,
+		KeepRounds:         pollerCfg.KeepRounds,
+		CurrentRound:       s.flagIDPoller.CurrentRound(),
 	})
 }
 
@@ -95,8 +110,8 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 		cfg.FlagRegex = *req.FlagRegex
 	}
 
-	// Reconfigure Flag ID poller if any flagID field was provided
-	if s.flagIDPoller != nil && (req.FlagIDEnabled != nil || req.FlagIDAPIURL != nil || req.FlagIDTeamID != nil || req.FlagIDPollInterval != nil || req.FlagIDFormat != nil) {
+	// Reconfigure Flag ID poller if any flagID/timing field was provided
+	if s.flagIDPoller != nil && (req.FlagIDEnabled != nil || req.FlagIDAPIURL != nil || req.FlagIDTeamID != nil || req.FlagIDPollInterval != nil || req.FlagIDFormat != nil || req.RoundDurationSec != nil || req.CompetitionStart != nil || req.KeepRounds != nil) {
 		current := s.flagIDPoller.GetConfig()
 		if req.FlagIDEnabled != nil {
 			current.Enabled = *req.FlagIDEnabled
@@ -112,6 +127,18 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.FlagIDFormat != nil {
 			current.Format = *req.FlagIDFormat
+		}
+		if req.RoundDurationSec != nil {
+			current.RoundDurationSec = *req.RoundDurationSec
+			cfg.RoundDurationSec = *req.RoundDurationSec
+		}
+		if req.CompetitionStart != nil {
+			current.CompetitionStart = *req.CompetitionStart
+			cfg.CompetitionStart = *req.CompetitionStart
+		}
+		if req.KeepRounds != nil {
+			current.KeepRounds = *req.KeepRounds
+			cfg.KeepRounds = *req.KeepRounds
 		}
 
 		// Also update global config
@@ -129,6 +156,10 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 		pollerCfg = s.flagIDPoller.GetConfig()
 	}
 
+	currentRound := 0
+	if s.flagIDPoller != nil {
+		currentRound = s.flagIDPoller.CurrentRound()
+	}
 	writeJSON(w, http.StatusOK, configResponse{
 		VMIP:               cfg.VMIP,
 		NetworkInterface:   cfg.NetworkInterface,
@@ -139,5 +170,9 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 		FlagIDTeamID:       pollerCfg.TeamID,
 		FlagIDPollInterval: pollerCfg.IntervalSec,
 		FlagIDFormat:       pollerCfg.Format,
+		RoundDurationSec:   pollerCfg.RoundDurationSec,
+		CompetitionStart:   pollerCfg.CompetitionStart,
+		KeepRounds:         pollerCfg.KeepRounds,
+		CurrentRound:       currentRound,
 	})
 }

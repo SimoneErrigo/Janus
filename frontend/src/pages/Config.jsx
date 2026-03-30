@@ -9,13 +9,9 @@ export default function Config() {
 
   // Flag ID state
   const [flagIDStatus, setFlagIDStatus] = useState(null)
-  const [flagIDMap, setFlagIDMap] = useState(null)
   const [flagIDCountdown, setFlagIDCountdown] = useState('')
   const [flagIDSaved, setFlagIDSaved] = useState(false)
   const [flagIDError, setFlagIDError] = useState('')
-
-  // Flag ID panel collapse
-  const [flagIDsCollapsed, setFlagIDsCollapsed] = useState(false)
 
   // Cleanup state
   const [cleanupConfig, setCleanupConfig] = useState(null)
@@ -25,6 +21,7 @@ export default function Config() {
   const [cleanupResult, setCleanupResult] = useState(null)
   const [cleanupRunning, setCleanupRunning] = useState(false)
   const [purgeRunning, setPurgeRunning] = useState(false)
+  const [purgePacketsRunning, setPurgePacketsRunning] = useState(false)
   const [dbSizeMB, setDbSizeMB] = useState(0)
 
   useEffect(() => {
@@ -35,9 +32,8 @@ export default function Config() {
 
   async function loadFlagIDData() {
     try {
-      const [status, ids] = await Promise.all([api.getFlagIDStatus(), api.getFlagIDs()])
+      const status = await api.getFlagIDStatus()
       setFlagIDStatus(status)
-      setFlagIDMap(ids?.flag_ids || {})
     } catch {}
   }
 
@@ -47,8 +43,6 @@ export default function Config() {
       try {
         const status = await api.getFlagIDStatus()
         setFlagIDStatus(status)
-        const ids = await api.getFlagIDs()
-        setFlagIDMap(ids?.flag_ids || {})
       } catch {}
     }, 10000)
     return () => clearInterval(interval)
@@ -191,6 +185,21 @@ export default function Config() {
       setCleanupError(err.message)
     } finally {
       setPurgeRunning(false)
+    }
+  }
+
+  async function handlePurgePackets() {
+    if (!confirm('Delete ALL packets? Alerts linked to packets will also be removed. This cannot be undone.')) return
+    setPurgePacketsRunning(true)
+    setCleanupResult(null)
+    try {
+      const result = await api.purgePackets()
+      setCleanupResult(result)
+      setDbSizeMB(result.db_size_mb)
+    } catch (err) {
+      setCleanupError(err.message)
+    } finally {
+      setPurgePacketsRunning(false)
     }
   }
 
@@ -358,34 +367,6 @@ export default function Config() {
               </div>
             </div>
 
-            {flagIDMap && Object.keys(flagIDMap).length > 0 ? (
-              <div>
-                <button
-                  type="button"
-                  onClick={() => setFlagIDsCollapsed(c => !c)}
-                  className="flex items-center gap-2 text-xs text-gray-400 hover:text-gray-200 mb-2 cursor-pointer"
-                >
-                  <span className={`transition-transform ${flagIDsCollapsed ? '' : 'rotate-90'}`}>&#9654;</span>
-                  <span>Fetched Flag IDs ({Object.values(flagIDMap).flat().length} values)</span>
-                </button>
-                {!flagIDsCollapsed && (
-                  <div className="space-y-2">
-                    {Object.entries(flagIDMap).map(([svcName, values]) => (
-                      <div key={svcName} className="bg-gray-800/50 rounded p-2">
-                        <div className="text-xs text-emerald-400 font-medium mb-1">{svcName}</div>
-                        <div className="flex flex-wrap gap-1">
-                          {values.map((v, i) => (
-                            <span key={i} className="text-xs bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded font-mono">{v}</span>
-                          ))}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ) : (
-              <p className="text-sm text-gray-500">No flag IDs fetched yet.</p>
-            )}
           </>
         )}
       </div>
@@ -459,6 +440,14 @@ export default function Config() {
               className="bg-orange-700 hover:bg-orange-600 disabled:bg-gray-700 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
             >
               {cleanupRunning ? 'Running...' : 'Run Cleanup Now'}
+            </button>
+            <button
+              type="button"
+              onClick={handlePurgePackets}
+              disabled={purgePacketsRunning}
+              className="bg-yellow-700 hover:bg-yellow-600 disabled:bg-gray-700 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
+            >
+              {purgePacketsRunning ? 'Deleting...' : 'Clear Packets'}
             </button>
             <button
               type="button"

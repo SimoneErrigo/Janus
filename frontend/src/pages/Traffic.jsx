@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react'
-import { api } from '../api'
+import { api, subscribePacketStream } from '../api'
 
 // Highlight matching text with support for multiple patterns (flags=yellow, flagIDs=cyan)
 const HighlightedText = memo(function HighlightedText({ text, contains, regex, flagidRegex }) {
@@ -68,6 +68,8 @@ export default function Traffic() {
   const [flagRegex, setFlagRegex] = useState('')
   const [flagIDFilter, setFlagIDFilter] = useState(false)
   const [flagIDEnabled, setFlagIDEnabled] = useState(false)
+  const [paused, setPaused] = useState(false)
+  const pausedRef = useRef(false)
   const [filters, setFilters] = useState({
     service_id: '', src_ip: '', dst_ip: '', protocol: '', method: '',
     session_id: '', peer_ip: '', contains: '', regex: '', sort: 'desc',
@@ -136,25 +138,86 @@ export default function Traffic() {
     }
   }, [filters, flagFilter, flagIDFilter])
 
-  // Silent refresh — same query as loadPackets but without loading indicator flicker
+  // Silent full refresh — for metadata changes (backfill) and periodic sync
   const refreshPackets = useCallback(async () => {
+    if (pausedRef.current) return
     try {
       const params = { ...filters }
       if (flagFilter) params.flagged = 'true'
       if (flagIDFilter) params.contains_flagid = 'true'
       const data = await api.getPackets(params)
+      if (pausedRef.current) return
       setPackets(data.packets || [])
       setTotal(data.total)
     } catch {}
   }, [filters, flagFilter, flagIDFilter])
 
-  useEffect(() => { loadPackets() }, [loadPackets])
+  // Check if any text/complex filters are active (can't client-side filter these)
+  const hasTextFilters = filters.contains || filters.regex || filters.src_ip || filters.dst_ip || filters.peer_ip
 
-  // Packet refresh: every 1s for real-time monitoring
+  // Handle streamed new packets: prepend to list without API round-trip
+  const filtersRef = useRef(filters)
+  const flagFilterRef = useRef(flagFilter)
+  const flagIDFilterRef = useRef(flagIDFilter)
+  useEffect(() => { filtersRef.current = filters }, [filters])
+  useEffect(() => { flagFilterRef.current = flagFilter }, [flagFilter])
+  useEffect(() => { flagIDFilterRef.current = flagIDFilter }, [flagIDFilter])
+
+  const onNewPackets = useCallback((newPkts) => {
+    if (pausedRef.current || newPkts.length === 0) return
+    const f = filtersRef.current
+    // Skip if user is not on page 1 (offset > 0) — new packets only go to the top/bottom
+    if (f.offset > 0) return
+    // Client-side filter for simple filters
+    const filtered = newPkts.filter((p) => {
+      if (f.service_id && p.service_id !== f.service_id) return false
+      if (f.protocol && p.protocol !== f.protocol) return false
+      if (f.method && p.method !== f.method) return false
+      if (f.session_id && p.session_id !== f.session_id) return false
+      if (flagFilterRef.current && !p.flagged) return false
+      if (flagIDFilterRef.current && !p.contains_flagid) return false
+      return true
+    })
+    if (filtered.length === 0) return
+
+    const limit = f.limit || 50
+    const isAsc = f.sort === 'asc'
+    setPackets((prev) => {
+      // Merge, deduplicate by id, sort by id
+      const map = new Map()
+      for (const p of prev) map.set(p.id, p)
+      for (const p of filtered) map.set(p.id, p)
+      const merged = Array.from(map.values())
+      merged.sort((a, b) => isAsc ? a.id - b.id : b.id - a.id)
+      return merged.slice(0, limit)
+    })
+    setTotal((prev) => prev + filtered.length)
+  }, [])
+
+  // Debounce filter changes: wait 300ms after last change before fetching
   useEffect(() => {
-    const interval = setInterval(refreshPackets, 1000)
-    return () => clearInterval(interval)
-  }, [refreshPackets])
+    const timer = setTimeout(() => { loadPackets() }, 300)
+    return () => clearTimeout(timer)
+  }, [loadPackets])
+
+  // SSE: stream new packets + refresh on metadata changes.
+  // When text filters are active, fall back to periodic full refresh.
+  useEffect(() => {
+    if (paused) return
+    const unsub = subscribePacketStream(
+      hasTextFilters ? () => {} : onNewPackets,
+      refreshPackets,
+    )
+    // When text filters are active, poll periodically since we can't client-side filter
+    let poll
+    if (hasTextFilters) {
+      poll = setInterval(refreshPackets, 2000)
+    }
+    return () => {
+      unsub()
+      if (poll) clearInterval(poll)
+    }
+  }, [onNewPackets, refreshPackets, paused, hasTextFilters])
 
 
   function setFilter(key, value) {
@@ -217,8 +280,20 @@ export default function Traffic() {
   }
 
   function toggleFlagIDFilter() {
-    setFlagIDFilter((v) => !v)
+    setFlagIDFilter((prev) => !prev)
     setFilters((f) => ({ ...f, offset: 0 }))
+  }
+
+  function togglePause() {
+    setPaused((prev) => {
+      const next = !prev
+      pausedRef.current = next
+      if (!next) {
+        // Resuming — trigger a fresh fetch to catch up
+        loadPackets()
+      }
+      return next
+    })
   }
 
   const isFlowActive = !!flowMode || !!filters.session_id
@@ -428,7 +503,25 @@ export default function Traffic() {
 
           {/* Pagination */}
           <div className="flex items-center justify-between px-3 py-2 bg-gray-900 border-t border-gray-800 text-sm text-gray-400">
-            <span>{displayTotal} packet{displayTotal !== 1 ? 's' : ''}</span>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={togglePause}
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs transition-colors cursor-pointer ${
+                  paused
+                    ? 'bg-yellow-900/50 text-yellow-300 border border-yellow-700/50'
+                    : 'bg-gray-800 text-gray-400 border border-gray-700 hover:text-gray-300'
+                }`}
+                title={paused ? 'Resume live capture' : 'Pause live capture'}
+              >
+                {paused ? (
+                  <svg className="w-3 h-3" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21" /></svg>
+                ) : (
+                  <svg className="w-3 h-3" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="3" width="6" height="18" /><rect x="14" y="3" width="6" height="18" /></svg>
+                )}
+                {paused ? 'Resume' : 'Pause'}
+              </button>
+              <span>{displayTotal} packet{displayTotal !== 1 ? 's' : ''}{paused ? ' (paused)' : ''}</span>
+            </div>
             {!flowMode && (
               <div className="flex gap-2">
                 <button onClick={prevPage} disabled={filters.offset === 0} className="px-3 py-1 bg-gray-800 rounded hover:bg-gray-700 disabled:opacity-30 cursor-pointer disabled:cursor-default">&laquo; Prev</button>

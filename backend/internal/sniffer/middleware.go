@@ -12,27 +12,36 @@ import (
 	"time"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
+	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
 
 const maxBodyCapture = 1 << 20 // 1 MB
 
 // CheckFlagID checks whether any of the packet content contains a current flag ID value.
-// Returns the boolean flag and the list of matched flag ID values.
-func CheckFlagID(checker FlagIDChecker, url, headers string, body []byte) (bool, []string) {
+// Returns the boolean flag, the list of matched flag ID string values, and the current round number.
+func CheckFlagID(checker FlagIDChecker, url, headers string, body []byte) (bool, []string, int) {
 	if checker == nil {
-		return false, nil
+		return false, nil, 0
 	}
 	text := url + " " + headers
 	if len(body) > 0 {
 		text += " " + string(body)
 	}
-	matched := checker.FindMatchingFlagIDs(text)
-	return len(matched) > 0, matched
+	matches := checker.FindMatchingFlagIDs(text)
+	if len(matches) == 0 {
+		return false, nil, checker.CurrentRound()
+	}
+	vals := make([]string, len(matches))
+	for i, m := range matches {
+		vals[i] = m.FlagID
+	}
+	return true, vals, checker.CurrentRound()
 }
 
 // HTTPMiddleware returns an http.Handler that logs requests/responses and evaluates drop rules.
-func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore, dropEngine *dropper.Engine, flagRegex *regexp.Regexp, flagIDChecker FlagIDChecker) http.Handler {
+// getFlagIDChecker is called per request so updates from SetFlagIDChecker apply without restarting the proxy.
+func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore, dropEngine *dropper.Engine, flagRegex *regexp.Regexp, flagScanner *flagids.FlagScanner, getFlagIDChecker func() FlagIDChecker) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
@@ -74,8 +83,8 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		}
 
 		// Check flagged status and flag ID containment
-		flagged := CheckFlagged(flagRegex, r.URL.String(), headersStr, reqBody)
-		containsFlagID, matchedFlagIDs := CheckFlagID(flagIDChecker, r.URL.String(), headersStr, reqBody)
+		flagged := CheckFlagged(flagRegex, flagScanner, r.URL.String(), headersStr, reqBody)
+		containsFlagID, matchedFlagIDs, flagIDRound := CheckFlagID(getFlagIDChecker(), r.URL.String(), headersStr, reqBody)
 
 		// Session ID: ties request + response from the same TCP connection.
 		// Even with SNAT (all traffic from same IP), src_port is unique per connection.
@@ -100,6 +109,7 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 			Flagged:        flagged,
 			ContainsFlagID: containsFlagID,
 			MatchedFlagIDs: matchedFlagIDs,
+			FlagIDRound:    flagIDRound,
 		}
 		if reqPacket.MatchedRules == nil {
 			reqPacket.MatchedRules = []MatchedRuleInfo{}
@@ -138,8 +148,8 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		respHeaders := flattenHeaders(rw.Header())
 		respBody := rw.body.Bytes()
 		respHeadersStr := flattenHeadersString(rw.Header())
-		respFlagged := CheckFlagged(flagRegex, r.URL.String(), respHeadersStr, respBody)
-		respContainsFlagID, respMatchedFlagIDs := CheckFlagID(flagIDChecker, r.URL.String(), respHeadersStr, respBody)
+		respFlagged := CheckFlagged(flagRegex, flagScanner, r.URL.String(), respHeadersStr, respBody)
+		respContainsFlagID, respMatchedFlagIDs, respFlagIDRound := CheckFlagID(getFlagIDChecker(), r.URL.String(), respHeadersStr, respBody)
 
 		// Evaluate rules against response (alert-only, never drop — response already sent)
 		var respMatchedRules []MatchedRuleInfo
@@ -179,6 +189,7 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 			Flagged:        respFlagged,
 			ContainsFlagID: respContainsFlagID,
 			MatchedFlagIDs: respMatchedFlagIDs,
+			FlagIDRound:    respFlagIDRound,
 		}
 		if err := store.Insert(respPacket); err != nil {
 			log.Printf("[%s] sniffer: failed to log response: %v", svc.Name, err)
@@ -201,8 +212,23 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 	})
 }
 
-// CheckFlagged checks whether any of the packet content matches the flag regex.
-func CheckFlagged(flagRegex *regexp.Regexp, url, headers string, body []byte) bool {
+// CheckFlagged checks whether any of the packet content matches a flag pattern.
+// Uses the fast FlagScanner when available, falls back to regexp.
+func CheckFlagged(flagRegex *regexp.Regexp, scanner *flagids.FlagScanner, url, headers string, body []byte) bool {
+	// Fast path: use the optimized byte scanner
+	if scanner != nil {
+		if url != "" && scanner.MatchString(url) {
+			return true
+		}
+		if headers != "" && scanner.MatchString(headers) {
+			return true
+		}
+		if len(body) > 0 && scanner.MatchBytes(body) {
+			return true
+		}
+		return false
+	}
+	// Fallback: regexp
 	if flagRegex == nil {
 		return false
 	}

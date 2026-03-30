@@ -106,19 +106,24 @@ func validateToken(token string) bool {
 	return time.Now().Unix() < payload.Exp
 }
 
+// AuthTokenFromRequest returns a bearer token from the Authorization header or ?token= (for EventSource).
+func AuthTokenFromRequest(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if auth != "" {
+		token := strings.TrimPrefix(auth, "Bearer ")
+		if token != auth {
+			return token
+		}
+	}
+	return r.URL.Query().Get("token")
+}
+
 // authMiddleware protects routes by requiring a valid token.
 func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Extract token from Authorization header
-		auth := r.Header.Get("Authorization")
-		if auth == "" {
+		token := AuthTokenFromRequest(r)
+		if token == "" {
 			http.Error(w, "missing authorization", http.StatusUnauthorized)
-			return
-		}
-
-		token := strings.TrimPrefix(auth, "Bearer ")
-		if token == auth {
-			http.Error(w, "invalid authorization format", http.StatusUnauthorized)
 			return
 		}
 

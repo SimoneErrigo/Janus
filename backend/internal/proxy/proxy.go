@@ -17,6 +17,7 @@ import (
 	"golang.org/x/net/http2/h2c"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
+	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
@@ -28,6 +29,7 @@ type Manager struct {
 	packetStore   *sniffer.PacketStore
 	ruleStore     *dropper.RuleStore
 	flagRegex     *regexp.Regexp
+	flagScanner   *flagids.FlagScanner // optimized byte-level flag scanner
 	rulesCache    dropper.RulesCache
 	flagIDChecker sniffer.FlagIDChecker
 }
@@ -40,12 +42,13 @@ type runningProxy struct {
 }
 
 // NewManager creates a new proxy manager.
-func NewManager(packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, flagRegex *regexp.Regexp) *Manager {
+func NewManager(packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, flagRegex *regexp.Regexp, flagScanner *flagids.FlagScanner) *Manager {
 	return &Manager{
 		proxies:     make(map[string]*runningProxy),
 		packetStore: packetStore,
 		ruleStore:   ruleStore,
 		flagRegex:   flagRegex,
+		flagScanner: flagScanner,
 	}
 }
 
@@ -61,6 +64,12 @@ func (m *Manager) SetFlagIDChecker(c sniffer.FlagIDChecker) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.flagIDChecker = c
+}
+
+func (m *Manager) currentFlagIDChecker() sniffer.FlagIDChecker {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.flagIDChecker
 }
 
 // StartService starts a proxy for the given service.
@@ -188,7 +197,7 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 				dropEngine.SetCache(m.rulesCache)
 			}
 		}
-		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine, m.flagRegex, m.flagIDChecker)
+		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine, m.flagRegex, m.flagScanner, m.currentFlagIDChecker)
 	}
 
 	server := &http.Server{
@@ -277,7 +286,7 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 				dropEngine.SetCache(m.rulesCache)
 			}
 		}
-		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine, m.flagRegex, m.flagIDChecker)
+		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine, m.flagRegex, m.flagScanner, m.currentFlagIDChecker)
 	}
 
 	// For gRPC, support h2c (HTTP/2 cleartext) from backend if needed

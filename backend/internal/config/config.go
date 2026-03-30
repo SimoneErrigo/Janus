@@ -28,6 +28,11 @@ type Config struct {
 	FlagIDAPIURL       string
 	FlagIDPollInterval int // seconds
 
+	// Competition timing
+	RoundDurationSec int    // duration of a single round in seconds (default 120)
+	CompetitionStart string // when the competition started (RFC3339, optional)
+	KeepRounds       int    // how many rounds of flagIds to keep (default 5)
+
 	// Redis settings
 	RedisAddr     string
 	RedisPassword string
@@ -97,6 +102,15 @@ func Load(envPath string) (*Config, error) {
 		if v, ok := env["FLAGID_POLL_INTERVAL"]; ok {
 			cfg.FlagIDPollInterval, _ = strconv.Atoi(v)
 		}
+		if v, ok := env["ROUND_DURATION"]; ok {
+			cfg.RoundDurationSec, _ = strconv.Atoi(v)
+		}
+		if v, ok := env["COMPETITION_START"]; ok {
+			cfg.CompetitionStart = v
+		}
+		if v, ok := env["KEEP_ROUNDS"]; ok {
+			cfg.KeepRounds, _ = strconv.Atoi(v)
+		}
 		if v, ok := env["REDIS_ADDR"]; ok {
 			cfg.RedisAddr = v
 		}
@@ -140,6 +154,15 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v := os.Getenv("FLAGID_POLL_INTERVAL"); v != "" {
 			cfg.FlagIDPollInterval, _ = strconv.Atoi(v)
+		}
+		if v := os.Getenv("ROUND_DURATION"); v != "" {
+			cfg.RoundDurationSec, _ = strconv.Atoi(v)
+		}
+		if v := os.Getenv("COMPETITION_START"); v != "" {
+			cfg.CompetitionStart = v
+		}
+		if v := os.Getenv("KEEP_ROUNDS"); v != "" {
+			cfg.KeepRounds, _ = strconv.Atoi(v)
 		}
 		if v := os.Getenv("REDIS_ADDR"); v != "" {
 			cfg.RedisAddr = v

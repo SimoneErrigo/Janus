@@ -104,7 +104,7 @@ func (s *Server) getAlert(w http.ResponseWriter, r *http.Request, id int64) {
 		alert.RuleName = rule.Name
 	}
 
-	// Get linked packet
+	// Get linked packet (flag IDs are now tagged at ingestion, no live enrichment needed)
 	linkedPacket, _ := s.packetStore.GetPacketByID(alert.PacketID)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{

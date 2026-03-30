@@ -3,6 +3,16 @@ package sniffer
 import (
 	"fmt"
 	"time"
+
+	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
+)
+
+// PacketChangeKind tells packet listeners why they should refresh (e.g. SSE clients).
+type PacketChangeKind byte
+
+const (
+	PacketChangeInsert PacketChangeKind = iota // new row
+	PacketChangeMetadata                       // e.g. flag-ID backfill updated rows
 )
 
 // Direction indicates whether this is a request or response.
@@ -71,12 +81,14 @@ type Packet struct {
 	Flagged        bool              `json:"flagged"`
 	ContainsFlagID bool              `json:"contains_flagid"`
 	MatchedFlagIDs []string          `json:"matched_flagids"`
+	FlagIDRound    int               `json:"flagid_round"` // round of the AC automaton used to scan this packet
 }
 
 // FlagIDChecker checks if text contains any current flag ID value.
 type FlagIDChecker interface {
 	ContainsFlagID(text string) bool
-	FindMatchingFlagIDs(text string) []string
+	FindMatchingFlagIDs(text string) []flagids.FlagMatch
+	CurrentRound() int
 }
 
 // MakeSessionID builds a session identifier from the client (external) side of the connection.
