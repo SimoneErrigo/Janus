@@ -542,5 +542,3 @@ func parseCyberChallenge(body []byte) (map[string][]string, error) {
 	}
 	return flattenRoundFlags(rounded), nil
 }
-
-}
