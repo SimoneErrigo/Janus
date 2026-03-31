@@ -18,13 +18,13 @@ import (
 
 // Server holds the REST API dependencies.
 type Server struct {
-	store        *storage.Store
-	proxy        *proxy.Manager
-	packetStore  *sniffer.PacketStore
-	ruleStore    *dropper.RuleStore
-	cleanupMgr   *cleanup.Manager
-	flagIDPoller *flagids.Poller
-	cache        *cache.Client
+	store          *storage.Store
+	proxy          *proxy.Manager
+	packetStore    *sniffer.PacketStore
+	ruleStore      *dropper.RuleStore
+	cleanupMgr     *cleanup.Manager
+	flagIDPoller   *flagids.Poller
+	cache          *cache.Client
 	statsCollector *sysstat.Collector
 	packetHub      *PacketStreamHub
 	mux            *http.ServeMux
@@ -62,9 +62,12 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/services", s.handleServices)
 	protected.HandleFunc("/api/services/", s.handleServiceByID)
 	protected.HandleFunc("/api/packets/stream", s.handlePacketStream)
-	protected.HandleFunc("/api/packets", s.handlePackets)
 	protected.HandleFunc("/api/packets/flow", s.handlePacketFlow)
 	protected.HandleFunc("/api/packets/exploit", s.handleExploitGen)
+	protected.HandleFunc("/api/packets/", s.handlePacketByID)
+	protected.HandleFunc("/api/packets", s.handlePackets)
+	protected.HandleFunc("/api/rules/presets/apply", s.handlePresetsApply)
+	protected.HandleFunc("/api/rules/presets", s.handlePresetsGet)
 	protected.HandleFunc("/api/rules", s.handleRules)
 	protected.HandleFunc("/api/rules/", s.handleRuleByID)
 	protected.HandleFunc("/api/alerts", s.handleAlerts)

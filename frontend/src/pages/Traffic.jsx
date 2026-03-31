@@ -18,9 +18,9 @@ const HighlightedText = memo(function HighlightedText({ text, contains, regex, f
       }
     }
 
-    // Flag/search highlights (yellow)
+    // Search highlights: contains (orange) and regex (yellow) — both apply independently
+    if (contains) addMatches(contains.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi', 'bg-orange-500/40 text-orange-200')
     if (regex) addMatches(regex, 'gi', 'bg-yellow-500/40 text-yellow-200')
-    else if (contains) addMatches(contains.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi', 'bg-yellow-500/40 text-yellow-200')
 
     // FlagID highlights (cyan) — regex built from backend-provided matched values (tiny, 1-3 values)
     if (flagidRegex) addMatches(flagidRegex, 'g', 'bg-teal-500/30 text-teal-200 border-b border-teal-400/50')
@@ -55,6 +55,162 @@ function getPeerIP(pkt) {
   return pkt.direction === 'request' ? pkt.src_ip : pkt.dst_ip
 }
 
+// Try to pretty-print JSON, return original string if not valid JSON
+function tryFormatJSON(str) {
+  if (!str) return { text: str, isJSON: false }
+  const trimmed = str.trim()
+  if ((trimmed[0] === '{' && trimmed[trimmed.length - 1] === '}') ||
+      (trimmed[0] === '[' && trimmed[trimmed.length - 1] === ']')) {
+    try {
+      return { text: JSON.stringify(JSON.parse(trimmed), null, 2), isJSON: true }
+    } catch {}
+  }
+  return { text: str, isJSON: false }
+}
+
+// ---- Quick Rule Panel ----
+
+function QuickRulePanel({ packet, services, onCreated, onCancel }) {
+  const [pattern, setPattern] = useState('')
+  const [type, setType] = useState('string')
+  const [scope, setScope] = useState('body')
+  const [action, setAction] = useState('drop')
+  const [creating, setCreating] = useState(false)
+  const [error, setError] = useState('')
+  const [success, setSuccess] = useState(false)
+  const [selectedServices, setSelectedServices] = useState([packet.service_id])
+  const allSelected = selectedServices.length === services.length
+
+  // Smart pre-fill based on packet content
+  useEffect(() => {
+    if (packet.url && packet.direction === 'request') {
+      setPattern(packet.url)
+      setScope('url')
+    } else if (packet.body_string) {
+      setPattern(packet.body_string.length > 300 ? packet.body_string.slice(0, 300) : packet.body_string)
+      setScope('body')
+    }
+  }, [packet])
+
+  function toggleService(id) {
+    setSelectedServices(prev =>
+      prev.includes(id) ? prev.filter(s => s !== id) : [...prev, id]
+    )
+  }
+
+  function toggleAll() {
+    setSelectedServices(allSelected ? [packet.service_id] : services.map(s => s.id))
+  }
+
+  async function handleCreate() {
+    const p = pattern.trim()
+    if (!p || selectedServices.length === 0) return
+    setCreating(true)
+    setError('')
+    try {
+      const label = p.length > 40 ? p.slice(0, 40) + '...' : p
+      const promises = selectedServices.map(svcId =>
+        api.createRule({
+          service_id: svcId,
+          name: `Quick: ${scope} ${type === 'regex' ? '~' : '='} ${label}`,
+          type,
+          scope,
+          pattern: p,
+          priority: 10,
+          enabled: true,
+          action,
+        })
+      )
+      await Promise.all(promises)
+      setSuccess(true)
+      setTimeout(() => onCreated?.(), 800)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  if (success) {
+    return (
+      <div className="bg-green-900/30 border border-green-700/50 rounded p-2 text-xs text-green-400 flex items-center gap-2">
+        <span>&#10003;</span> Rule created for {selectedServices.length} service{selectedServices.length !== 1 ? 's' : ''} — traffic matching this pattern will be {action === 'alert' ? 'alerted' : 'dropped'}
+      </div>
+    )
+  }
+
+  return (
+    <div className="bg-red-950/30 border border-red-800/50 rounded p-2 space-y-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <select value={action} onChange={e => setAction(e.target.value)}
+          className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-red-500">
+          <option value="drop">Drop</option>
+          <option value="alert">Alert</option>
+          <option value="both">Both</option>
+        </select>
+        <select value={type} onChange={e => setType(e.target.value)}
+          className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-red-500">
+          <option value="string">String</option>
+          <option value="regex">Regex</option>
+          <option value="bytes">Bytes</option>
+        </select>
+        <select value={scope} onChange={e => setScope(e.target.value)}
+          className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-red-500">
+          <option value="url">URL</option>
+          <option value="body">Body</option>
+          <option value="header">Header</option>
+          <option value="raw">Raw</option>
+        </select>
+      </div>
+      {/* Multi-service selector */}
+      <div className="flex items-center gap-2 flex-wrap text-[10px]">
+        <button onClick={toggleAll}
+          className={`px-1.5 py-0.5 rounded cursor-pointer transition-colors ${allSelected ? 'bg-cyan-800/60 text-cyan-300' : 'bg-gray-800 text-gray-500 hover:text-gray-300'}`}>
+          All
+        </button>
+        {services.map(s => (
+          <button key={s.id} onClick={() => toggleService(s.id)}
+            className={`px-1.5 py-0.5 rounded cursor-pointer transition-colors ${selectedServices.includes(s.id) ? 'bg-cyan-900/50 text-cyan-400' : 'bg-gray-800 text-gray-600 hover:text-gray-400'}`}>
+            {s.name}
+          </button>
+        ))}
+      </div>
+      <textarea
+        value={pattern}
+        onChange={e => setPattern(e.target.value)}
+        rows={3}
+        className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs font-mono text-gray-100 focus:outline-none focus:border-red-500 resize-y"
+        placeholder="Pattern to match..."
+        spellCheck={false}
+      />
+      <div className="flex items-center gap-2 flex-wrap">
+        {/* Pre-fill shortcuts */}
+        {packet.url && (
+          <button onClick={() => { setPattern(packet.url); setScope('url'); setType('string') }}
+            className="text-[10px] text-gray-500 hover:text-gray-300 cursor-pointer underline underline-offset-2">Fill URL</button>
+        )}
+        {packet.body_string && (
+          <button onClick={() => { setPattern(packet.body_string.length > 300 ? packet.body_string.slice(0, 300) : packet.body_string); setScope('body'); setType('string') }}
+            className="text-[10px] text-gray-500 hover:text-gray-300 cursor-pointer underline underline-offset-2">Fill Body</button>
+        )}
+      </div>
+      {error && <div className="text-xs text-red-400">{error}</div>}
+      <div className="flex items-center gap-2">
+        <button onClick={handleCreate} disabled={creating || !pattern.trim()}
+          className="bg-red-700 hover:bg-red-600 disabled:bg-gray-700 disabled:text-gray-500 text-white text-xs px-3 py-1.5 rounded transition-colors cursor-pointer disabled:cursor-default flex items-center gap-1">
+          {creating ? 'Creating...' : <><span>&#9889;</span> Create Rule</>}
+        </button>
+        <button onClick={onCancel}
+          className="bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs px-3 py-1.5 rounded transition-colors cursor-pointer">
+          Cancel
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// ---- Main Traffic component ----
+
 export default function Traffic() {
   const [services, setServices] = useState([])
   const [packets, setPackets] = useState([])
@@ -70,6 +226,7 @@ export default function Traffic() {
   const [flagIDEnabled, setFlagIDEnabled] = useState(false)
   const [paused, setPaused] = useState(false)
   const pausedRef = useRef(false)
+  const [showQuickRule, setShowQuickRule] = useState(false)
   const [filters, setFilters] = useState({
     service_id: '', src_ip: '', dst_ip: '', protocol: '', method: '',
     session_id: '', peer_ip: '', contains: '', regex: '', sort: 'desc',
@@ -296,23 +453,47 @@ export default function Traffic() {
     })
   }
 
+  // Select a packet — fetch full detail if body is missing (SSE-pushed lightweight packets)
+  async function selectPacket(pkt) {
+    if (pkt.body_string !== undefined) {
+      setSelected(pkt)
+      return
+    }
+    setSelected(pkt) // show immediately with what we have
+    try {
+      const full = await api.getPacket(pkt.id)
+      setSelected(full)
+    } catch {}
+  }
+
+  // Close quick rule panel when selecting a different packet
+  useEffect(() => { setShowQuickRule(false) }, [selected?.id])
+
   const isFlowActive = !!flowMode || !!filters.session_id
   const hasActiveFilter = filters.contains || filters.regex || flagFilter || flagIDFilter
 
   // Compute effective highlight regex: always include flag regex for yellow highlighting
   const highlightRegex = [filters.regex, flagRegex].filter(Boolean).join('|') || ''
 
+  // Highlight regex for search terms only (used in table rows — no flag regex to avoid noise)
+  const searchHighlightRegex = filters.regex || ''
+
   // Use flow mode packets when active, otherwise normal packets
   const displayPackets = flowMode ? flowMode.packets : packets
   const displayTotal = flowMode ? flowMode.total : total
 
   // FlagID highlight regex: built from the backend-provided matched values (typically 1-3).
-  // Zero client-side pattern matching — the backend already did the work at insertion time.
   const flagidHighlightRegex = useMemo(() => {
     const vals = selected?.matched_flagids
     if (!vals || vals.length === 0) return ''
     return vals.map(v => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
   }, [selected])
+
+  // Pretty-printed body for the detail panel
+  const formattedBody = useMemo(() => {
+    if (!selected?.body_string) return { text: '', isJSON: false }
+    return tryFormatJSON(selected.body_string)
+  }, [selected?.body_string])
 
   // Resolve service_id to service name
   const serviceName = (id) => {
@@ -448,10 +629,11 @@ export default function Traffic() {
                         : pkt.flagged
                           ? 'bg-yellow-950/20'
                           : '';
+                  const cellText = pkt.url || (pkt.body_string?.slice(0, 80)) || '\u2014'
                   return (
                   <tr
                     key={pkt.id}
-                    onClick={() => setSelected(pkt)}
+                    onClick={() => selectPacket(pkt)}
                     className={`border-b border-gray-800/50 cursor-pointer transition-colors ${
                       selected?.id === pkt.id ? 'bg-gray-800' : 'hover:bg-gray-900/80'
                     } ${rowBg}`}
@@ -489,7 +671,9 @@ export default function Traffic() {
                       </div>
                     </td>
                     <td className="px-3 py-1.5 text-gray-300 text-xs">{pkt.method}</td>
-                    <td className="px-3 py-1.5 text-gray-400 text-xs truncate max-w-xs">{pkt.url || (pkt.body_string?.slice(0, 80)) || '\u2014'}</td>
+                    <td className="px-3 py-1.5 text-gray-400 text-xs truncate max-w-xs">
+                      <HighlightedText text={cellText} contains={filters.contains} regex={searchHighlightRegex} />
+                    </td>
                     <td className="px-3 py-1.5 text-gray-300 font-mono text-xs">{getPeerIP(pkt)}</td>
                   </tr>
                   );
@@ -562,10 +746,32 @@ export default function Traffic() {
                     </svg>
                     {copyStatus === 'copying' ? '...' : 'Exploit'}
                   </button>
+                  <button
+                    onClick={() => setShowQuickRule(!showQuickRule)}
+                    className={`text-xs flex items-center gap-1 cursor-pointer transition-colors ${
+                      showQuickRule ? 'text-red-300' : 'text-red-400 hover:text-red-300'
+                    }`}
+                    title="Create a drop/alert rule from this packet"
+                  >
+                    <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                    </svg>
+                    Block
+                  </button>
                 </div>
                 <button onClick={() => setSelected(null)} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
               </div>
               <div className="p-3 space-y-2 text-sm">
+                {/* Quick Rule Panel */}
+                {showQuickRule && (
+                  <QuickRulePanel
+                    packet={selected}
+                    services={services}
+                    onCreated={() => setShowQuickRule(false)}
+                    onCancel={() => setShowQuickRule(false)}
+                  />
+                )}
+
                 {/* Compact metadata grid */}
                 <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs bg-gray-800/50 rounded p-2">
                   <div><span className="text-gray-500">Service </span><span className="text-gray-300">{serviceName(selected.service_id)}</span></div>
@@ -612,9 +818,21 @@ export default function Traffic() {
 
                 {selected.body_string && (
                   <div className="flex-1">
-                    <div className="text-gray-500 text-xs mb-1">Body</div>
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="text-gray-500 text-xs">Body</span>
+                      {formattedBody.isJSON && (
+                        <span className="text-[10px] text-cyan-600 bg-cyan-900/30 px-1 py-0.5 rounded">JSON</span>
+                      )}
+                      <button
+                        onClick={() => navigator.clipboard.writeText(selected.body_string)}
+                        className="text-[10px] text-gray-600 hover:text-gray-400 ml-auto cursor-pointer"
+                        title="Copy raw body"
+                      >
+                        Copy
+                      </button>
+                    </div>
                     <pre className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 overflow-auto whitespace-pre-wrap break-all" style={{ maxHeight: '60vh' }}>
-                      <HighlightedText text={selected.body_string} contains={filters.contains} regex={highlightRegex} flagidRegex={flagidHighlightRegex} />
+                      <HighlightedText text={formattedBody.text} contains={filters.contains} regex={highlightRegex} flagidRegex={flagidHighlightRegex} />
                     </pre>
                   </div>
                 )}

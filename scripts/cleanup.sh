@@ -5,7 +5,7 @@ set -euo pipefail
 # Connects to SQLite directly — no running Janus required.
 # Usage: ./scripts/cleanup.sh [--max-age-minutes N] [--max-db-size-mb N] [--db-path PATH]
 
-DB_PATH="./data/janus.db"
+DB_PATH="./data/packets.db"
 MAX_AGE_MINUTES=0
 MAX_DB_SIZE_MB=0
 
@@ -29,7 +29,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --max-age-minutes N   Delete packets older than N minutes (0 = disabled)"
             echo "  --max-db-size-mb N    Delete oldest packets until DB is below N MB (0 = disabled)"
-            echo "  --db-path PATH        Path to packets.db (default: ./data/janus.db)"
+            echo "  --db-path PATH        Path to packets.db (default: ./data/packets.db)"
             exit 0
             ;;
         *)

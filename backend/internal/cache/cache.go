@@ -2,8 +2,6 @@ package cache
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -172,107 +170,6 @@ func (c *Client) PopulateRules(ruleStore *dropper.RuleStore) {
 		c.SetServiceRules(svcID, rules)
 	}
 	log.Printf("[cache] Populated rules cache for %d services", len(byService))
-}
-
-// --- Packet query cache ---
-
-const (
-	pktQueryPrefix = "pkt_query:"
-	pktQueryTTL    = 1 * time.Second
-)
-
-// QueryHash builds a deterministic cache key for a packet query.
-func QueryHash(params map[string]string) string {
-	// Sort keys for deterministic hashing
-	keys := make([]string, 0, len(params))
-	for k := range params {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var sb strings.Builder
-	for _, k := range keys {
-		fmt.Fprintf(&sb, "%s=%s&", k, params[k])
-	}
-
-	h := sha256.Sum256([]byte(sb.String()))
-	return hex.EncodeToString(h[:8]) // 16-char hex
-}
-
-// SetPacketQuery caches a packet query response.
-func (c *Client) SetPacketQuery(serviceID, queryHash string, data []byte) {
-	if !c.Available() {
-		return
-	}
-
-	key := pktQueryPrefix + serviceID + ":" + queryHash
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	if err := c.rdb.Set(ctx, key, data, pktQueryTTL).Err(); err != nil {
-		log.Printf("[cache] Failed to cache packet query: %v", err)
-		c.ping()
-	}
-}
-
-// GetPacketQuery retrieves a cached packet query response.
-// Returns nil, false on cache miss.
-func (c *Client) GetPacketQuery(serviceID, queryHash string) ([]byte, bool) {
-	if !c.Available() {
-		return nil, false
-	}
-
-	key := pktQueryPrefix + serviceID + ":" + queryHash
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	data, err := c.rdb.Get(ctx, key).Bytes()
-	if err != nil {
-		if err != redis.Nil {
-			log.Printf("[cache] Failed to get packet query cache: %v", err)
-			c.ping()
-		}
-		return nil, false
-	}
-	return data, true
-}
-
-// InvalidatePacketQueries deletes all cached packet queries for a service.
-func (c *Client) InvalidatePacketQueries(serviceID string) {
-	if !c.Available() {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	pattern := pktQueryPrefix + serviceID + ":*"
-	iter := c.rdb.Scan(ctx, 0, pattern, 100).Iterator()
-	var keys []string
-	for iter.Next(ctx) {
-		keys = append(keys, iter.Val())
-	}
-	if len(keys) > 0 {
-		c.rdb.Del(ctx, keys...)
-	}
-}
-
-// InvalidateAllPacketQueries deletes all cached packet queries.
-func (c *Client) InvalidateAllPacketQueries() {
-	if !c.Available() {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	pattern := pktQueryPrefix + "*"
-	iter := c.rdb.Scan(ctx, 0, pattern, 500).Iterator()
-	var keys []string
-	for iter.Next(ctx) {
-		keys = append(keys, iter.Val())
-	}
-	if len(keys) > 0 {
-		c.rdb.Del(ctx, keys...)
-	}
 }
 
 // MemoryUsageMB returns the Redis used_memory in MB, or -1 if unavailable.

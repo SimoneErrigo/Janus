@@ -11,6 +11,7 @@ export default function Rules() {
   const [rules, setRules] = useState([])
   const [editing, setEditing] = useState(null)
   const [error, setError] = useState('')
+  const [showPresets, setShowPresets] = useState(false)
 
   useEffect(() => {
     api.listServices().then((data) => {
@@ -39,12 +40,18 @@ export default function Rules() {
     return svc ? svc.name : id
   }
 
-  async function handleSave(rule) {
+  async function handleSave(rule, targetServiceIds) {
     setError('')
     try {
       const payload = { ...rule, priority: parseInt(rule.priority, 10) || 0 }
       if (rule._isNew) {
-        await api.createRule(payload)
+        const svcIds = targetServiceIds && targetServiceIds.length > 0
+          ? targetServiceIds
+          : [payload.service_id]
+        const promises = svcIds.map(svcId =>
+          api.createRule({ ...payload, service_id: svcId })
+        )
+        await Promise.all(promises)
       } else {
         await api.updateRule(rule.id, payload)
       }
@@ -74,8 +81,6 @@ export default function Rules() {
     }
   }
 
-  const isAutoFlag = (rule) => rule.name?.startsWith('Auto flag filter')
-
   return (
     <div className="p-6">
       <div className="flex items-center justify-between mb-6">
@@ -90,6 +95,17 @@ export default function Rules() {
             {services.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
           <button
+            onClick={() => setShowPresets(!showPresets)}
+            disabled={services.length === 0}
+            className={`text-sm px-4 py-2 rounded transition-colors cursor-pointer flex items-center gap-1.5 ${
+              showPresets
+                ? 'bg-orange-700 hover:bg-orange-600 text-white'
+                : 'bg-orange-900/50 hover:bg-orange-800/50 text-orange-300 border border-orange-700/50'
+            }`}
+          >
+            <span>&#9889;</span> Presets
+          </button>
+          <button
             onClick={() => setEditing({ _isNew: true, service_id: selectedService === '_all' ? (services[0]?.id || '') : selectedService, name: '', type: 'string', scope: 'body', pattern: '', priority: 10, enabled: true, action: 'drop' })}
             disabled={!selectedService || services.length === 0}
             className="bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
@@ -101,6 +117,15 @@ export default function Rules() {
 
       {error && <div className="bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded mb-4">{error}</div>}
 
+      {showPresets && (
+        <PresetPanel
+          services={services}
+          defaultServiceId={selectedService === '_all' ? '' : selectedService}
+          onCreated={() => { setShowPresets(false); loadRules() }}
+          onCancel={() => setShowPresets(false)}
+        />
+      )}
+
       {editing && (
         <RuleForm rule={editing} services={services} onSave={handleSave} onCancel={() => setEditing(null)} />
       )}
@@ -110,9 +135,7 @@ export default function Rules() {
       ) : (
         <div className="space-y-2">
           {rules.map((rule) => (
-            <div key={rule.id} className={`bg-gray-900 border rounded-lg p-4 flex items-center justify-between ${
-              isAutoFlag(rule) ? 'border-yellow-800/50' : 'border-gray-800'
-            }`}>
+            <div key={rule.id} className="bg-gray-900 border border-gray-800 rounded-lg p-4 flex items-center justify-between">
               <div className="flex items-center gap-4">
                 <button
                   onClick={() => handleToggle(rule)}
@@ -123,7 +146,6 @@ export default function Rules() {
                 <div>
                   <div className="flex items-center gap-2">
                     <span className="font-medium text-gray-100">{rule.name}</span>
-                    {isAutoFlag(rule) && <span className="text-xs px-1.5 py-0.5 bg-yellow-900/40 text-yellow-400 rounded">Auto Flag</span>}
                     {selectedService === '_all' && <span className="text-xs px-1.5 py-0.5 bg-cyan-900/40 text-cyan-400 rounded">{serviceName(rule.service_id)}</span>}
                   </div>
                   <div className="text-xs text-gray-500 mt-0.5 font-mono">
@@ -153,33 +175,263 @@ export default function Rules() {
   )
 }
 
+// ---- Preset Panel (loads from backend) ----
+
+function PresetPanel({ services, defaultServiceId, onCreated, onCancel }) {
+  const [categories, setCategories] = useState([])
+  const [loadingPresets, setLoadingPresets] = useState(true)
+  const [selected, setSelected] = useState({})
+  const [targetServices, setTargetServices] = useState(
+    defaultServiceId ? [defaultServiceId] : services.map(s => s.id)
+  )
+  const [creating, setCreating] = useState(false)
+  const [error, setError] = useState('')
+  const [result, setResult] = useState(null)
+  const [expandedCat, setExpandedCat] = useState(null)
+  const allServicesSelected = targetServices.length === services.length
+
+  useEffect(() => {
+    let mounted = true
+    api.getPresets().then(data => {
+      if (mounted) {
+        setCategories(data || [])
+        setLoadingPresets(false)
+      }
+    }).catch(err => {
+      if (mounted) {
+        setError('Failed to load presets: ' + err.message)
+        setLoadingPresets(false)
+      }
+    })
+    return () => { mounted = false }
+  }, [])
+
+  function togglePreset(category, index) {
+    setSelected(prev => {
+      const cat = { ...(prev[category] || {}) }
+      if (cat[index]) delete cat[index]
+      else cat[index] = true
+      return { ...prev, [category]: cat }
+    })
+  }
+
+  function toggleCategory(categoryName, rulesCount) {
+    const catSelected = selected[categoryName] || {}
+    const allOn = rulesCount > 0 && Object.keys(catSelected).length === rulesCount
+    if (allOn) {
+      setSelected(prev => ({ ...prev, [categoryName]: {} }))
+    } else {
+      const all = {}
+      for (let i = 0; i < rulesCount; i++) all[i] = true
+      setSelected(prev => ({ ...prev, [categoryName]: all }))
+    }
+  }
+
+  function toggleService(id) {
+    setTargetServices(prev =>
+      prev.includes(id) ? prev.filter(s => s !== id) : [...prev, id]
+    )
+  }
+
+  function toggleAllServices() {
+    setTargetServices(allServicesSelected ? [] : services.map(s => s.id))
+  }
+
+  const totalSelected = Object.values(selected).reduce(
+    (sum, cat) => sum + Object.keys(cat).length, 0
+  )
+  const totalRules = totalSelected * targetServices.length
+
+  async function handleCreate() {
+    if (totalRules === 0 || targetServices.length === 0) return
+    setCreating(true)
+    setError('')
+    setResult(null)
+    try {
+      const selectedMap = {}
+      for (const [catName, indices] of Object.entries(selected)) {
+        const idxList = Object.keys(indices).map(Number)
+        if (idxList.length > 0) selectedMap[catName] = idxList
+      }
+
+      const res = await api.applyPresets({
+        service_ids: targetServices,
+        selected: selectedMap,
+      })
+      setResult(res)
+      setTimeout(() => onCreated(), 1200)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  if (loadingPresets) {
+    return (
+      <div className="bg-gray-900 border border-orange-800/50 rounded-lg p-5 mb-4 text-gray-500 text-sm">
+        Loading presets...
+      </div>
+    )
+  }
+
+  return (
+    <div className="bg-gray-900 border border-orange-800/50 rounded-lg p-5 mb-4">
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-lg font-medium text-gray-100">Attack Presets</h3>
+        <span className="text-xs text-gray-500">{totalSelected} presets &times; {targetServices.length} services = {totalRules} rules</span>
+      </div>
+
+      <div className="mb-4">
+        <div className="text-xs text-gray-500 mb-1.5">Apply to services:</div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <button onClick={toggleAllServices}
+            className={`text-xs px-2 py-1 rounded cursor-pointer transition-colors ${allServicesSelected ? 'bg-cyan-800/60 text-cyan-300' : 'bg-gray-800 text-gray-500 hover:text-gray-300'}`}>
+            All
+          </button>
+          {services.map(s => (
+            <button key={s.id} onClick={() => toggleService(s.id)}
+              className={`text-xs px-2 py-1 rounded cursor-pointer transition-colors ${targetServices.includes(s.id) ? 'bg-cyan-900/50 text-cyan-400' : 'bg-gray-800 text-gray-600 hover:text-gray-400'}`}>
+              {s.name}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 mb-4">
+        {categories.map((cat) => {
+          const catSelected = selected[cat.name] || {}
+          const countSelected = Object.keys(catSelected).length
+          const isExpanded = expandedCat === cat.name
+          return (
+            <div key={cat.name} className="bg-gray-800/50 border border-gray-700/50 rounded">
+              <div className="flex items-center justify-between px-3 py-2">
+                <button onClick={() => setExpandedCat(isExpanded ? null : cat.name)}
+                  className="flex items-center gap-2 text-sm text-gray-200 hover:text-white cursor-pointer flex-1 text-left">
+                  <span>{cat.icon}</span>
+                  <span className="font-medium">{cat.name}</span>
+                  {countSelected > 0 && <span className="text-[10px] text-cyan-400 bg-cyan-900/50 px-1.5 rounded">{countSelected}/{cat.rules.length}</span>}
+                  <svg className={`w-3 h-3 ml-auto text-gray-500 transition-transform ${isExpanded ? 'rotate-180' : ''}`} viewBox="0 0 12 12" fill="currentColor">
+                    <path d="M2 4l4 4 4-4z" />
+                  </svg>
+                </button>
+                <button onClick={() => toggleCategory(cat.name, cat.rules.length)}
+                  className="text-[10px] text-gray-500 hover:text-cyan-400 cursor-pointer ml-2 whitespace-nowrap">
+                  {countSelected === cat.rules.length ? 'None' : 'All'}
+                </button>
+              </div>
+              {isExpanded && (
+                <div className="px-3 pb-2 space-y-1">
+                  {cat.rules.map((preset, idx) => (
+                    <label key={idx} className="flex items-start gap-2 text-xs cursor-pointer group">
+                      <input
+                        type="checkbox"
+                        checked={!!catSelected[idx]}
+                        onChange={() => togglePreset(cat.name, idx)}
+                        className="accent-cyan-500 mt-0.5"
+                      />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-gray-300 group-hover:text-white">{preset.name}</span>
+                          <span className={`px-1 py-0.5 rounded text-[10px] ${
+                            preset.action === 'drop' ? 'bg-red-900/40 text-red-400' :
+                            preset.action === 'alert' ? 'bg-orange-900/40 text-orange-400' :
+                            'bg-purple-900/40 text-purple-400'
+                          }`}>{preset.action}</span>
+                        </div>
+                        <div className="text-[10px] text-gray-600 font-mono truncate">{preset.pattern}</div>
+                      </div>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      {error && <div className="bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded mb-3">{error}</div>}
+      {result && (
+        <div className="bg-green-900/30 border border-green-700/50 text-green-400 text-sm px-4 py-2 rounded mb-3">
+          Created {result.created} rules{result.errors > 0 ? `, ${result.errors} errors` : ''}
+        </div>
+      )}
+
+      <div className="flex items-center gap-2">
+        <button onClick={handleCreate}
+          disabled={creating || totalRules === 0}
+          className="bg-orange-600 hover:bg-orange-500 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer disabled:cursor-default flex items-center gap-1.5">
+          {creating ? 'Creating...' : <><span>&#9889;</span> Create {totalRules} Rule{totalRules !== 1 ? 's' : ''}</>}
+        </button>
+        <button onClick={onCancel}
+          className="bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm px-4 py-2 rounded transition-colors cursor-pointer">
+          Cancel
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// ---- Rule Form (with multi-service for new rules) ----
+
 function RuleForm({ rule, services, onSave, onCancel }) {
   const [form, setForm] = useState({ ...rule, action: rule.action || 'drop' })
+  const [targetServices, setTargetServices] = useState([rule.service_id])
   const isFlagRule = form.id?.startsWith('flag-auto-')
+  const allSelected = targetServices.length === services.length
 
   function set(field, value) {
     setForm((f) => ({ ...f, [field]: value }))
+  }
+
+  function toggleService(id) {
+    setTargetServices(prev =>
+      prev.includes(id) ? prev.filter(s => s !== id) : [...prev, id]
+    )
+  }
+
+  function toggleAll() {
+    setTargetServices(allSelected ? [form.service_id || services[0]?.id] : services.map(s => s.id))
   }
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 mb-4">
       <h3 className="text-lg font-medium text-gray-100 mb-4">{form._isNew ? 'New Rule' : 'Edit Rule'}</h3>
       <div className="grid grid-cols-2 gap-4">
-        <div>
-          <label className="block text-sm text-gray-400 mb-1">Service</label>
-          <select
-            value={form.service_id}
-            onChange={(e) => set('service_id', e.target.value)}
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
-          >
-            {services.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-          </select>
-        </div>
+        {form._isNew ? (
+          <div className="col-span-2">
+            <label className="block text-sm text-gray-400 mb-1">Services</label>
+            <div className="flex items-center gap-2 flex-wrap">
+              <button type="button" onClick={toggleAll}
+                className={`text-xs px-2 py-1 rounded cursor-pointer transition-colors ${allSelected ? 'bg-cyan-800/60 text-cyan-300' : 'bg-gray-800 text-gray-500 hover:text-gray-300'}`}>
+                All
+              </button>
+              {services.map(s => (
+                <button type="button" key={s.id} onClick={() => toggleService(s.id)}
+                  className={`text-xs px-2 py-1 rounded cursor-pointer transition-colors ${targetServices.includes(s.id) ? 'bg-cyan-900/50 text-cyan-400' : 'bg-gray-800 text-gray-600 hover:text-gray-400'}`}>
+                  {s.name}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">Service</label>
+            <select
+              value={form.service_id}
+              onChange={(e) => set('service_id', e.target.value)}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
+            >
+              {services.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+          </div>
+        )}
         <div>
           <label className="block text-sm text-gray-400 mb-1">Name</label>
           <input value={form.name} onChange={(e) => set('name', e.target.value)} placeholder="Rule name"
             className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500" />
         </div>
+        {!form._isNew && <div />}
         <div>
           <label className="block text-sm text-gray-400 mb-1">Priority</label>
           <input type="number" value={form.priority} onChange={(e) => set('priority', e.target.value)} placeholder="0"
@@ -228,7 +480,12 @@ function RuleForm({ rule, services, onSave, onCancel }) {
         </div>
       </div>
       <div className="flex gap-2 mt-4">
-        <button onClick={() => onSave(form)} className="bg-cyan-600 hover:bg-cyan-500 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer">Save</button>
+        <button onClick={() => onSave(form, form._isNew ? targetServices : null)}
+          className="bg-cyan-600 hover:bg-cyan-500 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer">
+          {form._isNew && targetServices.length > 1
+            ? `Save (${targetServices.length} services)`
+            : 'Save'}
+        </button>
         <button onClick={onCancel} className="bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm px-4 py-2 rounded transition-colors cursor-pointer">Cancel</button>
       </div>
     </div>

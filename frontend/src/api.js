@@ -95,6 +95,7 @@ export const api = {
     return request(`/packets?${qs.toString()}`);
   },
 
+  getPacket: (id) => request(`/packets/${id}`),
   getPacketFlow: (packetId) => request(`/packets/flow?packet_id=${packetId}`),
   generateExploit: (packetId) => request(`/packets/exploit?packet_id=${packetId}`),
 
@@ -107,6 +108,10 @@ export const api = {
   createRule: (data) => request('/rules', { method: 'POST', body: data }),
   updateRule: (id, data) => request(`/rules/${id}`, { method: 'PUT', body: data }),
   deleteRule: (id) => request(`/rules/${id}`, { method: 'DELETE' }),
+
+  // Rule presets
+  getPresets: () => request('/rules/presets'),
+  applyPresets: (data) => request('/rules/presets/apply', { method: 'POST', body: data }),
 
   // Alerts
   listAlerts: (params = {}) => {

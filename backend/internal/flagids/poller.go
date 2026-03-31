@@ -35,6 +35,9 @@ type Poller struct {
 	// Legacy flat view (backward compat with GetFlagIDs / GetAllValues)
 	flagIDs map[string][]string
 
+	// Reverse map: flagIDValue -> descKey (e.g., "8b026611-..." -> "answer_id")
+	valueKeyMap map[string]string
+
 	lastFetch time.Time
 	lastError string
 
@@ -406,11 +409,15 @@ func (p *Poller) fetch() {
 	// Flatten into legacy map for backward compat (GetFlagIDs, API responses)
 	flatFlagIDs := flattenRoundFlags(roundFlags)
 
+	// Build reverse map: flagIDValue -> descKey (for exploit generator)
+	vkm := parseValueKeyMap(body)
+
 	p.mu.Lock()
 	p.roundFlags = roundFlags
 	p.currentRound = maxRound
 	p.matcher = matcher
 	p.flagIDs = flatFlagIDs
+	p.valueKeyMap = vkm
 	p.lastFetch = time.Now()
 	p.lastError = ""
 	p.mu.Unlock()
@@ -450,6 +457,39 @@ func flattenRoundFlags(roundFlags map[int]map[string][]string) map[string][]stri
 		}
 	}
 	return flat
+}
+
+// GetValueKeyMap returns a copy of the reverse map: flagIDValue -> descKey.
+// Example: "8b026611-..." -> "answer_id"
+func (p *Poller) GetValueKeyMap() map[string]string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	cp := make(map[string]string, len(p.valueKeyMap))
+	for k, v := range p.valueKeyMap {
+		cp[k] = v
+	}
+	return cp
+}
+
+// parseValueKeyMap extracts a reverse map (flagIDValue -> descKey) from the raw API JSON.
+func parseValueKeyMap(body []byte) map[string]string {
+	var raw map[string]map[string]map[string]map[string]string
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil
+	}
+	result := make(map[string]string)
+	for _, teams := range raw {
+		for _, rounds := range teams {
+			for _, descs := range rounds {
+				for descKey, val := range descs {
+					if val != "" {
+						result[val] = descKey
+					}
+				}
+			}
+		}
+	}
+	return result
 }
 
 // parseCyberChallengeRounded parses the CyberChallenge flag ID format preserving round numbers:
@@ -501,4 +541,6 @@ func parseCyberChallenge(body []byte) (map[string][]string, error) {
 		return nil, err
 	}
 	return flattenRoundFlags(rounded), nil
+}
+
 }

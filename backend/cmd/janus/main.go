@@ -56,12 +56,7 @@ func main() {
 	ruleStore.SetOnChange(func(serviceID string) {
 		rules := ruleStore.ListRules(serviceID)
 		redisCache.SetServiceRules(serviceID, rules)
-		redisCache.InvalidatePacketQueries(serviceID)
 	})
-
-	// NOTE: no onInsert callback — Redis packet-query cache was removed
-	// because the 1s TTL + invalidation on every insert produced ~0% hit rate
-	// while adding 2× SCAN+DEL overhead to every packet insertion.
 
 	// Compile flag regex for packet flagging
 	var flagRegex *regexp.Regexp

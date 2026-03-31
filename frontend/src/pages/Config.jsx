@@ -129,6 +129,9 @@ export default function Config() {
         flagid_team_id: form.flagid_team_id,
         flagid_poll_interval: parseInt(form.flagid_poll_interval, 10) || 30,
         flagid_format: form.flagid_format,
+        round_duration_seconds: parseInt(form.round_duration_seconds, 10) || 120,
+        competition_start: form.competition_start || '',
+        keep_rounds: parseInt(form.keep_rounds, 10) || 5,
       })
       setConfig(data)
       setForm(data)
@@ -269,9 +272,16 @@ export default function Config() {
       <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 max-w-lg space-y-4">
         <div className="flex items-center justify-between">
           <h3 className="text-lg font-medium text-gray-100">Flag IDs</h3>
-          <span className={`text-xs px-2 py-0.5 rounded ${form.flagid_enabled ? 'bg-emerald-900/40 text-emerald-400' : 'bg-gray-800 text-gray-500'}`}>
-            {form.flagid_enabled ? 'Enabled' : 'Disabled'}
-          </span>
+          <div className="flex items-center gap-2">
+            {form.flagid_enabled && flagIDStatus?.current_round > 0 && (
+              <span className="text-xs px-2 py-0.5 rounded bg-cyan-900/40 text-cyan-400 font-mono">
+                Round {flagIDStatus.current_round}
+              </span>
+            )}
+            <span className={`text-xs px-2 py-0.5 rounded ${form.flagid_enabled ? 'bg-emerald-900/40 text-emerald-400' : 'bg-gray-800 text-gray-500'}`}>
+              {form.flagid_enabled ? 'Enabled' : 'Disabled'}
+            </span>
+          </div>
         </div>
 
         <form onSubmit={handleFlagIDSave} className="space-y-4">
@@ -333,6 +343,43 @@ export default function Config() {
             <p className="text-xs text-gray-600 mt-1">Response format of the flag ID API</p>
           </div>
 
+          {/* Competition Timing */}
+          <div className="border-t border-gray-800 pt-3">
+            <h4 className="text-sm font-medium text-gray-300 mb-3">Competition Timing</h4>
+            <div className="grid grid-cols-3 gap-4">
+              <div>
+                <label className="block text-sm text-gray-400 mb-1">Round Duration (s)</label>
+                <input
+                  type="number"
+                  min="10"
+                  value={form.round_duration_seconds ?? 120}
+                  onChange={(e) => set('round_duration_seconds', e.target.value)}
+                  className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 transition-colors"
+                />
+              </div>
+              <div>
+                <label className="block text-sm text-gray-400 mb-1">Keep Rounds</label>
+                <input
+                  type="number"
+                  min="1"
+                  value={form.keep_rounds ?? 5}
+                  onChange={(e) => set('keep_rounds', e.target.value)}
+                  className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 transition-colors"
+                />
+                <p className="text-xs text-gray-600 mt-1">Older rounds are pruned</p>
+              </div>
+              <div>
+                <label className="block text-sm text-gray-400 mb-1">Start Time (RFC3339)</label>
+                <input
+                  value={form.competition_start || ''}
+                  onChange={(e) => set('competition_start', e.target.value)}
+                  className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm font-mono focus:outline-none focus:border-cyan-500 transition-colors"
+                  placeholder="2026-03-29T10:00:00Z"
+                />
+              </div>
+            </div>
+          </div>
+
           {flagIDError && <div className="bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded">{flagIDError}</div>}
           {flagIDSaved && <div className="bg-green-900/30 border border-green-800 text-green-400 text-sm px-4 py-2 rounded">Flag ID settings saved</div>}
 
@@ -359,11 +406,27 @@ export default function Config() {
                   <span className="text-gray-500">Next refresh: </span>
                   <span className="text-cyan-400 font-mono">{flagIDCountdown || '...'}</span>
                 </div>
+                <div>
+                  <span className="text-gray-500">Current round: </span>
+                  <span className="text-cyan-400 font-mono">{flagIDStatus.current_round || '—'}</span>
+                </div>
+                <div>
+                  <span className="text-gray-500">Keeping: </span>
+                  <span className="text-gray-300">{flagIDStatus.keep_rounds || '—'} rounds</span>
+                </div>
                 {flagIDStatus.last_error && (
                   <div className="col-span-2">
                     <span className="text-red-400">Error: {flagIDStatus.last_error}</span>
                   </div>
                 )}
+              </div>
+              <div className="flex items-center gap-2 mt-2">
+                <button
+                  onClick={async () => { await api.refreshFlagIDs(); loadFlagIDData() }}
+                  className="text-xs bg-cyan-800/50 hover:bg-cyan-700/50 text-cyan-300 px-2.5 py-1 rounded cursor-pointer transition-colors"
+                >
+                  Refresh Now
+                </button>
               </div>
             </div>
 
@@ -426,7 +489,7 @@ export default function Config() {
             </div>
           )}
 
-          <div className="flex gap-2">
+          <div className="flex gap-2 flex-wrap">
             <button
               type="submit"
               className="bg-cyan-600 hover:bg-cyan-500 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"

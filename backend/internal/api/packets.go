@@ -136,6 +136,33 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+func (s *Server) handlePacketByID(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/packets/")
+	if idStr == "" {
+		http.Error(w, "missing packet ID", http.StatusBadRequest)
+		return
+	}
+
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid packet ID", http.StatusBadRequest)
+		return
+	}
+
+	pkt, err := s.packetStore.GetPacketByID(id)
+	if err != nil {
+		http.Error(w, "packet not found", http.StatusNotFound)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, pkt)
+}
+
 func (s *Server) handlePacketFlow(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

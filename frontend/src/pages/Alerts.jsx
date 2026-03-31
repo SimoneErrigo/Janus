@@ -1,5 +1,124 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import { api } from '../api'
+
+// Strip Go/PCRE inline flags like (?i) that are invalid in JavaScript regex
+function toJSRegex(pattern) {
+  if (!pattern) return null
+  // Remove inline flags (?i), (?s), (?m), (?is), etc.
+  const cleaned = pattern.replace(/\(\?[ismUux]+\)/g, '')
+  if (!cleaned) return null
+  try {
+    return new RegExp(cleaned, 'gi')
+  } catch {
+    // If regex is still invalid, try escaping it as a literal string
+    try {
+      return new RegExp(cleaned.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi')
+    } catch {
+      return null
+    }
+  }
+}
+
+// Highlight matching text segments
+function HighlightedBody({ text, pattern }) {
+  if (!text || !pattern) return <>{text}</>
+  try {
+    const re = toJSRegex(pattern)
+    if (!re) return <>{text}</>
+    const ranges = []
+    let m
+    while ((m = re.exec(text)) !== null) {
+      ranges.push({ start: m.index, end: m.index + m[0].length, text: m[0] })
+      if (m[0].length === 0) re.lastIndex++
+    }
+    if (ranges.length === 0) return <>{text}</>
+    const parts = []
+    let pos = 0
+    for (const r of ranges) {
+      if (r.start > pos) parts.push(<span key={`t${pos}`}>{text.slice(pos, r.start)}</span>)
+      parts.push(<mark key={`m${r.start}`} className="bg-orange-500/40 text-orange-200 rounded px-0.5">{r.text}</mark>)
+      pos = r.end
+    }
+    if (pos < text.length) parts.push(<span key={`t${pos}`}>{text.slice(pos)}</span>)
+    return <>{parts}</>
+  } catch {
+    return <>{text}</>
+  }
+}
+
+// Try to pretty-print JSON
+function tryFormatJSON(str) {
+  if (!str) return { text: str, isJSON: false }
+  const trimmed = str.trim()
+  if ((trimmed[0] === '{' && trimmed[trimmed.length - 1] === '}') ||
+      (trimmed[0] === '[' && trimmed[trimmed.length - 1] === ']')) {
+    try {
+      return { text: JSON.stringify(JSON.parse(trimmed), null, 2), isJSON: true }
+    } catch {}
+  }
+  return { text: str, isJSON: false }
+}
+
+function LinkedPacketDetail({ packet, pattern }) {
+  const formattedBody = useMemo(() => tryFormatJSON(packet.body_string), [packet.body_string])
+  const headers = useMemo(() => {
+    if (!packet.headers) return []
+    if (typeof packet.headers === 'string') {
+      try { return Object.entries(JSON.parse(packet.headers)) } catch { return [] }
+    }
+    if (typeof packet.headers === 'object') return Object.entries(packet.headers)
+    return []
+  }, [packet.headers])
+
+  return (
+    <div>
+      <div className="text-gray-500 text-xs mb-1">Linked Packet #{packet.id}</div>
+      <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs bg-gray-800/50 rounded p-2">
+        <div><span className="text-gray-500">Direction </span><span className={packet.direction === 'request' ? 'text-blue-400' : 'text-green-400'}>{packet.direction}</span></div>
+        <div><span className="text-gray-500">Protocol </span><span className="text-gray-300">{packet.protocol}</span></div>
+        <div><span className="text-gray-500">Src </span><span className="text-gray-300 font-mono">{packet.src_ip}:{packet.src_port}</span></div>
+        <div><span className="text-gray-500">Dst </span><span className="text-gray-300 font-mono">{packet.dst_ip}:{packet.dst_port}</span></div>
+        {packet.method && <div><span className="text-gray-500">Method </span><span className="text-gray-300">{packet.method}</span></div>}
+        {packet.status_code > 0 && <div><span className="text-gray-500">Status </span><span className="text-gray-300">{packet.status_code}</span></div>}
+      </div>
+
+      {packet.url && (
+        <div className="mt-2">
+          <div className="text-gray-500 text-xs mb-1">URL</div>
+          <div className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 break-all">
+            <HighlightedBody text={packet.url} pattern={pattern} />
+          </div>
+        </div>
+      )}
+
+      {headers.length > 0 && (
+        <div className="mt-2">
+          <div className="text-gray-500 text-xs mb-1">Headers</div>
+          <div className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 space-y-0.5 overflow-auto" style={{ maxHeight: '20vh' }}>
+            {headers.map(([k, v]) => (
+              <div key={k} className="break-all">
+                <span className="text-gray-500">{k}: </span>
+                <HighlightedBody text={Array.isArray(v) ? v.join(', ') : String(v)} pattern={pattern} />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {packet.body_string && (
+        <div className="mt-2">
+          <div className="flex items-center gap-2 mb-1">
+            <span className="text-gray-500 text-xs">Body</span>
+            {formattedBody.isJSON && <span className="text-xs px-1 py-0.5 bg-cyan-900/40 text-cyan-400 rounded">JSON</span>}
+          </div>
+          <pre className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 overflow-auto whitespace-pre-wrap break-all" style={{ maxHeight: '40vh' }}>
+            <HighlightedBody text={formattedBody.text} pattern={pattern} />
+          </pre>
+        </div>
+      )}
+    </div>
+  )
+}
 
 export default function Alerts() {
   const [alerts, setAlerts] = useState([])
@@ -183,25 +302,7 @@ export default function Alerts() {
                 </div>
 
                 {linkedPacket && (
-                  <div>
-                    <div className="text-gray-500 text-xs mb-1">Linked Packet #{linkedPacket.id}</div>
-                    <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs bg-gray-800/50 rounded p-2">
-                      <div><span className="text-gray-500">Direction </span><span className={linkedPacket.direction === 'request' ? 'text-blue-400' : 'text-green-400'}>{linkedPacket.direction}</span></div>
-                      <div><span className="text-gray-500">Protocol </span><span className="text-gray-300">{linkedPacket.protocol}</span></div>
-                      <div><span className="text-gray-500">Src </span><span className="text-gray-300 font-mono">{linkedPacket.src_ip}:{linkedPacket.src_port}</span></div>
-                      <div><span className="text-gray-500">Dst </span><span className="text-gray-300 font-mono">{linkedPacket.dst_ip}:{linkedPacket.dst_port}</span></div>
-                      {linkedPacket.method && <div><span className="text-gray-500">Method </span><span className="text-gray-300">{linkedPacket.method}</span></div>}
-                      {linkedPacket.url && <div className="col-span-2"><span className="text-gray-500">URL </span><span className="text-gray-300 font-mono break-all">{linkedPacket.url}</span></div>}
-                    </div>
-                    {linkedPacket.body_string && (
-                      <div className="mt-2">
-                        <div className="text-gray-500 text-xs mb-1">Body</div>
-                        <pre className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 overflow-auto whitespace-pre-wrap break-all" style={{ maxHeight: '40vh' }}>
-                          {linkedPacket.body_string}
-                        </pre>
-                      </div>
-                    )}
-                  </div>
+                  <LinkedPacketDetail packet={linkedPacket} pattern={selectedAlert.pattern_matched} />
                 )}
               </div>
             </div>

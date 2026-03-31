@@ -112,13 +112,39 @@ The generated exploit is compatible with [exploitfarm](https://github.com/pwnzer
 
 ### 7. Drop rules
 
-From the **Drop Rules** page, create rules to block malicious requests:
+From the **Rules** page, create rules to block malicious requests:
 
 - **String match** — exact substring in header/body/url
 - **Regex match** — regex pattern
 - **Byte sequence** — hex-encoded bytes for raw TCP
 
-Each rule can have an action: **drop** (block), **alert** (log only), or **both**. The flag regex from `.env` is automatically loaded as an alert-only rule for all services — it highlights flag-bearing traffic without blocking it (blocking would break the checker).
+Each rule can have an action: **drop** (block), **alert** (log only), or **both**.
+
+Flag and flag ID detection is handled automatically at the packet level (via the flag scanner and Aho-Corasick matcher) — no per-service flag rules are needed.
+
+#### Attack Presets
+
+Click **Presets** to open a library of ready-made rules for common CTF attack patterns. Select categories and individual rules, choose which services to apply them to, and create them in bulk. Available categories:
+
+| Category              | Examples                                                              |
+| --------------------- | --------------------------------------------------------------------- |
+| SQL Injection         | UNION SELECT, blind SLEEP/BENCHMARK, stacked queries, SQLite-specific |
+| XSS                   | script tags, event handlers, javascript: URI                          |
+| Path Traversal        | dot-dot-slash, /etc/passwd, /proc/self, null byte                     |
+| Command Injection     | shell metacharacters, reverse shells, IFS bypass                      |
+| XXE                   | DOCTYPE, ENTITY, SYSTEM file/http                                     |
+| SSTI                  | Jinja2 `{{ }}` / `{% %}`, `${...}`, dunder chains                     |
+| PHP                   | code execution, eval/assert, wrappers, deserialization                |
+| Python                | os/subprocess, eval/exec, pickle, dunder chains                       |
+| Node.js               | child_process, eval/Function, prototype pollution                     |
+| Flag Exfiltration     | curl/wget outbound, nc/ncat, DNS exfil, base64 pipe                   |
+| SSRF                  | internal IPs, localhost, metadata endpoints, file/gopher/dict schemes |
+| Deserialization       | Java serialized objects, gadget chains, Python pickle, .NET           |
+| Auth Bypass           | JWT none/confusion, admin params, mass assignment                     |
+| NoSQL Injection       | $gt/$ne operators, $where JS, $or bypass                              |
+| IDOR / Access Control | sequential ID scan, admin paths, method override                      |
+| Web Shell / Backdoor  | known shells, cmd params, suspicious User-Agents                      |
+| File Upload           | PHP extensions, double extensions, null byte, SVG XSS                 |
 
 ### 8. Alerts
 
@@ -130,7 +156,7 @@ The **Config** page lets you update:
 
 - VM IP, network interface, team password, flag regex
 - Auto-cleanup policies (max age, max DB size) — cleanup runs every 1 minute
-- Flag ID polling settings (API URL, team ID, poll interval, round duration, competition start, keep rounds) — with manual "Refresh" and "Backfill" buttons
+- Flag ID polling settings (API URL, team ID, poll interval, round duration, competition start, keep rounds) — with a manual "Refresh Now" button (backfill runs automatically after each fetch)
 - Competition timing: round duration, competition start time, number of rounds to keep
 - A "Run cleanup now" button, "Clear Packets" button (deletes all packets but keeps config), and current DB size display
 
@@ -198,6 +224,8 @@ All endpoints (except `/api/login`) require a `Bearer` token in the `Authorizati
 | GET            | `/api/rules?service_id=...`        | List drop/alert rules                                                                                                                                                                       |
 | POST           | `/api/rules`                       | Create rule                                                                                                                                                                                 |
 | GET/PUT/DELETE | `/api/rules/{id}`                  | Get/update/delete rule                                                                                                                                                                      |
+| GET            | `/api/rules/presets`               | List available attack preset categories                                                                                                                                                     |
+| POST           | `/api/rules/presets/apply`         | Apply selected presets to services (`{ service_ids, selected }`)                                                                                                                            |
 | GET            | `/api/alerts`                      | List alerts (filters: `service_id`, `rule_id`, `src_ip`, `time_from`, `time_to`)                                                                                                            |
 | GET            | `/api/alerts/{id}`                 | Get alert detail                                                                                                                                                                            |
 | DELETE         | `/api/alerts`                      | Clear all alerts                                                                                                                                                                            |
@@ -208,6 +236,5 @@ All endpoints (except `/api/login`) require a `Bearer` token in the `Authorizati
 | POST           | `/api/cleanup/purge-packets`       | Delete all packets (keeps config)                                                                                                                                                           |
 | GET            | `/api/flagids`                     | Current flag ID map                                                                                                                                                                         |
 | GET            | `/api/flagids/status`              | Flag ID poller status (includes current round, keep rounds)                                                                                                                                 |
-| POST           | `/api/flagids/refresh`             | Trigger immediate flag ID fetch                                                                                                                                                             |
-| POST           | `/api/flagids/backfill`            | Trigger on-demand smart backfill of flag IDs                                                                                                                                                |
+| POST           | `/api/flagids/refresh`             | Trigger immediate flag ID fetch (backfill runs automatically)                                                                                                                               |
 | GET            | `/api/system/stats`                | VM resource metrics (CPU, RAM, disk, DB size, Redis)                                                                                                                                        |
