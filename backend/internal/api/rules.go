@@ -133,6 +133,34 @@ func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request, id string) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) handleRulesBulkDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body.IDs) == 0 {
+		http.Error(w, "ids array is required", http.StatusBadRequest)
+		return
+	}
+
+	deleted, err := s.ruleStore.DeleteRules(body.IDs)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Bulk deleted %d rules", deleted)
+	writeJSON(w, http.StatusOK, map[string]int{"deleted": deleted})
+}
+
 func validateRule(r *dropper.Rule) error {
 	if r.ID == "" {
 		return fmt.Errorf("id is required")
@@ -153,10 +181,13 @@ func validateRule(r *dropper.Rule) error {
 		return fmt.Errorf("type must be one of: string, regex, bytes")
 	}
 
-	switch r.Scope {
-	case dropper.ScopeHeader, dropper.ScopeBody, dropper.ScopeURL, dropper.ScopeRaw:
-	default:
-		return fmt.Errorf("scope must be one of: header, body, url, raw")
+	// Validate scope — supports comma-separated multi-scope (e.g. "body,header")
+	for _, s := range strings.Split(string(r.Scope), ",") {
+		switch dropper.Scope(s) {
+		case dropper.ScopeHeader, dropper.ScopeBody, dropper.ScopeURL, dropper.ScopeRaw:
+		default:
+			return fmt.Errorf("scope must be one of: header, body, url, raw (comma-separated for multiple)")
+		}
 	}
 
 	switch r.Action {

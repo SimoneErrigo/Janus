@@ -55,6 +55,11 @@ function getPeerIP(pkt) {
   return pkt.direction === 'request' ? pkt.src_ip : pkt.dst_ip
 }
 
+function hasDropAction(pkt) {
+  if (!pkt?.matched_rules?.length) return false
+  return pkt.matched_rules.some((r) => r.action === 'drop' || r.action === 'both')
+}
+
 // Try to pretty-print JSON, return original string if not valid JSON
 function tryFormatJSON(str) {
   if (!str) return { text: str, isJSON: false }
@@ -154,13 +159,19 @@ function QuickRulePanel({ packet, services, onCreated, onCancel }) {
           <option value="regex">Regex</option>
           <option value="bytes">Bytes</option>
         </select>
-        <select value={scope} onChange={e => setScope(e.target.value)}
-          className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-red-500">
-          <option value="url">URL</option>
-          <option value="body">Body</option>
-          <option value="header">Header</option>
-          <option value="raw">Raw</option>
-        </select>
+        {['url', 'body', 'header', 'raw'].map(s => {
+          const active = scope.split(',').includes(s)
+          return (
+            <button key={s} type="button" onClick={() => {
+              const cur = scope.split(',').filter(Boolean)
+              const next = active ? cur.filter(x => x !== s) : [...cur, s]
+              if (next.length > 0) setScope(next.join(','))
+            }}
+              className={`text-xs px-2 py-1 rounded cursor-pointer transition-colors border ${active ? 'bg-cyan-900/50 text-cyan-400 border-cyan-600/50' : 'bg-gray-800 text-gray-500 border-gray-700 hover:text-gray-300'}`}>
+              {s}
+            </button>
+          )
+        })}
       </div>
       {/* Multi-service selector */}
       <div className="flex items-center gap-2 flex-wrap text-[10px]">
@@ -224,6 +235,7 @@ export default function Traffic() {
   const [flagRegex, setFlagRegex] = useState('')
   const [flagIDFilter, setFlagIDFilter] = useState(false)
   const [flagIDEnabled, setFlagIDEnabled] = useState(false)
+  const [blockedFilter, setBlockedFilter] = useState(false)
   const [paused, setPaused] = useState(false)
   const pausedRef = useRef(false)
   const [showQuickRule, setShowQuickRule] = useState(false)
@@ -285,6 +297,9 @@ export default function Traffic() {
       if (flagIDFilter) {
         params.contains_flagid = 'true'
       }
+      if (blockedFilter) {
+        params.dropped = 'true'
+      }
       const data = await api.getPackets(params)
       setPackets(data.packets || [])
       setTotal(data.total)
@@ -293,7 +308,7 @@ export default function Traffic() {
     } finally {
       setLoading(false)
     }
-  }, [filters, flagFilter, flagIDFilter])
+  }, [filters, flagFilter, flagIDFilter, blockedFilter])
 
   // Silent full refresh — for metadata changes (backfill) and periodic sync
   const refreshPackets = useCallback(async () => {
@@ -302,12 +317,13 @@ export default function Traffic() {
       const params = { ...filters }
       if (flagFilter) params.flagged = 'true'
       if (flagIDFilter) params.contains_flagid = 'true'
+      if (blockedFilter) params.dropped = 'true'
       const data = await api.getPackets(params)
       if (pausedRef.current) return
       setPackets(data.packets || [])
       setTotal(data.total)
     } catch {}
-  }, [filters, flagFilter, flagIDFilter])
+  }, [filters, flagFilter, flagIDFilter, blockedFilter])
 
   // Check if any text/complex filters are active (can't client-side filter these)
   const hasTextFilters = filters.contains || filters.regex || filters.src_ip || filters.dst_ip || filters.peer_ip
@@ -319,6 +335,8 @@ export default function Traffic() {
   useEffect(() => { filtersRef.current = filters }, [filters])
   useEffect(() => { flagFilterRef.current = flagFilter }, [flagFilter])
   useEffect(() => { flagIDFilterRef.current = flagIDFilter }, [flagIDFilter])
+  const blockedFilterRef = useRef(blockedFilter)
+  useEffect(() => { blockedFilterRef.current = blockedFilter }, [blockedFilter])
 
   const onNewPackets = useCallback((newPkts) => {
     if (pausedRef.current || newPkts.length === 0) return
@@ -333,6 +351,7 @@ export default function Traffic() {
       if (f.session_id && p.session_id !== f.session_id) return false
       if (flagFilterRef.current && !p.flagged) return false
       if (flagIDFilterRef.current && !p.contains_flagid) return false
+      if (blockedFilterRef.current && !hasDropAction(p)) return false
       return true
     })
     if (filtered.length === 0) return
@@ -441,6 +460,11 @@ export default function Traffic() {
     setFilters((f) => ({ ...f, offset: 0 }))
   }
 
+  function toggleBlockedFilter() {
+    setBlockedFilter((prev) => !prev)
+    setFilters((f) => ({ ...f, offset: 0 }))
+  }
+
   function togglePause() {
     setPaused((prev) => {
       const next = !prev
@@ -470,7 +494,7 @@ export default function Traffic() {
   useEffect(() => { setShowQuickRule(false) }, [selected?.id])
 
   const isFlowActive = !!flowMode || !!filters.session_id
-  const hasActiveFilter = filters.contains || filters.regex || flagFilter || flagIDFilter
+  const hasActiveFilter = filters.contains || filters.regex || flagFilter || flagIDFilter || blockedFilter
 
   // Compute effective highlight regex: always include flag regex for yellow highlighting
   const highlightRegex = [filters.regex, flagRegex].filter(Boolean).join('|') || ''
@@ -494,6 +518,20 @@ export default function Traffic() {
     if (!selected?.body_string) return { text: '', isJSON: false }
     return tryFormatJSON(selected.body_string)
   }, [selected?.body_string])
+
+  const matchedRuleForHighlight = useMemo(() => {
+    if (!selected?.matched_rules?.length) return null
+    return selected.matched_rules.find((r) => r.pattern) || null
+  }, [selected?.matched_rules])
+
+  const selectedRuleScope = matchedRuleForHighlight?.scope || ''
+  const selectedRulePattern = matchedRuleForHighlight?.pattern || ''
+  const highlightRuleInURL = !selectedRuleScope || selectedRuleScope.includes('url') || selectedRuleScope.includes('raw')
+  const highlightRuleInHeaders = !selectedRuleScope || selectedRuleScope.includes('header') || selectedRuleScope.includes('raw')
+  const highlightRuleInBody = !selectedRuleScope || selectedRuleScope.includes('body') || selectedRuleScope.includes('raw')
+  const urlRegex = [highlightRegex, highlightRuleInURL ? selectedRulePattern : ''].filter(Boolean).join('|')
+  const headersRegex = [highlightRegex, highlightRuleInHeaders ? selectedRulePattern : ''].filter(Boolean).join('|')
+  const bodyRegex = [highlightRegex, highlightRuleInBody ? selectedRulePattern : ''].filter(Boolean).join('|')
 
   // Resolve service_id to service name
   const serviceName = (id) => {
@@ -595,6 +633,16 @@ export default function Traffic() {
                   <span>&#9881;</span> Contains my Flag IDs
                 </button>
               )}
+              <button
+                onClick={toggleBlockedFilter}
+                className={`text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 ${
+                  blockedFilter
+                    ? 'bg-red-900/50 text-red-300 border border-red-700/50'
+                    : 'bg-gray-800 text-gray-400 border border-gray-700 hover:text-gray-300'
+                }`}
+              >
+                <span>&#9888;</span> Blocked
+              </button>
             </div>
           </div>
         )}
@@ -657,7 +705,7 @@ export default function Traffic() {
                     <td className="px-3 py-1.5">
                       <div className="flex items-center gap-1">
                         {pkt.flagged && <span className="text-yellow-400 text-xs" title="Contains flag">&#9873;</span>}
-                        {pkt.matched_rules?.length > 0 && <span className="text-red-400 text-xs" title="Rule matched">&#9888;</span>}
+                        {hasDropAction(pkt) && <span className="text-red-400 text-xs" title="Dropped by rule">&#9888;</span>}
                         {pkt.contains_flagid && <span className="text-teal-400 text-xs" title="Contains flag ID">&#9881;</span>}
                         <button
                           onClick={(e) => { e.stopPropagation(); showFlow(pkt) }}
@@ -788,7 +836,7 @@ export default function Traffic() {
                   <div className="text-xs">
                     <span className="text-gray-500">URL </span>
                     <span className="text-gray-300 break-all font-mono">
-                      <HighlightedText text={selected.url} contains={filters.contains} regex={highlightRegex} flagidRegex={flagidHighlightRegex} />
+                      <HighlightedText text={selected.url} contains={filters.contains} regex={urlRegex} flagidRegex={flagidHighlightRegex} />
                     </span>
                   </div>
                 )}
@@ -797,7 +845,11 @@ export default function Traffic() {
                   <div className="bg-red-900/20 border border-red-800/50 rounded px-2 py-1">
                     <span className="text-red-400 text-xs font-medium">Matched: </span>
                     {selected.matched_rules.map((r, i) => (
-                      <span key={r.id} className="text-red-300 text-xs">{i > 0 && ', '}{r.name}</span>
+                      <span key={r.id} className="text-red-300 text-xs">
+                        {i > 0 && ', '}
+                        {r.name}
+                        {r.action ? <span className="text-gray-500 ml-1">({r.action})</span> : null}
+                      </span>
                     ))}
                   </div>
                 )}
@@ -809,7 +861,7 @@ export default function Traffic() {
                       {Object.entries(selected.headers).map(([k, v]) => (
                         <div key={k}>
                           <span className="text-cyan-400">{k}:</span>{' '}
-                          <HighlightedText text={v} contains={filters.contains} regex={highlightRegex} flagidRegex={flagidHighlightRegex} />
+                          <HighlightedText text={v} contains={filters.contains} regex={headersRegex} flagidRegex={flagidHighlightRegex} />
                         </div>
                       ))}
                     </div>
@@ -832,7 +884,7 @@ export default function Traffic() {
                       </button>
                     </div>
                     <pre className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 overflow-auto whitespace-pre-wrap break-all" style={{ maxHeight: '60vh' }}>
-                      <HighlightedText text={formattedBody.text} contains={filters.contains} regex={highlightRegex} flagidRegex={flagidHighlightRegex} />
+                      <HighlightedText text={formattedBody.text} contains={filters.contains} regex={bodyRegex} flagidRegex={flagidHighlightRegex} />
                     </pre>
                   </div>
                 )}

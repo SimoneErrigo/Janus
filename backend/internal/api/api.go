@@ -68,6 +68,7 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/packets", s.handlePackets)
 	protected.HandleFunc("/api/rules/presets/apply", s.handlePresetsApply)
 	protected.HandleFunc("/api/rules/presets", s.handlePresetsGet)
+	protected.HandleFunc("/api/rules/bulk-delete", s.handleRulesBulkDelete)
 	protected.HandleFunc("/api/rules", s.handleRules)
 	protected.HandleFunc("/api/rules/", s.handleRuleByID)
 	protected.HandleFunc("/api/alerts", s.handleAlerts)
@@ -80,7 +81,6 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/flagids", s.handleFlagIDs)
 	protected.HandleFunc("/api/flagids/status", s.handleFlagIDStatus)
 	protected.HandleFunc("/api/flagids/refresh", s.handleFlagIDRefresh)
-	protected.HandleFunc("/api/flagids/backfill", s.handleFlagIDBackfill)
 	protected.HandleFunc("/api/system/stats", s.handleSystemStats)
 
 	s.mux.Handle("/api/", authMiddleware(protected))

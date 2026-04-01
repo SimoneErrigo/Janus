@@ -12,6 +12,7 @@ export default function Rules() {
   const [editing, setEditing] = useState(null)
   const [error, setError] = useState('')
   const [showPresets, setShowPresets] = useState(false)
+  const [selectedIds, setSelectedIds] = useState(new Set())
 
   useEffect(() => {
     api.listServices().then((data) => {
@@ -30,6 +31,7 @@ export default function Rules() {
       const serviceId = selectedService === '_all' ? '' : selectedService
       const data = await api.listRules(serviceId)
       setRules(data || [])
+      setSelectedIds(new Set())
     } catch (err) {
       setError(err.message)
     }
@@ -81,6 +83,32 @@ export default function Rules() {
     }
   }
 
+  async function handleBulkDelete() {
+    if (selectedIds.size === 0) return
+    if (!confirm(`Delete ${selectedIds.size} selected rule(s)?`)) return
+    try {
+      await api.bulkDeleteRules([...selectedIds])
+      setSelectedIds(new Set())
+      loadRules()
+    } catch (err) {
+      setError(err.message)
+    }
+  }
+
+  function toggleSelect(id) {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  function toggleSelectAll() {
+    if (selectedIds.size === rules.length) setSelectedIds(new Set())
+    else setSelectedIds(new Set(rules.map(r => r.id)))
+  }
+
   return (
     <div className="p-6">
       <div className="flex items-center justify-between mb-6">
@@ -105,6 +133,14 @@ export default function Rules() {
           >
             <span>&#9889;</span> Presets
           </button>
+          {selectedIds.size > 0 && (
+            <button
+              onClick={handleBulkDelete}
+              className="bg-red-900/50 hover:bg-red-800/50 text-red-400 text-sm px-4 py-2 rounded transition-colors cursor-pointer"
+            >
+              Delete {selectedIds.size} selected
+            </button>
+          )}
           <button
             onClick={() => setEditing({ _isNew: true, service_id: selectedService === '_all' ? (services[0]?.id || '') : selectedService, name: '', type: 'string', scope: 'body', pattern: '', priority: 10, enabled: true, action: 'drop' })}
             disabled={!selectedService || services.length === 0}
@@ -134,9 +170,18 @@ export default function Rules() {
         <p className="text-gray-600 text-center py-8">No services configured. Add a service first.</p>
       ) : (
         <div className="space-y-2">
+          {rules.length > 0 && (
+            <div className="flex items-center gap-2 mb-2 px-1">
+              <input type="checkbox" checked={selectedIds.size === rules.length && rules.length > 0}
+                onChange={toggleSelectAll} className="accent-cyan-500 cursor-pointer" />
+              <span className="text-xs text-gray-500">Select all ({rules.length})</span>
+            </div>
+          )}
           {rules.map((rule) => (
-            <div key={rule.id} className="bg-gray-900 border border-gray-800 rounded-lg p-4 flex items-center justify-between">
+            <div key={rule.id} className={`bg-gray-900 border rounded-lg p-4 flex items-center justify-between ${selectedIds.has(rule.id) ? 'border-cyan-700/50' : 'border-gray-800'}`}>
               <div className="flex items-center gap-4">
+                <input type="checkbox" checked={selectedIds.has(rule.id)}
+                  onChange={() => toggleSelect(rule.id)} className="accent-cyan-500 cursor-pointer flex-shrink-0" />
                 <button
                   onClick={() => handleToggle(rule)}
                   className={`w-10 h-5 rounded-full relative transition-colors cursor-pointer ${rule.enabled ? 'bg-cyan-600' : 'bg-gray-700'}`}
@@ -464,10 +509,21 @@ function RuleForm({ rule, services, onSave, onCancel }) {
         </div>
         <div>
           <label className="block text-sm text-gray-400 mb-1">Scope</label>
-          <select value={form.scope} onChange={(e) => set('scope', e.target.value)}
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500">
-            {scopes.map((s) => <option key={s} value={s}>{s}</option>)}
-          </select>
+          <div className="flex items-center gap-2 flex-wrap">
+            {scopes.map((s) => {
+              const active = (form.scope || '').split(',').includes(s)
+              return (
+                <button type="button" key={s} onClick={() => {
+                  const current = (form.scope || '').split(',').filter(Boolean)
+                  const next = active ? current.filter(x => x !== s) : [...current, s]
+                  if (next.length > 0) set('scope', next.join(','))
+                }}
+                  className={`text-xs px-2.5 py-1.5 rounded cursor-pointer transition-colors border ${active ? 'bg-cyan-900/50 text-cyan-400 border-cyan-700/50' : 'bg-gray-800 text-gray-500 border-gray-700 hover:text-gray-300'}`}>
+                  {s}
+                </button>
+              )
+            })}
+          </div>
         </div>
         <div className="col-span-2">
           <label className="block text-sm text-gray-400 mb-1">Pattern</label>

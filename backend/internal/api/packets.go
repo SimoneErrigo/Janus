@@ -111,6 +111,16 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 		q.ContainsFlagID = &b
 	}
 
+	if v := params.Get("has_matched_rules"); v != "" {
+		b := v == "true" || v == "1"
+		q.HasMatchedRules = &b
+	}
+
+	if v := params.Get("dropped"); v != "" {
+		b := v == "true" || v == "1"
+		q.Dropped = &b
+	}
+
 	packets, total, err := s.packetStore.Query(q)
 	if err != nil {
 		http.Error(w, "query error: "+err.Error(), http.StatusInternalServerError)

@@ -41,7 +41,8 @@ ROUND_DURATION=120
 COMPETITION_START=2026-03-29T10:00:00Z
 KEEP_ROUNDS=5
 
-# Redis caching (improves performance on hot paths)
+# Redis caching (rules cache — improves performance on hot paths)
+REDIS_ADDR=127.0.0.1:6379
 REDIS_PASSWORD=changeme_redis
 ```
 
@@ -51,8 +52,8 @@ REDIS_PASSWORD=changeme_redis
 docker compose up -d
 ```
 
-- **Frontend dashboard:** `http://<VM_IP>:3000`
-- **Backend API:** `http://<VM_IP>:8080`
+- **Frontend dashboard:** `http://localhost:3000` (bound to localhost only)
+- **Backend API:** `http://localhost:8080` (bound to localhost only)
 - **Redis:** `127.0.0.1:6379` (internal only, not exposed to the competition network)
 - **Dozzle (container logs):** `http://localhost:9999` (internal only, bound to localhost)
 
@@ -169,12 +170,11 @@ The sidebar has a **Logs** link that opens [Dozzle](http://localhost:9999) in a 
 
 ### 11. Redis caching
 
-Redis is used as a performance cache for two hot paths:
+Redis is used as a performance cache for the rules evaluation hot path:
 
-- **Rules evaluation** — rules are cached per service, eliminating a JSON file read on every packet
-- **Packet queries** — repeated identical queries are cached for 5 seconds
+- **Rules evaluation** — rules are cached per service, eliminating a JSON file read on every packet; the cache is invalidated automatically whenever a rule is created, updated, or deleted
 
-Redis is never the source of truth. If Redis is unreachable, Janus falls back to SQLite/JSON transparently with no loss of correctness.
+Redis is never the source of truth. If Redis is unreachable, Janus falls back to the JSON rules file transparently with no loss of correctness.
 
 ## Performance
 
@@ -238,3 +238,5 @@ All endpoints (except `/api/login`) require a `Bearer` token in the `Authorizati
 | GET            | `/api/flagids/status`              | Flag ID poller status (includes current round, keep rounds)                                                                                                                                 |
 | POST           | `/api/flagids/refresh`             | Trigger immediate flag ID fetch (backfill runs automatically)                                                                                                                               |
 | GET            | `/api/system/stats`                | VM resource metrics (CPU, RAM, disk, DB size, Redis)                                                                                                                                        |
+
+> **Note:** Backfill is fully automatic — after every flag ID fetch, Janus re-scans packets from the last 60 seconds using the Aho-Corasick automaton. No manual backfill endpoint is exposed.

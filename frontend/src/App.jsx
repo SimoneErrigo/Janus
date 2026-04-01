@@ -6,6 +6,7 @@ import Services from './pages/Services'
 import Traffic from './pages/Traffic'
 import Rules from './pages/Rules'
 import Alerts from './pages/Alerts'
+import Blocks from './pages/Blocks'
 import Config from './pages/Config'
 import System from './pages/System'
 
@@ -24,6 +25,7 @@ export default function App() {
         <Route path="traffic" element={<Traffic />} />
         <Route path="rules" element={<Rules />} />
         <Route path="alerts" element={<Alerts />} />
+        <Route path="blocks" element={<Blocks />} />
         <Route path="system" element={<System />} />
         <Route path="config" element={<Config />} />
       </Route>

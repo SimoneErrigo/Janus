@@ -123,10 +123,25 @@ func (e *Engine) EvaluateActions(req *HTTPRequest) EvalResult {
 }
 
 func (e *Engine) matches(rule *Rule, req *HTTPRequest) bool {
+	// Support comma-separated scopes (e.g. "body,header")
+	scopes := strings.Split(string(rule.Scope), ",")
+	for _, s := range scopes {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if e.matchesScope(Scope(s), rule, req) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Engine) matchesScope(scope Scope, rule *Rule, req *HTTPRequest) bool {
 	var target string
 	var targetBytes []byte
 
-	switch rule.Scope {
+	switch scope {
 	case ScopeHeader:
 		target = req.Headers
 	case ScopeBody:

@@ -75,10 +75,11 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 		alerts = []*sniffer.Alert{}
 	}
 
-	// Enrich alerts with rule names from the rule store
+	// Enrich alerts with rule names and scopes from the rule store
 	for _, a := range alerts {
 		if rule, ok := s.ruleStore.GetRule(a.RuleID); ok {
 			a.RuleName = rule.Name
+			a.MatchedScope = string(rule.Scope)
 		}
 	}
 
@@ -99,9 +100,10 @@ func (s *Server) getAlert(w http.ResponseWriter, r *http.Request, id int64) {
 		return
 	}
 
-	// Enrich with rule name
+	// Enrich with rule name and scope
 	if rule, ok := s.ruleStore.GetRule(alert.RuleID); ok {
 		alert.RuleName = rule.Name
+		alert.MatchedScope = string(rule.Scope)
 	}
 
 	// Get linked packet (flag IDs are now tagged at ingestion, no live enrichment needed)

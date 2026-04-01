@@ -108,6 +108,7 @@ export const api = {
   createRule: (data) => request('/rules', { method: 'POST', body: data }),
   updateRule: (id, data) => request(`/rules/${id}`, { method: 'PUT', body: data }),
   deleteRule: (id) => request(`/rules/${id}`, { method: 'DELETE' }),
+  bulkDeleteRules: (ids) => request('/rules/bulk-delete', { method: 'POST', body: { ids } }),
 
   // Rule presets
   getPresets: () => request('/rules/presets'),
@@ -132,7 +133,6 @@ export const api = {
   getFlagIDs: () => request('/flagids'),
   getFlagIDStatus: () => request('/flagids/status'),
   refreshFlagIDs: () => request('/flagids/refresh', { method: 'POST' }),
-  triggerBackfill: () => request('/flagids/backfill', { method: 'POST' }),
 
   // Cleanup
   getCleanupConfig: () => request('/config/cleanup'),

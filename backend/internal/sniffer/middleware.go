@@ -76,7 +76,13 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 				URL:       r.URL.String(),
 			})
 			for _, rule := range result.AllMatched {
-				matchedRules = append(matchedRules, MatchedRuleInfo{ID: rule.ID, Name: rule.Name, Action: string(rule.Action)})
+				matchedRules = append(matchedRules, MatchedRuleInfo{
+					ID:      rule.ID,
+					Name:    rule.Name,
+					Action:  string(rule.Action),
+					Pattern: rule.Pattern,
+					Scope:   string(rule.Scope),
+				})
 			}
 			shouldDrop = result.ShouldDrop
 			alertRules = result.AlertRules
@@ -92,19 +98,19 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 
 		// Build and insert request packet
 		reqPacket := &Packet{
-			ServiceID:    svc.ID,
-			SessionID:    sessionID,
-			Timestamp:    start,
-			SrcIP:        srcIP,
-			SrcPort:      srcPort,
-			DstIP:        dstIP,
-			DstPort:      dstPort,
-			Protocol:     string(svc.Protocol),
-			Direction:    DirectionRequest,
-			Method:       r.Method,
-			URL:          r.URL.String(),
-			Headers:      reqHeaders,
-			Body:         reqBody,
+			ServiceID:      svc.ID,
+			SessionID:      sessionID,
+			Timestamp:      start,
+			SrcIP:          srcIP,
+			SrcPort:        srcPort,
+			DstIP:          dstIP,
+			DstPort:        dstPort,
+			Protocol:       string(svc.Protocol),
+			Direction:      DirectionRequest,
+			Method:         r.Method,
+			URL:            r.URL.String(),
+			Headers:        reqHeaders,
+			Body:           reqBody,
 			MatchedRules:   matchedRules,
 			Flagged:        flagged,
 			ContainsFlagID: containsFlagID,
@@ -162,7 +168,13 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 				URL:       r.URL.String(),
 			})
 			for _, rule := range respResult.AllMatched {
-				respMatchedRules = append(respMatchedRules, MatchedRuleInfo{ID: rule.ID, Name: rule.Name, Action: string(rule.Action)})
+				respMatchedRules = append(respMatchedRules, MatchedRuleInfo{
+					ID:      rule.ID,
+					Name:    rule.Name,
+					Action:  string(rule.Action),
+					Pattern: rule.Pattern,
+					Scope:   string(rule.Scope),
+				})
 			}
 			respAlertRules = respResult.AlertRules
 		}
@@ -171,20 +183,20 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		}
 
 		respPacket := &Packet{
-			ServiceID:    svc.ID,
-			SessionID:    sessionID,
-			Timestamp:    time.Now(),
-			SrcIP:        dstIP,
-			SrcPort:      dstPort,
-			DstIP:        srcIP,
-			DstPort:      srcPort,
-			Protocol:     string(svc.Protocol),
-			Direction:    DirectionResponse,
-			Method:       r.Method,
-			URL:          r.URL.String(),
-			Status:       rw.statusCode,
-			Headers:      respHeaders,
-			Body:         respBody,
+			ServiceID:      svc.ID,
+			SessionID:      sessionID,
+			Timestamp:      time.Now(),
+			SrcIP:          dstIP,
+			SrcPort:        dstPort,
+			DstIP:          srcIP,
+			DstPort:        srcPort,
+			Protocol:       string(svc.Protocol),
+			Direction:      DirectionResponse,
+			Method:         r.Method,
+			URL:            r.URL.String(),
+			Status:         rw.statusCode,
+			Headers:        respHeaders,
+			Body:           respBody,
 			MatchedRules:   respMatchedRules,
 			Flagged:        respFlagged,
 			ContainsFlagID: respContainsFlagID,
@@ -247,8 +259,8 @@ func CheckFlagged(flagRegex *regexp.Regexp, scanner *flagids.FlagScanner, url, h
 // responseCapture wraps http.ResponseWriter to capture status code and body.
 type responseCapture struct {
 	http.ResponseWriter
-	statusCode int
-	body       bytes.Buffer
+	statusCode  int
+	body        bytes.Buffer
 	wroteHeader bool
 }
 

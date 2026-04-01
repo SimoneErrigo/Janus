@@ -90,7 +90,13 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 				Body:      initialData,
 			})
 			for _, rule := range result.AllMatched {
-				matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{ID: rule.ID, Name: rule.Name, Action: string(rule.Action)})
+				matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{
+					ID:      rule.ID,
+					Name:    rule.Name,
+					Action:  string(rule.Action),
+					Pattern: rule.Pattern,
+					Scope:   string(rule.Scope),
+				})
 			}
 			shouldDrop = result.ShouldDrop
 			alertRules = result.AlertRules

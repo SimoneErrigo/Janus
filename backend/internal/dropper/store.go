@@ -59,6 +59,9 @@ func (s *RuleStore) ListRules(serviceID string) []*Rule {
 		}
 	}
 	sort.Slice(list, func(i, j int) bool {
+		if list[i].Name != list[j].Name {
+			return list[i].Name < list[j].Name
+		}
 		return list[i].Priority < list[j].Priority
 	})
 	return list
@@ -130,6 +133,33 @@ func (s *RuleStore) DeleteRule(id string) error {
 		s.notifyChange(serviceID)
 	}
 	return err
+}
+
+// DeleteRules removes multiple rules by ID and persists the change.
+func (s *RuleStore) DeleteRules(ids []string) (int, error) {
+	s.mu.Lock()
+
+	affectedServices := map[string]bool{}
+	deleted := 0
+	for _, id := range ids {
+		if r, exists := s.rules[id]; exists {
+			affectedServices[r.ServiceID] = true
+			delete(s.rules, id)
+			deleted++
+		}
+	}
+	if deleted == 0 {
+		s.mu.Unlock()
+		return 0, nil
+	}
+	err := s.save()
+	s.mu.Unlock()
+	if err == nil {
+		for svcID := range affectedServices {
+			s.notifyChange(svcID)
+		}
+	}
+	return deleted, err
 }
 
 func (s *RuleStore) load() error {

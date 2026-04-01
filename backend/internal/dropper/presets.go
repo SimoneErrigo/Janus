@@ -25,7 +25,7 @@ func GetPresets() []PresetCategory {
 			Rules: []PresetRule{
 				{Name: "SQLi: UNION SELECT", Type: MatchRegex, Scope: ScopeBody, Pattern: `(?i)union\s+(all\s+)?select\b`, Action: ActionBoth},
 				{Name: "SQLi: OR/AND bypass", Type: MatchRegex, Scope: ScopeBody, Pattern: `(?i)['"]\s*(or|and)\s+['"]?\d+['"]?\s*=\s*['"]?\d+`, Action: ActionBoth},
-				{Name: "SQLi: comment terminator", Type: MatchRegex, Scope: ScopeBody, Pattern: `(?i)(--|#|/\*|\*/|;--|\|\|-- -)`, Action: ActionAlert},
+				{Name: "SQLi: comment terminator", Type: MatchRegex, Scope: ScopeBody, Pattern: `(?i)(?:\s|'|")(--|#|\/\*|%2d%2d|%23)`, Action: ActionAlert},
 				{Name: "SQLi: SLEEP/BENCHMARK (blind)", Type: MatchRegex, Scope: ScopeBody, Pattern: `(?i)(sleep|benchmark|waitfor\s+delay|pg_sleep)\s*\(`, Action: ActionBoth},
 				{Name: "SQLi: stacked queries", Type: MatchRegex, Scope: ScopeBody, Pattern: `(?i);\s*(drop|alter|delete|update|insert|create)\s`, Action: ActionDrop},
 				{Name: "SQLi: extractvalue/updatexml", Type: MatchRegex, Scope: ScopeBody, Pattern: `(?i)(extractvalue|updatexml|load_file|into\s+(out|dump)file)\s*\(`, Action: ActionBoth},

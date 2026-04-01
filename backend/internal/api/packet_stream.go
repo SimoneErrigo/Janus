@@ -13,37 +13,44 @@ import (
 
 // packetEvent is a lightweight packet representation for SSE streaming.
 // Excludes body/headers to keep events small.
+type packetRuleEvent struct {
+	ID     string `json:"id"`
+	Name   string `json:"name,omitempty"`
+	Action string `json:"action"`
+}
+
 type packetEvent struct {
-	ID             int64                      `json:"id"`
-	ServiceID      string                     `json:"service_id"`
-	SessionID      string                     `json:"session_id"`
-	Timestamp      time.Time                  `json:"timestamp"`
-	SrcIP          string                     `json:"src_ip"`
-	SrcPort        int                        `json:"src_port"`
-	DstIP          string                     `json:"dst_ip"`
-	DstPort        int                        `json:"dst_port"`
-	Protocol       string                     `json:"protocol"`
-	Direction      sniffer.Direction           `json:"direction"`
-	Method         string                     `json:"method,omitempty"`
-	URL            string                     `json:"url,omitempty"`
-	Status         int                        `json:"status,omitempty"`
-	MatchedRules   []sniffer.MatchedRuleInfo  `json:"matched_rules"`
-	Flagged        bool                       `json:"flagged"`
-	ContainsFlagID bool                       `json:"contains_flagid"`
-	MatchedFlagIDs []string                   `json:"matched_flagids,omitempty"`
-	FlagIDRound    int                        `json:"flagid_round"`
-	BodySize       int                        `json:"body_size"`
+	ID             int64             `json:"id"`
+	ServiceID      string            `json:"service_id"`
+	SessionID      string            `json:"session_id"`
+	Timestamp      time.Time         `json:"timestamp"`
+	SrcIP          string            `json:"src_ip"`
+	SrcPort        int               `json:"src_port"`
+	DstIP          string            `json:"dst_ip"`
+	DstPort        int               `json:"dst_port"`
+	Protocol       string            `json:"protocol"`
+	Direction      sniffer.Direction `json:"direction"`
+	Method         string            `json:"method,omitempty"`
+	URL            string            `json:"url,omitempty"`
+	Status         int               `json:"status,omitempty"`
+	MatchedRules   []packetRuleEvent `json:"matched_rules"`
+	Flagged        bool              `json:"flagged"`
+	ContainsFlagID bool              `json:"contains_flagid"`
+	BodySize       int               `json:"body_size"`
 }
 
 func toPacketEvent(p *sniffer.Packet) packetEvent {
+	rules := make([]packetRuleEvent, 0, len(p.MatchedRules))
+	for _, r := range p.MatchedRules {
+		rules = append(rules, packetRuleEvent{ID: r.ID, Name: r.Name, Action: r.Action})
+	}
 	return packetEvent{
 		ID: p.ID, ServiceID: p.ServiceID, SessionID: p.SessionID,
 		Timestamp: p.Timestamp, SrcIP: p.SrcIP, SrcPort: p.SrcPort,
 		DstIP: p.DstIP, DstPort: p.DstPort, Protocol: p.Protocol,
 		Direction: p.Direction, Method: p.Method, URL: p.URL, Status: p.Status,
-		MatchedRules: p.MatchedRules, Flagged: p.Flagged,
-		ContainsFlagID: p.ContainsFlagID, MatchedFlagIDs: p.MatchedFlagIDs,
-		FlagIDRound: p.FlagIDRound, BodySize: len(p.Body),
+		MatchedRules: rules, Flagged: p.Flagged,
+		ContainsFlagID: p.ContainsFlagID, BodySize: len(p.Body),
 	}
 }
 

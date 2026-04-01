@@ -28,7 +28,7 @@ type PacketStore struct {
 
 	dbPath   string // path to packets.db (for accurate file-size reporting)
 	muChange sync.RWMutex
-	onChange  func(PacketChangeKind, *Packet)
+	onChange func(PacketChangeKind, *Packet)
 }
 
 // NewPacketStore opens (or creates) the SQLite database at dataDir/packets.db.
@@ -102,7 +102,8 @@ func migrate(db *sql.DB) error {
 			body_string   TEXT    NOT NULL DEFAULT '',
 			matched_rules    TEXT    NOT NULL DEFAULT '[]',
 			flagged          INTEGER NOT NULL DEFAULT 0,
-			contains_flagid  INTEGER NOT NULL DEFAULT 0
+			contains_flagid  INTEGER NOT NULL DEFAULT 0,
+			has_drop_match   INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS idx_packets_service_id ON packets(service_id);
 		CREATE INDEX IF NOT EXISTS idx_packets_timestamp  ON packets(timestamp);
@@ -123,6 +124,7 @@ func migrate(db *sql.DB) error {
 		"ALTER TABLE packets ADD COLUMN contains_flagid INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE packets ADD COLUMN matched_flagids TEXT NOT NULL DEFAULT '[]'",
 		"ALTER TABLE packets ADD COLUMN flagid_round INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE packets ADD COLUMN has_drop_match INTEGER NOT NULL DEFAULT 0",
 	} {
 		db.Exec(col) // ignore "duplicate column" errors
 	}
@@ -130,6 +132,7 @@ func migrate(db *sql.DB) error {
 	// Create indexes for columns added by migrations (must run after ALTER TABLE)
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_session_id ON packets(session_id)")
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_contains_flagid ON packets(contains_flagid)")
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_has_drop_match ON packets(has_drop_match)")
 
 	// Composite index for the most common query: filter by service + sort by time
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_service_ts ON packets(service_id, timestamp DESC)")
@@ -139,6 +142,10 @@ func migrate(db *sql.DB) error {
 
 	// Index for smart backfill: find packets scanned with older AC automaton
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_flagid_round ON packets(flagid_round, timestamp)")
+
+	// Backfill existing rows once after migration.
+	// A row is considered dropped if any matched rule has action drop/both.
+	db.Exec("UPDATE packets SET has_drop_match = CASE WHEN (matched_rules LIKE '%\"action\":\"drop\"%' OR matched_rules LIKE '%\"action\":\"both\"%') THEN 1 ELSE 0 END WHERE has_drop_match = 0")
 
 	// Step 6: alerts table
 	_, err = db.Exec(`
@@ -213,6 +220,13 @@ func (s *PacketStore) Insert(p *Packet) error {
 	if p.ContainsFlagID {
 		containsFlagIDInt = 1
 	}
+	hasDropMatchInt := 0
+	for _, r := range p.MatchedRules {
+		if r.Action == "drop" || r.Action == "both" {
+			hasDropMatchInt = 1
+			break
+		}
+	}
 
 	if p.MatchedFlagIDs == nil {
 		p.MatchedFlagIDs = []string{}
@@ -225,8 +239,8 @@ func (s *PacketStore) Insert(p *Packet) error {
 	res, err := s.execInsertRetry(`
 		INSERT INTO packets (service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port,
 			protocol, direction, method, url, status, headers, body, body_string,
-			matched_rules, flagged, contains_flagid, matched_flagids, flagid_round)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, has_drop_match)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ServiceID, p.SessionID,
 		p.Timestamp.UTC().Format(time.RFC3339Nano),
 		p.SrcIP, p.SrcPort,
@@ -236,7 +250,7 @@ func (s *PacketStore) Insert(p *Packet) error {
 		string(headersJSON),
 		p.Body, p.BodyString,
 		string(matchedRulesJSON), flaggedInt, containsFlagIDInt,
-		string(matchedFlagIDsJSON), p.FlagIDRound,
+		string(matchedFlagIDsJSON), p.FlagIDRound, hasDropMatchInt,
 	)
 	if err != nil {
 		return fmt.Errorf("inserting packet: %w", err)
@@ -296,13 +310,6 @@ func (s *PacketStore) Query(q PacketQuery) ([]*Packet, int, error) {
 	return packets, total, nil
 }
 
-// QueryWithLiveFlagID runs Query. Packets are now properly tagged at ingestion
-// and smart backfill catches the limbo window, so the contains_flagid column
-// in the DB is authoritative — no live enrichment needed.
-func (s *PacketStore) QueryWithLiveFlagID(q PacketQuery, live bool, checker FlagIDChecker) ([]*Packet, int, error) {
-	return s.Query(q)
-}
-
 // queryWithRegex fetches SQL-filtered rows, applies regex in Go, then paginates.
 func (s *PacketStore) queryWithRegex(q PacketQuery, where string, args []interface{}, selectCols, sortOrder string, limit, offset int) ([]*Packet, int, error) {
 	re, err := regexp.Compile(q.Regex)
@@ -349,7 +356,7 @@ func regexMatchesPacket(re *regexp.Regexp, p *Packet) bool {
 	}
 	// Search in headers
 	for k, v := range p.Headers {
-		if re.MatchString(k+": "+v) {
+		if re.MatchString(k + ": " + v) {
 			return true
 		}
 	}
@@ -782,119 +789,6 @@ func (s *PacketStore) SmartBackfillFlagIDs(checker FlagIDChecker, currentRound i
 	return total, nil
 }
 
-// LegacyBackfillFlagIDs is the old LIKE-based backfill kept as a manual fallback.
-// Prefer SmartBackfillFlagIDs for automatic use.
-func (s *PacketStore) LegacyBackfillFlagIDs(values []string) (int64, error) {
-	if len(values) == 0 {
-		return 0, nil
-	}
-
-	// Filter to valid values (>= 6 chars)
-	var valid []string
-	for _, v := range values {
-		if len(v) >= 6 {
-			valid = append(valid, v)
-		}
-	}
-	if len(valid) == 0 {
-		return 0, nil
-	}
-
-	// Only backfill recent packets — older ones have already been seen
-	cutoff := time.Now().Add(-5 * time.Minute).UTC().Format(time.RFC3339Nano)
-
-	// Build LIKE conditions for candidate selection
-	var conditions []string
-	var args []interface{}
-	// First arg is the time cutoff
-	args = append(args, cutoff)
-	for _, v := range valid {
-		like := "%" + v + "%"
-		conditions = append(conditions, "(body_string LIKE ? OR url LIKE ? OR headers LIKE ?)")
-		args = append(args, like, like, like)
-	}
-
-	// Process in batches (SQLite max 999 params; 3 per value = 333 per batch, minus 1 for cutoff)
-	const maxPerBatch = 332
-	var total int64
-	for i := 0; i < len(conditions); i += maxPerBatch {
-		end := i + maxPerBatch
-		if end > len(conditions) {
-			end = len(conditions)
-		}
-		batch := conditions[i:end]
-		// +1 offset for the cutoff arg at position 0
-		batchArgs := append([]interface{}{cutoff}, args[1+i*3:1+end*3]...)
-		batchValues := valid[i:end]
-
-		// SELECT candidates, compute matched values per packet, then UPDATE
-		query := "SELECT id, body_string, url, headers FROM packets WHERE contains_flagid = 0 AND timestamp >= ? AND (" + strings.Join(batch, " OR ") + ")"
-		rows, err := s.db.Query(query, batchArgs...)
-		if err != nil {
-			return total, fmt.Errorf("backfilling flagids select: %w", err)
-		}
-
-		type pktMatch struct {
-			id      int64
-			matched []string
-		}
-		var updates []pktMatch
-		for rows.Next() {
-			var id int64
-			var bodyStr, url, headers string
-			if err := rows.Scan(&id, &bodyStr, &url, &headers); err != nil {
-				rows.Close()
-				return total, fmt.Errorf("backfilling flagids scan: %w", err)
-			}
-			text := url + " " + headers + " " + bodyStr
-			var matched []string
-			for _, v := range batchValues {
-				if strings.Contains(text, v) {
-					matched = append(matched, v)
-				}
-			}
-			if len(matched) > 0 {
-				updates = append(updates, pktMatch{id: id, matched: matched})
-			}
-		}
-		rows.Close()
-
-		// Chunked transactions: shorter write locks so proxy inserts rarely see SQLITE_BUSY.
-		const updateChunk = 32
-		if len(updates) > 0 {
-			for chunkStart := 0; chunkStart < len(updates); chunkStart += updateChunk {
-				chunkEnd := chunkStart + updateChunk
-				if chunkEnd > len(updates) {
-					chunkEnd = len(updates)
-				}
-				tx, err := s.db.Begin()
-				if err != nil {
-					return total, fmt.Errorf("backfilling flagids begin tx: %w", err)
-				}
-				for _, u := range updates[chunkStart:chunkEnd] {
-					mjson, _ := json.Marshal(u.matched)
-					_, err := tx.Exec(
-						"UPDATE packets SET contains_flagid = 1, matched_flagids = ? WHERE id = ?",
-						string(mjson), u.id,
-					)
-					if err != nil {
-						tx.Rollback()
-						return total, fmt.Errorf("backfilling flagids update: %w", err)
-					}
-					total++
-				}
-				if err := tx.Commit(); err != nil {
-					return total, fmt.Errorf("backfilling flagids commit: %w", err)
-				}
-			}
-		}
-	}
-	if total > 0 {
-		s.emitChange(PacketChangeMetadata, nil)
-	}
-	return total, nil
-}
-
 // DBSize returns the total on-disk size of the database (main + WAL + SHM).
 func (s *PacketStore) DBSize() (int64, error) {
 	var total int64
@@ -1230,6 +1124,17 @@ func buildWhere(q PacketQuery) (string, []interface{}) {
 		} else {
 			conditions = append(conditions, "contains_flagid = 0")
 		}
+	}
+	if q.HasMatchedRules != nil {
+		if *q.HasMatchedRules {
+			conditions = append(conditions, "matched_rules != '[]'")
+		} else {
+			conditions = append(conditions, "matched_rules = '[]'")
+		}
+	}
+	if q.Dropped != nil && *q.Dropped {
+		// Fast path: indexed column computed at ingestion time.
+		conditions = append(conditions, "has_drop_match = 1")
 	}
 
 	if len(conditions) == 0 {

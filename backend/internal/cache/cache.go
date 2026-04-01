@@ -20,13 +20,16 @@ type Client struct {
 	rdb *redis.Client
 	mu  sync.RWMutex
 	ok  bool // tracks whether Redis is reachable
+
+	memMu     sync.RWMutex
+	rulesMemo map[string][]*dropper.Rule
 }
 
 // New creates a Redis cache client. If addr is empty, returns a no-op client.
 func New(addr, password string) *Client {
 	if addr == "" {
 		log.Println("[cache] Redis address not configured, caching disabled")
-		return &Client{}
+		return &Client{rulesMemo: make(map[string][]*dropper.Rule)}
 	}
 
 	rdb := redis.NewClient(&redis.Options{
@@ -38,7 +41,7 @@ func New(addr, password string) *Client {
 		WriteTimeout: 1 * time.Second,
 	})
 
-	c := &Client{rdb: rdb}
+	c := &Client{rdb: rdb, rulesMemo: make(map[string][]*dropper.Rule)}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -93,6 +96,10 @@ const rulesKeyPrefix = "rules:"
 
 // SetServiceRules stores the full rule set for a service.
 func (c *Client) SetServiceRules(serviceID string, rules []*dropper.Rule) {
+	c.memMu.Lock()
+	c.rulesMemo[serviceID] = cloneRules(rules)
+	c.memMu.Unlock()
+
 	if !c.Available() {
 		return
 	}
@@ -114,6 +121,14 @@ func (c *Client) SetServiceRules(serviceID string, rules []*dropper.Rule) {
 // GetServiceRules retrieves the cached rule set for a service.
 // Returns nil, false on cache miss or error.
 func (c *Client) GetServiceRules(serviceID string) ([]*dropper.Rule, bool) {
+	c.memMu.RLock()
+	if rules, ok := c.rulesMemo[serviceID]; ok {
+		cp := cloneRules(rules)
+		c.memMu.RUnlock()
+		return cp, true
+	}
+	c.memMu.RUnlock()
+
 	if !c.Available() {
 		return nil, false
 	}
@@ -134,11 +149,18 @@ func (c *Client) GetServiceRules(serviceID string) ([]*dropper.Rule, bool) {
 		log.Printf("[cache] Failed to unmarshal rules for service %s: %v", serviceID, err)
 		return nil, false
 	}
+	c.memMu.Lock()
+	c.rulesMemo[serviceID] = cloneRules(rules)
+	c.memMu.Unlock()
 	return rules, true
 }
 
 // InvalidateServiceRules deletes the cached rules for a service.
 func (c *Client) InvalidateServiceRules(serviceID string) {
+	c.memMu.Lock()
+	delete(c.rulesMemo, serviceID)
+	c.memMu.Unlock()
+
 	if !c.Available() {
 		return
 	}
@@ -148,6 +170,18 @@ func (c *Client) InvalidateServiceRules(serviceID string) {
 		log.Printf("[cache] Failed to invalidate rules for service %s: %v", serviceID, err)
 		c.ping()
 	}
+}
+
+func cloneRules(rules []*dropper.Rule) []*dropper.Rule {
+	cp := make([]*dropper.Rule, 0, len(rules))
+	for _, r := range rules {
+		if r == nil {
+			continue
+		}
+		v := *r
+		cp = append(cp, &v)
+	}
+	return cp
 }
 
 // PopulateRules loads all rules from the store into Redis, grouped by service.

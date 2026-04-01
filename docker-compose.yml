@@ -39,7 +39,7 @@ services:
     environment:
       - API_BACKEND=janus
     ports:
-      - "2999:3000"
+      - "127.0.0.1:2999:3000"
     depends_on:
       - janus
     restart: unless-stopped

@@ -3,6 +3,7 @@ package flagids
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net/http"
@@ -23,9 +24,10 @@ type Poller struct {
 	format   string // competition format (e.g. "cyberchallenge")
 
 	// Round-aware storage: roundNum -> serviceName -> []flagIdValue
-	roundFlags   map[int]map[string][]string
-	currentRound int
-	matcher      *Matcher // Aho-Corasick automaton for O(text_length) matching
+	roundFlags       map[int]map[string][]string
+	currentRound     int
+	matcher          *Matcher // Aho-Corasick automaton for O(text_length) matching
+	lastSnapshotHash uint64   // hash of roundFlags snapshot, used to skip no-op refreshes
 
 	// Competition timing
 	roundDuration    time.Duration // duration of a single round
@@ -403,6 +405,21 @@ func (p *Poller) fetch() {
 		}
 	}
 
+	// Compute a deterministic snapshot hash before rebuilding matcher.
+	// If unchanged, skip matcher rebuild and avoid triggering backfill.
+	snapshotHash := hashRoundFlags(roundFlags)
+	p.mu.RLock()
+	prevHash := p.lastSnapshotHash
+	p.mu.RUnlock()
+	if snapshotHash == prevHash {
+		p.mu.Lock()
+		p.lastFetch = time.Now()
+		p.lastError = ""
+		p.mu.Unlock()
+		log.Printf("Flag IDs unchanged: skipping matcher rebuild/backfill (round=%d)", maxRound)
+		return
+	}
+
 	// Build Aho-Corasick automaton from all active round flagIds
 	matcher := BuildMatcher(roundFlags)
 
@@ -416,6 +433,7 @@ func (p *Poller) fetch() {
 	p.roundFlags = roundFlags
 	p.currentRound = maxRound
 	p.matcher = matcher
+	p.lastSnapshotHash = snapshotHash
 	p.flagIDs = flatFlagIDs
 	p.valueKeyMap = vkm
 	p.lastFetch = time.Now()
@@ -437,6 +455,44 @@ func (p *Poller) fetch() {
 	if onFetch != nil {
 		go onFetch(curRound)
 	}
+}
+
+func hashRoundFlags(roundFlags map[int]map[string][]string) uint64 {
+	h := fnv.New64a()
+
+	rounds := make([]int, 0, len(roundFlags))
+	for r := range roundFlags {
+		rounds = append(rounds, r)
+	}
+	sort.Ints(rounds)
+
+	for _, r := range rounds {
+		_, _ = h.Write([]byte("r:"))
+		_, _ = h.Write([]byte(strconv.Itoa(r)))
+		_, _ = h.Write([]byte(";"))
+
+		services := roundFlags[r]
+		svcNames := make([]string, 0, len(services))
+		for svc := range services {
+			svcNames = append(svcNames, svc)
+		}
+		sort.Strings(svcNames)
+
+		for _, svc := range svcNames {
+			_, _ = h.Write([]byte("s:"))
+			_, _ = h.Write([]byte(svc))
+			_, _ = h.Write([]byte(";"))
+
+			vals := append([]string(nil), services[svc]...)
+			sort.Strings(vals)
+			for _, v := range vals {
+				_, _ = h.Write([]byte("v:"))
+				_, _ = h.Write([]byte(v))
+				_, _ = h.Write([]byte(";"))
+			}
+		}
+	}
+	return h.Sum64()
 }
 
 // flattenRoundFlags merges all rounds into a flat service -> []values map.
@@ -531,14 +587,4 @@ func parseCyberChallengeRounded(body []byte) (map[int]map[string][]string, error
 		}
 	}
 	return result, nil
-}
-
-// parseCyberChallenge parses the CyberChallenge flag ID format into a flat map.
-// Kept for backward compatibility.
-func parseCyberChallenge(body []byte) (map[string][]string, error) {
-	rounded, err := parseCyberChallengeRounded(body)
-	if err != nil {
-		return nil, err
-	}
-	return flattenRoundFlags(rounded), nil
 }

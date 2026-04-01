@@ -11,8 +11,8 @@ import (
 type PacketChangeKind byte
 
 const (
-	PacketChangeInsert PacketChangeKind = iota // new row
-	PacketChangeMetadata                       // e.g. flag-ID backfill updated rows
+	PacketChangeInsert   PacketChangeKind = iota // new row
+	PacketChangeMetadata                         // e.g. flag-ID backfill updated rows
 )
 
 // Direction indicates whether this is a request or response.
@@ -25,9 +25,11 @@ const (
 
 // MatchedRuleInfo holds info about a rule that matched a packet.
 type MatchedRuleInfo struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Action string `json:"action"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Action  string `json:"action"`
+	Pattern string `json:"pattern,omitempty"`
+	Scope   string `json:"scope,omitempty"`
 }
 
 // Alert represents a triggered alert rule entry.
@@ -39,6 +41,7 @@ type Alert struct {
 	SrcIP          string    `json:"src_ip"`
 	Timestamp      time.Time `json:"timestamp"`
 	PatternMatched string    `json:"pattern_matched"`
+	MatchedScope   string    `json:"matched_scope,omitempty"`
 	RuleName       string    `json:"rule_name,omitempty"`
 }
 
@@ -99,21 +102,23 @@ func MakeSessionID(serviceID, clientIP string, clientPort int) string {
 
 // PacketQuery defines filters for retrieving packets.
 type PacketQuery struct {
-	ServiceID   string
-	ServiceName string // resolved to ServiceID(s) by the API layer
-	SrcIP       string
-	DstIP       string
-	Protocol    string
-	Method      string
-	SessionID   string // filter by session (same TCP connection)
-	PeerIP      string // filter by peer IP (src_ip for requests, dst_ip for responses)
-	TimeFrom    *time.Time
-	TimeTo      *time.Time
-	Contains    string // substring search across body, headers, url
-	Regex       string // regex search across body, headers, url
-	Flagged        *bool // nil = no filter, true = only flagged, false = only unflagged
-	ContainsFlagID *bool // nil = no filter, true = only with flagID, false = only without
-	SortOrder      string // "asc" or "desc" (default "desc")
-	Limit       int
-	Offset      int
+	ServiceID       string
+	ServiceName     string // resolved to ServiceID(s) by the API layer
+	SrcIP           string
+	DstIP           string
+	Protocol        string
+	Method          string
+	SessionID       string // filter by session (same TCP connection)
+	PeerIP          string // filter by peer IP (src_ip for requests, dst_ip for responses)
+	TimeFrom        *time.Time
+	TimeTo          *time.Time
+	Contains        string // substring search across body, headers, url
+	Regex           string // regex search across body, headers, url
+	Flagged         *bool  // nil = no filter, true = only flagged, false = only unflagged
+	ContainsFlagID  *bool  // nil = no filter, true = only with flagID, false = only without
+	HasMatchedRules *bool  // nil = no filter, true = only with matched rules, false = only without
+	Dropped         *bool  // nil = no filter, true = only packets dropped by a rule (action=drop|both)
+	SortOrder       string // "asc" or "desc" (default "desc")
+	Limit           int
+	Offset          int
 }
