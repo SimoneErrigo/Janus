@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/SimoneErrigo/Janus/backend/internal/cleanup"
 	"github.com/SimoneErrigo/Janus/backend/internal/config"
 	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
+	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 )
 
 type configResponse struct {
@@ -22,10 +24,12 @@ type configResponse struct {
 	FlagIDFormat       string `json:"flagid_format"`
 
 	// Competition timing
-	RoundDurationSec int    `json:"round_duration_seconds"`
-	CompetitionStart string `json:"competition_start,omitempty"`
-	KeepRounds       int    `json:"keep_rounds"`
-	CurrentRound     int    `json:"current_round"`
+	RoundDurationSec         int    `json:"round_duration_seconds"`
+	CompetitionStart         string `json:"competition_start,omitempty"`
+	KeepRounds               int    `json:"keep_rounds"`
+	CurrentRound             int    `json:"current_round"`
+	TrafficMode              string `json:"traffic_mode"`
+	FlowCorrelationWindowSec int    `json:"flow_correlation_window_seconds"`
 }
 
 type configUpdateRequest struct {
@@ -42,9 +46,11 @@ type configUpdateRequest struct {
 	FlagIDFormat       *string `json:"flagid_format,omitempty"`
 
 	// Competition timing
-	RoundDurationSec *int    `json:"round_duration_seconds,omitempty"`
-	CompetitionStart *string `json:"competition_start,omitempty"`
-	KeepRounds       *int    `json:"keep_rounds,omitempty"`
+	RoundDurationSec         *int    `json:"round_duration_seconds,omitempty"`
+	CompetitionStart         *string `json:"competition_start,omitempty"`
+	KeepRounds               *int    `json:"keep_rounds,omitempty"`
+	TrafficMode              *string `json:"traffic_mode,omitempty"`
+	FlowCorrelationWindowSec *int    `json:"flow_correlation_window_seconds,omitempty"`
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -68,19 +74,21 @@ func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, configResponse{
-		VMIP:               cfg.VMIP,
-		NetworkInterface:   cfg.NetworkInterface,
-		TeamPassword:       cfg.TeamPassword,
-		FlagRegex:          cfg.FlagRegex,
-		FlagIDEnabled:      pollerCfg.Enabled,
-		FlagIDAPIURL:       pollerCfg.APIURL,
-		FlagIDTeamID:       pollerCfg.TeamID,
-		FlagIDPollInterval: pollerCfg.IntervalSec,
-		FlagIDFormat:       pollerCfg.Format,
-		RoundDurationSec:   pollerCfg.RoundDurationSec,
-		CompetitionStart:   pollerCfg.CompetitionStart,
-		KeepRounds:         pollerCfg.KeepRounds,
-		CurrentRound:       s.flagIDPoller.CurrentRound(),
+		VMIP:                     cfg.VMIP,
+		NetworkInterface:         cfg.NetworkInterface,
+		TeamPassword:             cfg.TeamPassword,
+		FlagRegex:                cfg.FlagRegex,
+		FlagIDEnabled:            pollerCfg.Enabled,
+		FlagIDAPIURL:             pollerCfg.APIURL,
+		FlagIDTeamID:             pollerCfg.TeamID,
+		FlagIDPollInterval:       pollerCfg.IntervalSec,
+		FlagIDFormat:             pollerCfg.Format,
+		RoundDurationSec:         pollerCfg.RoundDurationSec,
+		CompetitionStart:         pollerCfg.CompetitionStart,
+		KeepRounds:               pollerCfg.KeepRounds,
+		CurrentRound:             s.flagIDPoller.CurrentRound(),
+		TrafficMode:              cfg.TrafficMode,
+		FlowCorrelationWindowSec: cfg.FlowCorrelationWindowSec,
 	})
 }
 
@@ -108,6 +116,45 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.FlagRegex != nil {
 		cfg.FlagRegex = *req.FlagRegex
+	}
+	if req.TrafficMode != nil {
+		mode := *req.TrafficMode
+		if mode != sniffer.TrafficModeLive && mode != sniffer.TrafficModeStatic {
+			http.Error(w, "traffic_mode must be one of: live, static", http.StatusBadRequest)
+			return
+		}
+		cfg.TrafficMode = mode
+		if s.captureCtrl != nil {
+			s.captureCtrl.SetMode(mode)
+		}
+		// Static mode: stop periodic fetch/backfill and disable auto-cleanup.
+		// Live mode: restore periodic behavior from current settings.
+		if s.flagIDPoller != nil {
+			current := s.flagIDPoller.GetConfig()
+			if mode == sniffer.TrafficModeStatic {
+				current.Enabled = false
+			} else {
+				current.Enabled = cfg.FlagIDEnabled
+			}
+			s.flagIDPoller.Reconfigure(current)
+		}
+		if s.cleanupMgr != nil {
+			if mode == sniffer.TrafficModeStatic {
+				s.cleanupMgr.UpdateSettings(cleanup.Settings{MaxAgeMinutes: 0, MaxDBSizeMB: 0})
+			} else {
+				s.cleanupMgr.UpdateSettings(cleanup.Settings{MaxAgeMinutes: cfg.CleanupMaxAgeMinutes, MaxDBSizeMB: cfg.CleanupMaxDBSizeMB})
+			}
+		}
+	}
+	if req.FlowCorrelationWindowSec != nil {
+		if *req.FlowCorrelationWindowSec < 5 {
+			http.Error(w, "flow_correlation_window_seconds must be >= 5", http.StatusBadRequest)
+			return
+		}
+		cfg.FlowCorrelationWindowSec = *req.FlowCorrelationWindowSec
+		if s.packetStore != nil {
+			s.packetStore.SetFlowCorrelationWindowSec(*req.FlowCorrelationWindowSec)
+		}
 	}
 
 	// Reconfigure Flag ID poller if any flagID/timing field was provided
@@ -161,18 +208,20 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 		currentRound = s.flagIDPoller.CurrentRound()
 	}
 	writeJSON(w, http.StatusOK, configResponse{
-		VMIP:               cfg.VMIP,
-		NetworkInterface:   cfg.NetworkInterface,
-		TeamPassword:       cfg.TeamPassword,
-		FlagRegex:          cfg.FlagRegex,
-		FlagIDEnabled:      pollerCfg.Enabled,
-		FlagIDAPIURL:       pollerCfg.APIURL,
-		FlagIDTeamID:       pollerCfg.TeamID,
-		FlagIDPollInterval: pollerCfg.IntervalSec,
-		FlagIDFormat:       pollerCfg.Format,
-		RoundDurationSec:   pollerCfg.RoundDurationSec,
-		CompetitionStart:   pollerCfg.CompetitionStart,
-		KeepRounds:         pollerCfg.KeepRounds,
-		CurrentRound:       currentRound,
+		VMIP:                     cfg.VMIP,
+		NetworkInterface:         cfg.NetworkInterface,
+		TeamPassword:             cfg.TeamPassword,
+		FlagRegex:                cfg.FlagRegex,
+		FlagIDEnabled:            pollerCfg.Enabled,
+		FlagIDAPIURL:             pollerCfg.APIURL,
+		FlagIDTeamID:             pollerCfg.TeamID,
+		FlagIDPollInterval:       pollerCfg.IntervalSec,
+		FlagIDFormat:             pollerCfg.Format,
+		RoundDurationSec:         pollerCfg.RoundDurationSec,
+		CompetitionStart:         pollerCfg.CompetitionStart,
+		KeepRounds:               pollerCfg.KeepRounds,
+		CurrentRound:             currentRound,
+		TrafficMode:              cfg.TrafficMode,
+		FlowCorrelationWindowSec: cfg.FlowCorrelationWindowSec,
 	})
 }

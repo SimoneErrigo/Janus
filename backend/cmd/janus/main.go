@@ -42,6 +42,7 @@ func main() {
 		log.Fatalf("Failed to initialize packet store: %v", err)
 	}
 	defer packetStore.Close()
+	packetStore.SetFlowCorrelationWindowSec(cfg.FlowCorrelationWindowSec)
 
 	ruleStore, err := dropper.NewRuleStore(cfg.DataDir)
 	if err != nil {
@@ -75,6 +76,8 @@ func main() {
 
 	proxyMgr := proxy.NewManager(packetStore, ruleStore, flagRegex, flagScanner)
 	proxyMgr.SetRulesCache(redisCache)
+	captureCtrl := sniffer.NewCaptureController(cfg.TrafficMode)
+	proxyMgr.SetCaptureController(captureCtrl)
 
 	services := store.ListServices()
 
@@ -106,6 +109,9 @@ func main() {
 		cfg.RoundDurationSec, competitionStart, cfg.KeepRounds,
 	)
 	flagIDPoller.SetOnFetch(func(currentRound int) {
+		if captureCtrl.Mode() != sniffer.TrafficModeLive {
+			return
+		}
 		// Smart backfill: re-scan only packets from the limbo window using AC automaton
 		n, backfillErr := packetStore.SmartBackfillFlagIDs(flagIDPoller, currentRound)
 		if backfillErr != nil {
@@ -127,14 +133,19 @@ func main() {
 		}
 	}
 
-	flagIDPoller.Start()
+	if cfg.TrafficMode == sniffer.TrafficModeLive {
+		flagIDPoller.Start()
+	}
 
 	// Start cleanup manager
 	cleanupMgr := cleanup.NewManager(packetStore, cfg.CleanupMaxAgeMinutes, cfg.CleanupMaxDBSizeMB)
+	if cfg.TrafficMode == sniffer.TrafficModeStatic {
+		cleanupMgr.UpdateSettings(cleanup.Settings{MaxAgeMinutes: 0, MaxDBSizeMB: 0})
+	}
 	cleanupMgr.Start()
 
 	statsCollector := sysstat.NewCollector(packetStore, redisCache, cfg.DataDir)
-	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller, redisCache, statsCollector, packetHub)
+	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller, redisCache, statsCollector, packetHub, captureCtrl)
 
 	// Graceful shutdown
 	go func() {

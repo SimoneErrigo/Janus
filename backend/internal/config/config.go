@@ -36,6 +36,12 @@ type Config struct {
 	// Redis settings
 	RedisAddr     string
 	RedisPassword string
+
+	// Traffic capture mode
+	TrafficMode string // "live" | "static"
+
+	// Flow reconstruction
+	FlowCorrelationWindowSec int // correlation time window in seconds
 }
 
 var (
@@ -49,12 +55,14 @@ func Load(envPath string) (*Config, error) {
 	once.Do(func() {
 		cfg := &Config{
 			// Defaults
-			VMIP:             "0.0.0.0",
-			NetworkInterface: "eth0",
-			TeamPassword:     "changeme",
-			FlagRegex:        "[A-Z0-9]{31}=",
-			DataDir:          "/data",
-			APIPort:          "8080",
+			VMIP:                     "0.0.0.0",
+			NetworkInterface:         "eth0",
+			TeamPassword:             "changeme",
+			FlagRegex:                "[A-Z0-9]{31}=",
+			DataDir:                  "/data",
+			APIPort:                  "8080",
+			TrafficMode:              "live",
+			FlowCorrelationWindowSec: 120,
 		}
 
 		env, err := parseEnvFile(envPath)
@@ -117,6 +125,12 @@ func Load(envPath string) (*Config, error) {
 		if v, ok := env["REDIS_PASSWORD"]; ok {
 			cfg.RedisPassword = v
 		}
+		if v, ok := env["TRAFFIC_MODE"]; ok && v != "" {
+			cfg.TrafficMode = strings.ToLower(v)
+		}
+		if v, ok := env["FLOW_CORRELATION_WINDOW_SECONDS"]; ok && v != "" {
+			cfg.FlowCorrelationWindowSec, _ = strconv.Atoi(v)
+		}
 
 		// Environment variables override .env file
 		if v := os.Getenv("VM_IP"); v != "" {
@@ -169,6 +183,12 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v := os.Getenv("REDIS_PASSWORD"); v != "" {
 			cfg.RedisPassword = v
+		}
+		if v := os.Getenv("TRAFFIC_MODE"); v != "" {
+			cfg.TrafficMode = strings.ToLower(v)
+		}
+		if v := os.Getenv("FLOW_CORRELATION_WINDOW_SECONDS"); v != "" {
+			cfg.FlowCorrelationWindowSec, _ = strconv.Atoi(v)
 		}
 
 		instance = cfg

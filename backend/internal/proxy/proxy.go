@@ -32,6 +32,7 @@ type Manager struct {
 	flagScanner   *flagids.FlagScanner // optimized byte-level flag scanner
 	rulesCache    dropper.RulesCache
 	flagIDChecker sniffer.FlagIDChecker
+	captureCtrl   *sniffer.CaptureController
 }
 
 type runningProxy struct {
@@ -70,6 +71,32 @@ func (m *Manager) currentFlagIDChecker() sniffer.FlagIDChecker {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.flagIDChecker
+}
+
+func (m *Manager) SetCaptureController(c *sniffer.CaptureController) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.captureCtrl = c
+}
+
+func (m *Manager) shouldCapture() bool {
+	m.mu.RLock()
+	ctrl := m.captureCtrl
+	m.mu.RUnlock()
+	if ctrl == nil {
+		return true
+	}
+	return ctrl.ShouldCapture()
+}
+
+func (m *Manager) shouldApplyFlagIDsOnIngest() bool {
+	m.mu.RLock()
+	ctrl := m.captureCtrl
+	m.mu.RUnlock()
+	if ctrl == nil {
+		return true
+	}
+	return ctrl.ShouldApplyFlagIDsOnIngest()
 }
 
 // StartService starts a proxy for the given service.
@@ -197,7 +224,7 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 				dropEngine.SetCache(m.rulesCache)
 			}
 		}
-		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine, m.flagRegex, m.flagScanner, m.currentFlagIDChecker)
+		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine, m.flagRegex, m.flagScanner, m.currentFlagIDChecker, m.shouldCapture, m.shouldApplyFlagIDsOnIngest)
 	}
 
 	server := &http.Server{
@@ -286,7 +313,7 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 				dropEngine.SetCache(m.rulesCache)
 			}
 		}
-		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine, m.flagRegex, m.flagScanner, m.currentFlagIDChecker)
+		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine, m.flagRegex, m.flagScanner, m.currentFlagIDChecker, m.shouldCapture, m.shouldApplyFlagIDsOnIngest)
 	}
 
 	// For gRPC, support h2c (HTTP/2 cleartext) from backend if needed

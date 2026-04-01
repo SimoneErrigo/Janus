@@ -108,6 +108,8 @@ export default function Config() {
         network_interface: form.network_interface,
         team_password: form.team_password,
         flag_regex: form.flag_regex,
+        traffic_mode: form.traffic_mode || 'live',
+        flow_correlation_window_seconds: parseInt(form.flow_correlation_window_seconds, 10) || 120,
       })
       setConfig(data)
       setForm(data)
@@ -255,6 +257,31 @@ export default function Config() {
             placeholder="e.g. [A-Z0-9]{31}="
           />
           <p className="text-xs text-gray-600 mt-1">Regex pattern to identify flags in traffic</p>
+        </div>
+
+        <div>
+          <label className="block text-sm text-gray-400 mb-1">Traffic Mode</label>
+          <select
+            value={form.traffic_mode || 'live'}
+            onChange={(e) => set('traffic_mode', e.target.value)}
+            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
+          >
+            <option value="live">Live (continuous capture + periodic flagId/backfill)</option>
+            <option value="static">Static (manual start/stop + manual apply flagIds)</option>
+          </select>
+          <p className="text-xs text-gray-600 mt-1">Switching to static mode disables periodic backfill and auto-cleanup policies.</p>
+        </div>
+
+        <div>
+          <label className="block text-sm text-gray-400 mb-1">Flow Correlation Window (seconds)</label>
+          <input
+            type="number"
+            min="5"
+            value={form.flow_correlation_window_seconds ?? 120}
+            onChange={(e) => set('flow_correlation_window_seconds', e.target.value)}
+            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 transition-colors"
+          />
+          <p className="text-xs text-gray-600 mt-1">Used by flow reconstruction to correlate related sessions in high-load traffic.</p>
         </div>
 
         {error && <div className="bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded">{error}</div>}

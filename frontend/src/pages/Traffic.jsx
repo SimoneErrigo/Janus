@@ -237,10 +237,15 @@ export default function Traffic() {
   const [flagIDEnabled, setFlagIDEnabled] = useState(false)
   const [blockedFilter, setBlockedFilter] = useState(false)
   const [paused, setPaused] = useState(false)
+  const [trafficMode, setTrafficMode] = useState('live')
+  const [captureStatus, setCaptureStatus] = useState(null)
+  const [captureBusy, setCaptureBusy] = useState(false)
+  const [applyBusy, setApplyBusy] = useState(false)
+  const [clearBusy, setClearBusy] = useState(false)
   const pausedRef = useRef(false)
   const [showQuickRule, setShowQuickRule] = useState(false)
   const [filters, setFilters] = useState({
-    service_id: '', src_ip: '', dst_ip: '', protocol: '', method: '',
+    service_id: '', src_ip: '', dst_ip: '', protocol: '', method: '', direction: '',
     session_id: '', peer_ip: '', contains: '', regex: '', sort: 'desc',
     limit: 50, offset: 0,
   })
@@ -283,8 +288,23 @@ export default function Traffic() {
     api.getConfig().then((cfg) => {
       if (cfg?.flag_regex) setFlagRegex(cfg.flag_regex)
       setFlagIDEnabled(!!cfg?.flagid_enabled)
+      setTrafficMode(cfg?.traffic_mode || 'live')
     }).catch(() => {})
+    api.getCaptureStatus().then(setCaptureStatus).catch(() => {})
   }, [])
+
+  useEffect(() => {
+    if (trafficMode !== 'static') return
+    setPaused(false)
+    pausedRef.current = false
+    const t = setInterval(async () => {
+      try {
+        const status = await api.getCaptureStatus()
+        setCaptureStatus(status)
+      } catch {}
+    }, 3000)
+    return () => clearInterval(t)
+  }, [trafficMode])
 
 
   const loadPackets = useCallback(async () => {
@@ -345,9 +365,12 @@ export default function Traffic() {
     if (f.offset > 0) return
     // Client-side filter for simple filters
     const filtered = newPkts.filter((p) => {
+      // Alert/drop packets are streamed in Alerts/Blocks pages, not Traffic.
+      if (p.matched_rules && p.matched_rules.length > 0) return false
       if (f.service_id && p.service_id !== f.service_id) return false
       if (f.protocol && p.protocol !== f.protocol) return false
       if (f.method && p.method !== f.method) return false
+      if (f.direction && p.direction !== f.direction) return false
       if (f.session_id && p.session_id !== f.session_id) return false
       if (flagFilterRef.current && !p.flagged) return false
       if (flagIDFilterRef.current && !p.contains_flagid) return false
@@ -379,6 +402,8 @@ export default function Traffic() {
   // SSE: stream new packets + refresh on metadata changes.
   // When text filters are active, fall back to periodic full refresh.
   useEffect(() => {
+    const streamEnabled = trafficMode === 'live' || (trafficMode === 'static' && !!captureStatus?.capturing)
+    if (!streamEnabled) return
     if (paused) return
     const unsub = subscribePacketStream(
       hasTextFilters ? () => {} : onNewPackets,
@@ -393,7 +418,7 @@ export default function Traffic() {
       unsub()
       if (poll) clearInterval(poll)
     }
-  }, [onNewPackets, refreshPackets, paused, hasTextFilters])
+  }, [onNewPackets, refreshPackets, paused, hasTextFilters, trafficMode, captureStatus?.capturing])
 
 
   function setFilter(key, value) {
@@ -466,6 +491,7 @@ export default function Traffic() {
   }
 
   function togglePause() {
+    if (trafficMode !== 'live') return
     setPaused((prev) => {
       const next = !prev
       pausedRef.current = next
@@ -475,6 +501,52 @@ export default function Traffic() {
       }
       return next
     })
+  }
+
+  async function handleStartCapture() {
+    setCaptureBusy(true)
+    try {
+      const status = await api.startCapture()
+      setCaptureStatus(status)
+      await loadPackets()
+    } finally {
+      setCaptureBusy(false)
+    }
+  }
+
+  async function handleStopCapture() {
+    setCaptureBusy(true)
+    try {
+      const status = await api.stopCapture()
+      setCaptureStatus(status)
+      await loadPackets()
+    } finally {
+      setCaptureBusy(false)
+    }
+  }
+
+  async function handleApplyFlagIDs() {
+    setApplyBusy(true)
+    try {
+      await api.applyCaptureFlagIDs()
+      await loadPackets()
+    } finally {
+      setApplyBusy(false)
+    }
+  }
+
+  async function handleClearPackets() {
+    if (!confirm('Delete all packets now? Alerts linked to packets will also be removed.')) return
+    setClearBusy(true)
+    try {
+      await api.purgePackets()
+      setSelected(null)
+      setFlowMode(null)
+      setFilters((f) => ({ ...f, session_id: '', offset: 0 }))
+      await loadPackets()
+    } finally {
+      setClearBusy(false)
+    }
   }
 
   // Select a packet — fetch full detail if body is missing (SSE-pushed lightweight packets)
@@ -494,7 +566,7 @@ export default function Traffic() {
   useEffect(() => { setShowQuickRule(false) }, [selected?.id])
 
   const isFlowActive = !!flowMode || !!filters.session_id
-  const hasActiveFilter = filters.contains || filters.regex || flagFilter || flagIDFilter || blockedFilter
+  const hasActiveFilter = filters.contains || filters.regex || flagFilter || flagIDFilter || blockedFilter || filters.direction
 
   // Compute effective highlight regex: always include flag regex for yellow highlighting
   const highlightRegex = [filters.regex, flagRegex].filter(Boolean).join('|') || ''
@@ -577,6 +649,42 @@ export default function Traffic() {
       )}
 
       {/* Filters — collapsible */}
+      {trafficMode === 'static' && (
+        <div className="mb-3 bg-gray-900 border border-gray-800 rounded-lg p-3 flex items-center gap-2 flex-wrap">
+          <span className="text-xs px-2 py-1 rounded bg-indigo-900/40 text-indigo-300 border border-indigo-700/50">Static mode</span>
+          <button
+            onClick={handleStartCapture}
+            disabled={captureBusy || captureStatus?.capturing}
+            className="text-xs px-3 py-1.5 rounded bg-green-800/60 hover:bg-green-700/60 disabled:bg-gray-800 disabled:text-gray-600 text-green-200 cursor-pointer"
+          >
+            {captureBusy && !captureStatus?.capturing ? 'Starting...' : 'Start Capture'}
+          </button>
+          <button
+            onClick={handleStopCapture}
+            disabled={captureBusy || !captureStatus?.capturing}
+            className="text-xs px-3 py-1.5 rounded bg-yellow-800/60 hover:bg-yellow-700/60 disabled:bg-gray-800 disabled:text-gray-600 text-yellow-200 cursor-pointer"
+          >
+            {captureBusy && captureStatus?.capturing ? 'Stopping...' : 'Stop Capture'}
+          </button>
+          <button
+            onClick={handleApplyFlagIDs}
+            disabled={applyBusy || captureStatus?.capturing || !captureStatus?.capture_start}
+            className="text-xs px-3 py-1.5 rounded bg-teal-800/60 hover:bg-teal-700/60 disabled:bg-gray-800 disabled:text-gray-600 text-teal-200 cursor-pointer"
+          >
+            {applyBusy ? 'Applying...' : 'Apply Flag IDs'}
+          </button>
+          <button
+            onClick={handleClearPackets}
+            disabled={clearBusy}
+            className="text-xs px-3 py-1.5 rounded bg-red-800/60 hover:bg-red-700/60 disabled:bg-gray-800 disabled:text-gray-600 text-red-200 cursor-pointer"
+          >
+            {clearBusy ? 'Clearing...' : 'Clear Packets'}
+          </button>
+          <span className="text-xs text-gray-500 ml-auto">
+            {captureStatus?.capturing ? 'Capturing traffic...' : 'Capture stopped'}
+          </span>
+        </div>
+      )}
       <div className="mb-3">
         <button
           onClick={() => setFiltersCollapsed(!filtersCollapsed)}
@@ -602,6 +710,13 @@ export default function Traffic() {
               <FilterSelect label="Method" value={filters.method} onChange={(v) => setFilter('method', v)}
                 options={[{ value: '', label: 'All' }, ...['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS'].map((m) => ({ value: m, label: m }))]}
               />
+              <FilterSelect label="Dir" value={filters.direction} onChange={(v) => setFilter('direction', v)}
+                options={[
+                  { value: '', label: 'All' },
+                  { value: 'request', label: 'REQ' },
+                  { value: 'response', label: 'RES' },
+                ]}
+              />
               <FilterInput label="Contains" value={filters.contains} onChange={(v) => setFilter('contains', v)} placeholder="Text search..." />
               <FilterInput label="Regex" value={filters.regex} onChange={(v) => setFilter('regex', v)} placeholder="Regex pattern..." />
               <FilterSelect label="Sort" value={filters.sort} onChange={(v) => setFilter('sort', v)}
@@ -621,7 +736,7 @@ export default function Traffic() {
                   <span>&#9873;</span> Contains Flag
                 </button>
               )}
-              {flagIDEnabled && (
+              {(flagIDEnabled || trafficMode === 'static') && (
                 <button
                   onClick={toggleFlagIDFilter}
                   className={`text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 ${
@@ -738,12 +853,15 @@ export default function Traffic() {
             <div className="flex items-center gap-2">
               <button
                 onClick={togglePause}
+                disabled={trafficMode !== 'live'}
                 className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs transition-colors cursor-pointer ${
-                  paused
+                  trafficMode !== 'live'
+                    ? 'bg-gray-800 text-gray-600 border border-gray-700 cursor-default'
+                    : paused
                     ? 'bg-yellow-900/50 text-yellow-300 border border-yellow-700/50'
                     : 'bg-gray-800 text-gray-400 border border-gray-700 hover:text-gray-300'
                 }`}
-                title={paused ? 'Resume live capture' : 'Pause live capture'}
+                title={trafficMode !== 'live' ? 'Pause/Resume is only available in live mode' : (paused ? 'Resume live capture' : 'Pause live capture')}
               >
                 {paused ? (
                   <svg className="w-3 h-3" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21" /></svg>

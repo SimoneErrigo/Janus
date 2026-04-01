@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
-import { clearToken } from '../api'
+import { api, clearToken } from '../api'
 
 const navItems = [
   { to: '/services', label: 'Services', icon: ServerIcon },
@@ -15,6 +15,25 @@ const navItems = [
 export default function Layout() {
   const navigate = useNavigate()
   const [collapsed, setCollapsed] = useState(false)
+  const [trafficMode, setTrafficMode] = useState('live')
+
+  useEffect(() => {
+    let mounted = true
+    api.getConfig().then((cfg) => {
+      if (!mounted) return
+      setTrafficMode(cfg?.traffic_mode || 'live')
+    }).catch(() => {})
+    const t = setInterval(async () => {
+      try {
+        const cfg = await api.getConfig()
+        if (mounted) setTrafficMode(cfg?.traffic_mode || 'live')
+      } catch {}
+    }, 10000)
+    return () => {
+      mounted = false
+      clearInterval(t)
+    }
+  }, [])
 
   function handleLogout() {
     clearToken()
@@ -29,7 +48,19 @@ export default function Layout() {
           {!collapsed && (
             <div className="px-2">
               <h1 className="text-xl font-bold text-cyan-400 tracking-wide">JANUS</h1>
-              <p className="text-xs text-gray-500 mt-0.5">CTF A/D Proxy</p>
+              <div className="flex items-center gap-2 mt-0.5">
+                <p className="text-xs text-gray-500">CTF A/D Proxy</p>
+                <span
+                  className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                    trafficMode === 'static'
+                      ? 'bg-indigo-900/40 text-indigo-300 border-indigo-700/50'
+                      : 'bg-emerald-900/40 text-emerald-300 border-emerald-700/50'
+                  }`}
+                  title={`Traffic mode: ${trafficMode}`}
+                >
+                  {trafficMode === 'static' ? 'STATIC' : 'LIVE'}
+                </span>
+              </div>
             </div>
           )}
           <button

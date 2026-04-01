@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -29,6 +30,8 @@ type PacketStore struct {
 	dbPath   string // path to packets.db (for accurate file-size reporting)
 	muChange sync.RWMutex
 	onChange func(PacketChangeKind, *Packet)
+
+	flowCorrelationWindowSec atomic.Int64
 }
 
 // NewPacketStore opens (or creates) the SQLite database at dataDir/packets.db.
@@ -60,7 +63,24 @@ func NewPacketStore(dataDir string) (*PacketStore, error) {
 		return nil, fmt.Errorf("migrating sqlite: %w", err)
 	}
 
-	return &PacketStore{db: db, rdb: rdb, dbPath: dbPath}, nil
+	ps := &PacketStore{db: db, rdb: rdb, dbPath: dbPath}
+	ps.flowCorrelationWindowSec.Store(120)
+	return ps, nil
+}
+
+func (s *PacketStore) SetFlowCorrelationWindowSec(sec int) {
+	if sec <= 0 {
+		sec = 120
+	}
+	s.flowCorrelationWindowSec.Store(int64(sec))
+}
+
+func (s *PacketStore) flowCorrelationWindow() time.Duration {
+	sec := s.flowCorrelationWindowSec.Load()
+	if sec <= 0 {
+		sec = 120
+	}
+	return time.Duration(sec) * time.Second
 }
 
 // SetPacketChangeListener is called when new packets are inserted or metadata is bulk-updated
@@ -789,6 +809,120 @@ func (s *PacketStore) SmartBackfillFlagIDs(checker FlagIDChecker, currentRound i
 	return total, nil
 }
 
+// BackfillFlagIDsWindow applies flag-ID matching to packets captured in [from, to].
+// Used by static mode to avoid periodic backfills.
+func (s *PacketStore) BackfillFlagIDsWindow(checker FlagIDChecker, currentRound int, from, to time.Time) (int64, error) {
+	if checker == nil || currentRound == 0 {
+		return 0, nil
+	}
+	fromTS := from.UTC().Format(time.RFC3339Nano)
+	toTS := to.UTC().Format(time.RFC3339Nano)
+
+	var total int64
+	const batchSize = 500
+	const updateChunk = 32
+
+	var lastID int64
+	for {
+		rows, err := s.db.Query(
+			`SELECT id, body, body_string, url, headers
+			 FROM packets
+			 WHERE id > ? AND timestamp >= ? AND timestamp <= ?
+			 ORDER BY id ASC LIMIT ?`,
+			lastID, fromTS, toTS, batchSize,
+		)
+		if err != nil {
+			return total, fmt.Errorf("window backfill select: %w", err)
+		}
+
+		type pktUpdate struct {
+			id      int64
+			matched []string
+		}
+		var updates []pktUpdate
+		var markProcessed []int64
+
+		for rows.Next() {
+			var id int64
+			var body []byte
+			var bodyStr, url, headers string
+			if err := rows.Scan(&id, &body, &bodyStr, &url, &headers); err != nil {
+				rows.Close()
+				return total, fmt.Errorf("window backfill scan: %w", err)
+			}
+			lastID = id
+			if bodyStr == "" && len(body) > 0 {
+				bodyStr = string(body)
+			}
+			text := url + " " + headers + " " + bodyStr
+			matches := checker.FindMatchingFlagIDs(text)
+			if len(matches) > 0 {
+				vals := make([]string, len(matches))
+				for i, m := range matches {
+					vals[i] = m.FlagID
+				}
+				updates = append(updates, pktUpdate{id: id, matched: vals})
+			} else {
+				markProcessed = append(markProcessed, id)
+			}
+		}
+		rows.Close()
+
+		batchCount := len(updates) + len(markProcessed)
+		if batchCount == 0 {
+			break
+		}
+
+		allOps := make([]pktUpdate, 0, batchCount)
+		allOps = append(allOps, updates...)
+		for _, id := range markProcessed {
+			allOps = append(allOps, pktUpdate{id: id})
+		}
+
+		for chunkStart := 0; chunkStart < len(allOps); chunkStart += updateChunk {
+			chunkEnd := chunkStart + updateChunk
+			if chunkEnd > len(allOps) {
+				chunkEnd = len(allOps)
+			}
+			tx, err := s.db.Begin()
+			if err != nil {
+				return total, fmt.Errorf("window backfill begin tx: %w", err)
+			}
+			for _, op := range allOps[chunkStart:chunkEnd] {
+				if op.matched != nil {
+					mjson, _ := json.Marshal(op.matched)
+					_, err = tx.Exec(
+						"UPDATE packets SET contains_flagid = 1, matched_flagids = ?, flagid_round = ? WHERE id = ?",
+						string(mjson), currentRound, op.id,
+					)
+					total++
+				} else {
+					_, err = tx.Exec(
+						"UPDATE packets SET flagid_round = ? WHERE id = ?",
+						currentRound, op.id,
+					)
+				}
+				if err != nil {
+					tx.Rollback()
+					return total, fmt.Errorf("window backfill update: %w", err)
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				return total, fmt.Errorf("window backfill commit: %w", err)
+			}
+		}
+
+		if batchCount < batchSize {
+			break
+		}
+	}
+
+	if total > 0 {
+		s.emitChange(PacketChangeMetadata, nil)
+	}
+	return total, nil
+}
+
 // DBSize returns the total on-disk size of the database (main + WAL + SHM).
 func (s *PacketStore) DBSize() (int64, error) {
 	var total int64
@@ -835,6 +969,20 @@ func (s *PacketStore) QueryFlow(packetID int64) ([]*Packet, error) {
 		return s.flowByPeerIP(startPkt, sessionPackets)
 	}
 
+	// Correlation window around the current session to reduce false positives
+	w := s.flowCorrelationWindow()
+	minTime := sessionPackets[0].Timestamp.Add(-w)
+	maxTime := sessionPackets[len(sessionPackets)-1].Timestamp.Add(w)
+	minTS := minTime.UTC().Format(time.RFC3339Nano)
+	maxTS := maxTime.UTC().Format(time.RFC3339Nano)
+
+	// In non-SNAT environments, constrain token correlation to the same peer IP.
+	peerIP := startPkt.SrcIP
+	if startPkt.Direction == DirectionResponse {
+		peerIP = startPkt.DstIP
+	}
+	peerFilter := !s.looksLikeSNAT(startPkt.ServiceID, sessionPackets[0].Timestamp)
+
 	// Step 4: find all packets containing any of these tokens (scoped to same service)
 	sessionIDs := map[string]bool{startPkt.SessionID: true}
 	for _, token := range tokens {
@@ -842,10 +990,14 @@ func (s *PacketStore) QueryFlow(packetID int64) ([]*Packet, error) {
 			continue // skip very short tokens to avoid false matches
 		}
 		like := "%" + token + "%"
-		rows, err := s.scanPackets(
-			"SELECT "+packetSelectCols+" FROM packets WHERE service_id = ? AND (headers LIKE ? OR body_string LIKE ?) LIMIT 500",
-			[]interface{}{startPkt.ServiceID, like, like},
-		)
+		query := "SELECT " + packetSelectCols + " FROM packets WHERE service_id = ? AND timestamp BETWEEN ? AND ? AND (headers LIKE ? OR body_string LIKE ?)"
+		args := []interface{}{startPkt.ServiceID, minTS, maxTS, like, like}
+		if peerFilter && peerIP != "" {
+			query += " AND ((direction = 'request' AND src_ip = ?) OR (direction = 'response' AND dst_ip = ?))"
+			args = append(args, peerIP, peerIP)
+		}
+		query += " LIMIT 500"
+		rows, err := s.scanPackets(query, args)
 		if err != nil {
 			continue
 		}
@@ -876,9 +1028,10 @@ func (s *PacketStore) flowByPeerIP(startPkt *Packet, sessionPackets []*Packet) (
 		return sessionPackets, nil
 	}
 
-	// Time window: session range ± 30s
-	minTime := sessionPackets[0].Timestamp.Add(-30 * time.Second)
-	maxTime := sessionPackets[len(sessionPackets)-1].Timestamp.Add(30 * time.Second)
+	// Time window: session range ± configured correlation window
+	w := s.flowCorrelationWindow()
+	minTime := sessionPackets[0].Timestamp.Add(-w)
+	maxTime := sessionPackets[len(sessionPackets)-1].Timestamp.Add(w)
 
 	rows, err := s.rdb.Query(
 		`SELECT DISTINCT session_id FROM packets
@@ -1092,6 +1245,10 @@ func buildWhere(q PacketQuery) (string, []interface{}) {
 	if q.Method != "" {
 		conditions = append(conditions, "method = ?")
 		args = append(args, q.Method)
+	}
+	if q.Direction != "" {
+		conditions = append(conditions, "direction = ?")
+		args = append(args, q.Direction)
 	}
 	if q.PeerIP != "" {
 		// Peer IP: the external party — src_ip on requests, dst_ip on responses

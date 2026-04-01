@@ -103,11 +103,17 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 		}
 	}
 
+	captureEnabled := m.shouldCapture()
+	applyFlagIDsNow := m.shouldApplyFlagIDsOnIngest()
+
 	// Check flagged and log the initial request packet
 	now := time.Now()
-	if len(initialData) > 0 && m.packetStore != nil {
+	if len(initialData) > 0 && m.packetStore != nil && captureEnabled {
 		flagged := sniffer.CheckFlagged(m.flagRegex, m.flagScanner, "", "", initialData)
-		containsFlagID, matchedFlagIDs, flagIDRound := sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", initialData)
+		containsFlagID, matchedFlagIDs, flagIDRound := false, []string(nil), 0
+		if applyFlagIDsNow {
+			containsFlagID, matchedFlagIDs, flagIDRound = sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", initialData)
+		}
 		if matchedRules == nil {
 			matchedRules = []sniffer.MatchedRuleInfo{}
 		}
@@ -212,10 +218,13 @@ func (m *Manager) sniffCopy(dst io.Writer, src io.Reader, svc *storage.Service, 
 
 	io.Copy(writer, src)
 
-	if m.packetStore != nil && buf.Len() > 0 {
+	if m.packetStore != nil && buf.Len() > 0 && m.shouldCapture() {
 		data := buf.Bytes()
 		flagged := sniffer.CheckFlagged(m.flagRegex, m.flagScanner, "", "", data)
-		containsFlagID, matchedFlagIDs, flagIDRound := sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", data)
+		containsFlagID, matchedFlagIDs, flagIDRound := false, []string(nil), 0
+		if m.shouldApplyFlagIDsOnIngest() {
+			containsFlagID, matchedFlagIDs, flagIDRound = sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", data)
+		}
 		pkt := &sniffer.Packet{
 			ServiceID:      svc.ID,
 			SessionID:      sessionID,

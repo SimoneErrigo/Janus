@@ -134,6 +134,12 @@ export const api = {
   getFlagIDStatus: () => request('/flagids/status'),
   refreshFlagIDs: () => request('/flagids/refresh', { method: 'POST' }),
 
+  // Static capture mode
+  getCaptureStatus: () => request('/traffic/capture'),
+  startCapture: () => request('/traffic/capture/start', { method: 'POST' }),
+  stopCapture: () => request('/traffic/capture/stop', { method: 'POST' }),
+  applyCaptureFlagIDs: () => request('/traffic/capture/apply-flagids', { method: 'POST' }),
+
   // Cleanup
   getCleanupConfig: () => request('/config/cleanup'),
   updateCleanupConfig: (data) => request('/config/cleanup', { method: 'PUT', body: data }),

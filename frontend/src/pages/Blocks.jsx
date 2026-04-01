@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, memo } from 'react'
-import { api } from '../api'
+import { api, subscribePacketStream } from '../api'
 
 function toJSRegex(pattern) {
   if (!pattern) return null
@@ -175,6 +175,22 @@ export default function Blocks() {
   useEffect(() => {
     const interval = setInterval(loadBlocks, 5000)
     return () => clearInterval(interval)
+  }, [loadBlocks])
+
+  // Live refresh blocks only when streamed packets include drop-capable matches.
+  useEffect(() => {
+    const unsub = subscribePacketStream(
+      (pkts) => {
+        if (!Array.isArray(pkts) || pkts.length === 0) return
+        const shouldReload = pkts.some((p) =>
+          Array.isArray(p.matched_rules) &&
+          p.matched_rules.some((r) => r.action === 'drop' || r.action === 'both')
+        )
+        if (shouldReload) loadBlocks()
+      },
+      loadBlocks,
+    )
+    return () => unsub()
   }, [loadBlocks])
 
   function setFilter(key, value) {

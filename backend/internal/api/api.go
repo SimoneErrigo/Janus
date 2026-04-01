@@ -27,11 +27,12 @@ type Server struct {
 	cache          *cache.Client
 	statsCollector *sysstat.Collector
 	packetHub      *PacketStreamHub
+	captureCtrl    *sniffer.CaptureController
 	mux            *http.ServeMux
 }
 
 // NewServer creates a new API server.
-func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager, flagIDPoller *flagids.Poller, cacheClient *cache.Client, statsCollector *sysstat.Collector, packetHub *PacketStreamHub) *Server {
+func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager, flagIDPoller *flagids.Poller, cacheClient *cache.Client, statsCollector *sysstat.Collector, packetHub *PacketStreamHub, captureCtrl *sniffer.CaptureController) *Server {
 	s := &Server{
 		store:          store,
 		proxy:          proxyMgr,
@@ -42,6 +43,7 @@ func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniff
 		cache:          cacheClient,
 		statsCollector: statsCollector,
 		packetHub:      packetHub,
+		captureCtrl:    captureCtrl,
 		mux:            http.NewServeMux(),
 	}
 	s.routes()
@@ -81,6 +83,10 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/flagids", s.handleFlagIDs)
 	protected.HandleFunc("/api/flagids/status", s.handleFlagIDStatus)
 	protected.HandleFunc("/api/flagids/refresh", s.handleFlagIDRefresh)
+	protected.HandleFunc("/api/traffic/capture", s.handleTrafficCaptureStatus)
+	protected.HandleFunc("/api/traffic/capture/start", s.handleTrafficCaptureStart)
+	protected.HandleFunc("/api/traffic/capture/stop", s.handleTrafficCaptureStop)
+	protected.HandleFunc("/api/traffic/capture/apply-flagids", s.handleTrafficCaptureApplyFlagIDs)
 	protected.HandleFunc("/api/system/stats", s.handleSystemStats)
 
 	s.mux.Handle("/api/", authMiddleware(protected))

@@ -52,6 +52,22 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 	q.DstIP = params.Get("dst_ip")
 	q.Protocol = params.Get("protocol")
 	q.Method = params.Get("method")
+	dirParam := params.Get("direction")
+	if dirParam == "" {
+		dirParam = params.Get("dir")
+	}
+	if dirParam != "" {
+		dir := strings.ToLower(strings.TrimSpace(dirParam))
+		switch dir {
+		case "req", "request":
+			q.Direction = "request"
+		case "res", "response":
+			q.Direction = "response"
+		default:
+			http.Error(w, "invalid direction: use 'req', 'res', 'request', or 'response'", http.StatusBadRequest)
+			return
+		}
+	}
 	q.SessionID = params.Get("session_id")
 	q.PeerIP = params.Get("peer_ip")
 	q.Contains = params.Get("contains")

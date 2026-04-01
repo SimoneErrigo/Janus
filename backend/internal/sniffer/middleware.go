@@ -41,7 +41,7 @@ func CheckFlagID(checker FlagIDChecker, url, headers string, body []byte) (bool,
 
 // HTTPMiddleware returns an http.Handler that logs requests/responses and evaluates drop rules.
 // getFlagIDChecker is called per request so updates from SetFlagIDChecker apply without restarting the proxy.
-func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore, dropEngine *dropper.Engine, flagRegex *regexp.Regexp, flagScanner *flagids.FlagScanner, getFlagIDChecker func() FlagIDChecker) http.Handler {
+func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore, dropEngine *dropper.Engine, flagRegex *regexp.Regexp, flagScanner *flagids.FlagScanner, getFlagIDChecker func() FlagIDChecker, shouldCapture func() bool, shouldApplyFlagIDsOnIngest func() bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
@@ -88,9 +88,15 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 			alertRules = result.AlertRules
 		}
 
+		captureEnabled := shouldCapture == nil || shouldCapture()
+		applyFlagIDsNow := shouldApplyFlagIDsOnIngest == nil || shouldApplyFlagIDsOnIngest()
+
 		// Check flagged status and flag ID containment
 		flagged := CheckFlagged(flagRegex, flagScanner, r.URL.String(), headersStr, reqBody)
-		containsFlagID, matchedFlagIDs, flagIDRound := CheckFlagID(getFlagIDChecker(), r.URL.String(), headersStr, reqBody)
+		containsFlagID, matchedFlagIDs, flagIDRound := false, []string(nil), 0
+		if applyFlagIDsNow {
+			containsFlagID, matchedFlagIDs, flagIDRound = CheckFlagID(getFlagIDChecker(), r.URL.String(), headersStr, reqBody)
+		}
 
 		// Session ID: ties request + response from the same TCP connection.
 		// Even with SNAT (all traffic from same IP), src_port is unique per connection.
@@ -120,22 +126,24 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		if reqPacket.MatchedRules == nil {
 			reqPacket.MatchedRules = []MatchedRuleInfo{}
 		}
-		if err := store.Insert(reqPacket); err != nil {
-			log.Printf("[%s] sniffer: failed to log request: %v", svc.Name, err)
-		}
-
-		// Insert alerts for alert/both rules
-		for _, rule := range alertRules {
-			alert := &Alert{
-				PacketID:       reqPacket.ID,
-				RuleID:         rule.ID,
-				ServiceID:      svc.ID,
-				SrcIP:          srcIP,
-				Timestamp:      start,
-				PatternMatched: rule.Pattern,
+		if captureEnabled {
+			if err := store.Insert(reqPacket); err != nil {
+				log.Printf("[%s] sniffer: failed to log request: %v", svc.Name, err)
 			}
-			if err := store.InsertAlert(alert); err != nil {
-				log.Printf("[%s] sniffer: failed to log alert: %v", svc.Name, err)
+
+			// Insert alerts for alert/both rules
+			for _, rule := range alertRules {
+				alert := &Alert{
+					PacketID:       reqPacket.ID,
+					RuleID:         rule.ID,
+					ServiceID:      svc.ID,
+					SrcIP:          srcIP,
+					Timestamp:      start,
+					PatternMatched: rule.Pattern,
+				}
+				if err := store.InsertAlert(alert); err != nil {
+					log.Printf("[%s] sniffer: failed to log alert: %v", svc.Name, err)
+				}
 			}
 		}
 
@@ -155,7 +163,10 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		respBody := rw.body.Bytes()
 		respHeadersStr := flattenHeadersString(rw.Header())
 		respFlagged := CheckFlagged(flagRegex, flagScanner, r.URL.String(), respHeadersStr, respBody)
-		respContainsFlagID, respMatchedFlagIDs, respFlagIDRound := CheckFlagID(getFlagIDChecker(), r.URL.String(), respHeadersStr, respBody)
+		respContainsFlagID, respMatchedFlagIDs, respFlagIDRound := false, []string(nil), 0
+		if applyFlagIDsNow {
+			respContainsFlagID, respMatchedFlagIDs, respFlagIDRound = CheckFlagID(getFlagIDChecker(), r.URL.String(), respHeadersStr, respBody)
+		}
 
 		// Evaluate rules against response (alert-only, never drop — response already sent)
 		var respMatchedRules []MatchedRuleInfo
@@ -203,22 +214,24 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 			MatchedFlagIDs: respMatchedFlagIDs,
 			FlagIDRound:    respFlagIDRound,
 		}
-		if err := store.Insert(respPacket); err != nil {
-			log.Printf("[%s] sniffer: failed to log response: %v", svc.Name, err)
-		}
-
-		// Insert alerts for response-matched rules
-		for _, rule := range respAlertRules {
-			alert := &Alert{
-				PacketID:       respPacket.ID,
-				RuleID:         rule.ID,
-				ServiceID:      svc.ID,
-				SrcIP:          srcIP,
-				Timestamp:      time.Now(),
-				PatternMatched: rule.Pattern,
+		if captureEnabled {
+			if err := store.Insert(respPacket); err != nil {
+				log.Printf("[%s] sniffer: failed to log response: %v", svc.Name, err)
 			}
-			if err := store.InsertAlert(alert); err != nil {
-				log.Printf("[%s] sniffer: failed to log response alert: %v", svc.Name, err)
+
+			// Insert alerts for response-matched rules
+			for _, rule := range respAlertRules {
+				alert := &Alert{
+					PacketID:       respPacket.ID,
+					RuleID:         rule.ID,
+					ServiceID:      svc.ID,
+					SrcIP:          srcIP,
+					Timestamp:      time.Now(),
+					PatternMatched: rule.Pattern,
+				}
+				if err := store.InsertAlert(alert); err != nil {
+					log.Printf("[%s] sniffer: failed to log response alert: %v", svc.Name, err)
+				}
 			}
 		}
 	})

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, memo } from 'react'
-import { api } from '../api'
+import { api, subscribePacketStream } from '../api'
 
 // Strip Go/PCRE inline flags like (?i) that are invalid in JavaScript regex
 function toJSRegex(pattern) {
@@ -163,6 +163,22 @@ export default function Alerts() {
   useEffect(() => {
     const interval = setInterval(loadAlerts, 5000)
     return () => clearInterval(interval)
+  }, [loadAlerts])
+
+  // Live refresh alerts only when streamed packets include alert-capable matches.
+  useEffect(() => {
+    const unsub = subscribePacketStream(
+      (pkts) => {
+        if (!Array.isArray(pkts) || pkts.length === 0) return
+        const shouldReload = pkts.some((p) =>
+          Array.isArray(p.matched_rules) &&
+          p.matched_rules.some((r) => r.action === 'alert' || r.action === 'both')
+        )
+        if (shouldReload) loadAlerts()
+      },
+      loadAlerts,
+    )
+    return () => unsub()
   }, [loadAlerts])
 
   async function handleClearAll() {

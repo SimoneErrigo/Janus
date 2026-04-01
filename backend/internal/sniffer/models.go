@@ -108,6 +108,7 @@ type PacketQuery struct {
 	DstIP           string
 	Protocol        string
 	Method          string
+	Direction       string // "request" or "response" (empty = no filter)
 	SessionID       string // filter by session (same TCP connection)
 	PeerIP          string // filter by peer IP (src_ip for requests, dst_ip for responses)
 	TimeFrom        *time.Time
