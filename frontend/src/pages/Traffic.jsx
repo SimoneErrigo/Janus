@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react'
+import { useNavigate, useLocation } from 'react-router-dom'
 import { api, subscribePacketStream } from '../api'
+import { getTrafficNavKeys } from '../trafficNavKeys'
 
 // Highlight matching text with support for multiple patterns (flags=yellow, flagIDs=cyan)
 const HighlightedText = memo(function HighlightedText({ text, contains, regex, flagidRegex }) {
@@ -223,12 +225,19 @@ function QuickRulePanel({ packet, services, onCreated, onCancel }) {
 // ---- Main Traffic component ----
 
 export default function Traffic() {
+  const navigate = useNavigate()
+  const location = useLocation()
   const [services, setServices] = useState([])
   const [packets, setPackets] = useState([])
   const [total, setTotal] = useState(0)
   const [selected, setSelected] = useState(null)
   const [loading, setLoading] = useState(false)
   const [flowMode, setFlowMode] = useState(null) // { packetId, packets, total }
+  /** Packet id used when entering flow (API or session fallback); restored on Clear flow */
+  const flowEntryPacketIdRef = useRef(null)
+  /** When opening flow from Alerts/Blocks, Clear flow navigates back and restores selection */
+  const flowReturnContextRef = useRef(null)
+  const packetTableScrollRef = useRef(null)
   const [filtersCollapsed, setFiltersCollapsed] = useState(false)
   const [copyStatus, setCopyStatus] = useState(null) // null | 'copying' | 'copied' | 'error'
   const [flagFilter, setFlagFilter] = useState(false)
@@ -433,7 +442,10 @@ export default function Traffic() {
   }
 
   // Flow: reconstruct multi-connection flow via auth token correlation
-  async function showFlow(pkt) {
+  const showFlow = useCallback(async (pkt, opts = {}) => {
+    if (pkt?.id == null) return
+    if (!opts.preserveFlowReturn) flowReturnContextRef.current = null
+    flowEntryPacketIdRef.current = pkt.id
     setLoading(true)
     try {
       const data = await api.getPacketFlow(pkt.id)
@@ -444,7 +456,6 @@ export default function Traffic() {
       })
     } catch (err) {
       console.error('Flow query failed, falling back to session_id:', err)
-      // Fallback to session_id filter
       setFilters((f) => ({
         ...f,
         session_id: pkt.session_id,
@@ -454,12 +465,7 @@ export default function Traffic() {
     } finally {
       setLoading(false)
     }
-  }
-
-  function clearFlow() {
-    setFlowMode(null)
-    setFilters((f) => ({ ...f, session_id: '', sort: 'desc', offset: 0 }))
-  }
+  }, [])
 
   function toggleFlagFilter() {
     setFlagFilter((v) => !v)
@@ -542,6 +548,8 @@ export default function Traffic() {
       await api.purgePackets()
       setSelected(null)
       setFlowMode(null)
+      flowEntryPacketIdRef.current = null
+      flowReturnContextRef.current = null
       setFilters((f) => ({ ...f, session_id: '', offset: 0 }))
       await loadPackets()
     } finally {
@@ -550,17 +558,80 @@ export default function Traffic() {
   }
 
   // Select a packet — fetch full detail if body is missing (SSE-pushed lightweight packets)
-  async function selectPacket(pkt) {
+  const selectPacket = useCallback(async (pkt) => {
+    if (!pkt) return
     if (pkt.body_string !== undefined) {
       setSelected(pkt)
       return
     }
-    setSelected(pkt) // show immediately with what we have
+    setSelected(pkt)
     try {
       const full = await api.getPacket(pkt.id)
       setSelected(full)
     } catch {}
-  }
+  }, [])
+
+  const clearFlow = useCallback(() => {
+    const anchorId = flowEntryPacketIdRef.current
+    const ret = flowReturnContextRef.current
+    flowEntryPacketIdRef.current = null
+    flowReturnContextRef.current = null
+    setFlowMode(null)
+    setFilters((f) => ({ ...f, session_id: '', sort: 'desc', offset: 0 }))
+    if (ret?.path === '/alerts' && ret.alertId != null) {
+      navigate('/alerts', { state: { restoreAlertId: ret.alertId } })
+      return
+    }
+    if (ret?.path === '/blocks' && ret.packetId != null) {
+      navigate('/blocks', { state: { restoreBlockedPacketId: ret.packetId } })
+      return
+    }
+    if (anchorId != null) selectPacket({ id: anchorId })
+  }, [selectPacket, navigate])
+
+  // Open flow when navigated from Alerts / Blocks with state
+  useEffect(() => {
+    const pid = location.state?.openFlowForPacketId
+    if (pid == null) return
+    const fr = location.state?.flowReturn
+    if (fr && (fr.path === '/alerts' || fr.path === '/blocks')) {
+      flowReturnContextRef.current = fr
+    }
+    navigate(location.pathname, { replace: true, state: {} })
+    showFlow({ id: pid }, { preserveFlowReturn: true })
+  }, [location.pathname, location.state, navigate, showFlow])
+
+  // Traffic table: J/K / arrows — keys from localStorage (Config page)
+  useEffect(() => {
+    function typingTarget(el) {
+      const t = el?.tagName
+      return t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT' || el?.isContentEditable
+    }
+    function onKeyDown(e) {
+      if (typingTarget(e.target)) return
+      const { up, down } = getTrafficNavKeys()
+      const list = flowMode ? flowMode.packets : packets
+      if (!list.length) return
+      let delta = 0
+      if (up.includes(e.key)) delta = -1
+      else if (down.includes(e.key)) delta = 1
+      else return
+      e.preventDefault()
+      let idx = selected ? list.findIndex((p) => p.id === selected.id) : -1
+      if (idx === -1) idx = delta > 0 ? 0 : list.length - 1
+      else idx = Math.max(0, Math.min(list.length - 1, idx + delta))
+      const next = list[idx]
+      if (next) selectPacket(next)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [flowMode, packets, selected, selectPacket])
+
+  useEffect(() => {
+    if (!selected?.id || !packetTableScrollRef.current) return
+    const row = packetTableScrollRef.current.querySelector(`tr[data-packet-id="${selected.id}"]`)
+    row?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  }, [selected?.id])
 
   // Close quick rule panel when selecting a different packet
   useEffect(() => { setShowQuickRule(false) }, [selected?.id])
@@ -767,7 +838,7 @@ export default function Traffic() {
       <div className="flex-1 flex gap-0 min-h-0 overflow-hidden">
         {/* Table */}
         <div className="flex-1 flex flex-col min-h-0 min-w-0">
-          <div className="flex-1 overflow-auto">
+          <div ref={packetTableScrollRef} className="flex-1 overflow-auto">
             <table className="w-full text-sm">
               <thead className="sticky top-0 bg-gray-900">
                 <tr className="text-left text-gray-500 border-b border-gray-800">
@@ -796,6 +867,7 @@ export default function Traffic() {
                   return (
                   <tr
                     key={pkt.id}
+                    data-packet-id={pkt.id}
                     onClick={() => selectPacket(pkt)}
                     className={`border-b border-gray-800/50 cursor-pointer transition-colors ${
                       selected?.id === pkt.id ? 'bg-gray-800' : 'hover:bg-gray-900/80'

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { api } from '../api'
 
 const matchTypes = ['string', 'regex', 'bytes']
@@ -13,6 +13,7 @@ export default function Rules() {
   const [error, setError] = useState('')
   const [showPresets, setShowPresets] = useState(false)
   const [selectedIds, setSelectedIds] = useState(new Set())
+  const ruleFormAnchorRef = useRef(null)
 
   useEffect(() => {
     api.listServices().then((data) => {
@@ -109,6 +110,13 @@ export default function Rules() {
     else setSelectedIds(new Set(rules.map(r => r.id)))
   }
 
+  useEffect(() => {
+    if (!editing) return
+    requestAnimationFrame(() => {
+      ruleFormAnchorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }, [editing])
+
   return (
     <div className="p-6">
       <div className="flex items-center justify-between mb-6">
@@ -162,9 +170,11 @@ export default function Rules() {
         />
       )}
 
-      {editing && (
-        <RuleForm rule={editing} services={services} onSave={handleSave} onCancel={() => setEditing(null)} />
-      )}
+      <div ref={ruleFormAnchorRef}>
+        {editing && (
+          <RuleForm rule={editing} services={services} onSave={handleSave} onCancel={() => setEditing(null)} />
+        )}
+      </div>
 
       {services.length === 0 ? (
         <p className="text-gray-600 text-center py-8">No services configured. Add a service first.</p>

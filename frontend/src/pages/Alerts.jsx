@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, memo } from 'react'
+import { useNavigate, useLocation } from 'react-router-dom'
 import { api, subscribePacketStream } from '../api'
 
 // Strip Go/PCRE inline flags like (?i) that are invalid in JavaScript regex
@@ -131,6 +132,8 @@ function LinkedPacketDetail({ packet, pattern, scope }) {
 }
 
 export default function Alerts() {
+  const navigate = useNavigate()
+  const location = useLocation()
   const [alerts, setAlerts] = useState([])
   const [total, setTotal] = useState(0)
   const [services, setServices] = useState([])
@@ -159,6 +162,23 @@ export default function Alerts() {
   }, [filters])
 
   useEffect(() => { loadAlerts() }, [loadAlerts])
+
+  useEffect(() => {
+    const id = location.state?.restoreAlertId
+    if (id == null) return
+    navigate(location.pathname, { replace: true, state: {} })
+    ;(async () => {
+      try {
+        const data = await api.getAlert(id)
+        if (data?.alert) {
+          setSelectedAlert(data.alert)
+          setLinkedPacket(data.packet ?? null)
+        }
+      } catch (err) {
+        console.error(err)
+      }
+    })()
+  }, [location.state, location.pathname, navigate])
 
   useEffect(() => {
     const interval = setInterval(loadAlerts, 5000)
@@ -312,7 +332,23 @@ export default function Alerts() {
             <div className="w-[400px] flex-shrink-0 bg-gray-900 border border-gray-800 rounded-lg overflow-auto">
               <div className="flex items-center justify-between p-3 border-b border-gray-800 sticky top-0 bg-gray-900 z-10">
                 <h3 className="text-sm font-medium text-gray-100">Alert #{selectedAlert.id}</h3>
-                <button onClick={() => { setSelectedAlert(null); setLinkedPacket(null) }} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={!linkedPacket?.id}
+                    onClick={() => linkedPacket?.id && selectedAlert && navigate('/traffic', {
+                      state: {
+                        openFlowForPacketId: linkedPacket.id,
+                        flowReturn: { path: '/alerts', alertId: selectedAlert.id },
+                      },
+                    })}
+                    className="text-xs text-purple-400 hover:text-purple-300 disabled:text-gray-600 disabled:cursor-default cursor-pointer"
+                    title={linkedPacket?.id ? 'Open Traffic and show flow for this packet' : 'Load packet detail first'}
+                  >
+                    Flow
+                  </button>
+                  <button type="button" onClick={() => { setSelectedAlert(null); setLinkedPacket(null) }} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
+                </div>
               </div>
               <div className="p-3 space-y-3 text-sm">
                 <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs bg-gray-800/50 rounded p-2">

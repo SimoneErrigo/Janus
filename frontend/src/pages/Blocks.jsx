@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, memo } from 'react'
+import { useNavigate, useLocation } from 'react-router-dom'
 import { api, subscribePacketStream } from '../api'
 
 function toJSRegex(pattern) {
@@ -143,6 +144,8 @@ function BlockedPacketDetail({ packet, rule }) {
 }
 
 export default function Blocks() {
+  const navigate = useNavigate()
+  const location = useLocation()
   const [packets, setPackets] = useState([])
   const [total, setTotal] = useState(0)
   const [services, setServices] = useState([])
@@ -171,6 +174,20 @@ export default function Blocks() {
   }, [filters])
 
   useEffect(() => { loadBlocks() }, [loadBlocks])
+
+  useEffect(() => {
+    const id = location.state?.restoreBlockedPacketId
+    if (id == null) return
+    navigate(location.pathname, { replace: true, state: {} })
+    ;(async () => {
+      try {
+        const full = await api.getPacket(id)
+        setSelectedPacket(full)
+      } catch (err) {
+        console.error(err)
+      }
+    })()
+  }, [location.state, location.pathname, navigate])
 
   useEffect(() => {
     const interval = setInterval(loadBlocks, 5000)
@@ -308,7 +325,22 @@ export default function Blocks() {
             <div className="w-[400px] flex-shrink-0 bg-gray-900 border border-gray-800 rounded-lg overflow-auto">
               <div className="flex items-center justify-between p-3 border-b border-gray-800 sticky top-0 bg-gray-900 z-10">
                 <h3 className="text-sm font-medium text-gray-100">Blocked Packet #{selectedPacket.id}</h3>
-                <button onClick={() => setSelectedPacket(null)} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => navigate('/traffic', {
+                      state: {
+                        openFlowForPacketId: selectedPacket.id,
+                        flowReturn: { path: '/blocks', packetId: selectedPacket.id },
+                      },
+                    })}
+                    className="text-xs text-purple-400 hover:text-purple-300 cursor-pointer"
+                    title="Open Traffic and show flow for this packet"
+                  >
+                    Flow
+                  </button>
+                  <button type="button" onClick={() => setSelectedPacket(null)} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
+                </div>
               </div>
               <div className="p-3 space-y-3 text-sm">
                 <BlockedPacketDetail packet={selectedPacket} rule={selectedRule} />

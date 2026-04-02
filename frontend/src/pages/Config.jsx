@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { api } from '../api'
+import { getTrafficNavKeys, saveTrafficNavKeys, keysToInputString, parseKeyList, defaultTrafficNavKeys } from '../trafficNavKeys'
 
 export default function Config() {
   const [config, setConfig] = useState(null)
@@ -24,10 +25,21 @@ export default function Config() {
   const [purgePacketsRunning, setPurgePacketsRunning] = useState(false)
   const [dbSizeMB, setDbSizeMB] = useState(0)
 
+  const [trafficNavUp, setTrafficNavUp] = useState('')
+  const [trafficNavDown, setTrafficNavDown] = useState('')
+  const [trafficNavSaved, setTrafficNavSaved] = useState(false)
+  const [trafficNavError, setTrafficNavError] = useState('')
+
   useEffect(() => {
     loadConfig()
     loadCleanupConfig()
     loadFlagIDData()
+  }, [])
+
+  useEffect(() => {
+    const k = getTrafficNavKeys()
+    setTrafficNavUp(keysToInputString(k.up))
+    setTrafficNavDown(keysToInputString(k.down))
   }, [])
 
   async function loadFlagIDData() {
@@ -294,6 +306,66 @@ export default function Config() {
           Save Configuration
         </button>
       </form>
+
+      <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 max-w-lg space-y-4 mt-6">
+        <h3 className="text-lg font-medium text-gray-100">Traffic keyboard</h3>
+        <p className="text-xs text-gray-500">Select previous/next packet on the Traffic page. Uses browser <code className="text-gray-400">KeyboardEvent.key</code> names (comma-separated), e.g. <code className="text-gray-400">k, K, ArrowUp</code>.</p>
+        <div>
+          <label className="block text-sm text-gray-400 mb-1">Previous packet (up in list)</label>
+          <input
+            value={trafficNavUp}
+            onChange={(e) => { setTrafficNavUp(e.target.value); setTrafficNavError('') }}
+            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm font-mono focus:outline-none focus:border-cyan-500"
+            spellCheck={false}
+          />
+        </div>
+        <div>
+          <label className="block text-sm text-gray-400 mb-1">Next packet (down in list)</label>
+          <input
+            value={trafficNavDown}
+            onChange={(e) => { setTrafficNavDown(e.target.value); setTrafficNavError('') }}
+            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm font-mono focus:outline-none focus:border-cyan-500"
+            spellCheck={false}
+          />
+        </div>
+        {trafficNavError && <div className="bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded">{trafficNavError}</div>}
+        {trafficNavSaved && <div className="bg-green-900/30 border border-green-800 text-green-400 text-sm px-4 py-2 rounded">Shortcuts saved (this browser only)</div>}
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              const up = parseKeyList(trafficNavUp)
+              const down = parseKeyList(trafficNavDown)
+              if (up.length === 0 || down.length === 0) {
+                setTrafficNavError('Each field needs at least one key.')
+                return
+              }
+              saveTrafficNavKeys(up, down)
+              setTrafficNavSaved(true)
+              setTrafficNavError('')
+              setTimeout(() => setTrafficNavSaved(false), 2500)
+            }}
+            className="bg-cyan-600 hover:bg-cyan-500 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
+          >
+            Save shortcuts
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              const d = defaultTrafficNavKeys()
+              setTrafficNavUp(keysToInputString(d.up))
+              setTrafficNavDown(keysToInputString(d.down))
+              saveTrafficNavKeys(d.up, d.down)
+              setTrafficNavSaved(true)
+              setTrafficNavError('')
+              setTimeout(() => setTrafficNavSaved(false), 2500)
+            }}
+            className="bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm px-4 py-2 rounded transition-colors cursor-pointer"
+          >
+            Reset defaults
+          </button>
+        </div>
+      </div>
 
       {/* Flag IDs section — configurable */}
       <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 max-w-lg space-y-4">

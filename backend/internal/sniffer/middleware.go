@@ -90,6 +90,8 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 
 		captureEnabled := shouldCapture == nil || shouldCapture()
 		applyFlagIDsNow := shouldApplyFlagIDsOnIngest == nil || shouldApplyFlagIDsOnIngest()
+		// In static mode without capture, still persist drops and alert-triggering traffic so Alerts/Blocks stay useful.
+		mustPersistReq := captureEnabled || shouldDrop || len(alertRules) > 0
 
 		// Check flagged status and flag ID containment
 		flagged := CheckFlagged(flagRegex, flagScanner, r.URL.String(), headersStr, reqBody)
@@ -126,7 +128,7 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		if reqPacket.MatchedRules == nil {
 			reqPacket.MatchedRules = []MatchedRuleInfo{}
 		}
-		if captureEnabled {
+		if mustPersistReq {
 			if err := store.Insert(reqPacket); err != nil {
 				log.Printf("[%s] sniffer: failed to log request: %v", svc.Name, err)
 			}
@@ -192,6 +194,7 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		if respMatchedRules == nil {
 			respMatchedRules = []MatchedRuleInfo{}
 		}
+		mustPersistResp := captureEnabled || len(respAlertRules) > 0
 
 		respPacket := &Packet{
 			ServiceID:      svc.ID,
@@ -214,7 +217,7 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 			MatchedFlagIDs: respMatchedFlagIDs,
 			FlagIDRound:    respFlagIDRound,
 		}
-		if captureEnabled {
+		if mustPersistResp {
 			if err := store.Insert(respPacket); err != nil {
 				log.Printf("[%s] sniffer: failed to log response: %v", svc.Name, err)
 			}

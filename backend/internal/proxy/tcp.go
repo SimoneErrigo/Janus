@@ -105,10 +105,11 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 
 	captureEnabled := m.shouldCapture()
 	applyFlagIDsNow := m.shouldApplyFlagIDsOnIngest()
+	mustPersistInitial := captureEnabled || shouldDrop || len(alertRules) > 0
 
 	// Check flagged and log the initial request packet
 	now := time.Now()
-	if len(initialData) > 0 && m.packetStore != nil && captureEnabled {
+	if len(initialData) > 0 && m.packetStore != nil && mustPersistInitial {
 		flagged := sniffer.CheckFlagged(m.flagRegex, m.flagScanner, "", "", initialData)
 		containsFlagID, matchedFlagIDs, flagIDRound := false, []string(nil), 0
 		if applyFlagIDsNow {
