@@ -13,6 +13,7 @@ COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
 ENV API_BACKEND=127.0.0.1
+ENV FRONTEND_BIND=0.0.0.0
 
 EXPOSE 3000
 ENTRYPOINT ["/docker-entrypoint.sh"]

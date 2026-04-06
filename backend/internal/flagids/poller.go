@@ -79,7 +79,7 @@ type Status struct {
 }
 
 // NewPoller creates a flag ID poller.
-func NewPoller(apiURL, teamID string, intervalSec int, enabled bool, roundDurationSec int, competitionStart time.Time, keepRounds int) *Poller {
+func NewPoller(apiURL, teamID string, intervalSec int, enabled bool, format string, roundDurationSec int, competitionStart time.Time, keepRounds int) *Poller {
 	if intervalSec <= 0 {
 		intervalSec = 5
 	}
@@ -89,12 +89,16 @@ func NewPoller(apiURL, teamID string, intervalSec int, enabled bool, roundDurati
 	if keepRounds <= 0 {
 		keepRounds = 5
 	}
+	if format == "" {
+		format = "cyberchallenge"
+	}
+	format = strings.ToLower(format)
 	return &Poller{
 		apiURL:           apiURL,
 		teamID:           teamID,
 		interval:         time.Duration(intervalSec) * time.Second,
 		enabled:          enabled,
-		format:           "cyberchallenge",
+		format:           format,
 		roundFlags:       make(map[int]map[string][]string),
 		flagIDs:          make(map[string][]string),
 		roundDuration:    time.Duration(roundDurationSec) * time.Second,
@@ -370,6 +374,10 @@ func (p *Poller) fetch() {
 	switch format {
 	case "cyberchallenge":
 		roundFlags, err = parseCyberChallengeRounded(body)
+	case "saarctf":
+		roundFlags, err = parseSaarCTFRounded(body, teamID)
+	case "faustctf":
+		roundFlags, err = parseFaustCTFRounded(body, teamID, p.roundDuration, p.competitionStart)
 	default:
 		roundFlags, err = parseCyberChallengeRounded(body)
 	}
@@ -427,7 +435,11 @@ func (p *Poller) fetch() {
 	flatFlagIDs := flattenRoundFlags(roundFlags)
 
 	// Build reverse map: flagIDValue -> descKey (for exploit generator)
-	vkm := parseValueKeyMap(body)
+	// Only CyberChallenge format carries a stable "description key" mapping.
+	var vkm map[string]string
+	if format == "cyberchallenge" {
+		vkm = parseValueKeyMap(body)
+	}
 
 	p.mu.Lock()
 	p.roundFlags = roundFlags
@@ -583,6 +595,128 @@ func parseCyberChallengeRounded(body []byte) (map[int]map[string][]string, error
 						result[roundNum][serviceName] = append(result[roundNum][serviceName], val)
 					}
 				}
+			}
+		}
+	}
+	return result, nil
+}
+
+// parseSaarCTFRounded parses saarCTF's attack.json format:
+// {
+//   "teams": [ { "id": 1, "ip": "10.32.1.2", ... }, ... ],
+//   "flag_ids": {
+//     "service_1": {
+//       "10.32.1.2": { "15": ["u1","u2"], "16": "u3" }
+//     }
+//   }
+// }
+// teamID is interpreted as the numeric team id (from teams[].id). If teams are missing,
+// it falls back to using teamID as the map key under flag_ids (rare setups).
+func parseSaarCTFRounded(body []byte, teamID string) (map[int]map[string][]string, error) {
+	type saarTeam struct {
+		ID int    `json:"id"`
+		IP string `json:"ip"`
+	}
+	var raw struct {
+		Teams  []saarTeam                                                                  `json:"teams"`
+		FlagIDs map[string]map[string]map[string]json.RawMessage                           `json:"flag_ids"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+
+	targetKey := ""
+	if teamID != "" {
+		if n, err := strconv.Atoi(teamID); err == nil {
+			for _, t := range raw.Teams {
+				if t.ID == n && t.IP != "" {
+					targetKey = t.IP
+					break
+				}
+			}
+		}
+	}
+	if targetKey == "" && teamID != "" {
+		// Fallback (in case the API keys by team id instead of IP)
+		targetKey = teamID
+	}
+
+	result := make(map[int]map[string][]string)
+	for serviceName, perKey := range raw.FlagIDs {
+		rounds, ok := perKey[targetKey]
+		if !ok {
+			continue
+		}
+		for roundStr, msg := range rounds {
+			roundNum, err := strconv.Atoi(roundStr)
+			if err != nil {
+				continue
+			}
+			if result[roundNum] == nil {
+				result[roundNum] = make(map[string][]string)
+			}
+
+			// Values can be either a string or an array of strings
+			var one string
+			if err := json.Unmarshal(msg, &one); err == nil {
+				if one != "" {
+					result[roundNum][serviceName] = append(result[roundNum][serviceName], one)
+				}
+				continue
+			}
+			var many []string
+			if err := json.Unmarshal(msg, &many); err == nil {
+				for _, v := range many {
+					if v != "" {
+						result[roundNum][serviceName] = append(result[roundNum][serviceName], v)
+					}
+				}
+			}
+		}
+	}
+	return result, nil
+}
+
+// parseFaustCTFRounded parses FaustCTF's teams.json style:
+// {
+//   "teams": [123, 456, ...],
+//   "flag_ids": { "service1": { "123": ["a","b"], "789": ["x","y"] } }
+// }
+// The API has no round numbers, so all values are assigned to the "current round"
+// computed from competitionStart/roundDuration when available, otherwise round=1.
+func parseFaustCTFRounded(body []byte, teamID string, roundDuration time.Duration, competitionStart time.Time) (map[int]map[string][]string, error) {
+	var raw struct {
+		FlagIDs map[string]map[string][]string `json:"flag_ids"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+
+	roundNum := 1
+	if !competitionStart.IsZero() && roundDuration > 0 {
+		elapsed := time.Since(competitionStart)
+		if elapsed >= 0 {
+			roundNum = int(elapsed/roundDuration) + 1
+			if roundNum < 1 {
+				roundNum = 1
+			}
+		}
+	}
+
+	result := make(map[int]map[string][]string)
+	result[roundNum] = make(map[string][]string)
+	if teamID == "" {
+		return result, nil
+	}
+
+	for serviceName, perTeam := range raw.FlagIDs {
+		vals := perTeam[teamID]
+		if len(vals) == 0 {
+			continue
+		}
+		for _, v := range vals {
+			if v != "" {
+				result[roundNum][serviceName] = append(result[roundNum][serviceName], v)
 			}
 		}
 	}

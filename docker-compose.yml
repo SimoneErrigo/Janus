@@ -13,6 +13,7 @@ services:
       - ./data:/data
       - ./certs:/certs
     ports:
+      - "127.0.0.1:8080:8080"
       - "3000-3001:3000-3001"
     depends_on:
       - redis
@@ -38,6 +39,7 @@ services:
       dockerfile: Dockerfile
     environment:
       - API_BACKEND=janus
+      - FRONTEND_BIND=0.0.0.0
     ports:
       - "127.0.0.1:2999:3000"
     depends_on:

@@ -11,8 +11,6 @@ import (
 )
 
 type configResponse struct {
-	VMIP             string `json:"vm_ip"`
-	NetworkInterface string `json:"network_interface"`
 	TeamPassword     string `json:"team_password"`
 	FlagRegex        string `json:"flag_regex"`
 
@@ -33,8 +31,6 @@ type configResponse struct {
 }
 
 type configUpdateRequest struct {
-	VMIP             *string `json:"vm_ip,omitempty"`
-	NetworkInterface *string `json:"network_interface,omitempty"`
 	TeamPassword     *string `json:"team_password,omitempty"`
 	FlagRegex        *string `json:"flag_regex,omitempty"`
 
@@ -74,8 +70,6 @@ func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, configResponse{
-		VMIP:                     cfg.VMIP,
-		NetworkInterface:         cfg.NetworkInterface,
 		TeamPassword:             cfg.TeamPassword,
 		FlagRegex:                cfg.FlagRegex,
 		FlagIDEnabled:            pollerCfg.Enabled,
@@ -100,13 +94,6 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := config.Get()
-
-	if req.VMIP != nil {
-		cfg.VMIP = *req.VMIP
-	}
-	if req.NetworkInterface != nil {
-		cfg.NetworkInterface = *req.NetworkInterface
-	}
 	if req.TeamPassword != nil {
 		if *req.TeamPassword == "" {
 			http.Error(w, "team_password cannot be empty", http.StatusBadRequest)
@@ -174,6 +161,7 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.FlagIDFormat != nil {
 			current.Format = *req.FlagIDFormat
+			cfg.FlagIDFormat = *req.FlagIDFormat
 		}
 		if req.RoundDurationSec != nil {
 			current.RoundDurationSec = *req.RoundDurationSec
@@ -208,8 +196,6 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 		currentRound = s.flagIDPoller.CurrentRound()
 	}
 	writeJSON(w, http.StatusOK, configResponse{
-		VMIP:                     cfg.VMIP,
-		NetworkInterface:         cfg.NetworkInterface,
 		TeamPassword:             cfg.TeamPassword,
 		FlagRegex:                cfg.FlagRegex,
 		FlagIDEnabled:            pollerCfg.Enabled,

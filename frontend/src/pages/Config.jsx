@@ -116,8 +116,6 @@ export default function Config() {
     setSaved(false)
     try {
       const data = await api.updateConfig({
-        vm_ip: form.vm_ip,
-        network_interface: form.network_interface,
         team_password: form.team_password,
         flag_regex: form.flag_regex,
         traffic_mode: form.traffic_mode || 'live',
@@ -227,27 +225,6 @@ export default function Config() {
       <h2 className="text-2xl font-semibold text-gray-100">Configuration</h2>
 
       <form onSubmit={handleSave} className="bg-gray-900 border border-gray-800 rounded-lg p-5 max-w-lg space-y-4">
-        <div>
-          <label className="block text-sm text-gray-400 mb-1">VM IP Address</label>
-          <input
-            value={form.vm_ip || ''}
-            onChange={(e) => set('vm_ip', e.target.value)}
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 transition-colors"
-            placeholder="e.g. 10.10.0.1"
-          />
-          <p className="text-xs text-gray-600 mt-1">The IP address of this VM in the competition network</p>
-        </div>
-
-        <div>
-          <label className="block text-sm text-gray-400 mb-1">Network Interface</label>
-          <input
-            value={form.network_interface || ''}
-            onChange={(e) => set('network_interface', e.target.value)}
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 transition-colors"
-            placeholder="e.g. eth0"
-          />
-        </div>
-
         <div>
           <label className="block text-sm text-gray-400 mb-1">Team Password</label>
           <input
@@ -438,6 +415,8 @@ export default function Config() {
               className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
             >
               <option value="cyberchallenge">CyberChallenge</option>
+              <option value="saarctf">saarCTF</option>
+              <option value="faustctf">FaustCTF</option>
             </select>
             <p className="text-xs text-gray-600 mt-1">Response format of the flag ID API</p>
           </div>

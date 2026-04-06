@@ -105,7 +105,7 @@ func main() {
 	}
 
 	flagIDPoller := flagids.NewPoller(
-		cfg.FlagIDAPIURL, cfg.OurTeamID, cfg.FlagIDPollInterval, cfg.FlagIDEnabled,
+		cfg.FlagIDAPIURL, cfg.OurTeamID, cfg.FlagIDPollInterval, cfg.FlagIDEnabled, cfg.FlagIDFormat,
 		cfg.RoundDurationSec, competitionStart, cfg.KeepRounds,
 	)
 	flagIDPoller.SetOnFetch(func(currentRound int) {
@@ -163,6 +163,7 @@ func main() {
 	}()
 
 	addr := ":" + cfg.APIPort
+	addr = cfg.APIBind + addr
 	log.Printf("Janus API listening on %s", addr)
 	if err := http.ListenAndServe(addr, apiServer.Handler()); err != nil {
 		log.Fatalf("API server error: %v", err)
