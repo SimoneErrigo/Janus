@@ -11,12 +11,11 @@ import (
 
 // Config holds the global configuration loaded from .env.
 type Config struct {
-	VMIP             string
-	NetworkInterface string
 	TeamPassword     string
 	FlagRegex        string
 	DataDir          string
 	APIPort          string
+	APIBind          string
 
 	// Cleanup settings
 	CleanupMaxAgeMinutes int
@@ -27,6 +26,7 @@ type Config struct {
 	OurTeamID          string
 	FlagIDAPIURL       string
 	FlagIDPollInterval int // seconds
+	FlagIDFormat       string
 
 	// Competition timing
 	RoundDurationSec int    // duration of a single round in seconds (default 120)
@@ -55,14 +55,14 @@ func Load(envPath string) (*Config, error) {
 	once.Do(func() {
 		cfg := &Config{
 			// Defaults
-			VMIP:                     "0.0.0.0",
-			NetworkInterface:         "eth0",
 			TeamPassword:             "changeme",
 			FlagRegex:                "[A-Z0-9]{31}=",
 			DataDir:                  "/data",
 			APIPort:                  "8080",
+			APIBind:                  "0.0.0.0",
 			TrafficMode:              "live",
 			FlowCorrelationWindowSec: 120,
+			FlagIDFormat:             "cyberchallenge",
 		}
 
 		env, err := parseEnvFile(envPath)
@@ -74,12 +74,6 @@ func Load(envPath string) (*Config, error) {
 			}
 		}
 
-		if v, ok := env["VM_IP"]; ok {
-			cfg.VMIP = v
-		}
-		if v, ok := env["NETWORK_INTERFACE"]; ok {
-			cfg.NetworkInterface = v
-		}
 		if v, ok := env["TEAM_PASSWORD"]; ok {
 			cfg.TeamPassword = v
 		}
@@ -91,6 +85,9 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v, ok := env["API_PORT"]; ok {
 			cfg.APIPort = v
+		}
+		if v, ok := env["API_BIND"]; ok && v != "" {
+			cfg.APIBind = v
 		}
 		if v, ok := env["CLEANUP_MAX_AGE_MINUTES"]; ok {
 			cfg.CleanupMaxAgeMinutes, _ = strconv.Atoi(v)
@@ -109,6 +106,9 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v, ok := env["FLAGID_POLL_INTERVAL"]; ok {
 			cfg.FlagIDPollInterval, _ = strconv.Atoi(v)
+		}
+		if v, ok := env["FLAGID_FORMAT"]; ok && v != "" {
+			cfg.FlagIDFormat = strings.ToLower(v)
 		}
 		if v, ok := env["ROUND_DURATION"]; ok {
 			cfg.RoundDurationSec, _ = strconv.Atoi(v)
@@ -133,12 +133,6 @@ func Load(envPath string) (*Config, error) {
 		}
 
 		// Environment variables override .env file
-		if v := os.Getenv("VM_IP"); v != "" {
-			cfg.VMIP = v
-		}
-		if v := os.Getenv("NETWORK_INTERFACE"); v != "" {
-			cfg.NetworkInterface = v
-		}
 		if v := os.Getenv("TEAM_PASSWORD"); v != "" {
 			cfg.TeamPassword = v
 		}
@@ -150,6 +144,9 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v := os.Getenv("API_PORT"); v != "" {
 			cfg.APIPort = v
+		}
+		if v := os.Getenv("API_BIND"); v != "" {
+			cfg.APIBind = v
 		}
 		if v := os.Getenv("CLEANUP_MAX_AGE_MINUTES"); v != "" {
 			cfg.CleanupMaxAgeMinutes, _ = strconv.Atoi(v)
@@ -168,6 +165,9 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v := os.Getenv("FLAGID_POLL_INTERVAL"); v != "" {
 			cfg.FlagIDPollInterval, _ = strconv.Atoi(v)
+		}
+		if v := os.Getenv("FLAGID_FORMAT"); v != "" {
+			cfg.FlagIDFormat = strings.ToLower(v)
 		}
 		if v := os.Getenv("ROUND_DURATION"); v != "" {
 			cfg.RoundDurationSec, _ = strconv.Atoi(v)

@@ -1,0 +1,38 @@
+## Linux competition override.
+##
+## Rationale:
+## - Janus needs to bind arbitrary "service ports" (the original challenge ports).
+## - Using host networking avoids pre-declaring a huge ports list.
+## - Management surfaces (API, dashboard, Redis) are explicitly bound to localhost.
+##
+## Usage:
+##   docker compose -f docker-compose.yml -f docker-compose-competition.yml up --build -d
+services:
+  janus:
+    network_mode: host
+    ports: !reset []
+    environment:
+      - DATA_DIR=/data
+      - API_PORT=8080
+      - API_BIND=127.0.0.1
+      - ENV_PATH=/dev/null
+      - REDIS_ADDR=127.0.0.1:6379
+
+  redis:
+    network_mode: host
+    ports: !reset []
+    command: >
+      sh -c '
+      if [ -n "$$REDIS_PASSWORD" ]; then
+        exec redis-server --bind 127.0.0.1 --requirepass "$$REDIS_PASSWORD" --save "" --appendonly no
+      else
+        exec redis-server --bind 127.0.0.1 --save "" --appendonly no
+      fi'
+
+  frontend:
+    environment:
+      - API_BACKEND=host.docker.internal
+      - FRONTEND_BIND=0.0.0.0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+

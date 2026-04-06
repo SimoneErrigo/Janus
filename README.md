@@ -18,32 +18,12 @@ In a CTF A/D competition, each team runs vulnerable services on a VM. Opponents 
 
 ## Quick start
 
-### 1. Configure `.env`
+### 1. Create your `.env`
 
-```env
-VM_IP=10.10.0.1
-NETWORK_INTERFACE=eth0
-TEAM_PASSWORD=changeme
-FLAG_REGEX=[A-Z0-9]{31}=
+Copy the example and edit the few competition-specific values:
 
-# Auto-cleanup (0 = disabled)
-CLEANUP_MAX_AGE_MINUTES=120
-CLEANUP_MAX_DB_SIZE_MB=500
-
-# Flag ID polling (set FLAGID_ENABLED=true to activate)
-FLAGID_ENABLED=false
-OUR_TEAM_ID=1
-FLAGID_API_URL=http://10.10.0.1:8081/flagIds
-FLAGID_POLL_INTERVAL=5
-
-# Competition timing
-ROUND_DURATION=120
-COMPETITION_START=2026-03-29T10:00:00Z
-KEEP_ROUNDS=5
-
-# Redis caching (rules cache — improves performance on hot paths)
-REDIS_ADDR=127.0.0.1:6379
-REDIS_PASSWORD=changeme_redis
+```bash
+cp .env.example .env
 ```
 
 ### 2. Deploy
@@ -52,16 +32,22 @@ REDIS_PASSWORD=changeme_redis
 docker compose up -d
 ```
 
-- **Frontend dashboard:** `http://localhost:3000` (bound to localhost only)
-- **Backend API:** `http://localhost:8080` (bound to localhost only)
+- **Frontend dashboard:** `http://localhost:2999` (localhost-only)
+- **Backend API:** `http://localhost:8080` (localhost-only)
 - **Redis:** `127.0.0.1:6379` (internal only, not exposed to the competition network)
 - **Dozzle (container logs):** `http://localhost:9999` (internal only, bound to localhost)
 
-For production (competition VM with host networking):
+### Competition VM (Linux)
+
+On Linux competition VMs, Janus often needs to bind many “service ports” (original challenge ports). The easiest way is host networking for the `janus` container, while keeping the dashboard/API/Redis bound to localhost:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build -d
+docker compose -f docker-compose.yml -f docker-compose-competition.yml up --build -d
 ```
+
+### macOS development note (why ports are published)
+
+On macOS, Docker runs inside a VM (no true `--network host`). If you want to test the reverse proxy from your host (or another machine) you must **publish the service ports you want Janus to listen on** via Docker port mappings. That’s why `docker-compose.yml` publishes a small port range for proxied services.
 
 ### 3. Login
 
@@ -94,6 +80,13 @@ The **Traffic** page shows all captured packets with real-time updates via SSE (
 - Packets with both a flag and a flag ID display a combined yellow-to-teal gradient
 - Flag regex matches are always highlighted in yellow in the detail panel; flag ID values in teal
 - Click a packet to see full headers, body, and matched rules
+
+#### Live vs Static mode
+
+Janus supports two traffic modes (configurable from the **Config** page):
+
+- **Live** (default): continuous capture, SSE streaming enabled, periodic flagId fetch + automatic smart backfill, auto-cleanup policies enabled.
+- **Static**: manual capture start/stop (useful for offline analysis or when you want to “freeze” ingestion), periodic flagId fetch/backfill is disabled, and auto-cleanup policies are disabled to avoid deleting evidence while reviewing.
 
 ### 6. Copy Exploit
 
@@ -155,9 +148,9 @@ The **Alerts** page shows real-time alerts triggered by rules with `alert` or `b
 
 The **Config** page lets you update:
 
-- VM IP, network interface, team password, flag regex
+- Team password, flag regex, traffic mode, flow correlation window
 - Auto-cleanup policies (max age, max DB size) — cleanup runs every 1 minute
-- Flag ID polling settings (API URL, team ID, poll interval, round duration, competition start, keep rounds) — with a manual "Refresh Now" button (backfill runs automatically after each fetch)
+- Flag ID polling settings (format, API URL, team ID, poll interval, round duration, competition start, keep rounds) — with a manual "Refresh Now" button (backfill runs automatically after each fetch)
 - Competition timing: round duration, competition start time, number of rounds to keep
 - A "Run cleanup now" button, "Clear Packets" button (deletes all packets but keeps config), and current DB size display
 
@@ -172,9 +165,9 @@ The sidebar has a **Logs** link that opens [Dozzle](http://localhost:9999) in a 
 
 Redis is used as a performance cache for the rules evaluation hot path:
 
-- **Rules evaluation** — rules are cached per service, eliminating a JSON file read on every packet; the cache is invalidated automatically whenever a rule is created, updated, or deleted
+- **Rules evaluation** — rules are cached per service; the cache is invalidated automatically whenever a rule is created, updated, or deleted
 
-Redis is never the source of truth. If Redis is unreachable, Janus falls back to the JSON rules file transparently with no loss of correctness.
+Redis is never the source of truth. If Redis is unreachable, Janus falls back to the persistent store transparently with no loss of correctness.
 
 ## Performance
 
@@ -240,3 +233,68 @@ All endpoints (except `/api/login`) require a `Bearer` token in the `Authorizati
 | GET            | `/api/system/stats`                | VM resource metrics (CPU, RAM, disk, DB size, Redis)                                                                                                                                        |
 
 > **Note:** Backfill is fully automatic — after every flag ID fetch, Janus re-scans packets from the last 60 seconds using the Aho-Corasick automaton. No manual backfill endpoint is exposed.
+
+## Flag ID formats
+
+Janus can parse multiple scoreboard flagId JSON formats. Select the format from the **Config → Flag IDs → Competition Format** dropdown (sent as `flagid_format` via `/api/config`).
+
+### CyberChallenge (default)
+
+The API shape is the “rounded” nested format used in CyberChallenge deployments (see `.env.example` for the variables).
+
+```json
+{
+  "service1": {
+    "1": {
+      "5" : {
+        "flag_id_description": "flag_id_service_service1_team_1_round_5"
+      }
+    },
+    ...
+  },
+  ...
+}
+```
+
+### saarCTF (`saarctf`)
+
+```json
+{
+  "teams": [
+    { "id": 1, "name": "NOP", "ip": "10.32.1.2" },
+    { "id": 2, "name": "saarsec", "ip": "10.32.2.2" }
+  ],
+  "flag_ids": {
+    "service_1": {
+      "10.32.1.2": {
+        "15": ["username1", "username1.2"],
+        "16": ["username2", "username2.2"]
+      },
+      "10.32.2.2": {
+        "15": ["username3", "username3.2"],
+        "16": ["username4", "username4.2"]
+      }
+    },
+    "service_2": {
+      "10.32.1.2": {
+        "15": "username3",
+        "16": "username4"
+      }
+    }
+  }
+}
+```
+
+### FaustCTF (`faustctf`)
+
+```json
+{
+  "teams": [123, 456, 789],
+  "flag_ids": {
+    "service1": {
+      "123": ["abc123", "def456"],
+      "789": ["xxx", "yyy"]
+    }
+  }
+}
+```

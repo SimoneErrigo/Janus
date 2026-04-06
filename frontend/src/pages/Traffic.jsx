@@ -3,6 +3,49 @@ import { useNavigate, useLocation } from 'react-router-dom'
 import { api, subscribePacketStream } from '../api'
 import { getTrafficNavKeys } from '../trafficNavKeys'
 
+function base64ToBytes(b64) {
+  if (!b64) return new Uint8Array()
+  try {
+    const bin = atob(b64)
+    const bytes = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+    return bytes
+  } catch {
+    return new Uint8Array()
+  }
+}
+
+function bytesToHex(bytes, maxBytes = 1024 * 64) {
+  const n = Math.min(bytes.length, maxBytes)
+  let out = ''
+  for (let i = 0; i < n; i++) out += bytes[i].toString(16).padStart(2, '0')
+  if (bytes.length > n) out += `...(+${bytes.length - n} bytes)`
+  return out
+}
+
+async function copyRawBytesFromBase64(b64) {
+  const bytes = base64ToBytes(b64)
+  if (!bytes || bytes.length === 0) return false
+
+  // Prefer true binary clipboard when supported; fall back to hex text.
+  try {
+    if (navigator.clipboard?.write && typeof ClipboardItem !== 'undefined') {
+      const blob = new Blob([bytes], { type: 'application/octet-stream' })
+      await navigator.clipboard.write([new ClipboardItem({ 'application/octet-stream': blob })])
+      return true
+    }
+  } catch {
+    // ignore; fallback below
+  }
+
+  try {
+    await navigator.clipboard.writeText(bytesToHex(bytes))
+    return true
+  } catch {
+    return false
+  }
+}
+
 // Highlight matching text with support for multiple patterns (flags=yellow, flagIDs=cyan)
 const HighlightedText = memo(function HighlightedText({ text, contains, regex, flagidRegex }) {
   if (!text || (!contains && !regex && !flagidRegex)) return <>{text}</>
@@ -1058,23 +1101,44 @@ export default function Traffic() {
                   </div>
                 )}
 
-                {selected.body_string && (
+                {(selected.body_string || selected.body) && (
                   <div className="flex-1">
                     <div className="flex items-center gap-2 mb-1">
                       <span className="text-gray-500 text-xs">Body</span>
                       {formattedBody.isJSON && (
                         <span className="text-[10px] text-cyan-600 bg-cyan-900/30 px-1 py-0.5 rounded">JSON</span>
                       )}
+                      {selected.body && (
+                        <span className="text-[10px] text-gray-600 font-mono">
+                          {base64ToBytes(selected.body).length} bytes
+                        </span>
+                      )}
                       <button
                         onClick={() => navigator.clipboard.writeText(selected.body_string)}
                         className="text-[10px] text-gray-600 hover:text-gray-400 ml-auto cursor-pointer"
                         title="Copy raw body"
+                        disabled={!selected.body_string}
                       >
                         Copy
                       </button>
+                      {selected.body && (
+                        <button
+                          onClick={async () => { await copyRawBytesFromBase64(selected.body) }}
+                          className="text-[10px] text-gray-600 hover:text-gray-400 cursor-pointer"
+                          title="Copy body as raw bytes (binary clipboard when supported; otherwise hex)"
+                        >
+                          Copy bytes
+                        </button>
+                      )}
                     </div>
                     <pre className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 overflow-auto whitespace-pre-wrap break-all" style={{ maxHeight: '60vh' }}>
-                      <HighlightedText text={formattedBody.text} contains={filters.contains} regex={bodyRegex} flagidRegex={flagidHighlightRegex} />
+                      {selected.body_string ? (
+                        <HighlightedText text={formattedBody.text} contains={filters.contains} regex={bodyRegex} flagidRegex={flagidHighlightRegex} />
+                      ) : (
+                        <span className="text-gray-500">
+                          (non-UTF8 body) — use “Copy bytes”
+                        </span>
+                      )}
                     </pre>
                   </div>
                 )}
