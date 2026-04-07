@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -65,104 +64,6 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 	dstPort := svc.ListenPort
 	sessionID := sniffer.MakeSessionID(svc.ID, srcIP, srcPort)
 
-	// Read initial data from client for rule evaluation
-	var initialData []byte
-	var matchedRules []sniffer.MatchedRuleInfo
-	shouldDrop := false
-	var alertRules []dropper.Rule
-
-	if m.ruleStore != nil {
-		buf := make([]byte, 4096)
-		clientConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		n, _ := clientConn.Read(buf)
-		clientConn.SetReadDeadline(time.Time{})
-		if n > 0 {
-			initialData = buf[:n]
-
-			// Evaluate all rules on initial data
-			engine := dropper.NewEngine(m.ruleStore)
-			if m.rulesCache != nil {
-				engine.SetCache(m.rulesCache)
-			}
-			result := engine.EvaluateActions(&dropper.HTTPRequest{
-				ServiceID: svc.ID,
-				RawBytes:  initialData,
-				Body:      initialData,
-			})
-			for _, rule := range result.AllMatched {
-				matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{
-					ID:      rule.ID,
-					Name:    rule.Name,
-					Action:  string(rule.Action),
-					Pattern: rule.Pattern,
-					Scope:   string(rule.Scope),
-				})
-			}
-			shouldDrop = result.ShouldDrop
-			alertRules = result.AlertRules
-		}
-	}
-
-	captureEnabled := m.shouldCapture()
-	applyFlagIDsNow := m.shouldApplyFlagIDsOnIngest()
-	mustPersistInitial := captureEnabled || shouldDrop || len(alertRules) > 0
-
-	// Check flagged and log the initial request packet
-	now := time.Now()
-	if len(initialData) > 0 && m.packetStore != nil && mustPersistInitial {
-		flagged := sniffer.CheckFlagged(m.flagRegex, m.flagScanner, "", "", initialData)
-		containsFlagID, matchedFlagIDs, flagIDRound := false, []string(nil), 0
-		if applyFlagIDsNow {
-			containsFlagID, matchedFlagIDs, flagIDRound = sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", initialData)
-		}
-		if matchedRules == nil {
-			matchedRules = []sniffer.MatchedRuleInfo{}
-		}
-		pkt := &sniffer.Packet{
-			ServiceID:      svc.ID,
-			SessionID:      sessionID,
-			Timestamp:      now,
-			SrcIP:          srcIP,
-			SrcPort:        srcPort,
-			DstIP:          dstIP,
-			DstPort:        dstPort,
-			Protocol:       string(svc.Protocol),
-			Direction:      sniffer.DirectionRequest,
-			Body:           initialData,
-			MatchedRules:   matchedRules,
-			Flagged:        flagged,
-			ContainsFlagID: containsFlagID,
-			MatchedFlagIDs: matchedFlagIDs,
-			FlagIDRound:    flagIDRound,
-		}
-		if err := m.packetStore.Insert(pkt); err != nil {
-			log.Printf("[%s] sniffer: failed to log TCP initial packet: %v", svc.Name, err)
-		}
-
-		// Insert alerts for alert/both rules
-		for _, rule := range alertRules {
-			alert := &sniffer.Alert{
-				PacketID:       pkt.ID,
-				RuleID:         rule.ID,
-				ServiceID:      svc.ID,
-				SrcIP:          srcIP,
-				Timestamp:      now,
-				PatternMatched: rule.Pattern,
-			}
-			if err := m.packetStore.InsertAlert(alert); err != nil {
-				log.Printf("[%s] sniffer: failed to log TCP alert: %v", svc.Name, err)
-			}
-		}
-	}
-
-	if shouldDrop {
-		log.Printf("[%s] TCP DROP: %d rule(s) matched", svc.Name, len(matchedRules))
-		if tc, ok := clientConn.(*net.TCPConn); ok {
-			tc.SetLinger(0)
-		}
-		return
-	}
-
 	backendConn, err := net.DialTimeout("tcp", svc.TargetAddr, 10*time.Second)
 	if err != nil {
 		log.Printf("[%s] TCP dial backend error: %v", svc.Name, err)
@@ -170,30 +71,31 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 	}
 	defer backendConn.Close()
 
-	// Forward initial data that was already read
-	if len(initialData) > 0 {
-		backendConn.Write(initialData)
+	// Shared close-once: when a drop rule fires or either side finishes,
+	// close both connections so the other goroutine also exits.
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			clientConn.Close()
+			backendConn.Close()
+		})
 	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Client -> Backend (request direction)
+	// Client -> Backend (request direction) — evaluate rules on every chunk
 	go func() {
 		defer wg.Done()
-		m.sniffCopy(backendConn, clientConn, svc, sessionID, srcIP, srcPort, dstIP, dstPort, sniffer.DirectionRequest)
-		if tc, ok := backendConn.(*net.TCPConn); ok {
-			tc.CloseWrite()
-		}
+		defer closeBoth()
+		m.sniffCopyWithRules(backendConn, clientConn, svc, sessionID, srcIP, srcPort, dstIP, dstPort, sniffer.DirectionRequest)
 	}()
 
-	// Backend -> Client (response direction)
+	// Backend -> Client (response direction) — no rule evaluation, just sniff
 	go func() {
 		defer wg.Done()
+		defer closeBoth()
 		m.sniffCopy(clientConn, backendConn, svc, sessionID, dstIP, dstPort, srcIP, srcPort, sniffer.DirectionResponse)
-		if tc, ok := clientConn.(*net.TCPConn); ok {
-			tc.CloseWrite()
-		}
 	}()
 
 	done := make(chan struct{})
@@ -205,64 +107,166 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 	select {
 	case <-done:
 	case <-ctx.Done():
+		closeBoth()
 	}
 }
 
+// sniffCopyWithRules reads from src chunk by chunk, evaluates drop/alert rules
+// on each chunk, and forwards to dst. If a drop rule matches, the connection
+// is closed immediately. Each chunk is logged as a separate packet.
+func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.Service, sessionID string, srcIP string, srcPort int, dstIP string, dstPort int, dir sniffer.Direction) {
+	buf := make([]byte, 32*1024)
+	var engine *dropper.Engine
+	if m.ruleStore != nil {
+		engine = dropper.NewEngine(m.ruleStore)
+		if m.rulesCache != nil {
+			engine.SetCache(m.rulesCache)
+		}
+	}
+
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+
+			// Evaluate rules on this chunk
+			var matchedRules []sniffer.MatchedRuleInfo
+			shouldDrop := false
+			var alertRules []dropper.Rule
+
+			if engine != nil {
+				result := engine.EvaluateActions(&dropper.HTTPRequest{
+					ServiceID: svc.ID,
+					RawBytes:  chunk,
+					Body:      chunk,
+				})
+				for _, rule := range result.AllMatched {
+					matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{
+						ID:      rule.ID,
+						Name:    rule.Name,
+						Action:  string(rule.Action),
+						Pattern: rule.Pattern,
+						Scope:   string(rule.Scope),
+					})
+				}
+				shouldDrop = result.ShouldDrop
+				alertRules = result.AlertRules
+			}
+
+			captureEnabled := m.shouldCapture()
+			mustPersist := captureEnabled || shouldDrop || len(alertRules) > 0
+
+			// Log this chunk as a packet
+			if m.packetStore != nil && mustPersist {
+				now := time.Now()
+				flagged := sniffer.CheckFlagged(m.flagRegex, m.flagScanner, "", "", chunk)
+				containsFlagID, matchedFlagIDs, flagIDRound := false, []string(nil), 0
+				if m.shouldApplyFlagIDsOnIngest() {
+					containsFlagID, matchedFlagIDs, flagIDRound = sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", chunk)
+				}
+				if matchedRules == nil {
+					matchedRules = []sniffer.MatchedRuleInfo{}
+				}
+				data := make([]byte, len(chunk))
+				copy(data, chunk)
+				pkt := &sniffer.Packet{
+					ServiceID:      svc.ID,
+					SessionID:      sessionID,
+					Timestamp:      now,
+					SrcIP:          srcIP,
+					SrcPort:        srcPort,
+					DstIP:          dstIP,
+					DstPort:        dstPort,
+					Protocol:       string(svc.Protocol),
+					Direction:      dir,
+					Body:           data,
+					MatchedRules:   matchedRules,
+					Flagged:        flagged,
+					ContainsFlagID: containsFlagID,
+					MatchedFlagIDs: matchedFlagIDs,
+					FlagIDRound:    flagIDRound,
+				}
+				if err := m.packetStore.Insert(pkt); err != nil {
+					log.Printf("[%s] sniffer: failed to log TCP packet: %v", svc.Name, err)
+				}
+
+				for _, rule := range alertRules {
+					alert := &sniffer.Alert{
+						PacketID:       pkt.ID,
+						RuleID:         rule.ID,
+						ServiceID:      svc.ID,
+						SrcIP:          srcIP,
+						Timestamp:      now,
+						PatternMatched: rule.Pattern,
+					}
+					if err := m.packetStore.InsertAlert(alert); err != nil {
+						log.Printf("[%s] sniffer: failed to log TCP alert: %v", svc.Name, err)
+					}
+				}
+			}
+
+			if shouldDrop {
+				log.Printf("[%s] TCP DROP: %d rule(s) matched on chunk", svc.Name, len(matchedRules))
+				return // closeBoth() is deferred in the caller
+			}
+
+			// Forward chunk to backend
+			if _, writeErr := dst.Write(chunk); writeErr != nil {
+				return
+			}
+		}
+		if readErr != nil {
+			return
+		}
+	}
+}
+
+// sniffCopy copies data from src to dst, logging each chunk as a separate packet.
+// Used for the response direction (no rule evaluation).
 func (m *Manager) sniffCopy(dst io.Writer, src io.Reader, svc *storage.Service, sessionID string, srcIP string, srcPort int, dstIP string, dstPort int, dir sniffer.Direction) {
-	var buf bytes.Buffer
-	writer := dst
-	if m.packetStore != nil {
-		// Use TeeReader to capture a copy of the data
-		limited := &limitedWriter{buf: &buf, max: maxTCPCapture}
-		writer = io.MultiWriter(dst, limited)
-	}
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
 
-	io.Copy(writer, src)
+			if _, writeErr := dst.Write(chunk); writeErr != nil {
+				break
+			}
 
-	if m.packetStore != nil && buf.Len() > 0 && m.shouldCapture() {
-		data := buf.Bytes()
-		flagged := sniffer.CheckFlagged(m.flagRegex, m.flagScanner, "", "", data)
-		containsFlagID, matchedFlagIDs, flagIDRound := false, []string(nil), 0
-		if m.shouldApplyFlagIDsOnIngest() {
-			containsFlagID, matchedFlagIDs, flagIDRound = sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", data)
+			if m.packetStore != nil && m.shouldCapture() {
+				data := make([]byte, n)
+				copy(data, chunk)
+				flagged := sniffer.CheckFlagged(m.flagRegex, m.flagScanner, "", "", data)
+				containsFlagID, matchedFlagIDs, flagIDRound := false, []string(nil), 0
+				if m.shouldApplyFlagIDsOnIngest() {
+					containsFlagID, matchedFlagIDs, flagIDRound = sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", data)
+				}
+				pkt := &sniffer.Packet{
+					ServiceID:      svc.ID,
+					SessionID:      sessionID,
+					Timestamp:      time.Now(),
+					SrcIP:          srcIP,
+					SrcPort:        srcPort,
+					DstIP:          dstIP,
+					DstPort:        dstPort,
+					Protocol:       string(svc.Protocol),
+					Direction:      dir,
+					Body:           data,
+					MatchedRules:   []sniffer.MatchedRuleInfo{},
+					Flagged:        flagged,
+					ContainsFlagID: containsFlagID,
+					MatchedFlagIDs: matchedFlagIDs,
+					FlagIDRound:    flagIDRound,
+				}
+				if err := m.packetStore.Insert(pkt); err != nil {
+					log.Printf("[%s] sniffer: failed to log TCP packet: %v", svc.Name, err)
+				}
+			}
 		}
-		pkt := &sniffer.Packet{
-			ServiceID:      svc.ID,
-			SessionID:      sessionID,
-			Timestamp:      time.Now(),
-			SrcIP:          srcIP,
-			SrcPort:        srcPort,
-			DstIP:          dstIP,
-			DstPort:        dstPort,
-			Protocol:       string(svc.Protocol),
-			Direction:      dir,
-			Body:           data,
-			MatchedRules:   []sniffer.MatchedRuleInfo{},
-			Flagged:        flagged,
-			ContainsFlagID: containsFlagID,
-			MatchedFlagIDs: matchedFlagIDs,
-			FlagIDRound:    flagIDRound,
-		}
-		if err := m.packetStore.Insert(pkt); err != nil {
-			log.Printf("[%s] sniffer: failed to log TCP packet: %v", svc.Name, err)
+		if readErr != nil {
+			return
 		}
 	}
 }
 
-// limitedWriter writes up to max bytes into buf, then silently discards the rest.
-type limitedWriter struct {
-	buf *bytes.Buffer
-	max int
-}
-
-func (lw *limitedWriter) Write(p []byte) (int, error) {
-	remaining := lw.max - lw.buf.Len()
-	if remaining <= 0 {
-		return len(p), nil // discard but report success
-	}
-	if len(p) > remaining {
-		p = p[:remaining]
-	}
-	lw.buf.Write(p)
-	return len(p), nil
-}

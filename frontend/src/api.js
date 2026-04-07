@@ -146,6 +146,7 @@ export const api = {
   runCleanup: () => request('/cleanup/run', { method: 'POST' }),
   purgeAll: () => request('/cleanup/purge', { method: 'POST' }),
   purgePackets: () => request('/cleanup/purge-packets', { method: 'POST' }),
+  purgeDropped: () => request('/cleanup/purge-dropped', { method: 'POST' }),
 
   // System stats
   getSystemStats: () => request('/system/stats'),

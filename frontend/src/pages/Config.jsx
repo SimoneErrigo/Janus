@@ -417,6 +417,7 @@ export default function Config() {
               <option value="cyberchallenge">CyberChallenge</option>
               <option value="saarctf">saarCTF</option>
               <option value="faustctf">FaustCTF</option>
+              <option value="forcad">ForcAD</option>
             </select>
             <p className="text-xs text-gray-600 mt-1">Response format of the flag ID API</p>
           </div>

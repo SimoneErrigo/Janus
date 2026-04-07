@@ -151,6 +151,25 @@ func (m *Manager) PurgePackets() Result {
 	}
 }
 
+// PurgeDroppedPackets deletes all packets that were dropped by a rule.
+func (m *Manager) PurgeDroppedPackets() Result {
+	start := time.Now()
+	pkts, err := m.packetStore.PurgeDroppedPackets()
+	if err != nil {
+		log.Printf("PurgeDroppedPackets error: %v", err)
+		return Result{Error: err.Error()}
+	}
+	duration := time.Since(start)
+	dbSize := m.DBSizeMB()
+	log.Printf("PurgeDroppedPackets: deleted %d packets in %dms (DB: %.1f MB)",
+		pkts, duration.Milliseconds(), dbSize)
+	return Result{
+		PacketsDeleted: pkts,
+		DurationMs:     duration.Milliseconds(),
+		DBSizeMB:       dbSize,
+	}
+}
+
 func (m *Manager) run() Result {
 	start := time.Now()
 	var totalPkts, totalAlerts int64

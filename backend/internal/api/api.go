@@ -80,6 +80,7 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/cleanup/run", s.handleCleanupRun)
 	protected.HandleFunc("/api/cleanup/purge", s.handleCleanupPurge)
 	protected.HandleFunc("/api/cleanup/purge-packets", s.handleCleanupPurgePackets)
+	protected.HandleFunc("/api/cleanup/purge-dropped", s.handleCleanupPurgeDropped)
 	protected.HandleFunc("/api/flagids", s.handleFlagIDs)
 	protected.HandleFunc("/api/flagids/status", s.handleFlagIDStatus)
 	protected.HandleFunc("/api/flagids/refresh", s.handleFlagIDRefresh)

@@ -638,6 +638,19 @@ func (s *PacketStore) PurgePackets() (int64, error) {
 	return n, nil
 }
 
+// PurgeDroppedPackets deletes all packets that were dropped by a rule (has_drop_match=1)
+// and their associated alerts. Returns the number of packets deleted.
+func (s *PacketStore) PurgeDroppedPackets() (int64, error) {
+	s.db.Exec("DELETE FROM alerts WHERE packet_id IN (SELECT id FROM packets WHERE has_drop_match = 1)")
+
+	res, err := s.db.Exec("DELETE FROM packets WHERE has_drop_match = 1")
+	if err != nil {
+		return 0, fmt.Errorf("deleting dropped packets: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // DeleteOlderThan deletes packets and their alerts older than the given time.
 // Returns the number of rows deleted from each table.
 func (s *PacketStore) DeleteOlderThan(before time.Time) (packetsDeleted, alertsDeleted int64, err error) {

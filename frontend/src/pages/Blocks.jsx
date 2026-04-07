@@ -189,6 +189,17 @@ export default function Blocks() {
     })()
   }, [location.state, location.pathname, navigate])
 
+  async function handleClearAll() {
+    if (!confirm('Clear all blocked packets?')) return
+    try {
+      await api.purgeDropped()
+      loadBlocks()
+      setSelectedPacket(null)
+    } catch (err) {
+      console.error(err)
+    }
+  }
+
   useEffect(() => {
     const interval = setInterval(loadBlocks, 5000)
     return () => clearInterval(interval)
@@ -252,6 +263,13 @@ export default function Blocks() {
             placeholder="Source IP..."
             className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 w-40"
           />
+          <button
+            onClick={handleClearAll}
+            disabled={total === 0}
+            className="bg-red-900/50 hover:bg-red-800/50 disabled:bg-gray-800 disabled:text-gray-600 text-red-400 text-sm px-4 py-2 rounded transition-colors cursor-pointer disabled:cursor-default"
+          >
+            Clear All
+          </button>
         </div>
       </div>
 

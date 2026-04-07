@@ -105,6 +105,11 @@ function hasDropAction(pkt) {
   return pkt.matched_rules.some((r) => r.action === 'drop' || r.action === 'both')
 }
 
+function hasAlertAction(pkt) {
+  if (!pkt?.matched_rules?.length) return false
+  return pkt.matched_rules.some((r) => r.action === 'alert' || r.action === 'both')
+}
+
 // Try to pretty-print JSON, return original string if not valid JSON
 function tryFormatJSON(str) {
   if (!str) return { text: str, isJSON: false }
@@ -417,8 +422,6 @@ export default function Traffic() {
     if (f.offset > 0) return
     // Client-side filter for simple filters
     const filtered = newPkts.filter((p) => {
-      // Alert/drop packets are streamed in Alerts/Blocks pages, not Traffic.
-      if (p.matched_rules && p.matched_rules.length > 0) return false
       if (f.service_id && p.service_id !== f.service_id) return false
       if (f.protocol && p.protocol !== f.protocol) return false
       if (f.method && p.method !== f.method) return false
@@ -936,6 +939,7 @@ export default function Traffic() {
                       <div className="flex items-center gap-1">
                         {pkt.flagged && <span className="text-yellow-400 text-xs" title="Contains flag">&#9873;</span>}
                         {hasDropAction(pkt) && <span className="text-red-400 text-xs" title="Dropped by rule">&#9888;</span>}
+                        {hasAlertAction(pkt) && <span className="text-yellow-400 text-xs" title="Alert rule triggered">&#9888;</span>}
                         {pkt.contains_flagid && <span className="text-teal-400 text-xs" title="Contains flag ID">&#9881;</span>}
                         <button
                           onClick={(e) => { e.stopPropagation(); showFlow(pkt) }}

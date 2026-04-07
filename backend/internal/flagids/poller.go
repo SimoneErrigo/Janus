@@ -378,6 +378,8 @@ func (p *Poller) fetch() {
 		roundFlags, err = parseSaarCTFRounded(body, teamID)
 	case "faustctf":
 		roundFlags, err = parseFaustCTFRounded(body, teamID, p.roundDuration, p.competitionStart)
+	case "forcad":
+		roundFlags, err = parseForcADRounded(body, teamID, p.roundDuration, p.competitionStart)
 	default:
 		roundFlags, err = parseCyberChallengeRounded(body)
 	}
@@ -710,6 +712,47 @@ func parseFaustCTFRounded(body []byte, teamID string, roundDuration time.Duratio
 	}
 
 	for serviceName, perTeam := range raw.FlagIDs {
+		vals := perTeam[teamID]
+		if len(vals) == 0 {
+			continue
+		}
+		for _, v := range vals {
+			if v != "" {
+				result[roundNum][serviceName] = append(result[roundNum][serviceName], v)
+			}
+		}
+	}
+	return result, nil
+}
+
+// parseForcADRounded parses ForcAD's flag ID format:
+// { "service_name": { "team_ip": ["value1", "value2", ...] } }
+// teamID is the team's IP address (e.g., "10.0.0.2").
+// No round numbers in the API, so the current round is computed from competition timing.
+func parseForcADRounded(body []byte, teamID string, roundDuration time.Duration, competitionStart time.Time) (map[int]map[string][]string, error) {
+	var raw map[string]map[string][]string
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+
+	roundNum := 1
+	if !competitionStart.IsZero() && roundDuration > 0 {
+		elapsed := time.Since(competitionStart)
+		if elapsed >= 0 {
+			roundNum = int(elapsed/roundDuration) + 1
+			if roundNum < 1 {
+				roundNum = 1
+			}
+		}
+	}
+
+	result := make(map[int]map[string][]string)
+	result[roundNum] = make(map[string][]string)
+	if teamID == "" {
+		return result, nil
+	}
+
+	for serviceName, perTeam := range raw {
 		vals := perTeam[teamID]
 		if len(vals) == 0 {
 			continue
