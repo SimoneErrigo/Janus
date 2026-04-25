@@ -54,6 +54,11 @@ type AlertQuery struct {
 	TimeTo    *time.Time
 	Limit     int
 	Offset    int
+
+	// Negation filters
+	NotServiceID string
+	NotRuleID    string
+	NotSrcIP     string
 }
 
 // Packet represents a captured request or response passing through the proxy.
@@ -84,7 +89,8 @@ type Packet struct {
 	Flagged        bool              `json:"flagged"`
 	ContainsFlagID bool              `json:"contains_flagid"`
 	MatchedFlagIDs []string          `json:"matched_flagids"`
-	FlagIDRound    int               `json:"flagid_round"` // round of the AC automaton used to scan this packet
+	FlagIDRound    int               `json:"flagid_round"`    // round of the AC automaton used to scan this packet
+	IsWhitelisted  bool              `json:"is_whitelisted"`  // matched a whitelist rule; hidden from Traffic by default
 }
 
 // FlagIDChecker checks if text contains any current flag ID value.
@@ -100,6 +106,17 @@ func MakeSessionID(serviceID, clientIP string, clientPort int) string {
 	return fmt.Sprintf("%s/%s:%d", serviceID, clientIP, clientPort)
 }
 
+// SavedFlow is a pinned/bookmarked flow snapshot.
+type SavedFlow struct {
+	ID             int64     `json:"id"`
+	Name           string    `json:"name"`
+	AnchorPacketID int64     `json:"anchor_packet_id"`
+	PacketIDs      []int64   `json:"packet_ids"` // snapshot at save time
+	CreatedBy      string    `json:"created_by"`
+	CreatedAt      time.Time `json:"created_at"`
+	Notes          string    `json:"notes,omitempty"`
+}
+
 // PacketQuery defines filters for retrieving packets.
 type PacketQuery struct {
 	ServiceID       string
@@ -111,15 +128,41 @@ type PacketQuery struct {
 	Direction       string // "request" or "response" (empty = no filter)
 	SessionID       string // filter by session (same TCP connection)
 	PeerIP          string // filter by peer IP (src_ip for requests, dst_ip for responses)
+	URL             string // filter by URL substring
 	TimeFrom        *time.Time
 	TimeTo          *time.Time
-	Contains        string // substring search across body, headers, url
+	Contains        string // substring search across body, headers, url (legacy)
+	ContainsBody    string // substring search in body_string only
+	ContainsHeaders string // substring search in headers JSON; supports "Name: Value" syntax
 	Regex           string // regex search across body, headers, url
 	Flagged         *bool  // nil = no filter, true = only flagged, false = only unflagged
 	ContainsFlagID  *bool  // nil = no filter, true = only with flagID, false = only without
 	HasMatchedRules *bool  // nil = no filter, true = only with matched rules, false = only without
 	Dropped         *bool  // nil = no filter, true = only packets dropped by a rule (action=drop|both)
+	Whitelisted     *bool  // nil = show all; false = exclude whitelisted (default in API); true = only whitelisted
 	SortOrder       string // "asc" or "desc" (default "desc")
 	Limit           int
 	Offset          int
+
+	// Negation filters — same semantics as their positive counterparts but inverted.
+	NotServiceID string
+	NotSrcIP     string
+	NotDstIP     string
+	NotProtocol  string
+	NotMethod    string
+	NotDirection string
+	NotPeerIP    string
+	NotURL       string
+	NotContains        string // excludes packets whose body/headers/url contain this substring (legacy)
+	NotContainsBody    string // excludes packets whose body_string contains this substring
+	NotContainsHeaders string // excludes packets whose headers contain this (supports "Name: Value")
+	NotRegex           string // excludes packets matching this regex (applied in Go, same path as Regex)
+
+	// Per-user client-side hide filters.
+	// ExcludeIDs omits any packet whose ID is in the list (user-level deletes).
+	// HiddenBefore omits packets whose timestamp is earlier than this (user-level "Clear Packets").
+	ExcludeIDs   []int64
+	HiddenBefore *time.Time
 }
+
+

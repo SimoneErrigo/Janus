@@ -9,6 +9,8 @@ import Alerts from './pages/Alerts'
 import Blocks from './pages/Blocks'
 import Config from './pages/Config'
 import System from './pages/System'
+import SavedFlows from './pages/SavedFlows'
+import Logs from './pages/Logs'
 
 function ProtectedRoute({ children }) {
   if (!hasToken()) return <Navigate to="/login" replace />
@@ -26,7 +28,9 @@ export default function App() {
         <Route path="rules" element={<Rules />} />
         <Route path="alerts" element={<Alerts />} />
         <Route path="blocks" element={<Blocks />} />
+        <Route path="saved-flows" element={<SavedFlows />} />
         <Route path="system" element={<System />} />
+        <Route path="logs" element={<Logs />} />
         <Route path="config" element={<Config />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

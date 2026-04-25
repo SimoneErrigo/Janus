@@ -28,6 +28,7 @@ type Server struct {
 	statsCollector *sysstat.Collector
 	packetHub      *PacketStreamHub
 	captureCtrl    *sniffer.CaptureController
+	sessionHub     *SessionHub
 	mux            *http.ServeMux
 }
 
@@ -44,6 +45,7 @@ func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniff
 		statsCollector: statsCollector,
 		packetHub:      packetHub,
 		captureCtrl:    captureCtrl,
+		sessionHub:     NewSessionHub(),
 		mux:            http.NewServeMux(),
 	}
 	s.routes()
@@ -64,8 +66,10 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/services", s.handleServices)
 	protected.HandleFunc("/api/services/", s.handleServiceByID)
 	protected.HandleFunc("/api/packets/stream", s.handlePacketStream)
+	protected.HandleFunc("/api/packets/flow/pcap", s.handleFlowPcap)
 	protected.HandleFunc("/api/packets/flow", s.handlePacketFlow)
 	protected.HandleFunc("/api/packets/exploit", s.handleExploitGen)
+	protected.HandleFunc("/api/packets/bulk-delete", s.handlePacketsBulkDelete)
 	protected.HandleFunc("/api/packets/", s.handlePacketByID)
 	protected.HandleFunc("/api/packets", s.handlePackets)
 	protected.HandleFunc("/api/rules/presets/apply", s.handlePresetsApply)
@@ -89,8 +93,16 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/traffic/capture/stop", s.handleTrafficCaptureStop)
 	protected.HandleFunc("/api/traffic/capture/apply-flagids", s.handleTrafficCaptureApplyFlagIDs)
 	protected.HandleFunc("/api/system/stats", s.handleSystemStats)
+	protected.HandleFunc("/api/session/active", s.handleSessionActive)
+	protected.HandleFunc("/api/flows/saved/", s.handleSavedFlowByID)
+	protected.HandleFunc("/api/flows/saved", s.handleSavedFlows)
+	protected.HandleFunc("/api/pcap/export", s.handlePcapExport)
+	protected.HandleFunc("/api/pcap/files/", s.handlePcapFile)
+	protected.HandleFunc("/api/pcap/files", s.handlePcapListFiles)
+	protected.HandleFunc("/api/pcap/import", s.handlePcapImport)
+	protected.HandleFunc("/api/pcap/import/", s.handlePcapImportStatus)
 
-	s.mux.Handle("/api/", authMiddleware(protected))
+	s.mux.Handle("/api/", s.authMiddleware(protected))
 }
 
 // corsMiddleware adds CORS headers for the frontend.

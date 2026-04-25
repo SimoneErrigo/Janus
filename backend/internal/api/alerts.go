@@ -2,6 +2,7 @@ package api
 
 import (
 	"database/sql"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -44,9 +45,12 @@ func (s *Server) handleAlertByID(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 	q := sniffer.AlertQuery{
-		ServiceID: r.URL.Query().Get("service_id"),
-		RuleID:    r.URL.Query().Get("rule_id"),
-		SrcIP:     r.URL.Query().Get("src_ip"),
+		ServiceID:    r.URL.Query().Get("service_id"),
+		RuleID:       r.URL.Query().Get("rule_id"),
+		SrcIP:        r.URL.Query().Get("src_ip"),
+		NotServiceID: r.URL.Query().Get("not_service_id"),
+		NotRuleID:    r.URL.Query().Get("not_rule_id"),
+		NotSrcIP:     r.URL.Query().Get("not_src_ip"),
 	}
 
 	if v := r.URL.Query().Get("time_from"); v != "" {
@@ -120,5 +124,6 @@ func (s *Server) clearAlerts(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	log.Printf("[user=%s] action=clear-alerts", DisplayNameFromRequest(r))
 	w.WriteHeader(http.StatusNoContent)
 }

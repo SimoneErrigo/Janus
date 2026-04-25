@@ -55,6 +55,12 @@ func (m *Manager) startTCPProxy(ctx context.Context, cancel context.CancelFunc, 
 	return rp, nil
 }
 
+// tcpLingerTimeout is the extra time the response goroutine is allowed to
+// keep reading after the request side has finished. This captures late-arriving
+// TCP segments such as Python rich.console.print_exception tracebacks that the
+// backend sends after it has processed the full request.
+const tcpLingerTimeout = 5 * time.Second
+
 func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clientConn net.Conn) {
 	defer clientConn.Close()
 
@@ -71,8 +77,8 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 	}
 	defer backendConn.Close()
 
-	// Shared close-once: when a drop rule fires or either side finishes,
-	// close both connections so the other goroutine also exits.
+	// closeBoth tears down both connections immediately. Used for drop rules,
+	// ctx cancellation, and when the response side finishes.
 	var closeOnce sync.Once
 	closeBoth := func() {
 		closeOnce.Do(func() {
@@ -81,17 +87,37 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 		})
 	}
 
+	// halfCloseBackend sends TCP FIN on the write side of backendConn without
+	// closing the read side. This tells the backend the client is done sending
+	// while keeping backendConn readable so the response goroutine can still
+	// drain any remaining (or late-arriving) data from the backend.
+	halfCloseBackend := func() {
+		if tc, ok := backendConn.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Client -> Backend (request direction) — evaluate rules on every chunk
+	// Client -> Backend (request direction) — evaluate rules on every chunk.
+	// No defer closeBoth here: on natural EOF we half-close instead of tearing
+	// down both sides, so the response goroutine can drain any late data.
 	go func() {
 		defer wg.Done()
-		defer closeBoth()
-		m.sniffCopyWithRules(backendConn, clientConn, svc, sessionID, srcIP, srcPort, dstIP, dstPort, sniffer.DirectionRequest)
+		m.sniffCopyWithRules(backendConn, clientConn, svc, sessionID, srcIP, srcPort, dstIP, dstPort, sniffer.DirectionRequest, closeBoth)
+		// Request side is done (natural EOF, write error, or drop).
+		// Half-close the write side so the backend knows the client is done,
+		// then arm a linger deadline so the response goroutine drains any
+		// late segments (e.g. tracebacks) before timing out.
+		halfCloseBackend()
+		_ = backendConn.SetReadDeadline(time.Now().Add(tcpLingerTimeout))
 	}()
 
-	// Backend -> Client (response direction) — no rule evaluation, just sniff
+	// Backend -> Client (response direction) — no rule evaluation, just sniff.
+	// defer closeBoth ensures full teardown when the response side completes,
+	// whether by reading all data, by a write error to the client, or by
+	// hitting the linger deadline set by the request goroutine above.
 	go func() {
 		defer wg.Done()
 		defer closeBoth()
@@ -112,9 +138,10 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 }
 
 // sniffCopyWithRules reads from src chunk by chunk, evaluates drop/alert rules
-// on each chunk, and forwards to dst. If a drop rule matches, the connection
-// is closed immediately. Each chunk is logged as a separate packet.
-func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.Service, sessionID string, srcIP string, srcPort int, dstIP string, dstPort int, dir sniffer.Direction) {
+// on each chunk, and forwards to dst. If a drop rule matches, closeBoth is
+// called to tear down both connections immediately. Each chunk is logged as a
+// separate packet.
+func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.Service, sessionID string, srcIP string, srcPort int, dstIP string, dstPort int, dir sniffer.Direction, closeBoth func()) {
 	buf := make([]byte, 32*1024)
 	var engine *dropper.Engine
 	if m.ruleStore != nil {
@@ -207,7 +234,8 @@ func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.
 
 			if shouldDrop {
 				log.Printf("[%s] TCP DROP: %d rule(s) matched on chunk", svc.Name, len(matchedRules))
-				return // closeBoth() is deferred in the caller
+				closeBoth()
+				return
 			}
 
 			// Forward chunk to backend

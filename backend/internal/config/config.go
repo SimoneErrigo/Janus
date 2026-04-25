@@ -42,6 +42,10 @@ type Config struct {
 
 	// Flow reconstruction
 	FlowCorrelationWindowSec int // correlation time window in seconds
+
+	// PCAP export
+	PcapExportDir string // directory for exported .pcap files (default: {DataDir}/pcap)
+	PcapAutoSave  bool   // if true, auto-export when static capture stops
 }
 
 var (
@@ -131,6 +135,12 @@ func Load(envPath string) (*Config, error) {
 		if v, ok := env["FLOW_CORRELATION_WINDOW_SECONDS"]; ok && v != "" {
 			cfg.FlowCorrelationWindowSec, _ = strconv.Atoi(v)
 		}
+		if v, ok := env["PCAP_EXPORT_DIR"]; ok && v != "" {
+			cfg.PcapExportDir = v
+		}
+		if v, ok := env["PCAP_AUTO_SAVE"]; ok {
+			cfg.PcapAutoSave = strings.EqualFold(v, "true") || v == "1"
+		}
 
 		// Environment variables override .env file
 		if v := os.Getenv("TEAM_PASSWORD"); v != "" {
@@ -189,6 +199,17 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v := os.Getenv("FLOW_CORRELATION_WINDOW_SECONDS"); v != "" {
 			cfg.FlowCorrelationWindowSec, _ = strconv.Atoi(v)
+		}
+		if v := os.Getenv("PCAP_EXPORT_DIR"); v != "" {
+			cfg.PcapExportDir = v
+		}
+		if v := os.Getenv("PCAP_AUTO_SAVE"); v != "" {
+			cfg.PcapAutoSave = strings.EqualFold(v, "true") || v == "1"
+		}
+
+		// Derive PcapExportDir default from DataDir if not set
+		if cfg.PcapExportDir == "" {
+			cfg.PcapExportDir = cfg.DataDir + "/pcap"
 		}
 
 		instance = cfg

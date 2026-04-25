@@ -2,6 +2,10 @@ import { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { api, subscribePacketStream } from '../api'
 import { getTrafficNavKeys } from '../trafficNavKeys'
+import { useInfiniteList } from '../hooks/useInfiniteList'
+import { getDisplayName } from '../api'
+import { hideParams, addHiddenIds, setClearCursor, getHiddenIds, getClearCursor, resetClearCursor, clearHiddenIds } from '../userHidden'
+import QuickRulePanel from '../components/QuickRulePanel'
 
 function base64ToBytes(b64) {
   if (!b64) return new Uint8Array()
@@ -23,13 +27,42 @@ function bytesToHex(bytes, maxBytes = 1024 * 64) {
   return out
 }
 
+// Clipboard helper that falls back to a hidden textarea + execCommand when
+// navigator.clipboard is unavailable (insecure context, e.g. HTTP on a LAN IP).
+async function copyText(text) {
+  try {
+    if (navigator.clipboard?.writeText && window.isSecureContext) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // fall through to legacy path
+  }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.setAttribute('readonly', '')
+    ta.style.position = 'fixed'
+    ta.style.top = '-9999px'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    ta.setSelectionRange(0, text.length)
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    return ok
+  } catch {
+    return false
+  }
+}
+
 async function copyRawBytesFromBase64(b64) {
   const bytes = base64ToBytes(b64)
   if (!bytes || bytes.length === 0) return false
 
   // Prefer true binary clipboard when supported; fall back to hex text.
   try {
-    if (navigator.clipboard?.write && typeof ClipboardItem !== 'undefined') {
+    if (navigator.clipboard?.write && typeof ClipboardItem !== 'undefined' && window.isSecureContext) {
       const blob = new Blob([bytes], { type: 'application/octet-stream' })
       await navigator.clipboard.write([new ClipboardItem({ 'application/octet-stream': blob })])
       return true
@@ -37,13 +70,7 @@ async function copyRawBytesFromBase64(b64) {
   } catch {
     // ignore; fallback below
   }
-
-  try {
-    await navigator.clipboard.writeText(bytesToHex(bytes))
-    return true
-  } catch {
-    return false
-  }
+  return copyText(bytesToHex(bytes))
 }
 
 // Highlight matching text with support for multiple patterns (flags=yellow, flagIDs=cyan)
@@ -123,163 +150,14 @@ function tryFormatJSON(str) {
   return { text: str, isJSON: false }
 }
 
-// ---- Quick Rule Panel ----
-
-function QuickRulePanel({ packet, services, onCreated, onCancel }) {
-  const [pattern, setPattern] = useState('')
-  const [type, setType] = useState('string')
-  const [scope, setScope] = useState('body')
-  const [action, setAction] = useState('drop')
-  const [creating, setCreating] = useState(false)
-  const [error, setError] = useState('')
-  const [success, setSuccess] = useState(false)
-  const [selectedServices, setSelectedServices] = useState([packet.service_id])
-  const allSelected = selectedServices.length === services.length
-
-  // Smart pre-fill based on packet content
-  useEffect(() => {
-    if (packet.url && packet.direction === 'request') {
-      setPattern(packet.url)
-      setScope('url')
-    } else if (packet.body_string) {
-      setPattern(packet.body_string.length > 300 ? packet.body_string.slice(0, 300) : packet.body_string)
-      setScope('body')
-    }
-  }, [packet])
-
-  function toggleService(id) {
-    setSelectedServices(prev =>
-      prev.includes(id) ? prev.filter(s => s !== id) : [...prev, id]
-    )
-  }
-
-  function toggleAll() {
-    setSelectedServices(allSelected ? [packet.service_id] : services.map(s => s.id))
-  }
-
-  async function handleCreate() {
-    const p = pattern.trim()
-    if (!p || selectedServices.length === 0) return
-    setCreating(true)
-    setError('')
-    try {
-      const label = p.length > 40 ? p.slice(0, 40) + '...' : p
-      const promises = selectedServices.map(svcId =>
-        api.createRule({
-          service_id: svcId,
-          name: `Quick: ${scope} ${type === 'regex' ? '~' : '='} ${label}`,
-          type,
-          scope,
-          pattern: p,
-          priority: 10,
-          enabled: true,
-          action,
-        })
-      )
-      await Promise.all(promises)
-      setSuccess(true)
-      setTimeout(() => onCreated?.(), 800)
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setCreating(false)
-    }
-  }
-
-  if (success) {
-    return (
-      <div className="bg-green-900/30 border border-green-700/50 rounded p-2 text-xs text-green-400 flex items-center gap-2">
-        <span>&#10003;</span> Rule created for {selectedServices.length} service{selectedServices.length !== 1 ? 's' : ''} — traffic matching this pattern will be {action === 'alert' ? 'alerted' : 'dropped'}
-      </div>
-    )
-  }
-
-  return (
-    <div className="bg-red-950/30 border border-red-800/50 rounded p-2 space-y-2">
-      <div className="flex items-center gap-2 flex-wrap">
-        <select value={action} onChange={e => setAction(e.target.value)}
-          className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-red-500">
-          <option value="drop">Drop</option>
-          <option value="alert">Alert</option>
-          <option value="both">Both</option>
-        </select>
-        <select value={type} onChange={e => setType(e.target.value)}
-          className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-red-500">
-          <option value="string">String</option>
-          <option value="regex">Regex</option>
-          <option value="bytes">Bytes</option>
-        </select>
-        {['url', 'body', 'header', 'raw'].map(s => {
-          const active = scope.split(',').includes(s)
-          return (
-            <button key={s} type="button" onClick={() => {
-              const cur = scope.split(',').filter(Boolean)
-              const next = active ? cur.filter(x => x !== s) : [...cur, s]
-              if (next.length > 0) setScope(next.join(','))
-            }}
-              className={`text-xs px-2 py-1 rounded cursor-pointer transition-colors border ${active ? 'bg-cyan-900/50 text-cyan-400 border-cyan-600/50' : 'bg-gray-800 text-gray-500 border-gray-700 hover:text-gray-300'}`}>
-              {s}
-            </button>
-          )
-        })}
-      </div>
-      {/* Multi-service selector */}
-      <div className="flex items-center gap-2 flex-wrap text-[10px]">
-        <button onClick={toggleAll}
-          className={`px-1.5 py-0.5 rounded cursor-pointer transition-colors ${allSelected ? 'bg-cyan-800/60 text-cyan-300' : 'bg-gray-800 text-gray-500 hover:text-gray-300'}`}>
-          All
-        </button>
-        {services.map(s => (
-          <button key={s.id} onClick={() => toggleService(s.id)}
-            className={`px-1.5 py-0.5 rounded cursor-pointer transition-colors ${selectedServices.includes(s.id) ? 'bg-cyan-900/50 text-cyan-400' : 'bg-gray-800 text-gray-600 hover:text-gray-400'}`}>
-            {s.name}
-          </button>
-        ))}
-      </div>
-      <textarea
-        value={pattern}
-        onChange={e => setPattern(e.target.value)}
-        rows={3}
-        className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs font-mono text-gray-100 focus:outline-none focus:border-red-500 resize-y"
-        placeholder="Pattern to match..."
-        spellCheck={false}
-      />
-      <div className="flex items-center gap-2 flex-wrap">
-        {/* Pre-fill shortcuts */}
-        {packet.url && (
-          <button onClick={() => { setPattern(packet.url); setScope('url'); setType('string') }}
-            className="text-[10px] text-gray-500 hover:text-gray-300 cursor-pointer underline underline-offset-2">Fill URL</button>
-        )}
-        {packet.body_string && (
-          <button onClick={() => { setPattern(packet.body_string.length > 300 ? packet.body_string.slice(0, 300) : packet.body_string); setScope('body'); setType('string') }}
-            className="text-[10px] text-gray-500 hover:text-gray-300 cursor-pointer underline underline-offset-2">Fill Body</button>
-        )}
-      </div>
-      {error && <div className="text-xs text-red-400">{error}</div>}
-      <div className="flex items-center gap-2">
-        <button onClick={handleCreate} disabled={creating || !pattern.trim()}
-          className="bg-red-700 hover:bg-red-600 disabled:bg-gray-700 disabled:text-gray-500 text-white text-xs px-3 py-1.5 rounded transition-colors cursor-pointer disabled:cursor-default flex items-center gap-1">
-          {creating ? 'Creating...' : <><span>&#9889;</span> Create Rule</>}
-        </button>
-        <button onClick={onCancel}
-          className="bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs px-3 py-1.5 rounded transition-colors cursor-pointer">
-          Cancel
-        </button>
-      </div>
-    </div>
-  )
-}
-
 // ---- Main Traffic component ----
 
 export default function Traffic() {
   const navigate = useNavigate()
   const location = useLocation()
   const [services, setServices] = useState([])
-  const [packets, setPackets] = useState([])
-  const [total, setTotal] = useState(0)
+  const [activeSessions, setActiveSessions] = useState([])
   const [selected, setSelected] = useState(null)
-  const [loading, setLoading] = useState(false)
   const [flowMode, setFlowMode] = useState(null) // { packetId, packets, total }
   /** Packet id used when entering flow (API or session fallback); restored on Clear flow */
   const flowEntryPacketIdRef = useRef(null)
@@ -293,6 +171,7 @@ export default function Traffic() {
   const [flagIDFilter, setFlagIDFilter] = useState(false)
   const [flagIDEnabled, setFlagIDEnabled] = useState(false)
   const [blockedFilter, setBlockedFilter] = useState(false)
+  const [showWhitelisted, setShowWhitelisted] = useState(false)
   const [paused, setPaused] = useState(false)
   const [trafficMode, setTrafficMode] = useState('live')
   const [captureStatus, setCaptureStatus] = useState(null)
@@ -301,11 +180,28 @@ export default function Traffic() {
   const [clearBusy, setClearBusy] = useState(false)
   const pausedRef = useRef(false)
   const [showQuickRule, setShowQuickRule] = useState(false)
+  const [pinDialog, setPinDialog] = useState(null) // null | { anchorId, name, notes, saving, error }
+  const [pinToast, setPinToast] = useState(null)
+  const [pcapDialog, setPcapDialog] = useState(false)
+  const [pcapResult, setPcapResult] = useState(null) // { filename } after export
+  const [pcapExporting, setPcapExporting] = useState(false)
   const [filters, setFilters] = useState({
     service_id: '', src_ip: '', dst_ip: '', protocol: '', method: '', direction: '',
-    session_id: '', peer_ip: '', contains: '', regex: '', sort: 'desc',
-    limit: 50, offset: 0,
+    session_id: '', peer_ip: '', url: '',
+    contains_body: '', contains_headers: '',
+    regex: '', sort: 'desc',
+    limit: 50,
   })
+  const [filterNegated, setFilterNegated] = useState({
+    service_id: false, src_ip: false, dst_ip: false, protocol: false, method: false,
+    direction: false, peer_ip: false, url: false,
+    contains_body: false, contains_headers: false,
+    regex: false,
+  })
+
+  function toggleNegate(key) {
+    setFilterNegated((prev) => ({ ...prev, [key]: !prev[key] }))
+  }
 
   // Resizable detail panel
   const [detailWidth, setDetailWidth] = useState(450)
@@ -341,6 +237,10 @@ export default function Traffic() {
   }
 
   useEffect(() => {
+    api.getSessionActive().then((d) => setActiveSessions(d?.sessions || [])).catch(() => {})
+  }, [])
+
+  useEffect(() => {
     api.listServices().then((data) => setServices(data || []))
     api.getConfig().then((cfg) => {
       if (cfg?.flag_regex) setFlagRegex(cfg.flag_regex)
@@ -364,64 +264,71 @@ export default function Traffic() {
   }, [trafficMode])
 
 
-  const loadPackets = useCallback(async () => {
-    setLoading(true)
-    try {
-      const params = { ...filters }
-      if (flagFilter) {
-        params.flagged = 'true'
+  // Build API params, applying negation: if a filter is negated, send not_<field> instead of <field>
+  const buildParams = useCallback((base) => {
+    const params = { ...base }
+    const negKeys = ['service_id', 'src_ip', 'dst_ip', 'protocol', 'method', 'direction', 'peer_ip', 'url', 'contains_body', 'contains_headers', 'regex']
+    for (const key of negKeys) {
+      if (filterNegated[key] && params[key]) {
+        params[`not_${key}`] = params[key]
+        delete params[key]
       }
-      if (flagIDFilter) {
-        params.contains_flagid = 'true'
-      }
-      if (blockedFilter) {
-        params.dropped = 'true'
-      }
-      const data = await api.getPackets(params)
-      setPackets(data.packets || [])
-      setTotal(data.total)
-    } catch (err) {
-      console.error(err)
-    } finally {
-      setLoading(false)
     }
-  }, [filters, flagFilter, flagIDFilter, blockedFilter])
+    return params
+  }, [filterNegated])
 
-  // Silent full refresh — for metadata changes (backfill) and periodic sync
-  const refreshPackets = useCallback(async () => {
-    if (pausedRef.current) return
-    try {
-      const params = { ...filters }
-      if (flagFilter) params.flagged = 'true'
-      if (flagIDFilter) params.contains_flagid = 'true'
-      if (blockedFilter) params.dropped = 'true'
-      const data = await api.getPackets(params)
-      if (pausedRef.current) return
-      setPackets(data.packets || [])
-      setTotal(data.total)
-    } catch {}
-  }, [filters, flagFilter, flagIDFilter, blockedFilter])
+  // Force refetch when user hides/unhides packets. Bumping this key re-runs the
+  // hook's effect via fetchPage's dep list.
+  const [hideVersion, setHideVersion] = useState(0)
 
-  // Check if any text/complex filters are active (can't client-side filter these)
-  const hasTextFilters = filters.contains || filters.regex || filters.src_ip || filters.dst_ip || filters.peer_ip
+  // fetchPage: called by the hook for each page load
+  const fetchPage = useCallback(async (offset, limit) => {
+    const params = buildParams({ ...filters, ...hideParams() })
+    params.limit = limit
+    params.offset = offset
+    if (flagFilter) params.flagged = 'true'
+    if (flagIDFilter) params.contains_flagid = 'true'
+    if (blockedFilter) params.dropped = 'true'
+    if (showWhitelisted) params.show_whitelisted = 'true'
+    const data = await api.getPackets(params)
+    return { items: data.packets || [], total: data.total }
+  }, [filters, flagFilter, flagIDFilter, blockedFilter, showWhitelisted, buildParams, hideVersion])
 
-  // Handle streamed new packets: prepend to list without API round-trip
+  const {
+    items: packets,
+    total,
+    loading,
+    hasMore,
+    sentinelRef: packetSentinelRef,
+    prepend: prependPackets,
+    refresh: refreshPackets,
+    reset: resetPackets,
+  } = useInfiniteList({ fetchPage, pageSize: filters.limit || 50 })
+
+  // Check if any text/complex filters are active (can't client-side filter these).
+  // Any active negation also forces server-side fetching.
+  const hasNegation = Object.entries(filterNegated).some(([key, isNeg]) => isNeg && filters[key])
+  const hasTextFilters = filters.contains_body || filters.contains_headers || filters.regex || filters.src_ip || filters.dst_ip || filters.peer_ip || filters.url || hasNegation
+
+  // Refs for SSE client-side filtering (stale-closure-safe)
   const filtersRef = useRef(filters)
   const flagFilterRef = useRef(flagFilter)
   const flagIDFilterRef = useRef(flagIDFilter)
+  const blockedFilterRef = useRef(blockedFilter)
   useEffect(() => { filtersRef.current = filters }, [filters])
   useEffect(() => { flagFilterRef.current = flagFilter }, [flagFilter])
   useEffect(() => { flagIDFilterRef.current = flagIDFilter }, [flagIDFilter])
-  const blockedFilterRef = useRef(blockedFilter)
   useEffect(() => { blockedFilterRef.current = blockedFilter }, [blockedFilter])
 
-  const onNewPackets = useCallback((newPkts) => {
+  // SSE new-packet handler: client-side filter then prepend
+  const handleNewPackets = useCallback((newPkts) => {
     if (pausedRef.current || newPkts.length === 0) return
     const f = filtersRef.current
-    // Skip if user is not on page 1 (offset > 0) — new packets only go to the top/bottom
-    if (f.offset > 0) return
-    // Client-side filter for simple filters
+    const hiddenSet = new Set(getHiddenIds())
+    const cursor = getClearCursor()
     const filtered = newPkts.filter((p) => {
+      if (hiddenSet.has(Number(p.id))) return false
+      if (cursor && p.timestamp && p.timestamp < cursor) return false
       if (f.service_id && p.service_id !== f.service_id) return false
       if (f.protocol && p.protocol !== f.protocol) return false
       if (f.method && p.method !== f.method) return false
@@ -432,27 +339,17 @@ export default function Traffic() {
       if (blockedFilterRef.current && !hasDropAction(p)) return false
       return true
     })
-    if (filtered.length === 0) return
+    if (filtered.length > 0) prependPackets(filtered, f.sort !== 'asc')
+  }, [prependPackets])
 
-    const limit = f.limit || 50
-    const isAsc = f.sort === 'asc'
-    setPackets((prev) => {
-      // Merge, deduplicate by id, sort by id
-      const map = new Map()
-      for (const p of prev) map.set(p.id, p)
-      for (const p of filtered) map.set(p.id, p)
-      const merged = Array.from(map.values())
-      merged.sort((a, b) => isAsc ? a.id - b.id : b.id - a.id)
-      return merged.slice(0, limit)
-    })
-    setTotal((prev) => prev + filtered.length)
-  }, [])
-
-  // Debounce filter changes: wait 300ms after last change before fetching
+  // Reset + re-fetch when filters change (debounced 300ms). Runs regardless of
+  // pause state so filter edits apply to the frozen view. `fetchPage` identity
+  // changes whenever any filter/negation/flag toggle changes, which is the
+  // cheapest reliable trigger.
   useEffect(() => {
-    const timer = setTimeout(() => { loadPackets() }, 300)
+    const timer = setTimeout(() => { resetPackets() }, 300)
     return () => clearTimeout(timer)
-  }, [loadPackets])
+  }, [fetchPage, resetPackets])
 
   // SSE: stream new packets + refresh on metadata changes.
   // When text filters are active, fall back to periodic full refresh.
@@ -461,44 +358,42 @@ export default function Traffic() {
     if (!streamEnabled) return
     if (paused) return
     const unsub = subscribePacketStream(
-      hasTextFilters ? () => {} : onNewPackets,
-      refreshPackets,
+      hasTextFilters ? () => {} : handleNewPackets,
+      () => { if (!pausedRef.current) refreshPackets() },
     )
-    // When text filters are active, poll periodically since we can't client-side filter
     let poll
     if (hasTextFilters) {
-      poll = setInterval(refreshPackets, 2000)
+      poll = setInterval(() => { if (!pausedRef.current) refreshPackets() }, 2000)
     }
     return () => {
       unsub()
       if (poll) clearInterval(poll)
     }
-  }, [onNewPackets, refreshPackets, paused, hasTextFilters, trafficMode, captureStatus?.capturing])
+  }, [handleNewPackets, refreshPackets, paused, hasTextFilters, trafficMode, captureStatus?.capturing])
 
 
   function setFilter(key, value) {
-    setFilters((f) => ({ ...f, [key]: value, offset: 0 }))
+    setFilters((f) => ({ ...f, [key]: value }))
   }
 
-  function nextPage() {
-    setFilters((f) => ({ ...f, offset: f.offset + f.limit }))
-  }
-  function prevPage() {
-    setFilters((f) => ({ ...f, offset: Math.max(0, f.offset - f.limit) }))
-  }
+  const [flowLoading, setFlowLoading] = useState(false)
 
-  // Flow: reconstruct multi-connection flow via auth token correlation
+  // Flow: reconstruct multi-connection flow via auth token correlation.
+  // Per-user hides intentionally do NOT apply here — a flow is an investigation
+  // tool, and dropping hidden packets (or anything before the clear cursor)
+  // would leave gaps in the correlated sequence.
   const showFlow = useCallback(async (pkt, opts = {}) => {
     if (pkt?.id == null) return
     if (!opts.preserveFlowReturn) flowReturnContextRef.current = null
     flowEntryPacketIdRef.current = pkt.id
-    setLoading(true)
+    setFlowLoading(true)
     try {
       const data = await api.getPacketFlow(pkt.id)
+      const pkts = data.packets || []
       setFlowMode({
         packetId: pkt.id,
-        packets: data.packets || [],
-        total: data.total || 0,
+        packets: pkts,
+        total: pkts.length,
       })
     } catch (err) {
       console.error('Flow query failed, falling back to session_id:', err)
@@ -506,10 +401,9 @@ export default function Traffic() {
         ...f,
         session_id: pkt.session_id,
         sort: 'asc',
-        offset: 0,
       }))
     } finally {
-      setLoading(false)
+      setFlowLoading(false)
     }
   }, [])
 
@@ -522,7 +416,8 @@ export default function Traffic() {
     setCopyStatus('copying')
     try {
       const data = await api.generateExploit(packetId)
-      await navigator.clipboard.writeText(data.code)
+      const ok = await copyText(data.code)
+      if (!ok) throw new Error('clipboard copy failed')
       setCopyStatus('copied')
       setTimeout(() => setCopyStatus(null), 2000)
     } catch (err) {
@@ -547,12 +442,120 @@ export default function Traffic() {
     setPaused((prev) => {
       const next = !prev
       pausedRef.current = next
-      if (!next) {
-        // Resuming — trigger a fresh fetch to catch up
-        loadPackets()
+      if (!next) resetPackets()
+      return next
+    })
+  }
+
+  // Build a confirmation message that warns about active teammates
+  function destructiveConfirm(action) {
+    const myName = getDisplayName()
+    const others = activeSessions.filter((s) => s.name !== myName)
+    const warning = others.length > 0
+      ? `\n\nActive teammates: ${others.map((s) => s.name).join(', ')} — this will affect their view.`
+      : ''
+    return confirm(action + warning)
+  }
+
+  // ---- Bulk selection & deletion ----
+  const [selectedPkts, setSelectedPkts] = useState(new Set())
+  // Anchor for shift-click range selection. Set by any single-select click (row
+  // or checkbox). Range selection works from anchor → target.
+  const selectionAnchorRef = useRef(null)
+
+  function toggleSingleSelect(id) {
+    setSelectedPkts((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+    selectionAnchorRef.current = id
+  }
+
+  // Extend (or remove) selection from anchor → target. Used by shift+click on
+  // both checkbox and row. Returns true if the action was handled.
+  function selectRange(pkt) {
+    const anchorId = selectionAnchorRef.current
+    if (anchorId == null) return false
+    const list = displayPackets
+    const anchorIdx = list.findIndex((p) => p.id === anchorId)
+    const targetIdx = list.findIndex((p) => p.id === pkt.id)
+    if (anchorIdx === -1 || targetIdx === -1) return false
+    const [from, to] = [Math.min(anchorIdx, targetIdx), Math.max(anchorIdx, targetIdx)]
+    const rangeIds = list.slice(from, to + 1).map((p) => p.id)
+    setSelectedPkts((prev) => {
+      const next = new Set(prev)
+      // If anchor is already selected, treat this as "extend"; otherwise treat
+      // as "fresh range". This matches file-manager / mail-client conventions.
+      const anchorSelected = prev.has(anchorId)
+      if (anchorSelected) rangeIds.forEach((rid) => next.add(rid))
+      else {
+        next.clear()
+        rangeIds.forEach((rid) => next.add(rid))
       }
       return next
     })
+    return true
+  }
+
+  function handleCheckboxClick(pkt, e) {
+    e.stopPropagation()
+    if (e.shiftKey && selectRange(pkt)) return
+    toggleSingleSelect(pkt.id)
+  }
+
+  // Row click: normal = open detail, Shift = range-select, Cmd/Ctrl = toggle.
+  function handleRowClick(pkt, e) {
+    if (e.shiftKey) {
+      e.preventDefault()
+      window.getSelection()?.removeAllRanges() // shift+click adds text selection otherwise
+      if (selectRange(pkt)) return
+      // No anchor yet → fall back to single toggle, acts as the first anchor
+      toggleSingleSelect(pkt.id)
+      return
+    }
+    if (e.metaKey || e.ctrlKey) {
+      e.preventDefault()
+      toggleSingleSelect(pkt.id)
+      return
+    }
+    // Plain click: open detail panel AND update the range anchor so a
+    // subsequent shift+click can extend from here.
+    selectionAnchorRef.current = pkt.id
+    selectPacket(pkt)
+  }
+
+  async function bulkDelete() {
+    const ids = Array.from(selectedPkts)
+    if (ids.length === 0) return
+    // Per-user hide: doesn't affect teammates. Data stays in the DB; only this
+    // user's view excludes the IDs via the exclude_ids query param.
+    if (!confirm(`Hide ${ids.length} selected packet${ids.length !== 1 ? 's' : ''} from your view? (Teammates will still see them.)`)) return
+    addHiddenIds(ids)
+    if (selected && ids.includes(selected.id)) setSelected(null)
+    setSelectedPkts(new Set())
+    selectionAnchorRef.current = null
+    setHideVersion((v) => v + 1)
+    resetPackets()
+  }
+
+  async function switchMode(newMode) {
+    if (newMode === trafficMode) return
+    // Traffic mode is global (one proxy, one capture behavior). Warn the user
+    // that every logged-in teammate will be affected.
+    const base = newMode === 'static'
+      ? 'Switch proxy to Static mode? Live streaming will stop for everyone. Captures must then be started/stopped manually from this page.'
+      : 'Switch proxy back to Live mode? Any ongoing Static capture will stop.'
+    if (!destructiveConfirm(base)) return
+    try {
+      const cfg = await api.updateConfig({ traffic_mode: newMode })
+      setTrafficMode(cfg?.traffic_mode || newMode)
+      api.getCaptureStatus().then(setCaptureStatus).catch(() => {})
+      if (newMode === 'live') resetPackets()
+    } catch (err) {
+      console.error('Failed to switch traffic mode:', err)
+    }
   }
 
   async function handleStartCapture() {
@@ -560,7 +563,7 @@ export default function Traffic() {
     try {
       const status = await api.startCapture()
       setCaptureStatus(status)
-      await loadPackets()
+      resetPackets()
     } finally {
       setCaptureBusy(false)
     }
@@ -571,7 +574,7 @@ export default function Traffic() {
     try {
       const status = await api.stopCapture()
       setCaptureStatus(status)
-      await loadPackets()
+      resetPackets()
     } finally {
       setCaptureBusy(false)
     }
@@ -581,26 +584,38 @@ export default function Traffic() {
     setApplyBusy(true)
     try {
       await api.applyCaptureFlagIDs()
-      await loadPackets()
+      resetPackets()
     } finally {
       setApplyBusy(false)
     }
   }
 
   async function handleClearPackets() {
-    if (!confirm('Delete all packets now? Alerts linked to packets will also be removed.')) return
+    // Per-user clear: sets a local cursor; packets older than "now" are hidden
+    // from this user only. Teammates are unaffected; DB rows remain intact.
+    if (!confirm('Clear all packets from your view? Teammates keep their view; this is reversible with "Show all hidden".')) return
     setClearBusy(true)
     try {
-      await api.purgePackets()
+      setClearCursor(new Date().toISOString())
       setSelected(null)
       setFlowMode(null)
       flowEntryPacketIdRef.current = null
       flowReturnContextRef.current = null
-      setFilters((f) => ({ ...f, session_id: '', offset: 0 }))
-      await loadPackets()
+      setFilters((f) => ({ ...f, session_id: '' }))
+      setHideVersion((v) => v + 1)
+      resetPackets()
     } finally {
       setClearBusy(false)
     }
+  }
+
+  // Undo per-user hiding (useful if the user cleared by mistake).
+  function handleUnhideAll() {
+    if (!confirm('Show all hidden packets again in your view?')) return
+    clearHiddenIds()
+    resetClearCursor()
+    setHideVersion((v) => v + 1)
+    resetPackets()
   }
 
   // Select a packet — fetch full detail if body is missing (SSE-pushed lightweight packets)
@@ -623,7 +638,7 @@ export default function Traffic() {
     flowEntryPacketIdRef.current = null
     flowReturnContextRef.current = null
     setFlowMode(null)
-    setFilters((f) => ({ ...f, session_id: '', sort: 'desc', offset: 0 }))
+    setFilters((f) => ({ ...f, session_id: '', sort: 'desc' }))
     if (ret?.path === '/alerts' && ret.alertId != null) {
       navigate('/alerts', { state: { restoreAlertId: ret.alertId } })
       return
@@ -655,6 +670,18 @@ export default function Traffic() {
     }
     function onKeyDown(e) {
       if (typingTarget(e.target)) return
+      // x — toggle current packet in bulk selection
+      if (e.key === 'x' && selected) {
+        e.preventDefault()
+        toggleSingleSelect(selected.id)
+        return
+      }
+      // Delete / Backspace — bulk-delete selection
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedPkts.size > 0) {
+        e.preventDefault()
+        bulkDelete()
+        return
+      }
       const { up, down } = getTrafficNavKeys()
       const list = flowMode ? flowMode.packets : packets
       if (!list.length) return
@@ -671,7 +698,7 @@ export default function Traffic() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [flowMode, packets, selected, selectPacket])
+  }, [flowMode, packets, selected, selectPacket, selectedPkts, toggleSingleSelect, bulkDelete, resetPackets])
 
   useEffect(() => {
     if (!selected?.id || !packetTableScrollRef.current) return
@@ -683,7 +710,7 @@ export default function Traffic() {
   useEffect(() => { setShowQuickRule(false) }, [selected?.id])
 
   const isFlowActive = !!flowMode || !!filters.session_id
-  const hasActiveFilter = filters.contains || filters.regex || flagFilter || flagIDFilter || blockedFilter || filters.direction
+  const hasActiveFilter = filters.contains_body || filters.contains_headers || filters.regex || flagFilter || flagIDFilter || blockedFilter || filters.direction
 
   // Compute effective highlight regex: always include flag regex for yellow highlighting
   const highlightRegex = [filters.regex, flagRegex].filter(Boolean).join('|') || ''
@@ -759,10 +786,76 @@ export default function Traffic() {
             </svg>
             {copyStatus === 'copying' ? 'Generating...' : 'Copy Exploit'}
           </button>
+          <a
+            href={api.flowPcapDownloadUrl(flowMode ? flowMode.packetId : selected?.id)}
+            download={`flow-${flowMode ? flowMode.packetId : selected?.id}.pcap`}
+            className="text-xs bg-gray-700/60 hover:bg-gray-600/60 text-gray-300 px-2 py-1 rounded cursor-pointer flex items-center gap-1"
+            title="Download this flow as a .pcap file"
+          >
+            ⬇ PCAP
+          </a>
+          <button
+            onClick={() => setPinDialog({ anchorId: flowMode ? flowMode.packetId : selected?.id, name: '', notes: '', saving: false, error: '' })}
+            className="text-xs bg-purple-800/30 hover:bg-purple-700/40 text-purple-400 px-2 py-1 rounded cursor-pointer"
+            title="Save this flow for later comparison"
+          >
+            Pin flow
+          </button>
           <button onClick={clearFlow} className="text-xs bg-purple-800/50 hover:bg-purple-700/50 text-purple-300 px-2 py-1 rounded cursor-pointer">
             Clear flow
           </button>
         </div>
+      )}
+
+      {/* Pin-flow inline dialog */}
+      {pinDialog && (
+        <div className="mb-2 bg-gray-900 border border-purple-700/50 rounded-lg px-4 py-3 flex flex-col gap-2">
+          <div className="flex items-center gap-3">
+            <span className="text-sm text-purple-300 font-medium">Save flow</span>
+            <input
+              autoFocus
+              value={pinDialog.name}
+              onChange={(e) => setPinDialog((d) => ({ ...d, name: e.target.value }))}
+              placeholder="Flow name..."
+              maxLength={80}
+              className="flex-1 bg-gray-800 border border-gray-700 rounded px-2.5 py-1 text-sm text-gray-100 focus:outline-none focus:border-purple-500"
+              onKeyDown={(e) => { if (e.key === 'Escape') setPinDialog(null) }}
+            />
+            <input
+              value={pinDialog.notes}
+              onChange={(e) => setPinDialog((d) => ({ ...d, notes: e.target.value }))}
+              placeholder="Notes (optional)..."
+              className="flex-1 bg-gray-800 border border-gray-700 rounded px-2.5 py-1 text-sm text-gray-100 focus:outline-none focus:border-purple-500"
+            />
+            <button
+              disabled={pinDialog.saving}
+              onClick={async () => {
+                if (!pinDialog.anchorId) return
+                setPinDialog((d) => ({ ...d, saving: true, error: '' }))
+                try {
+                  await api.createSavedFlow({
+                    anchor_packet_id: pinDialog.anchorId,
+                    name: pinDialog.name.trim() || `Flow #${pinDialog.anchorId}`,
+                    notes: pinDialog.notes.trim(),
+                  })
+                  setPinDialog(null)
+                  setPinToast('Saved!')
+                  setTimeout(() => setPinToast(null), 2000)
+                } catch (err) {
+                  setPinDialog((d) => ({ ...d, saving: false, error: err.message }))
+                }
+              }}
+              className="text-xs px-3 py-1 bg-purple-700 hover:bg-purple-600 disabled:bg-gray-700 text-white rounded cursor-pointer transition-colors"
+            >
+              {pinDialog.saving ? 'Saving…' : 'Save'}
+            </button>
+            <button onClick={() => setPinDialog(null)} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
+          </div>
+          {pinDialog.error && <span className="text-xs text-red-400">{pinDialog.error}</span>}
+        </div>
+      )}
+      {pinToast && (
+        <div className="fixed bottom-4 right-4 bg-purple-900 text-purple-200 text-xs px-3 py-1.5 rounded-full z-50">{pinToast}</div>
       )}
 
       {/* Filters — collapsible */}
@@ -793,9 +886,10 @@ export default function Traffic() {
           <button
             onClick={handleClearPackets}
             disabled={clearBusy}
+            title="Hide all current packets from your view (per-user; teammates unaffected)"
             className="text-xs px-3 py-1.5 rounded bg-red-800/60 hover:bg-red-700/60 disabled:bg-gray-800 disabled:text-gray-600 text-red-200 cursor-pointer"
           >
-            {clearBusy ? 'Clearing...' : 'Clear Packets'}
+            {clearBusy ? 'Clearing...' : 'Clear my view'}
           </button>
           <span className="text-xs text-gray-500 ml-auto">
             {captureStatus?.capturing ? 'Capturing traffic...' : 'Capture stopped'}
@@ -817,15 +911,24 @@ export default function Traffic() {
             <div className="grid grid-cols-5 gap-3">
               <FilterSelect label="Service" value={filters.service_id} onChange={(v) => setFilter('service_id', v)}
                 options={[{ value: '', label: 'All' }, ...services.map((s) => ({ value: s.id, label: s.name }))]}
+                negated={filterNegated.service_id} onToggleNegate={() => toggleNegate('service_id')}
               />
-              <FilterInput label="Peer IP" value={filters.peer_ip} onChange={(v) => setFilter('peer_ip', v)} placeholder="Attacker IP..." />
-              <FilterInput label="Source IP" value={filters.src_ip} onChange={(v) => setFilter('src_ip', v)} placeholder="e.g. 10.10.0.5" />
-              <FilterInput label="Dest IP" value={filters.dst_ip} onChange={(v) => setFilter('dst_ip', v)} placeholder="e.g. 10.10.0.1" />
+              <FilterInput label="Peer IP" value={filters.peer_ip} onChange={(v) => setFilter('peer_ip', v)} placeholder="Attacker IP..."
+                negated={filterNegated.peer_ip} onToggleNegate={() => toggleNegate('peer_ip')}
+              />
+              <FilterInput label="Source IP" value={filters.src_ip} onChange={(v) => setFilter('src_ip', v)} placeholder="e.g. 10.10.0.5"
+                negated={filterNegated.src_ip} onToggleNegate={() => toggleNegate('src_ip')}
+              />
+              <FilterInput label="Dest IP" value={filters.dst_ip} onChange={(v) => setFilter('dst_ip', v)} placeholder="e.g. 10.10.0.1"
+                negated={filterNegated.dst_ip} onToggleNegate={() => toggleNegate('dst_ip')}
+              />
               <FilterSelect label="Protocol" value={filters.protocol} onChange={(v) => setFilter('protocol', v)}
                 options={[{ value: '', label: 'All' }, ...['http','https','h2','grpc','tcp'].map((p) => ({ value: p, label: p.toUpperCase() }))]}
+                negated={filterNegated.protocol} onToggleNegate={() => toggleNegate('protocol')}
               />
               <FilterSelect label="Method" value={filters.method} onChange={(v) => setFilter('method', v)}
                 options={[{ value: '', label: 'All' }, ...['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS'].map((m) => ({ value: m, label: m }))]}
+                negated={filterNegated.method} onToggleNegate={() => toggleNegate('method')}
               />
               <FilterSelect label="Dir" value={filters.direction} onChange={(v) => setFilter('direction', v)}
                 options={[
@@ -833,9 +936,20 @@ export default function Traffic() {
                   { value: 'request', label: 'REQ' },
                   { value: 'response', label: 'RES' },
                 ]}
+                negated={filterNegated.direction} onToggleNegate={() => toggleNegate('direction')}
               />
-              <FilterInput label="Contains" value={filters.contains} onChange={(v) => setFilter('contains', v)} placeholder="Text search..." />
-              <FilterInput label="Regex" value={filters.regex} onChange={(v) => setFilter('regex', v)} placeholder="Regex pattern..." />
+              <FilterInput label="URL" value={filters.url} onChange={(v) => setFilter('url', v)} placeholder="URL path..."
+                negated={filterNegated.url} onToggleNegate={() => toggleNegate('url')}
+              />
+              <FilterInput label="Body contains" value={filters.contains_body} onChange={(v) => setFilter('contains_body', v)} placeholder="Body text..."
+                negated={filterNegated.contains_body} onToggleNegate={() => toggleNegate('contains_body')}
+              />
+              <FilterInput label="Header contains" value={filters.contains_headers} onChange={(v) => setFilter('contains_headers', v)} placeholder="Name: Value"
+                negated={filterNegated.contains_headers} onToggleNegate={() => toggleNegate('contains_headers')}
+              />
+              <FilterInput label="Regex" value={filters.regex} onChange={(v) => setFilter('regex', v)} placeholder="Regex pattern..."
+                negated={filterNegated.regex} onToggleNegate={() => toggleNegate('regex')}
+              />
               <FilterSelect label="Sort" value={filters.sort} onChange={(v) => setFilter('sort', v)}
                 options={[{ value: 'desc', label: 'Newest first' }, { value: 'asc', label: 'Oldest first' }]}
               />
@@ -875,6 +989,17 @@ export default function Traffic() {
               >
                 <span>&#9888;</span> Blocked
               </button>
+              <button
+                onClick={() => setShowWhitelisted((v) => !v)}
+                className={`text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 ${
+                  showWhitelisted
+                    ? 'bg-gray-700/60 text-gray-300 border border-gray-600/50'
+                    : 'bg-gray-800 text-gray-500 border border-gray-700 hover:text-gray-300'
+                }`}
+                title="Show traffic matched by whitelist rules (normally hidden)"
+              >
+                <span>&#10003;</span> Show whitelisted
+              </button>
             </div>
           </div>
         )}
@@ -888,6 +1013,12 @@ export default function Traffic() {
             <table className="w-full text-sm">
               <thead className="sticky top-0 bg-gray-900">
                 <tr className="text-left text-gray-500 border-b border-gray-800">
+                  <th className="pl-2 pr-1 py-2 w-7">
+                    {selectedPkts.size > 0 && (
+                      <button type="button" onClick={() => setSelectedPkts(new Set())} title="Clear selection"
+                        className="text-gray-600 hover:text-gray-400 cursor-pointer text-xs leading-none">✕</button>
+                    )}
+                  </th>
                   <th className="px-3 py-2 font-medium">Time</th>
                   <th className="px-3 py-2 font-medium">Service</th>
                   <th className="px-3 py-2 font-medium">Dir</th>
@@ -900,7 +1031,10 @@ export default function Traffic() {
               </thead>
               <tbody>
                 {displayPackets.map((pkt) => {
-                  const rowBg = pkt.matched_rules?.length > 0
+                  const isWL = pkt.is_whitelisted
+                  const rowBg = isWL
+                    ? 'opacity-40'
+                    : pkt.matched_rules?.length > 0
                     ? 'bg-red-950/20'
                     : pkt.contains_flagid && pkt.flagged
                       ? 'bg-gradient-to-r from-yellow-950/30 to-teal-950/30'
@@ -914,11 +1048,24 @@ export default function Traffic() {
                   <tr
                     key={pkt.id}
                     data-packet-id={pkt.id}
-                    onClick={() => selectPacket(pkt)}
-                    className={`border-b border-gray-800/50 cursor-pointer transition-colors ${
+                    onClick={(e) => handleRowClick(pkt, e)}
+                    className={`group border-b border-gray-800/50 cursor-pointer transition-colors select-none ${
+                      selectedPkts.has(pkt.id) ? 'bg-blue-950/30 hover:bg-blue-950/40' :
                       selected?.id === pkt.id ? 'bg-gray-800' : 'hover:bg-gray-900/80'
                     } ${rowBg}`}
                   >
+                    <td className="pl-2 pr-1 py-1.5 w-7" onClick={(e) => e.stopPropagation()}>
+                      <input
+                        type="checkbox"
+                        checked={selectedPkts.has(pkt.id)}
+                        onChange={(e) => handleCheckboxClick(pkt, e)}
+                        onClick={(e) => e.stopPropagation()}
+                        title="Select (Shift+click row or checkbox for range, Cmd/Ctrl+click row to toggle, Del to delete selection)"
+                        className={`w-3.5 h-3.5 cursor-pointer accent-cyan-500 transition-opacity ${
+                          selectedPkts.has(pkt.id) ? 'opacity-100' : 'opacity-40 group-hover:opacity-90'
+                        }`}
+                      />
+                    </td>
                     <td className="px-3 py-1.5 text-gray-400 whitespace-nowrap font-mono text-xs">
                       {new Date(pkt.timestamp).toLocaleTimeString()}
                     </td>
@@ -941,31 +1088,66 @@ export default function Traffic() {
                         {hasDropAction(pkt) && <span className="text-red-400 text-xs" title="Dropped by rule">&#9888;</span>}
                         {hasAlertAction(pkt) && <span className="text-yellow-400 text-xs" title="Alert rule triggered">&#9888;</span>}
                         {pkt.contains_flagid && <span className="text-teal-400 text-xs" title="Contains flag ID">&#9881;</span>}
+                        {pkt.is_whitelisted && <span className="text-gray-500 text-[10px] px-1 bg-gray-800 rounded" title="Whitelisted — known-good traffic">wl</span>}
                         <button
                           onClick={(e) => { e.stopPropagation(); showFlow(pkt) }}
-                          className="text-gray-600 hover:text-purple-400 text-xs cursor-pointer ml-auto"
-                          title={`Show flow for ${getPeerIP(pkt)}`}
+                          className="ml-auto text-[10px] font-semibold px-1.5 py-0.5 rounded bg-purple-950/40 text-purple-300/80 border border-purple-900/40 hover:bg-purple-900/50 hover:text-purple-200 cursor-pointer flex items-center gap-1 transition-colors"
+                          title={`Reconstruct full flow for ${getPeerIP(pkt)} (correlates across TCP connections)`}
                         >
-                          <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
                             <path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
                           </svg>
+                          Flow
                         </button>
                       </div>
                     </td>
                     <td className="px-3 py-1.5 text-gray-300 text-xs">{pkt.method}</td>
                     <td className="px-3 py-1.5 text-gray-400 text-xs truncate max-w-xs">
-                      <HighlightedText text={cellText} contains={filters.contains} regex={searchHighlightRegex} />
+                      <HighlightedText text={cellText} contains={filters.contains_body} regex={searchHighlightRegex} />
                     </td>
                     <td className="px-3 py-1.5 text-gray-300 font-mono text-xs">{getPeerIP(pkt)}</td>
                   </tr>
                   );
                 })}
                 {displayPackets.length === 0 && (
-                  <tr><td colSpan="8" className="text-center py-8 text-gray-600">No packets found</td></tr>
+                  <tr><td colSpan="9" className="text-center py-8 text-gray-600">No packets found</td></tr>
                 )}
               </tbody>
+              {/* Infinite scroll sentinel — only shown outside flow mode */}
+              {!flowMode && (
+                <tfoot>
+                  <tr>
+                    <td colSpan="9" className="py-3 text-center text-xs text-gray-700">
+                      <span ref={packetSentinelRef}>
+                        {loading ? 'Loading…' : (!hasMore && packets.length > 0) ? '— end —' : ''}
+                      </span>
+                    </td>
+                  </tr>
+                </tfoot>
+              )}
             </table>
           </div>
+
+          {/* Bulk selection action bar */}
+          {selectedPkts.size > 0 && (
+            <div className="flex items-center gap-3 px-3 py-2 bg-blue-950/40 border-t border-blue-800/40 text-sm">
+              <span className="text-blue-300 text-xs font-medium">{selectedPkts.size} packet{selectedPkts.size !== 1 ? 's' : ''} selected</span>
+              <button
+                onClick={bulkDelete}
+                title="Hide from your view (per-user; teammates unaffected)"
+                className="text-xs px-3 py-1 bg-red-800/60 hover:bg-red-700/60 text-red-200 rounded cursor-pointer transition-colors"
+              >
+                Hide {selectedPkts.size}
+              </button>
+              <button
+                onClick={() => { setSelectedPkts(new Set()); selectionAnchorRef.current = null }}
+                className="text-xs text-gray-500 hover:text-gray-300 cursor-pointer"
+              >
+                Clear selection
+              </button>
+              <span className="text-gray-600 text-xs ml-auto">x = toggle · Del = hide</span>
+            </div>
+          )}
 
           {/* Pagination */}
           <div className="flex items-center justify-between px-3 py-2 bg-gray-900 border-t border-gray-800 text-sm text-gray-400">
@@ -990,16 +1172,96 @@ export default function Traffic() {
                 {paused ? 'Resume' : 'Pause'}
               </button>
               <span>{displayTotal} packet{displayTotal !== 1 ? 's' : ''}{paused ? ' (paused)' : ''}</span>
-            </div>
-            {!flowMode && (
-              <div className="flex gap-2">
-                <button onClick={prevPage} disabled={filters.offset === 0} className="px-3 py-1 bg-gray-800 rounded hover:bg-gray-700 disabled:opacity-30 cursor-pointer disabled:cursor-default">&laquo; Prev</button>
-                <span className="px-2 py-1">{Math.floor(filters.offset / filters.limit) + 1} / {Math.max(1, Math.ceil(displayTotal / filters.limit))}</span>
-                <button onClick={nextPage} disabled={filters.offset + filters.limit >= displayTotal} className="px-3 py-1 bg-gray-800 rounded hover:bg-gray-700 disabled:opacity-30 cursor-pointer disabled:cursor-default">Next &raquo;</button>
+              <div className="flex items-center text-xs rounded overflow-hidden border border-gray-700 ml-1">
+                {['live', 'static'].map((mode) => (
+                  <button
+                    key={mode}
+                    onClick={() => switchMode(mode)}
+                    className={`px-2.5 py-1 transition-colors cursor-pointer ${
+                      trafficMode === mode
+                        ? mode === 'static'
+                          ? 'bg-indigo-900/60 text-indigo-300'
+                          : 'bg-emerald-900/60 text-emerald-300'
+                        : 'bg-gray-800 text-gray-500 hover:text-gray-300'
+                    }`}
+                    title={mode === 'live' ? 'Live capture mode' : 'Static capture mode'}
+                  >
+                    {mode === 'live' ? 'Live' : 'Static'}
+                  </button>
+                ))}
               </div>
+            </div>
+            {flowMode && (
+              <span className="text-xs text-gray-600">{displayTotal} in flow</span>
             )}
+            <div className="flex items-center gap-1 ml-auto">
+              <button
+                onClick={handleClearPackets}
+                disabled={clearBusy}
+                className="text-xs px-2.5 py-1 bg-gray-800 border border-gray-700 text-gray-400 hover:text-red-300 hover:border-red-800/60 rounded cursor-pointer transition-colors"
+                title="Hide all current packets from your view (per-user; teammates unaffected)"
+              >
+                {clearBusy ? 'Clearing…' : 'Clear my view'}
+              </button>
+              {(getHiddenIds().length > 0 || !!getClearCursor()) && (
+                <button
+                  onClick={handleUnhideAll}
+                  className="text-xs px-2.5 py-1 bg-gray-800 border border-gray-700 text-gray-400 hover:text-emerald-300 hover:border-emerald-800/60 rounded cursor-pointer transition-colors"
+                  title="Restore all packets hidden by you"
+                >
+                  Show hidden
+                </button>
+              )}
+              <button
+                onClick={() => { setPcapDialog(true); setPcapResult(null) }}
+                className="text-xs px-2.5 py-1 bg-gray-800 border border-gray-700 text-gray-400 hover:text-gray-200 rounded cursor-pointer transition-colors"
+                title="Export matching packets as .pcap file"
+              >
+                ⬇ PCAP
+              </button>
+            </div>
           </div>
         </div>
+
+        {/* PCAP export inline dialog */}
+        {pcapDialog && (
+          <div className="border-t border-gray-800 bg-gray-900 px-4 py-3 flex flex-col gap-2">
+            <div className="flex items-center gap-3 flex-wrap">
+              <span className="text-sm text-gray-300 font-medium">Export PCAP</span>
+              <span className="text-xs text-gray-500">Exports all packets matching current filters</span>
+              <button
+                disabled={pcapExporting}
+                onClick={async () => {
+                  setPcapExporting(true); setPcapResult(null)
+                  try {
+                    const params = {}
+                    if (filters.service_id) params.service_id = filters.service_id
+                    if (filters.session_id) params.session_id = filters.session_id
+                    const data = await api.pcapExport(params)
+                    setPcapResult(data)
+                  } catch (err) {
+                    alert('PCAP export failed: ' + err.message)
+                  } finally {
+                    setPcapExporting(false)
+                  }
+                }}
+                className="text-xs px-3 py-1.5 bg-cyan-700 hover:bg-cyan-600 disabled:bg-gray-700 text-white rounded cursor-pointer transition-colors"
+              >
+                {pcapExporting ? 'Exporting…' : 'Export'}
+              </button>
+              {pcapResult && (
+                <a
+                  href={api.pcapDownloadUrl(pcapResult.filename)}
+                  download={pcapResult.filename}
+                  className="text-xs px-3 py-1.5 bg-green-800/60 hover:bg-green-700/60 text-green-300 rounded cursor-pointer transition-colors"
+                >
+                  ⬇ Download {pcapResult.filename} ({pcapResult.packet_count} pkts)
+                </a>
+              )}
+              <button onClick={() => setPcapDialog(false)} className="text-gray-500 hover:text-gray-300 cursor-pointer ml-auto">&times;</button>
+            </div>
+          </div>
+        )}
 
         {/* Detail panel — resizable */}
         {selected && (
@@ -1043,6 +1305,16 @@ export default function Traffic() {
                     </svg>
                     Block
                   </button>
+                  <button
+                    onClick={() => setPinDialog({ anchorId: selected.id, name: '', notes: '', saving: false, error: '' })}
+                    className="text-xs flex items-center gap-1 text-amber-400 hover:text-amber-300 cursor-pointer"
+                    title="Pin this packet's flow to Saved Flows (shared with teammates)"
+                  >
+                    <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/>
+                    </svg>
+                    Pin
+                  </button>
                 </div>
                 <button onClick={() => setSelected(null)} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
               </div>
@@ -1073,16 +1345,16 @@ export default function Traffic() {
                   <div className="text-xs">
                     <span className="text-gray-500">URL </span>
                     <span className="text-gray-300 break-all font-mono">
-                      <HighlightedText text={selected.url} contains={filters.contains} regex={urlRegex} flagidRegex={flagidHighlightRegex} />
+                      <HighlightedText text={selected.url} contains={filters.url} regex={urlRegex} flagidRegex={flagidHighlightRegex} />
                     </span>
                   </div>
                 )}
 
                 {selected.matched_rules?.length > 0 && (
-                  <div className="bg-red-900/20 border border-red-800/50 rounded px-2 py-1">
-                    <span className="text-red-400 text-xs font-medium">Matched: </span>
+                  <div className={`border rounded px-2 py-1 ${selected.is_whitelisted ? 'bg-gray-800/40 border-gray-700/50' : 'bg-red-900/20 border-red-800/50'}`}>
+                    <span className={`text-xs font-medium ${selected.is_whitelisted ? 'text-gray-400' : 'text-red-400'}`}>Matched: </span>
                     {selected.matched_rules.map((r, i) => (
-                      <span key={r.id} className="text-red-300 text-xs">
+                      <span key={r.id} className={`text-xs ${r.action === 'whitelist' ? 'text-gray-400' : 'text-red-300'}`}>
                         {i > 0 && ', '}
                         {r.name}
                         {r.action ? <span className="text-gray-500 ml-1">({r.action})</span> : null}
@@ -1095,12 +1367,21 @@ export default function Traffic() {
                   <div className="flex-1">
                     <div className="text-gray-500 text-xs mb-1">Headers</div>
                     <div className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 overflow-auto" style={{ maxHeight: '40vh' }}>
-                      {Object.entries(selected.headers).map(([k, v]) => (
-                        <div key={k}>
-                          <span className="text-cyan-400">{k}:</span>{' '}
-                          <HighlightedText text={v} contains={filters.contains} regex={headersRegex} flagidRegex={flagidHighlightRegex} />
-                        </div>
-                      ))}
+                      {(() => {
+                        const hc = filters.contains_headers || ''
+                        const colonIdx = hc.indexOf(':')
+                        const headerName = colonIdx > 0 ? hc.slice(0, colonIdx).trim().toLowerCase() : ''
+                        const headerValue = colonIdx > 0 ? hc.slice(colonIdx + 1).trim() : hc
+                        return Object.entries(selected.headers).map(([k, v]) => {
+                          const highlight = headerName === '' || k.toLowerCase() === headerName ? headerValue : ''
+                          return (
+                            <div key={k}>
+                              <span className="text-cyan-400">{k}:</span>{' '}
+                              <HighlightedText text={v} contains={highlight} regex={headersRegex} flagidRegex={flagidHighlightRegex} />
+                            </div>
+                          )
+                        })
+                      })()}
                     </div>
                   </div>
                 )}
@@ -1118,7 +1399,7 @@ export default function Traffic() {
                         </span>
                       )}
                       <button
-                        onClick={() => navigator.clipboard.writeText(selected.body_string)}
+                        onClick={() => copyText(selected.body_string)}
                         className="text-[10px] text-gray-600 hover:text-gray-400 ml-auto cursor-pointer"
                         title="Copy raw body"
                         disabled={!selected.body_string}
@@ -1137,7 +1418,7 @@ export default function Traffic() {
                     </div>
                     <pre className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 overflow-auto whitespace-pre-wrap break-all" style={{ maxHeight: '60vh' }}>
                       {selected.body_string ? (
-                        <HighlightedText text={formattedBody.text} contains={filters.contains} regex={bodyRegex} flagidRegex={flagidHighlightRegex} />
+                        <HighlightedText text={formattedBody.text} contains={filters.contains_body} regex={bodyRegex} flagidRegex={flagidHighlightRegex} />
                       ) : (
                         <span className="text-gray-500">
                           (non-UTF8 body) — use “Copy bytes”
@@ -1152,35 +1433,63 @@ export default function Traffic() {
         )}
       </div>
 
-      {loading && <div className="fixed bottom-4 right-4 bg-gray-800 text-cyan-400 text-xs px-3 py-1.5 rounded-full">Loading...</div>}
+      {(loading || flowLoading) && <div className="fixed bottom-4 right-4 bg-gray-800 text-cyan-400 text-xs px-3 py-1.5 rounded-full">{flowLoading ? 'Reconstructing flow…' : 'Loading...'}</div>}
       {copyStatus === 'copied' && <div className="fixed bottom-4 right-4 bg-green-800 text-green-200 text-xs px-3 py-1.5 rounded-full z-50">Exploit copied to clipboard!</div>}
       {copyStatus === 'error' && <div className="fixed bottom-4 right-4 bg-red-800 text-red-200 text-xs px-3 py-1.5 rounded-full z-50">Failed to generate exploit</div>}
     </div>
   )
 }
 
-function FilterInput({ label, value, onChange, placeholder }) {
+function FilterInput({ label, value, onChange, placeholder, negated, onToggleNegate }) {
   return (
     <div>
-      <label className="block text-xs text-gray-500 mb-1">{label}</label>
+      <div className="flex items-center justify-between mb-1">
+        <label className="text-xs text-gray-500">{label}</label>
+        {onToggleNegate && (
+          <button
+            type="button"
+            onClick={onToggleNegate}
+            title={negated ? 'Exclude mode active — click to switch to include' : 'Click to exclude instead of include'}
+            className={`text-[10px] px-1 py-0.5 rounded leading-none cursor-pointer transition-colors ${
+              negated ? 'bg-red-900/60 text-red-400 border border-red-700/60' : 'text-gray-600 hover:text-gray-400'
+            }`}
+          >≠</button>
+        )}
+      </div>
       <input
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
-        className="w-full bg-gray-800 border border-gray-700 rounded px-2.5 py-1.5 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 transition-colors"
+        className={`w-full bg-gray-800 rounded px-2.5 py-1.5 text-gray-100 text-sm focus:outline-none transition-colors border ${
+          negated && value ? 'border-red-700/60 focus:border-red-500' : 'border-gray-700 focus:border-cyan-500'
+        }`}
       />
     </div>
   )
 }
 
-function FilterSelect({ label, value, onChange, options }) {
+function FilterSelect({ label, value, onChange, options, negated, onToggleNegate }) {
   return (
     <div>
-      <label className="block text-xs text-gray-500 mb-1">{label}</label>
+      <div className="flex items-center justify-between mb-1">
+        <label className="text-xs text-gray-500">{label}</label>
+        {onToggleNegate && (
+          <button
+            type="button"
+            onClick={onToggleNegate}
+            title={negated ? 'Exclude mode active — click to switch to include' : 'Click to exclude instead of include'}
+            className={`text-[10px] px-1 py-0.5 rounded leading-none cursor-pointer transition-colors ${
+              negated ? 'bg-red-900/60 text-red-400 border border-red-700/60' : 'text-gray-600 hover:text-gray-400'
+            }`}
+          >≠</button>
+        )}
+      </div>
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full bg-gray-800 border border-gray-700 rounded px-2.5 py-1.5 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
+        className={`w-full bg-gray-800 rounded px-2.5 py-1.5 text-gray-100 text-sm focus:outline-none transition-colors border ${
+          negated && value ? 'border-red-700/60 focus:border-red-500' : 'border-gray-700 focus:border-cyan-500'
+        }`}
       >
         {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
       </select>

@@ -28,6 +28,10 @@ type configResponse struct {
 	CurrentRound             int    `json:"current_round"`
 	TrafficMode              string `json:"traffic_mode"`
 	FlowCorrelationWindowSec int    `json:"flow_correlation_window_seconds"`
+
+	// PCAP export
+	PcapExportDir string `json:"pcap_export_dir"`
+	PcapAutoSave  bool   `json:"pcap_auto_save"`
 }
 
 type configUpdateRequest struct {
@@ -47,6 +51,8 @@ type configUpdateRequest struct {
 	KeepRounds               *int    `json:"keep_rounds,omitempty"`
 	TrafficMode              *string `json:"traffic_mode,omitempty"`
 	FlowCorrelationWindowSec *int    `json:"flow_correlation_window_seconds,omitempty"`
+	PcapExportDir            *string `json:"pcap_export_dir,omitempty"`
+	PcapAutoSave             *bool   `json:"pcap_auto_save,omitempty"`
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -83,6 +89,8 @@ func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 		CurrentRound:             s.flagIDPoller.CurrentRound(),
 		TrafficMode:              cfg.TrafficMode,
 		FlowCorrelationWindowSec: cfg.FlowCorrelationWindowSec,
+		PcapExportDir:            cfg.PcapExportDir,
+		PcapAutoSave:             cfg.PcapAutoSave,
 	})
 }
 
@@ -142,6 +150,13 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 		if s.packetStore != nil {
 			s.packetStore.SetFlowCorrelationWindowSec(*req.FlowCorrelationWindowSec)
 		}
+	}
+
+	if req.PcapExportDir != nil {
+		cfg.PcapExportDir = *req.PcapExportDir
+	}
+	if req.PcapAutoSave != nil {
+		cfg.PcapAutoSave = *req.PcapAutoSave
 	}
 
 	// Reconfigure Flag ID poller if any flagID/timing field was provided
@@ -209,5 +224,7 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 		CurrentRound:             currentRound,
 		TrafficMode:              cfg.TrafficMode,
 		FlowCorrelationWindowSec: cfg.FlowCorrelationWindowSec,
+		PcapExportDir:            cfg.PcapExportDir,
+		PcapAutoSave:             cfg.PcapAutoSave,
 	})
 }

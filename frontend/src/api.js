@@ -50,6 +50,15 @@ export function hasToken() {
   return !!getToken();
 }
 
+export function getDisplayName() {
+  return localStorage.getItem('janus_name') || '';
+}
+
+export function setDisplayName(name) {
+  if (name) localStorage.setItem('janus_name', name);
+  else localStorage.removeItem('janus_name');
+}
+
 async function request(path, options = {}) {
   const token = getToken();
   const headers = { ...options.headers };
@@ -77,7 +86,46 @@ async function request(path, options = {}) {
 }
 
 export const api = {
-  login: (password) => request('/login', { method: 'POST', body: { password } }),
+  login: (password, displayName = '') => request('/login', { method: 'POST', body: { password, display_name: displayName } }),
+
+  // Session / multi-user
+  getSessionActive: () => request('/session/active'),
+
+  // PCAP export
+  pcapExport: (params) => request('/pcap/export', { method: 'POST', body: params || {} }),
+  listPcapFiles: () => request('/pcap/files'),
+  deletePcapFile: (name) => request(`/pcap/files/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  pcapDownloadUrl: (name) => {
+    const token = localStorage.getItem('janus_token') || '';
+    return `/api/pcap/files/${encodeURIComponent(name)}?token=${encodeURIComponent(token)}`;
+  },
+  flowPcapDownloadUrl: (packetId) => {
+    const token = localStorage.getItem('janus_token') || '';
+    return `/api/packets/flow/pcap?packet_id=${packetId}&token=${encodeURIComponent(token)}`;
+  },
+  pcapImport: async (file, serviceId) => {
+    const token = getToken();
+    const fd = new FormData();
+    fd.append('file', file);
+    if (serviceId) fd.append('service_id', serviceId);
+    const res = await fetch(BASE + '/pcap/import', {
+      method: 'POST',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: fd,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || res.statusText);
+    }
+    return res.json();
+  },
+  getPcapImportStatus: (id) => request(`/pcap/import/${encodeURIComponent(id)}/status`),
+
+  // Saved flows
+  listSavedFlows: () => request('/flows/saved'),
+  createSavedFlow: (data) => request('/flows/saved', { method: 'POST', body: data }),
+  getSavedFlow: (id) => request(`/flows/saved/${id}`),
+  deleteSavedFlow: (id) => request(`/flows/saved/${id}`, { method: 'DELETE' }),
 
   // Services
   listServices: () => request('/services'),
@@ -96,6 +144,8 @@ export const api = {
   },
 
   getPacket: (id) => request(`/packets/${id}`),
+  deletePacket: (id) => request(`/packets/${id}`, { method: 'DELETE' }),
+  bulkDeletePackets: (ids) => request('/packets/bulk-delete', { method: 'POST', body: { ids } }),
   getPacketFlow: (packetId) => request(`/packets/flow?packet_id=${packetId}`),
   generateExploit: (packetId) => request(`/packets/exploit?packet_id=${packetId}`),
 

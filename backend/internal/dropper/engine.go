@@ -90,10 +90,12 @@ func (e *Engine) EvaluateAll(req *HTTPRequest) []Rule {
 
 // EvalResult holds categorized rule matches.
 type EvalResult struct {
-	ShouldDrop bool   // true if any drop or both rule matched
-	DropRules  []Rule // rules with action=drop or both
-	AlertRules []Rule // rules with action=alert or both
-	AllMatched []Rule // all matched rules
+	ShouldDrop     bool   // true if any drop or both rule matched
+	DropRules      []Rule // rules with action=drop or both
+	AlertRules     []Rule // rules with action=alert or both
+	WhitelistRules []Rule // rules with action=whitelist
+	IsWhitelisted  bool   // true if any whitelist rule matched
+	AllMatched     []Rule // all matched rules (all actions)
 }
 
 // EvaluateActions checks all enabled rules and categorizes matches by action.
@@ -113,6 +115,9 @@ func (e *Engine) EvaluateActions(req *HTTPRequest) EvalResult {
 			result.ShouldDrop = true
 			result.DropRules = append(result.DropRules, rule)
 			result.AlertRules = append(result.AlertRules, rule)
+		case ActionWhitelist:
+			result.IsWhitelisted = true
+			result.WhitelistRules = append(result.WhitelistRules, rule)
 		default:
 			// Legacy rules without action default to drop
 			result.ShouldDrop = true

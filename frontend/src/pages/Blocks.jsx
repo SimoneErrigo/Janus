@@ -1,6 +1,8 @@
-import { useState, useEffect, useCallback, useMemo, memo } from 'react'
+import { useState, useEffect, useCallback, useMemo, memo, useRef } from 'react'
+import { useInfiniteList } from '../hooks/useInfiniteList'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { api, subscribePacketStream } from '../api'
+import { hideParams, addHiddenIds } from '../userHidden'
 
 function toJSRegex(pattern) {
   if (!pattern) return null
@@ -146,34 +148,49 @@ function BlockedPacketDetail({ packet, rule }) {
 export default function Blocks() {
   const navigate = useNavigate()
   const location = useLocation()
-  const [packets, setPackets] = useState([])
-  const [total, setTotal] = useState(0)
   const [services, setServices] = useState([])
-  const [loading, setLoading] = useState(false)
   const [selectedPacket, setSelectedPacket] = useState(null)
   const [filters, setFilters] = useState({
-    service_id: '', src_ip: '', limit: 50, offset: 0,
+    service_id: '', src_ip: '', limit: 50,
   })
+  const [filterNegated, setFilterNegated] = useState({ service_id: false, src_ip: false })
+  const [paused, setPaused] = useState(false)
+  const pausedRef = useRef(false)
+
+  const fetchPage = useCallback(async (offset, limit) => {
+    const params = { ...filters, ...hideParams(), dropped: 'true', sort: 'desc', limit, offset }
+    if (filterNegated.service_id && params.service_id) { params.not_service_id = params.service_id; delete params.service_id }
+    if (filterNegated.src_ip && params.src_ip) { params.not_src_ip = params.src_ip; delete params.src_ip }
+    const data = await api.getPackets(params)
+    return { items: data.packets || [], total: data.total }
+  }, [filters, filterNegated])
+
+  const {
+    items: packets,
+    total,
+    loading,
+    sentinelRef: blockSentinelRef,
+    refresh: refreshBlocks,
+    reset: resetBlocks,
+  } = useInfiniteList({ fetchPage, pageSize: 50 })
+
+  function togglePause() {
+    const next = !pausedRef.current
+    pausedRef.current = next
+    setPaused(next)
+    if (!next) refreshBlocks()
+  }
 
   useEffect(() => {
     api.listServices().then((data) => setServices(data || []))
   }, [])
 
-  const loadBlocks = useCallback(async () => {
-    setLoading(true)
-    try {
-      const params = { ...filters, dropped: 'true', sort: 'desc' }
-      const data = await api.getPackets(params)
-      setPackets(data.packets || [])
-      setTotal(data.total)
-    } catch (err) {
-      console.error(err)
-    } finally {
-      setLoading(false)
-    }
-  }, [filters])
-
-  useEffect(() => { loadBlocks() }, [loadBlocks])
+  // Reset when filters change. Depend on fetchPage so any filter/negation edit
+  // fires a fresh fetch — even while paused.
+  useEffect(() => {
+    const timer = setTimeout(() => resetBlocks(), 200)
+    return () => clearTimeout(timer)
+  }, [fetchPage, resetBlocks])
 
   useEffect(() => {
     const id = location.state?.restoreBlockedPacketId
@@ -189,47 +206,39 @@ export default function Blocks() {
     })()
   }, [location.state, location.pathname, navigate])
 
-  async function handleClearAll() {
-    if (!confirm('Clear all blocked packets?')) return
-    try {
-      await api.purgeDropped()
-      loadBlocks()
-      setSelectedPacket(null)
-    } catch (err) {
-      console.error(err)
-    }
+  function handleClearAll() {
+    if (!confirm('Hide all blocked packets from your view? (Teammates still see them.)')) return
+    if (packets.length > 0) addHiddenIds(packets.map((p) => p.id))
+    resetBlocks()
+    setSelectedPacket(null)
   }
 
   useEffect(() => {
-    const interval = setInterval(loadBlocks, 5000)
+    const interval = setInterval(() => {
+      if (!pausedRef.current) refreshBlocks()
+    }, 5000)
     return () => clearInterval(interval)
-  }, [loadBlocks])
+  }, [refreshBlocks])
 
   // Live refresh blocks only when streamed packets include drop-capable matches.
   useEffect(() => {
     const unsub = subscribePacketStream(
       (pkts) => {
+        if (pausedRef.current) return
         if (!Array.isArray(pkts) || pkts.length === 0) return
         const shouldReload = pkts.some((p) =>
           Array.isArray(p.matched_rules) &&
           p.matched_rules.some((r) => r.action === 'drop' || r.action === 'both')
         )
-        if (shouldReload) loadBlocks()
+        if (shouldReload) refreshBlocks()
       },
-      loadBlocks,
+      () => { if (!pausedRef.current) refreshBlocks() },
     )
     return () => unsub()
-  }, [loadBlocks])
+  }, [refreshBlocks])
 
   function setFilter(key, value) {
-    setFilters((f) => ({ ...f, [key]: value, offset: 0 }))
-  }
-
-  function nextPage() {
-    setFilters((f) => ({ ...f, offset: f.offset + f.limit }))
-  }
-  function prevPage() {
-    setFilters((f) => ({ ...f, offset: Math.max(0, f.offset - f.limit) }))
+    setFilters((f) => ({ ...f, [key]: value }))
   }
 
   const serviceName = (id) => {
@@ -249,20 +258,38 @@ export default function Blocks() {
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-2xl font-semibold text-gray-100">Blocks</h2>
         <div className="flex items-center gap-3">
-          <select
-            value={filters.service_id}
-            onChange={(e) => setFilter('service_id', e.target.value)}
-            className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
+          <div className="flex items-center gap-1">
+            <select
+              value={filters.service_id}
+              onChange={(e) => setFilter('service_id', e.target.value)}
+              className={`bg-gray-800 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none transition-colors border ${filterNegated.service_id && filters.service_id ? 'border-red-700/60 focus:border-red-500' : 'border-gray-700 focus:border-cyan-500'}`}
+            >
+              <option value="">All Services</option>
+              {services.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+            <button type="button" title="Toggle exclude mode" onClick={() => setFilterNegated(p => ({ ...p, service_id: !p.service_id }))}
+              className={`text-xs px-1.5 py-1 rounded cursor-pointer transition-colors ${filterNegated.service_id ? 'bg-red-900/60 text-red-400 border border-red-700/60' : 'text-gray-600 hover:text-gray-400 border border-transparent'}`}>≠</button>
+          </div>
+          <div className="flex items-center gap-1">
+            <input
+              value={filters.src_ip}
+              onChange={(e) => setFilter('src_ip', e.target.value)}
+              placeholder="Source IP..."
+              className={`bg-gray-800 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none transition-colors border w-36 ${filterNegated.src_ip && filters.src_ip ? 'border-red-700/60 focus:border-red-500' : 'border-gray-700 focus:border-cyan-500'}`}
+            />
+            <button type="button" title="Toggle exclude mode" onClick={() => setFilterNegated(p => ({ ...p, src_ip: !p.src_ip }))}
+              className={`text-xs px-1.5 py-1 rounded cursor-pointer transition-colors ${filterNegated.src_ip ? 'bg-red-900/60 text-red-400 border border-red-700/60' : 'text-gray-600 hover:text-gray-400 border border-transparent'}`}>≠</button>
+          </div>
+          <button
+            onClick={togglePause}
+            className={`text-sm px-4 py-2 rounded transition-colors cursor-pointer ${
+              paused
+                ? 'bg-cyan-900/50 hover:bg-cyan-800/50 text-cyan-400'
+                : 'bg-gray-800 hover:bg-gray-700 text-gray-300'
+            }`}
           >
-            <option value="">All Services</option>
-            {services.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-          </select>
-          <input
-            value={filters.src_ip}
-            onChange={(e) => setFilter('src_ip', e.target.value)}
-            placeholder="Source IP..."
-            className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 w-40"
-          />
+            {paused ? '▶ Resume' : '⏸ Pause'}
+          </button>
           <button
             onClick={handleClearAll}
             disabled={total === 0}
@@ -322,17 +349,21 @@ export default function Blocks() {
                   <tr><td colSpan="5" className="text-center py-8 text-gray-600">No blocked packets</td></tr>
                 )}
               </tbody>
+              <tfoot>
+                <tr>
+                  <td colSpan="5" className="py-2 text-center text-xs text-gray-700">
+                    <span ref={blockSentinelRef}>
+                      {loading ? 'Loading…' : ''}
+                    </span>
+                  </td>
+                </tr>
+              </tfoot>
             </table>
           </div>
 
-          {/* Pagination */}
-          <div className="flex items-center justify-between px-3 py-2 bg-gray-900 border-t border-gray-800 text-sm text-gray-400">
+          {/* Footer: total count */}
+          <div className="flex items-center px-3 py-2 bg-gray-900 border-t border-gray-800 text-sm text-gray-500">
             <span>{total} blocked packet{total !== 1 ? 's' : ''}</span>
-            <div className="flex gap-2">
-              <button onClick={prevPage} disabled={filters.offset === 0} className="px-3 py-1 bg-gray-800 rounded hover:bg-gray-700 disabled:opacity-30 cursor-pointer disabled:cursor-default">&laquo; Prev</button>
-              <span className="px-2 py-1">{Math.floor(filters.offset / filters.limit) + 1} / {Math.max(1, Math.ceil(total / filters.limit))}</span>
-              <button onClick={nextPage} disabled={filters.offset + filters.limit >= total} className="px-3 py-1 bg-gray-800 rounded hover:bg-gray-700 disabled:opacity-30 cursor-pointer disabled:cursor-default">Next &raquo;</button>
-            </div>
           </div>
         </div>
 
@@ -356,6 +387,19 @@ export default function Blocks() {
                     title="Open Traffic and show flow for this packet"
                   >
                     Flow
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!confirm('Hide this packet from your view? (Teammates still see it.)')) return
+                      addHiddenIds([selectedPacket.id])
+                      setSelectedPacket(null)
+                      resetBlocks()
+                    }}
+                    className="text-xs text-red-500 hover:text-red-400 cursor-pointer"
+                    title="Hide this packet from your view (per-user; teammates unaffected)"
+                  >
+                    Hide
                   </button>
                   <button type="button" onClick={() => setSelectedPacket(null)} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
                 </div>

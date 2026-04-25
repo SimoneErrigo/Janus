@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { api, setToken, hasToken } from '../api'
+import { api, setToken, setDisplayName, getDisplayName, hasToken } from '../api'
 
 export default function Login() {
+  const [displayName, setName] = useState(() => getDisplayName())
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
@@ -18,8 +19,9 @@ export default function Login() {
     setError('')
     setLoading(true)
     try {
-      const data = await api.login(password)
+      const data = await api.login(password, displayName.trim())
       setToken(data.token)
+      setDisplayName(data.display_name || displayName.trim())
       navigate('/', { replace: true })
     } catch (err) {
       setError('Invalid password')
@@ -38,6 +40,18 @@ export default function Login() {
 
         <form onSubmit={handleSubmit} className="bg-gray-900 border border-gray-800 rounded-lg p-6 space-y-4">
           <div>
+            <label className="block text-sm text-gray-400 mb-1.5">Your Name <span className="text-gray-600">(optional)</span></label>
+            <input
+              type="text"
+              value={displayName}
+              onChange={(e) => setName(e.target.value)}
+              maxLength={32}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 transition-colors"
+              placeholder="e.g. alice"
+              autoFocus
+            />
+          </div>
+          <div>
             <label className="block text-sm text-gray-400 mb-1.5">Team Password</label>
             <input
               type="password"
@@ -45,7 +59,6 @@ export default function Login() {
               onChange={(e) => setPassword(e.target.value)}
               className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 transition-colors"
               placeholder="Enter password..."
-              autoFocus
             />
           </div>
 

@@ -1,7 +1,9 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -70,8 +72,33 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 	}
 	q.SessionID = params.Get("session_id")
 	q.PeerIP = params.Get("peer_ip")
+	q.URL = params.Get("url")
 	q.Contains = params.Get("contains")
+	q.ContainsBody = params.Get("contains_body")
+	q.ContainsHeaders = params.Get("contains_headers")
 	q.Regex = params.Get("regex")
+
+	// Negation filters
+	q.NotServiceID = params.Get("not_service_id")
+	q.NotSrcIP = params.Get("not_src_ip")
+	q.NotDstIP = params.Get("not_dst_ip")
+	q.NotProtocol = params.Get("not_protocol")
+	q.NotMethod = params.Get("not_method")
+	q.NotPeerIP = params.Get("not_peer_ip")
+	q.NotURL = params.Get("not_url")
+	q.NotContains = params.Get("not_contains")
+	q.NotContainsBody = params.Get("not_contains_body")
+	q.NotContainsHeaders = params.Get("not_contains_headers")
+	q.NotRegex = params.Get("not_regex")
+	if v := params.Get("not_direction"); v != "" {
+		dir := strings.ToLower(strings.TrimSpace(v))
+		switch dir {
+		case "req", "request":
+			q.NotDirection = "request"
+		case "res", "response":
+			q.NotDirection = "response"
+		}
+	}
 
 	if v := params.Get("flagged"); v != "" {
 		flagged := v == "true" || v == "1"
@@ -137,6 +164,37 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 		q.Dropped = &b
 	}
 
+	// Whitelisted packets are hidden by default unless show_whitelisted=true
+	if params.Get("show_whitelisted") == "true" || params.Get("show_whitelisted") == "1" {
+		// nil = no filter = show all (including whitelisted)
+	} else {
+		hide := false
+		q.Whitelisted = &hide
+	}
+
+	// Per-user hide filters (client-sent): exclude_ids=comma,separated and hidden_before=RFC3339.
+	if v := params.Get("exclude_ids"); v != "" {
+		parts := strings.Split(v, ",")
+		if len(parts) > 2000 {
+			parts = parts[:2000]
+		}
+		ids := make([]int64, 0, len(parts))
+		for _, p := range parts {
+			if id, err := strconv.ParseInt(strings.TrimSpace(p), 10, 64); err == nil {
+				ids = append(ids, id)
+			}
+		}
+		q.ExcludeIDs = ids
+	}
+	if v := params.Get("hidden_before"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			http.Error(w, "invalid hidden_before: use RFC3339 format", http.StatusBadRequest)
+			return
+		}
+		q.HiddenBefore = &t
+	}
+
 	packets, total, err := s.packetStore.Query(q)
 	if err != nil {
 		http.Error(w, "query error: "+err.Error(), http.StatusInternalServerError)
@@ -163,11 +221,6 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePacketByID(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	idStr := strings.TrimPrefix(r.URL.Path, "/api/packets/")
 	if idStr == "" {
 		http.Error(w, "missing packet ID", http.StatusBadRequest)
@@ -180,13 +233,57 @@ func (s *Server) handlePacketByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pkt, err := s.packetStore.GetPacketByID(id)
-	if err != nil {
-		http.Error(w, "packet not found", http.StatusNotFound)
+	switch r.Method {
+	case http.MethodGet:
+		pkt, err := s.packetStore.GetPacketByID(id)
+		if err != nil {
+			http.Error(w, "packet not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, pkt)
+
+	case http.MethodDelete:
+		n, err := s.packetStore.DeletePacketIDs([]int64{id})
+		if err != nil {
+			http.Error(w, "delete error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if n == 0 {
+			http.Error(w, "packet not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]int64{"deleted": n})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handlePacketsBulkDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, pkt)
+	var body struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body.IDs) == 0 {
+		writeJSON(w, http.StatusOK, map[string]int64{"deleted": 0})
+		return
+	}
+
+	n, err := s.packetStore.DeletePacketIDs(body.IDs)
+	if err != nil {
+		http.Error(w, "bulk delete error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	log.Printf("[user=%s] action=bulk-delete-packets count=%d", DisplayNameFromRequest(r), n)
+	writeJSON(w, http.StatusOK, map[string]int64{"deleted": n})
 }
 
 func (s *Server) handlePacketFlow(w http.ResponseWriter, r *http.Request) {

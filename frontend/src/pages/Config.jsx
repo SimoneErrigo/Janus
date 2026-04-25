@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import { getTrafficNavKeys, saveTrafficNavKeys, keysToInputString, parseKeyList, defaultTrafficNavKeys } from '../trafficNavKeys'
 
@@ -30,11 +31,55 @@ export default function Config() {
   const [trafficNavSaved, setTrafficNavSaved] = useState(false)
   const [trafficNavError, setTrafficNavError] = useState('')
 
+  // PCAP state
+  const [pcapFiles, setPcapFiles] = useState([])
+  const [pcapSaved, setPcapSaved] = useState(false)
+
+  // PCAP import state
+  const navigate = useNavigate()
+  const [importFile, setImportFile] = useState(null)
+  const [importServiceID, setImportServiceID] = useState('')
+  const [importStatus, setImportStatus] = useState(null) // {state, packets_imported, service_id, error}
+  const [importError, setImportError] = useState('')
+  const [services, setServices] = useState([])
+  const importFileRef = useRef(null)
+
   useEffect(() => {
     loadConfig()
     loadCleanupConfig()
     loadFlagIDData()
+    api.listPcapFiles().then(d => setPcapFiles(d?.files || [])).catch(() => {})
+    api.listServices().then(d => setServices(d || [])).catch(() => {})
   }, [])
+
+  async function startPcapImport(e) {
+    e.preventDefault()
+    setImportError('')
+    if (!importFile) {
+      setImportError('Select a .pcap file first.')
+      return
+    }
+    try {
+      const { import_id, service_id } = await api.pcapImport(importFile, importServiceID)
+      setImportStatus({ state: 'running', packets_imported: 0, service_id })
+      const poll = async () => {
+        try {
+          const st = await api.getPcapImportStatus(import_id)
+          setImportStatus(st)
+          if (st.state === 'running') {
+            setTimeout(poll, 800)
+          } else if (st.state === 'done') {
+            api.listServices().then(d => setServices(d || [])).catch(() => {})
+          }
+        } catch (err) {
+          setImportError(err.message)
+        }
+      }
+      poll()
+    } catch (err) {
+      setImportError(err.message)
+    }
+  }
 
   useEffect(() => {
     const k = getTrafficNavKeys()
@@ -600,6 +645,158 @@ export default function Config() {
               {purgeRunning ? 'Deleting...' : 'Delete All Data'}
             </button>
           </div>
+        </form>
+      </div>
+
+      {/* PCAP Export section */}
+      <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 max-w-2xl space-y-4">
+        <h3 className="text-lg font-medium text-gray-100">PCAP Export</h3>
+        <form
+          onSubmit={async (e) => {
+            e.preventDefault()
+            try {
+              await api.updateConfig({
+                pcap_export_dir: form.pcap_export_dir || '',
+                pcap_auto_save: !!form.pcap_auto_save,
+              })
+              setPcapSaved(true)
+              setTimeout(() => setPcapSaved(false), 2000)
+            } catch {}
+          }}
+          className="space-y-4"
+        >
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">Export Directory</label>
+            <input
+              type="text"
+              value={form.pcap_export_dir || ''}
+              onChange={(e) => setForm(f => ({ ...f, pcap_export_dir: e.target.value }))}
+              placeholder="/data/pcap"
+              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
+            />
+            <p className="text-xs text-gray-600 mt-1">Directory where .pcap files are saved.</p>
+          </div>
+          <div className="flex items-center gap-3">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={!!form.pcap_auto_save}
+                onChange={(e) => setForm(f => ({ ...f, pcap_auto_save: e.target.checked }))}
+                className="accent-cyan-500"
+              />
+              <span className="text-sm text-gray-300">Auto-save PCAP when static capture stops</span>
+            </label>
+          </div>
+          <div className="flex items-center gap-3">
+            <button type="submit" className="bg-cyan-600 hover:bg-cyan-500 text-white text-sm px-4 py-2 rounded cursor-pointer">Save</button>
+            {pcapSaved && <span className="text-green-400 text-sm">Saved</span>}
+          </div>
+        </form>
+
+        {/* PCAP file list */}
+        {pcapFiles.length > 0 && (
+          <div className="mt-4">
+            <h4 className="text-sm font-medium text-gray-300 mb-2">Saved PCAP Files</h4>
+            <div className="space-y-1">
+              {pcapFiles.map((f) => (
+                <div key={f.name} className="flex items-center justify-between bg-gray-800 rounded px-3 py-2 text-sm">
+                  <div>
+                    <span className="text-gray-200 font-mono">{f.name}</span>
+                    <span className="ml-2 text-gray-500 text-xs">{(f.size_bytes / 1024).toFixed(1)} KB</span>
+                    {f.mod_time && <span className="ml-2 text-gray-600 text-xs">{new Date(f.mod_time).toLocaleString()}</span>}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <a
+                      href={api.pcapDownloadUrl(f.name)}
+                      download={f.name}
+                      className="text-xs text-cyan-400 hover:text-cyan-300 cursor-pointer"
+                    >
+                      Download
+                    </a>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          await api.deletePcapFile(f.name)
+                          setPcapFiles(prev => prev.filter(p => p.name !== f.name))
+                        } catch {}
+                      }}
+                      className="text-xs text-red-500 hover:text-red-400 cursor-pointer"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        {pcapFiles.length === 0 && (
+          <p className="text-xs text-gray-600 mt-2">No PCAP files saved yet. Use the "⬇ PCAP" button in Traffic to export.</p>
+        )}
+      </div>
+
+      {/* PCAP Import section */}
+      <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 max-w-2xl space-y-4">
+        <h3 className="text-lg font-medium text-gray-100">PCAP Import</h3>
+        <p className="text-xs text-gray-500">
+          Upload a .pcap capture. Janus reassembles TCP streams and reconstructs HTTP request/response pairs
+          when possible; otherwise raw TCP payloads are stored per direction.
+        </p>
+        <form onSubmit={startPcapImport} className="space-y-3">
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">PCAP file</label>
+            <input
+              ref={importFileRef}
+              type="file"
+              accept=".pcap,.pcapng,application/vnd.tcpdump.pcap"
+              onChange={(e) => setImportFile(e.target.files?.[0] || null)}
+              className="text-sm text-gray-300 file:mr-3 file:py-1.5 file:px-3 file:rounded file:border-0 file:bg-gray-800 file:text-gray-200 file:cursor-pointer hover:file:bg-gray-700"
+            />
+          </div>
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">Target service</label>
+            <select
+              value={importServiceID}
+              onChange={(e) => setImportServiceID(e.target.value)}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
+            >
+              <option value="">(create new virtual service named pcap:&lt;filename&gt;)</option>
+              {services.map(s => (
+                <option key={s.id} value={s.id}>{s.name}</option>
+              ))}
+            </select>
+          </div>
+          <div className="flex items-center gap-3">
+            <button
+              type="submit"
+              disabled={importStatus?.state === 'running'}
+              className="bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 disabled:cursor-not-allowed text-white text-sm px-4 py-2 rounded cursor-pointer"
+            >
+              {importStatus?.state === 'running' ? 'Importing…' : 'Import'}
+            </button>
+            {importStatus?.state === 'done' && (
+              <>
+                <span className="text-green-400 text-sm">
+                  Imported {importStatus.packets_imported} packets
+                </span>
+                <button
+                  type="button"
+                  onClick={() => navigate(`/traffic?service_id=${encodeURIComponent(importStatus.service_id || '')}`)}
+                  className="text-xs text-cyan-400 hover:text-cyan-300 cursor-pointer underline"
+                >
+                  Open in Traffic →
+                </button>
+              </>
+            )}
+            {importStatus?.state === 'error' && (
+              <span className="text-red-400 text-sm">Error: {importStatus.error}</span>
+            )}
+            {importStatus?.state === 'running' && (
+              <span className="text-xs text-gray-500">Parsing & inserting…</span>
+            )}
+          </div>
+          {importError && <p className="text-sm text-red-400">{importError}</p>}
         </form>
       </div>
     </div>

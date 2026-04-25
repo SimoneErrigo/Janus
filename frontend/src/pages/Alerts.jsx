@@ -1,6 +1,8 @@
-import { useState, useEffect, useCallback, useMemo, memo } from 'react'
+import { useState, useEffect, useCallback, useMemo, memo, useRef } from 'react'
+import { useInfiniteList } from '../hooks/useInfiniteList'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { api, subscribePacketStream } from '../api'
+import { addHiddenIds, getHiddenIds, getClearCursor, getHiddenAlertIds, addHiddenAlertIds } from '../userHidden'
 
 // Strip Go/PCRE inline flags like (?i) that are invalid in JavaScript regex
 function toJSRegex(pattern) {
@@ -134,34 +136,68 @@ function LinkedPacketDetail({ packet, pattern, scope }) {
 export default function Alerts() {
   const navigate = useNavigate()
   const location = useLocation()
-  const [alerts, setAlerts] = useState([])
-  const [total, setTotal] = useState(0)
   const [services, setServices] = useState([])
-  const [loading, setLoading] = useState(false)
   const [selectedAlert, setSelectedAlert] = useState(null)
   const [linkedPacket, setLinkedPacket] = useState(null)
   const [filters, setFilters] = useState({
-    service_id: '', rule_id: '', src_ip: '', limit: 50, offset: 0,
+    service_id: '', rule_id: '', src_ip: '', limit: 50,
   })
+  const [filterNegated, setFilterNegated] = useState({ service_id: false, src_ip: false })
+  const [paused, setPaused] = useState(false)
+  const pausedRef = useRef(false)
+
+  const fetchPage = useCallback(async (offset, limit) => {
+    const params = { ...filters, limit, offset }
+    if (filterNegated.service_id && params.service_id) { params.not_service_id = params.service_id; delete params.service_id }
+    if (filterNegated.src_ip && params.src_ip) { params.not_src_ip = params.src_ip; delete params.src_ip }
+    const data = await api.listAlerts(params)
+    return { items: data.alerts || [], total: data.total }
+  }, [filters, filterNegated])
+
+  const {
+    items: alertsRaw,
+    total: totalRaw,
+    loading,
+    sentinelRef: alertSentinelRef,
+    refresh: refreshAlerts,
+    reset: resetAlerts,
+  } = useInfiniteList({ fetchPage, pageSize: 50 })
+
+  // Filter out alerts whose linked packet this user has hidden, plus any alerts
+  // the user dismissed from their own view via "Clear All".
+  const [hideVersion, setHideVersion] = useState(0)
+  const alerts = useMemo(() => {
+    const hiddenPkts = new Set(getHiddenIds())
+    const hiddenAlerts = new Set(getHiddenAlertIds())
+    const cursor = getClearCursor()
+    return alertsRaw.filter((a) => {
+      if (hiddenAlerts.has(Number(a.id))) return false
+      if (hiddenPkts.has(Number(a.packet_id))) return false
+      if (cursor && a.timestamp && a.timestamp < cursor) return false
+      return true
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [alertsRaw, hideVersion])
+  const hiddenCount = alertsRaw.length - alerts.length
+  const total = Math.max(0, totalRaw - hiddenCount)
+
+  function togglePause() {
+    const next = !pausedRef.current
+    pausedRef.current = next
+    setPaused(next)
+    if (!next) refreshAlerts()
+  }
 
   useEffect(() => {
     api.listServices().then((data) => setServices(data || []))
   }, [])
 
-  const loadAlerts = useCallback(async () => {
-    setLoading(true)
-    try {
-      const data = await api.listAlerts(filters)
-      setAlerts(data.alerts || [])
-      setTotal(data.total)
-    } catch (err) {
-      console.error(err)
-    } finally {
-      setLoading(false)
-    }
-  }, [filters])
-
-  useEffect(() => { loadAlerts() }, [loadAlerts])
+  // Reset when filters change. Depend on fetchPage so any filter/negation edit
+  // fires a fresh fetch — even while paused.
+  useEffect(() => {
+    const timer = setTimeout(() => resetAlerts(), 200)
+    return () => clearTimeout(timer)
+  }, [fetchPage, resetAlerts])
 
   useEffect(() => {
     const id = location.state?.restoreAlertId
@@ -181,36 +217,35 @@ export default function Alerts() {
   }, [location.state, location.pathname, navigate])
 
   useEffect(() => {
-    const interval = setInterval(loadAlerts, 5000)
+    const interval = setInterval(() => {
+      if (!pausedRef.current) refreshAlerts()
+    }, 5000)
     return () => clearInterval(interval)
-  }, [loadAlerts])
+  }, [refreshAlerts])
 
   // Live refresh alerts only when streamed packets include alert-capable matches.
   useEffect(() => {
     const unsub = subscribePacketStream(
       (pkts) => {
+        if (pausedRef.current) return
         if (!Array.isArray(pkts) || pkts.length === 0) return
         const shouldReload = pkts.some((p) =>
           Array.isArray(p.matched_rules) &&
           p.matched_rules.some((r) => r.action === 'alert' || r.action === 'both')
         )
-        if (shouldReload) loadAlerts()
+        if (shouldReload) refreshAlerts()
       },
-      loadAlerts,
+      () => { if (!pausedRef.current) refreshAlerts() },
     )
     return () => unsub()
-  }, [loadAlerts])
+  }, [refreshAlerts])
 
-  async function handleClearAll() {
-    if (!confirm('Clear all alerts?')) return
-    try {
-      await api.clearAlerts()
-      loadAlerts()
-      setSelectedAlert(null)
-      setLinkedPacket(null)
-    } catch (err) {
-      console.error(err)
-    }
+  function handleClearAll() {
+    if (!confirm('Hide all alerts from your view? (Teammates still see them.)')) return
+    if (alertsRaw.length > 0) addHiddenAlertIds(alertsRaw.map((a) => a.id))
+    setSelectedAlert(null)
+    setLinkedPacket(null)
+    setHideVersion((v) => v + 1)
   }
 
   async function viewAlert(alert) {
@@ -225,14 +260,7 @@ export default function Alerts() {
   }
 
   function setFilter(key, value) {
-    setFilters((f) => ({ ...f, [key]: value, offset: 0 }))
-  }
-
-  function nextPage() {
-    setFilters((f) => ({ ...f, offset: f.offset + f.limit }))
-  }
-  function prevPage() {
-    setFilters((f) => ({ ...f, offset: Math.max(0, f.offset - f.limit) }))
+    setFilters((f) => ({ ...f, [key]: value }))
   }
 
   const serviceName = (id) => {
@@ -245,20 +273,38 @@ export default function Alerts() {
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-2xl font-semibold text-gray-100">Alerts</h2>
         <div className="flex items-center gap-3">
-          <select
-            value={filters.service_id}
-            onChange={(e) => setFilter('service_id', e.target.value)}
-            className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
+          <div className="flex items-center gap-1">
+            <select
+              value={filters.service_id}
+              onChange={(e) => setFilter('service_id', e.target.value)}
+              className={`bg-gray-800 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none transition-colors border ${filterNegated.service_id && filters.service_id ? 'border-red-700/60 focus:border-red-500' : 'border-gray-700 focus:border-cyan-500'}`}
+            >
+              <option value="">All Services</option>
+              {services.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+            <button type="button" title="Toggle exclude mode" onClick={() => setFilterNegated(p => ({ ...p, service_id: !p.service_id }))}
+              className={`text-xs px-1.5 py-1 rounded cursor-pointer transition-colors ${filterNegated.service_id ? 'bg-red-900/60 text-red-400 border border-red-700/60' : 'text-gray-600 hover:text-gray-400 border border-transparent'}`}>≠</button>
+          </div>
+          <div className="flex items-center gap-1">
+            <input
+              value={filters.src_ip}
+              onChange={(e) => setFilter('src_ip', e.target.value)}
+              placeholder="Source IP..."
+              className={`bg-gray-800 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none transition-colors border w-36 ${filterNegated.src_ip && filters.src_ip ? 'border-red-700/60 focus:border-red-500' : 'border-gray-700 focus:border-cyan-500'}`}
+            />
+            <button type="button" title="Toggle exclude mode" onClick={() => setFilterNegated(p => ({ ...p, src_ip: !p.src_ip }))}
+              className={`text-xs px-1.5 py-1 rounded cursor-pointer transition-colors ${filterNegated.src_ip ? 'bg-red-900/60 text-red-400 border border-red-700/60' : 'text-gray-600 hover:text-gray-400 border border-transparent'}`}>≠</button>
+          </div>
+          <button
+            onClick={togglePause}
+            className={`text-sm px-4 py-2 rounded transition-colors cursor-pointer ${
+              paused
+                ? 'bg-cyan-900/50 hover:bg-cyan-800/50 text-cyan-400'
+                : 'bg-gray-800 hover:bg-gray-700 text-gray-300'
+            }`}
           >
-            <option value="">All Services</option>
-            {services.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-          </select>
-          <input
-            value={filters.src_ip}
-            onChange={(e) => setFilter('src_ip', e.target.value)}
-            placeholder="Source IP..."
-            className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 w-40"
-          />
+            {paused ? '▶ Resume' : '⏸ Pause'}
+          </button>
           <button
             onClick={handleClearAll}
             disabled={total === 0}
@@ -311,17 +357,21 @@ export default function Alerts() {
                   <tr><td colSpan="5" className="text-center py-8 text-gray-600">No alerts</td></tr>
                 )}
               </tbody>
+              <tfoot>
+                <tr>
+                  <td colSpan="5" className="py-2 text-center text-xs text-gray-700">
+                    <span ref={alertSentinelRef}>
+                      {loading ? 'Loading…' : ''}
+                    </span>
+                  </td>
+                </tr>
+              </tfoot>
             </table>
           </div>
 
-          {/* Pagination */}
-          <div className="flex items-center justify-between px-3 py-2 bg-gray-900 border-t border-gray-800 text-sm text-gray-400">
+          {/* Footer: total count */}
+          <div className="flex items-center px-3 py-2 bg-gray-900 border-t border-gray-800 text-sm text-gray-500">
             <span>{total} alert{total !== 1 ? 's' : ''}</span>
-            <div className="flex gap-2">
-              <button onClick={prevPage} disabled={filters.offset === 0} className="px-3 py-1 bg-gray-800 rounded hover:bg-gray-700 disabled:opacity-30 cursor-pointer disabled:cursor-default">&laquo; Prev</button>
-              <span className="px-2 py-1">{Math.floor(filters.offset / filters.limit) + 1} / {Math.max(1, Math.ceil(total / filters.limit))}</span>
-              <button onClick={nextPage} disabled={filters.offset + filters.limit >= total} className="px-3 py-1 bg-gray-800 rounded hover:bg-gray-700 disabled:opacity-30 cursor-pointer disabled:cursor-default">Next &raquo;</button>
-            </div>
           </div>
         </div>
 
@@ -347,6 +397,22 @@ export default function Alerts() {
                   >
                     Flow
                   </button>
+                  {linkedPacket?.id && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!confirm('Hide this packet from your view? (Teammates still see it.)')) return
+                        addHiddenIds([linkedPacket.id])
+                        setLinkedPacket(null)
+                        setSelectedAlert(null)
+                        refreshAlerts()
+                      }}
+                      className="text-xs text-red-500 hover:text-red-400 cursor-pointer"
+                      title="Hide this packet from your view (per-user; teammates unaffected)"
+                    >
+                      Hide
+                    </button>
+                  )}
                   <button type="button" onClick={() => { setSelectedAlert(null); setLinkedPacket(null) }} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
                 </div>
               </div>

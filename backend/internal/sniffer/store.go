@@ -17,7 +17,7 @@ import (
 )
 
 // packetSelectCols is the standard column list for packet SELECTs.
-const packetSelectCols = "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged, contains_flagid, matched_flagids, flagid_round"
+const packetSelectCols = "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, is_whitelisted"
 
 // PacketStore handles SQLite persistence for captured packets.
 // Uses separate read/write connection pools for WAL-mode concurrency:
@@ -145,6 +145,7 @@ func migrate(db *sql.DB) error {
 		"ALTER TABLE packets ADD COLUMN matched_flagids TEXT NOT NULL DEFAULT '[]'",
 		"ALTER TABLE packets ADD COLUMN flagid_round INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE packets ADD COLUMN has_drop_match INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE packets ADD COLUMN is_whitelisted INTEGER NOT NULL DEFAULT 0",
 	} {
 		db.Exec(col) // ignore "duplicate column" errors
 	}
@@ -153,6 +154,7 @@ func migrate(db *sql.DB) error {
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_session_id ON packets(session_id)")
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_contains_flagid ON packets(contains_flagid)")
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_has_drop_match ON packets(has_drop_match)")
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_is_whitelisted ON packets(is_whitelisted)")
 
 	// Composite index for the most common query: filter by service + sort by time
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_service_ts ON packets(service_id, timestamp DESC)")
@@ -182,6 +184,22 @@ func migrate(db *sql.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_alerts_rule_id    ON alerts(rule_id);
 		CREATE INDEX IF NOT EXISTS idx_alerts_timestamp  ON alerts(timestamp);
 		CREATE INDEX IF NOT EXISTS idx_alerts_src_ip     ON alerts(src_ip);
+	`)
+	if err != nil {
+		return err
+	}
+
+	// Step 21: saved flows table
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS saved_flows (
+			id               INTEGER PRIMARY KEY AUTOINCREMENT,
+			name             TEXT    NOT NULL,
+			anchor_packet_id INTEGER NOT NULL,
+			packet_ids       TEXT    NOT NULL DEFAULT '[]',
+			created_by       TEXT    NOT NULL DEFAULT '',
+			created_at       TEXT    NOT NULL,
+			notes            TEXT    NOT NULL DEFAULT ''
+		);
 	`)
 	if err != nil {
 		return err
@@ -241,11 +259,17 @@ func (s *PacketStore) Insert(p *Packet) error {
 		containsFlagIDInt = 1
 	}
 	hasDropMatchInt := 0
+	isWhitelistedInt := 0
 	for _, r := range p.MatchedRules {
-		if r.Action == "drop" || r.Action == "both" {
+		switch r.Action {
+		case "drop", "both":
 			hasDropMatchInt = 1
-			break
+		case "whitelist":
+			isWhitelistedInt = 1
 		}
+	}
+	if p.IsWhitelisted {
+		isWhitelistedInt = 1
 	}
 
 	if p.MatchedFlagIDs == nil {
@@ -259,8 +283,8 @@ func (s *PacketStore) Insert(p *Packet) error {
 	res, err := s.execInsertRetry(`
 		INSERT INTO packets (service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port,
 			protocol, direction, method, url, status, headers, body, body_string,
-			matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, has_drop_match)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, has_drop_match, is_whitelisted)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ServiceID, p.SessionID,
 		p.Timestamp.UTC().Format(time.RFC3339Nano),
 		p.SrcIP, p.SrcPort,
@@ -270,7 +294,7 @@ func (s *PacketStore) Insert(p *Packet) error {
 		string(headersJSON),
 		p.Body, p.BodyString,
 		string(matchedRulesJSON), flaggedInt, containsFlagIDInt,
-		string(matchedFlagIDsJSON), p.FlagIDRound, hasDropMatchInt,
+		string(matchedFlagIDsJSON), p.FlagIDRound, hasDropMatchInt, isWhitelistedInt,
 	)
 	if err != nil {
 		return fmt.Errorf("inserting packet: %w", err)
@@ -286,7 +310,7 @@ func (s *PacketStore) Insert(p *Packet) error {
 // The regex filter is applied in Go after the SQL query for correct pagination.
 func (s *PacketStore) Query(q PacketQuery) ([]*Packet, int, error) {
 	where, args := buildWhere(q)
-	hasRegex := q.Regex != ""
+	hasRegex := q.Regex != "" || q.NotRegex != ""
 
 	// Sort order
 	sortOrder := "DESC"
@@ -311,13 +335,10 @@ func (s *PacketStore) Query(q PacketQuery) ([]*Packet, int, error) {
 		return s.queryWithRegex(q, where, args, selectCols, sortOrder, limit, offset)
 	}
 
-	// Without regex: standard SQL pagination
-	var total int
-	countSQL := "SELECT COUNT(*) FROM packets" + where
-	if err := s.rdb.QueryRow(countSQL, args...).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("counting packets: %w", err)
-	}
-
+	// Fetch the page first, then only run COUNT(*) if it's cheap. COUNT on LIKE
+	// predicates over body_string/headers is a full table scan and dominates
+	// query time — in practice the UI only needs a bound ("is there another
+	// page?") so we skip the expensive COUNT and estimate total.
 	querySQL := "SELECT " + selectCols + " FROM packets" +
 		where + " ORDER BY timestamp " + sortOrder + " LIMIT ? OFFSET ?"
 	queryArgs := append(args, limit, offset)
@@ -327,14 +348,59 @@ func (s *PacketStore) Query(q PacketQuery) ([]*Packet, int, error) {
 		return nil, 0, err
 	}
 
+	total, err := s.countOrEstimate(q, where, args, offset, len(packets), limit)
+	if err != nil {
+		return nil, 0, err
+	}
 	return packets, total, nil
 }
 
-// queryWithRegex fetches SQL-filtered rows, applies regex in Go, then paginates.
+// countOrEstimate returns the exact COUNT(*) when the predicate is cheap, or an
+// estimated total otherwise. "Cheap" = no wildcard LIKE / negation text scans.
+// The estimate is tight enough for infinite-scroll (offset + returned ± 1).
+func (s *PacketStore) countOrEstimate(q PacketQuery, where string, args []interface{}, offset, returned, limit int) (int, error) {
+	if isExpensiveTextPredicate(q) {
+		// Estimate: the backend doesn't know the true total without a full scan.
+		// Return offset+returned when the page isn't full (we've reached the end),
+		// otherwise offset+returned+1 to signal "more available" to the client.
+		if returned < limit {
+			return offset + returned, nil
+		}
+		return offset + returned + 1, nil
+	}
+	var total int
+	countSQL := "SELECT COUNT(*) FROM packets" + where
+	if err := s.rdb.QueryRow(countSQL, args...).Scan(&total); err != nil {
+		return 0, fmt.Errorf("counting packets: %w", err)
+	}
+	return total, nil
+}
+
+// isExpensiveTextPredicate returns true when the query uses a text-search
+// predicate that forces a full table scan (wildcard LIKE on body/headers/url).
+func isExpensiveTextPredicate(q PacketQuery) bool {
+	return q.Contains != "" || q.NotContains != "" ||
+		q.ContainsBody != "" || q.NotContainsBody != "" ||
+		q.ContainsHeaders != "" || q.NotContainsHeaders != "" ||
+		q.URL != "" || q.NotURL != ""
+}
+
+// queryWithRegex fetches SQL-filtered rows, applies regex/not-regex in Go, then paginates.
 func (s *PacketStore) queryWithRegex(q PacketQuery, where string, args []interface{}, selectCols, sortOrder string, limit, offset int) ([]*Packet, int, error) {
-	re, err := regexp.Compile(q.Regex)
-	if err != nil {
-		return nil, 0, fmt.Errorf("invalid regex: %w", err)
+	var re, notRe *regexp.Regexp
+	if q.Regex != "" {
+		var err error
+		re, err = regexp.Compile(q.Regex)
+		if err != nil {
+			return nil, 0, fmt.Errorf("invalid regex: %w", err)
+		}
+	}
+	if q.NotRegex != "" {
+		var err error
+		notRe, err = regexp.Compile(q.NotRegex)
+		if err != nil {
+			return nil, 0, fmt.Errorf("invalid not_regex: %w", err)
+		}
 	}
 
 	querySQL := "SELECT " + selectCols + " FROM packets" +
@@ -345,12 +411,16 @@ func (s *PacketStore) queryWithRegex(q PacketQuery, where string, args []interfa
 		return nil, 0, err
 	}
 
-	// Apply regex filter
+	// Apply regex / not-regex filters
 	var filtered []*Packet
 	for _, p := range allPackets {
-		if regexMatchesPacket(re, p) {
-			filtered = append(filtered, p)
+		if re != nil && !regexMatchesPacket(re, p) {
+			continue
 		}
+		if notRe != nil && regexMatchesPacket(notRe, p) {
+			continue
+		}
+		filtered = append(filtered, p)
 	}
 
 	total := len(filtered)
@@ -397,8 +467,7 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 		var headersJSON string
 		var matchedRulesJSON string
 		var matchedFlagIDsJSON string
-		var flaggedInt int
-		var containsFlagIDInt int
+		var flaggedInt, containsFlagIDInt, isWhitelistedInt int
 		if err := rows.Scan(
 			&p.ID, &p.ServiceID, &p.SessionID, &ts,
 			&p.SrcIP, &p.SrcPort, &p.DstIP, &p.DstPort,
@@ -406,7 +475,7 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 			&p.Method, &p.URL, &p.Status,
 			&headersJSON, &p.Body, &p.BodyString,
 			&matchedRulesJSON, &flaggedInt, &containsFlagIDInt,
-			&matchedFlagIDsJSON, &p.FlagIDRound,
+			&matchedFlagIDsJSON, &p.FlagIDRound, &isWhitelistedInt,
 		); err != nil {
 			return nil, fmt.Errorf("scanning packet: %w", err)
 		}
@@ -414,6 +483,7 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 		p.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
 		p.Flagged = flaggedInt != 0
 		p.ContainsFlagID = containsFlagIDInt != 0
+		p.IsWhitelisted = isWhitelistedInt != 0
 
 		if headersJSON != "" && headersJSON != "{}" {
 			json.Unmarshal([]byte(headersJSON), &p.Headers)
@@ -453,8 +523,7 @@ func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
 	var headersJSON string
 	var matchedRulesJSON string
 	var matchedFlagIDsJSON string
-	var flaggedInt int
-	var containsFlagIDInt int
+	var flaggedInt, containsFlagIDInt, isWhitelistedInt int
 	if err := row.Scan(
 		&p.ID, &p.ServiceID, &p.SessionID, &ts,
 		&p.SrcIP, &p.SrcPort, &p.DstIP, &p.DstPort,
@@ -462,7 +531,7 @@ func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
 		&p.Method, &p.URL, &p.Status,
 		&headersJSON, &p.Body, &p.BodyString,
 		&matchedRulesJSON, &flaggedInt, &containsFlagIDInt,
-		&matchedFlagIDsJSON, &p.FlagIDRound,
+		&matchedFlagIDsJSON, &p.FlagIDRound, &isWhitelistedInt,
 	); err != nil {
 		return nil, err
 	}
@@ -470,6 +539,7 @@ func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
 	p.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
 	p.Flagged = flaggedInt != 0
 	p.ContainsFlagID = containsFlagIDInt != 0
+	p.IsWhitelisted = isWhitelistedInt != 0
 
 	if headersJSON != "" && headersJSON != "{}" {
 		json.Unmarshal([]byte(headersJSON), &p.Headers)
@@ -523,6 +593,18 @@ func (s *PacketStore) QueryAlerts(q AlertQuery) ([]*Alert, int, error) {
 	if q.SrcIP != "" {
 		conditions = append(conditions, "a.src_ip = ?")
 		args = append(args, q.SrcIP)
+	}
+	if q.NotServiceID != "" {
+		conditions = append(conditions, "a.service_id != ?")
+		args = append(args, q.NotServiceID)
+	}
+	if q.NotRuleID != "" {
+		conditions = append(conditions, "a.rule_id != ?")
+		args = append(args, q.NotRuleID)
+	}
+	if q.NotSrcIP != "" {
+		conditions = append(conditions, "a.src_ip != ?")
+		args = append(args, q.NotSrcIP)
 	}
 	if q.TimeFrom != nil {
 		conditions = append(conditions, "a.timestamp >= ?")
@@ -601,6 +683,87 @@ func (s *PacketStore) ClearAlerts() error {
 	return err
 }
 
+// ---- Saved flows ----
+
+// InsertSavedFlow persists a new saved flow and populates its ID.
+func (s *PacketStore) InsertSavedFlow(sf *SavedFlow) error {
+	idsJSON, err := json.Marshal(sf.PacketIDs)
+	if err != nil {
+		return fmt.Errorf("marshalling packet_ids: %w", err)
+	}
+	res, err := s.db.Exec(
+		`INSERT INTO saved_flows (name, anchor_packet_id, packet_ids, created_by, created_at, notes)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		sf.Name, sf.AnchorPacketID, string(idsJSON), sf.CreatedBy,
+		sf.CreatedAt.UTC().Format(time.RFC3339Nano), sf.Notes,
+	)
+	if err != nil {
+		return fmt.Errorf("inserting saved flow: %w", err)
+	}
+	sf.ID, _ = res.LastInsertId()
+	return nil
+}
+
+// ListSavedFlows returns all saved flows ordered newest-first.
+func (s *PacketStore) ListSavedFlows() ([]*SavedFlow, error) {
+	rows, err := s.rdb.Query(
+		`SELECT id, name, anchor_packet_id, packet_ids, created_by, created_at, notes
+		 FROM saved_flows ORDER BY id DESC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var flows []*SavedFlow
+	for rows.Next() {
+		sf, err := scanSavedFlow(rows)
+		if err != nil {
+			return nil, err
+		}
+		flows = append(flows, sf)
+	}
+	return flows, rows.Err()
+}
+
+// GetSavedFlowByID returns a single saved flow.
+func (s *PacketStore) GetSavedFlowByID(id int64) (*SavedFlow, error) {
+	row := s.rdb.QueryRow(
+		`SELECT id, name, anchor_packet_id, packet_ids, created_by, created_at, notes
+		 FROM saved_flows WHERE id = ?`, id,
+	)
+	return scanSavedFlow(row)
+}
+
+// DeleteSavedFlow removes a saved flow by ID.
+func (s *PacketStore) DeleteSavedFlow(id int64) error {
+	res, err := s.db.Exec("DELETE FROM saved_flows WHERE id = ?", id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("saved flow not found")
+	}
+	return nil
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanSavedFlow(row rowScanner) (*SavedFlow, error) {
+	sf := &SavedFlow{}
+	var idsJSON, ts string
+	if err := row.Scan(&sf.ID, &sf.Name, &sf.AnchorPacketID, &idsJSON, &sf.CreatedBy, &ts, &sf.Notes); err != nil {
+		return nil, err
+	}
+	sf.CreatedAt, _ = time.Parse(time.RFC3339Nano, ts)
+	if err := json.Unmarshal([]byte(idsJSON), &sf.PacketIDs); err != nil {
+		sf.PacketIDs = []int64{}
+	}
+	return sf, nil
+}
+
 // PurgeAll deletes all packets and alerts from the database.
 // Returns the number of rows deleted from each table.
 func (s *PacketStore) PurgeAll() (packetsDeleted, alertsDeleted int64, err error) {
@@ -635,6 +798,32 @@ func (s *PacketStore) PurgePackets() (int64, error) {
 	n, _ := res.RowsAffected()
 
 	s.db.Exec("VACUUM")
+	return n, nil
+}
+
+// DeletePacketIDs deletes the specified packets and their linked alerts.
+// Returns the number of packets actually deleted.
+func (s *PacketStore) DeletePacketIDs(ids []int64) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	placeholders := strings.Repeat("?,", len(ids))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	// Remove linked alerts first (best-effort)
+	_, _ = s.db.Exec("DELETE FROM alerts WHERE packet_id IN ("+placeholders+")", args...)
+	// Delete the packets
+	res, err := s.db.Exec("DELETE FROM packets WHERE id IN ("+placeholders+")", args...)
+	if err != nil {
+		return 0, fmt.Errorf("deleting packets by ID: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		s.emitChange(PacketChangeMetadata, nil)
+	}
 	return n, nil
 }
 
@@ -1231,6 +1420,24 @@ func extractSetCookieValues(header string) []string {
 	return values
 }
 
+// headerSearchPattern builds a SQL LIKE pattern for searching headers.
+// Headers are stored as a JSON object like {"X-Powered-By":"Express","Content-Type":"application/json"}.
+// If the query contains a colon ("Name: Value"), it's split so users can paste header lines
+// as they see them on screen. Otherwise a plain substring is used.
+func headerSearchPattern(q string) string {
+	if idx := strings.Index(q, ":"); idx > 0 {
+		name := strings.TrimSpace(q[:idx])
+		value := strings.TrimSpace(q[idx+1:])
+		if name != "" {
+			if value == "" {
+				return `%"` + name + `"%`
+			}
+			return `%"` + name + `"%` + value + `%`
+		}
+	}
+	return "%" + q + "%"
+}
+
 func buildWhere(q PacketQuery) (string, []interface{}) {
 	var conditions []string
 	var args []interface{}
@@ -1276,10 +1483,68 @@ func buildWhere(q PacketQuery) (string, []interface{}) {
 		conditions = append(conditions, "timestamp <= ?")
 		args = append(args, q.TimeTo.UTC().Format(time.RFC3339Nano))
 	}
+	if q.URL != "" {
+		conditions = append(conditions, "url LIKE ?")
+		args = append(args, "%"+q.URL+"%")
+	}
 	if q.Contains != "" {
 		conditions = append(conditions, "(body_string LIKE ? OR headers LIKE ? OR url LIKE ?)")
 		like := "%" + q.Contains + "%"
 		args = append(args, like, like, like)
+	}
+	if q.ContainsBody != "" {
+		conditions = append(conditions, "body_string LIKE ?")
+		args = append(args, "%"+q.ContainsBody+"%")
+	}
+	if q.ContainsHeaders != "" {
+		conditions = append(conditions, "headers LIKE ?")
+		args = append(args, headerSearchPattern(q.ContainsHeaders))
+	}
+	// Negation conditions
+	if q.NotServiceID != "" {
+		conditions = append(conditions, "service_id != ?")
+		args = append(args, q.NotServiceID)
+	}
+	if q.NotSrcIP != "" {
+		conditions = append(conditions, "src_ip != ?")
+		args = append(args, q.NotSrcIP)
+	}
+	if q.NotDstIP != "" {
+		conditions = append(conditions, "dst_ip != ?")
+		args = append(args, q.NotDstIP)
+	}
+	if q.NotProtocol != "" {
+		conditions = append(conditions, "protocol != ?")
+		args = append(args, q.NotProtocol)
+	}
+	if q.NotMethod != "" {
+		conditions = append(conditions, "method != ?")
+		args = append(args, q.NotMethod)
+	}
+	if q.NotDirection != "" {
+		conditions = append(conditions, "direction != ?")
+		args = append(args, q.NotDirection)
+	}
+	if q.NotPeerIP != "" {
+		conditions = append(conditions, "NOT ((direction = 'request' AND src_ip = ?) OR (direction = 'response' AND dst_ip = ?))")
+		args = append(args, q.NotPeerIP, q.NotPeerIP)
+	}
+	if q.NotURL != "" {
+		conditions = append(conditions, "url NOT LIKE ?")
+		args = append(args, "%"+q.NotURL+"%")
+	}
+	if q.NotContains != "" {
+		conditions = append(conditions, "NOT (body_string LIKE ? OR headers LIKE ? OR url LIKE ?)")
+		like := "%" + q.NotContains + "%"
+		args = append(args, like, like, like)
+	}
+	if q.NotContainsBody != "" {
+		conditions = append(conditions, "body_string NOT LIKE ?")
+		args = append(args, "%"+q.NotContainsBody+"%")
+	}
+	if q.NotContainsHeaders != "" {
+		conditions = append(conditions, "headers NOT LIKE ?")
+		args = append(args, headerSearchPattern(q.NotContainsHeaders))
 	}
 	if q.Flagged != nil {
 		if *q.Flagged {
@@ -1305,6 +1570,25 @@ func buildWhere(q PacketQuery) (string, []interface{}) {
 	if q.Dropped != nil && *q.Dropped {
 		// Fast path: indexed column computed at ingestion time.
 		conditions = append(conditions, "has_drop_match = 1")
+	}
+	if q.Whitelisted != nil {
+		if *q.Whitelisted {
+			conditions = append(conditions, "is_whitelisted = 1")
+		} else {
+			conditions = append(conditions, "is_whitelisted = 0")
+		}
+	}
+	if q.HiddenBefore != nil {
+		conditions = append(conditions, "timestamp >= ?")
+		args = append(args, q.HiddenBefore.UTC().Format(time.RFC3339Nano))
+	}
+	if len(q.ExcludeIDs) > 0 {
+		placeholders := make([]string, len(q.ExcludeIDs))
+		for i, id := range q.ExcludeIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		conditions = append(conditions, "id NOT IN ("+strings.Join(placeholders, ",")+")")
 	}
 
 	if len(conditions) == 0 {

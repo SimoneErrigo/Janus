@@ -3,7 +3,7 @@ import { api } from '../api'
 
 const matchTypes = ['string', 'regex', 'bytes']
 const scopes = ['header', 'body', 'url', 'raw']
-const actions = ['drop', 'alert', 'both']
+const actions = ['drop', 'alert', 'both', 'whitelist']
 
 export default function Rules() {
   const [services, setServices] = useState([])
@@ -13,6 +13,7 @@ export default function Rules() {
   const [error, setError] = useState('')
   const [showPresets, setShowPresets] = useState(false)
   const [selectedIds, setSelectedIds] = useState(new Set())
+  const [actionFilter, setActionFilter] = useState('all') // 'all' | 'drop' | 'alert' | 'both' | 'whitelist'
   const ruleFormAnchorRef = useRef(null)
 
   useEffect(() => {
@@ -105,9 +106,16 @@ export default function Rules() {
     })
   }
 
+  const filteredRules = actionFilter === 'all' ? rules : rules.filter(r => (r.action || 'drop') === actionFilter)
+
   function toggleSelectAll() {
-    if (selectedIds.size === rules.length) setSelectedIds(new Set())
-    else setSelectedIds(new Set(rules.map(r => r.id)))
+    const allSelected = filteredRules.length > 0 && filteredRules.every(r => selectedIds.has(r.id))
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (allSelected) filteredRules.forEach(r => next.delete(r.id))
+      else filteredRules.forEach(r => next.add(r.id))
+      return next
+    })
   }
 
   useEffect(() => {
@@ -181,13 +189,35 @@ export default function Rules() {
       ) : (
         <div className="space-y-2">
           {rules.length > 0 && (
-            <div className="flex items-center gap-2 mb-2 px-1">
-              <input type="checkbox" checked={selectedIds.size === rules.length && rules.length > 0}
-                onChange={toggleSelectAll} className="accent-cyan-500 cursor-pointer" />
-              <span className="text-xs text-gray-500">Select all ({rules.length})</span>
+            <div className="flex items-center gap-3 mb-2 px-1 flex-wrap">
+              <div className="flex items-center gap-2">
+                <input type="checkbox" checked={filteredRules.length > 0 && filteredRules.every(r => selectedIds.has(r.id))}
+                  onChange={toggleSelectAll} className="accent-cyan-500 cursor-pointer" />
+                <span className="text-xs text-gray-500">Select all ({filteredRules.length})</span>
+              </div>
+              <div className="flex items-center gap-1 ml-auto">
+                <span className="text-xs text-gray-600 mr-1">Action:</span>
+                {['all', 'drop', 'alert', 'both', 'whitelist'].map((a) => (
+                  <button
+                    key={a}
+                    onClick={() => setActionFilter(a)}
+                    className={`text-xs px-2 py-0.5 rounded border transition-colors cursor-pointer ${
+                      actionFilter === a
+                        ? a === 'drop' ? 'bg-red-900/50 text-red-300 border-red-700/50'
+                          : a === 'alert' ? 'bg-orange-900/50 text-orange-300 border-orange-700/50'
+                          : a === 'both' ? 'bg-purple-900/50 text-purple-300 border-purple-700/50'
+                          : a === 'whitelist' ? 'bg-gray-700/60 text-gray-200 border-gray-600/60'
+                          : 'bg-cyan-900/50 text-cyan-300 border-cyan-700/50'
+                        : 'bg-gray-800 text-gray-500 border-gray-700 hover:text-gray-300'
+                    }`}
+                  >
+                    {a === 'all' ? 'All' : a.charAt(0).toUpperCase() + a.slice(1)}
+                  </button>
+                ))}
+              </div>
             </div>
           )}
-          {rules.map((rule) => (
+          {filteredRules.map((rule) => (
             <div key={rule.id} className={`bg-gray-900 border rounded-lg p-4 flex items-center justify-between ${selectedIds.has(rule.id) ? 'border-cyan-700/50' : 'border-gray-800'}`}>
               <div className="flex items-center gap-4">
                 <input type="checkbox" checked={selectedIds.has(rule.id)}
@@ -208,12 +238,16 @@ export default function Rules() {
                       rule.action === 'drop' ? 'bg-red-900/40 text-red-400' :
                       rule.action === 'alert' ? 'bg-orange-900/40 text-orange-400' :
                       rule.action === 'both' ? 'bg-purple-900/40 text-purple-400' :
+                      rule.action === 'whitelist' ? 'bg-gray-700/60 text-gray-400' :
                       'bg-gray-800 text-gray-400'
                     }`}>{rule.action || 'drop'}</span>
                     <span className="px-1.5 py-0.5 bg-gray-800 rounded mr-1">{rule.type}</span>
                     <span className="px-1.5 py-0.5 bg-gray-800 rounded mr-2">{rule.scope}</span>
                     <span className="text-gray-400">{rule.pattern.length > 60 ? rule.pattern.slice(0, 60) + '...' : rule.pattern}</span>
                     <span className="ml-2 text-gray-600">priority: {rule.priority}</span>
+                    {rule.created_by && (
+                      <span className="ml-2 text-gray-600">by: <span className="text-gray-500">{rule.created_by}</span></span>
+                    )}
                   </div>
                 </div>
               </div>
@@ -506,6 +540,11 @@ function RuleForm({ rule, services, onSave, onCancel }) {
             {isFlagRule && (
               <div className="text-xs text-yellow-500 mt-1">
                 Flag rules must be alert-only. Dropping flags breaks the checker.
+              </div>
+            )}
+            {form.action === 'whitelist' && !isFlagRule && (
+              <div className="text-xs text-gray-500 mt-1">
+                Whitelist: matching packets pass through and are hidden from the Traffic view by default. Toggle "Show whitelisted" in Traffic to reveal them.
               </div>
             )}
           </div>

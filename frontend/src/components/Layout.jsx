@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
-import { api, clearToken } from '../api'
+import { api, clearToken, getDisplayName } from '../api'
 
 const navItems = [
   { to: '/services', label: 'Services', icon: ServerIcon },
@@ -8,7 +8,9 @@ const navItems = [
   { to: '/rules', label: 'Rules', icon: ShieldIcon },
   { to: '/alerts', label: 'Alerts', icon: AlertIcon },
   { to: '/blocks', label: 'Blocks', icon: BlockIcon },
+  { to: '/saved-flows', label: 'Saved Flows', icon: BookmarkIcon },
   { to: '/system', label: 'System', icon: SystemIcon },
+  { to: '/logs', label: 'Logs', icon: LogsIcon },
   { to: '/config', label: 'Config', icon: GearIcon },
 ]
 
@@ -16,6 +18,8 @@ export default function Layout() {
   const navigate = useNavigate()
   const [collapsed, setCollapsed] = useState(false)
   const [trafficMode, setTrafficMode] = useState('live')
+  const [activeSessions, setActiveSessions] = useState([])
+  const myName = getDisplayName()
 
   useEffect(() => {
     let mounted = true
@@ -35,6 +39,19 @@ export default function Layout() {
     }
   }, [])
 
+  useEffect(() => {
+    let mounted = true
+    const poll = async () => {
+      try {
+        const data = await api.getSessionActive()
+        if (mounted) setActiveSessions(data?.sessions || [])
+      } catch {}
+    }
+    poll()
+    const t = setInterval(poll, 10000)
+    return () => { mounted = false; clearInterval(t) }
+  }, [])
+
   function handleLogout() {
     clearToken()
     navigate('/login')
@@ -46,12 +63,11 @@ export default function Layout() {
       <nav className={`${collapsed ? 'w-12' : 'w-56'} bg-gray-900 border-r border-gray-800 flex flex-col transition-all duration-200 flex-shrink-0`}>
         <div className="p-2 border-b border-gray-800 flex items-center justify-between">
           {!collapsed && (
-            <div className="px-2">
+            <div className="px-2 min-w-0">
               <h1 className="text-xl font-bold text-cyan-400 tracking-wide">JANUS</h1>
-              <div className="flex items-center gap-2 mt-0.5">
-                <p className="text-xs text-gray-500">CTF A/D Proxy</p>
+              <div className="flex items-center gap-2 mt-0.5 flex-wrap">
                 <span
-                  className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                  className={`text-[10px] px-1.5 py-0.5 rounded border flex-shrink-0 ${
                     trafficMode === 'static'
                       ? 'bg-indigo-900/40 text-indigo-300 border-indigo-700/50'
                       : 'bg-emerald-900/40 text-emerald-300 border-emerald-700/50'
@@ -60,7 +76,20 @@ export default function Layout() {
                 >
                   {trafficMode === 'static' ? 'STATIC' : 'LIVE'}
                 </span>
+                {activeSessions.length > 0 && (
+                  <span
+                    className="text-[10px] px-1.5 py-0.5 rounded border bg-cyan-900/30 text-cyan-400 border-cyan-700/40 flex-shrink-0 cursor-default"
+                    title={activeSessions.map(s => s.name).join(', ')}
+                  >
+                    {activeSessions.length} online
+                  </span>
+                )}
               </div>
+              {myName && (
+                <p className="text-[10px] text-gray-600 mt-0.5 truncate" title={myName}>
+                  {myName}
+                </p>
+              )}
             </div>
           )}
           <button
@@ -91,21 +120,6 @@ export default function Layout() {
               {!collapsed && label}
             </NavLink>
           ))}
-          <a
-            href="http://localhost:9999"
-            target="_blank"
-            rel="noopener noreferrer"
-            title={collapsed ? 'Logs (Dozzle)' : undefined}
-            className={`flex items-center ${collapsed ? 'justify-center px-0 py-2.5' : 'gap-3 px-4 py-2.5'} text-sm transition-colors text-gray-400 hover:text-gray-200 hover:bg-gray-800/50`}
-          >
-            <LogsIcon className="w-4 h-4 flex-shrink-0" />
-            {!collapsed && (
-              <>
-                Logs
-                <ExternalLinkIcon className="w-3 h-3 ml-auto text-gray-600" />
-              </>
-            )}
-          </a>
         </div>
         <div className="p-2 border-t border-gray-800">
           <button
@@ -197,10 +211,10 @@ function LogsIcon(props) {
   )
 }
 
-function ExternalLinkIcon(props) {
+function BookmarkIcon(props) {
   return (
     <svg {...props} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /><polyline points="15 3 21 3 21 9" /><line x1="10" y1="14" x2="21" y2="3" />
+      <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
     </svg>
   )
 }

@@ -23,9 +23,10 @@ const (
 type Action string
 
 const (
-	ActionDrop  Action = "drop"
-	ActionAlert Action = "alert"
-	ActionBoth  Action = "both"
+	ActionDrop      Action = "drop"
+	ActionAlert     Action = "alert"
+	ActionBoth      Action = "both"
+	ActionWhitelist Action = "whitelist" // packet passes; marked as known-good, hidden by default
 )
 
 // Rule represents a drop/alert rule for a service.
@@ -39,6 +40,7 @@ type Rule struct {
 	Priority  int       `json:"priority"`
 	Enabled   bool      `json:"enabled"`
 	Action    Action    `json:"action"`
+	CreatedBy string    `json:"created_by,omitempty"` // display name of the user who created this rule
 }
 
 // IsFlagRule returns true if this rule is an auto-generated flag rule.

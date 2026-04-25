@@ -5,10 +5,13 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/config"
 )
@@ -21,15 +24,19 @@ func init() {
 }
 
 type loginRequest struct {
-	Password string `json:"password"`
+	Password    string `json:"password"`
+	DisplayName string `json:"display_name"`
 }
 
 type loginResponse struct {
-	Token string `json:"token"`
+	Token       string `json:"token"`
+	DisplayName string `json:"display_name"`
 }
 
 type tokenPayload struct {
-	Exp int64 `json:"exp"`
+	Exp  int64  `json:"exp"`
+	Name string `json:"name,omitempty"` // display name chosen at login
+	ID   string `json:"id,omitempty"`   // short random token ID for session tracking
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -50,18 +57,35 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := generateToken(24 * time.Hour)
+	// Sanitize display name: trim whitespace, cap at 32 chars, ASCII/UTF-8 only
+	name := strings.TrimSpace(req.DisplayName)
+	if utf8.RuneCountInString(name) > 32 {
+		runes := []rune(name)
+		name = string(runes[:32])
+	}
+	if name == "" {
+		// Default to guest-XXXX so teammates can identify each other
+		b := make([]byte, 2)
+		rand.Read(b)
+		name = "guest-" + hex.EncodeToString(b)
+	}
+
+	token, err := generateTokenForUser(name, 24*time.Hour)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, loginResponse{Token: token})
+	writeJSON(w, http.StatusOK, loginResponse{Token: token, DisplayName: name})
 }
 
-func generateToken(duration time.Duration) (string, error) {
+func generateTokenForUser(name string, duration time.Duration) (string, error) {
+	idBytes := make([]byte, 4)
+	rand.Read(idBytes)
 	payload := tokenPayload{
-		Exp: time.Now().Add(duration).Unix(),
+		Exp:  time.Now().Add(duration).Unix(),
+		Name: name,
+		ID:   hex.EncodeToString(idBytes),
 	}
 
 	payloadJSON, err := json.Marshal(payload)
@@ -76,6 +100,38 @@ func generateToken(duration time.Duration) (string, error) {
 	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 
 	return payloadB64 + "." + sig, nil
+}
+
+// decodeTokenPayload decodes a token's payload WITHOUT signature verification.
+// Only call this on already-validated tokens.
+func decodeTokenPayload(token string) (tokenPayload, error) {
+	parts := strings.SplitN(token, ".", 2)
+	if len(parts) != 2 {
+		return tokenPayload{}, fmt.Errorf("invalid token format")
+	}
+	payloadJSON, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return tokenPayload{}, err
+	}
+	var payload tokenPayload
+	if err := json.Unmarshal(payloadJSON, &payload); err != nil {
+		return tokenPayload{}, err
+	}
+	return payload, nil
+}
+
+// DisplayNameFromRequest returns the display name from the request's token.
+// Returns "guest" when the token is absent or carries no name.
+func DisplayNameFromRequest(r *http.Request) string {
+	token := AuthTokenFromRequest(r)
+	if token == "" {
+		return "guest"
+	}
+	payload, err := decodeTokenPayload(token)
+	if err != nil || payload.Name == "" {
+		return "guest"
+	}
+	return payload.Name
 }
 
 func validateToken(token string) bool {
@@ -119,7 +175,8 @@ func AuthTokenFromRequest(r *http.Request) string {
 }
 
 // authMiddleware protects routes by requiring a valid token.
-func authMiddleware(next http.Handler) http.Handler {
+// It also updates the session hub so active users are tracked.
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := AuthTokenFromRequest(r)
 		if token == "" {
@@ -130,6 +187,13 @@ func authMiddleware(next http.Handler) http.Handler {
 		if !validateToken(token) {
 			http.Error(w, "invalid or expired token", http.StatusUnauthorized)
 			return
+		}
+
+		// Heartbeat the session hub so active users are tracked
+		if s.sessionHub != nil {
+			if payload, err := decodeTokenPayload(token); err == nil && payload.ID != "" {
+				s.sessionHub.Heartbeat(payload.ID, payload.Name)
+			}
 		}
 
 		next.ServeHTTP(w, r)

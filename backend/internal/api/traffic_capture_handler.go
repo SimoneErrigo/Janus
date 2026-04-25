@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/SimoneErrigo/Janus/backend/internal/config"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 )
 
@@ -68,6 +69,21 @@ func (s *Server) handleTrafficCaptureStop(w http.ResponseWriter, r *http.Request
 		http.Error(w, "capture stop is only available while static capture is active", http.StatusBadRequest)
 		return
 	}
+
+	// Auto-save PCAP if configured
+	cfg := config.Get()
+	if cfg.PcapAutoSave {
+		from, to, ok := s.captureCtrl.CaptureWindow()
+		if ok {
+			q := sniffer.PacketQuery{TimeFrom: &from, TimeTo: &to}
+			if filename, count, _, err := s.ExportPcap(q); err == nil {
+				log.Printf("auto-save pcap: %s (%d packets, window %s-%s)", filename, count, from.Format(time.RFC3339), to.Format(time.RFC3339))
+			} else {
+				log.Printf("auto-save pcap failed: %v", err)
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, s.currentCaptureStatus())
 }
 

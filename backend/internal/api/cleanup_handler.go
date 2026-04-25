@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/cleanup"
@@ -47,6 +48,7 @@ func (s *Server) handleCleanupPurgePackets(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	log.Printf("[user=%s] action=purge-packets", DisplayNameFromRequest(r))
 	result := s.cleanupMgr.PurgePackets()
 	writeJSON(w, http.StatusOK, result)
 }
@@ -56,6 +58,7 @@ func (s *Server) handleCleanupPurgeDropped(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	log.Printf("[user=%s] action=purge-dropped", DisplayNameFromRequest(r))
 	result := s.cleanupMgr.PurgeDroppedPackets()
 	writeJSON(w, http.StatusOK, result)
 }
@@ -65,6 +68,7 @@ func (s *Server) handleCleanupPurge(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	log.Printf("[user=%s] action=purge-all", DisplayNameFromRequest(r))
 	result := s.cleanupMgr.PurgeAll()
 	writeJSON(w, http.StatusOK, result)
 }

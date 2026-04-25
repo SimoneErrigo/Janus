@@ -81,12 +81,26 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject duplicate rules (same service + type + scope + pattern + action)
+	existing := s.ruleStore.ListRules(rule.ServiceID)
+	for _, e := range existing {
+		if e.Type == rule.Type && e.Scope == rule.Scope &&
+			e.Pattern == rule.Pattern && e.Action == rule.Action {
+			http.Error(w, fmt.Sprintf("duplicate rule: an identical rule already exists (id=%s, name=%q)", e.ID, e.Name), http.StatusConflict)
+			return
+		}
+	}
+
+	// Attribute the rule to the requesting user
+	rule.CreatedBy = DisplayNameFromRequest(r)
+
 	if err := s.ruleStore.CreateRule(&rule); err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
 
-	log.Printf("Rule created: %s (%s) for service %s", rule.Name, rule.ID, rule.ServiceID)
+	user := rule.CreatedBy
+	log.Printf("[user=%s] Rule created: %s (%s) for service %s", user, rule.Name, rule.ID, rule.ServiceID)
 	writeJSON(w, http.StatusCreated, rule)
 }
 
@@ -119,7 +133,7 @@ func (s *Server) updateRule(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
-	log.Printf("Rule updated: %s (%s)", rule.Name, rule.ID)
+	log.Printf("[user=%s] Rule updated: %s (%s)", DisplayNameFromRequest(r), rule.Name, rule.ID)
 	writeJSON(w, http.StatusOK, rule)
 }
 
@@ -129,7 +143,7 @@ func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
-	log.Printf("Rule deleted: %s", id)
+	log.Printf("[user=%s] Rule deleted: %s", DisplayNameFromRequest(r), id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -191,9 +205,9 @@ func validateRule(r *dropper.Rule) error {
 	}
 
 	switch r.Action {
-	case dropper.ActionDrop, dropper.ActionAlert, dropper.ActionBoth:
+	case dropper.ActionDrop, dropper.ActionAlert, dropper.ActionBoth, dropper.ActionWhitelist:
 	default:
-		return fmt.Errorf("action must be one of: drop, alert, both")
+		return fmt.Errorf("action must be one of: drop, alert, both, whitelist")
 	}
 
 	return nil
