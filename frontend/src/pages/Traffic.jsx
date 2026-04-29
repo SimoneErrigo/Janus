@@ -6,6 +6,8 @@ import { useInfiniteList } from '../hooks/useInfiniteList'
 import { getDisplayName } from '../api'
 import { hideParams, addHiddenIds, setClearCursor, getHiddenIds, getClearCursor, resetClearCursor, clearHiddenIds } from '../userHidden'
 import QuickRulePanel from '../components/QuickRulePanel'
+import { tryFormatJSON } from '../utils/formatting'
+import { useServiceMap } from '../hooks/useServiceMap'
 
 function base64ToBytes(b64) {
   if (!b64) return new Uint8Array()
@@ -137,19 +139,6 @@ function hasAlertAction(pkt) {
   return pkt.matched_rules.some((r) => r.action === 'alert' || r.action === 'both')
 }
 
-// Try to pretty-print JSON, return original string if not valid JSON
-function tryFormatJSON(str) {
-  if (!str) return { text: str, isJSON: false }
-  const trimmed = str.trim()
-  if ((trimmed[0] === '{' && trimmed[trimmed.length - 1] === '}') ||
-      (trimmed[0] === '[' && trimmed[trimmed.length - 1] === ']')) {
-    try {
-      return { text: JSON.stringify(JSON.parse(trimmed), null, 2), isJSON: true }
-    } catch {}
-  }
-  return { text: str, isJSON: false }
-}
-
 // ---- Main Traffic component ----
 
 export default function Traffic() {
@@ -171,7 +160,6 @@ export default function Traffic() {
   const [flagIDFilter, setFlagIDFilter] = useState(false)
   const [flagIDEnabled, setFlagIDEnabled] = useState(false)
   const [blockedFilter, setBlockedFilter] = useState(false)
-  const [showWhitelisted, setShowWhitelisted] = useState(false)
   const [paused, setPaused] = useState(false)
   const [trafficMode, setTrafficMode] = useState('live')
   const [captureStatus, setCaptureStatus] = useState(null)
@@ -289,10 +277,10 @@ export default function Traffic() {
     if (flagFilter) params.flagged = 'true'
     if (flagIDFilter) params.contains_flagid = 'true'
     if (blockedFilter) params.dropped = 'true'
-    if (showWhitelisted) params.show_whitelisted = 'true'
+    params.summary = '1'
     const data = await api.getPackets(params)
     return { items: data.packets || [], total: data.total }
-  }, [filters, flagFilter, flagIDFilter, blockedFilter, showWhitelisted, buildParams, hideVersion])
+  }, [filters, flagFilter, flagIDFilter, blockedFilter, buildParams, hideVersion])
 
   const {
     items: packets,
@@ -618,14 +606,13 @@ export default function Traffic() {
     resetPackets()
   }
 
-  // Select a packet — fetch full detail if body is missing (SSE-pushed lightweight packets)
+  // Select a packet — fetch full detail if it's a lite/summary packet or
+  // came from SSE (no body_string). Lite packets carry a `lite: true` flag.
   const selectPacket = useCallback(async (pkt) => {
     if (!pkt) return
-    if (pkt.body_string !== undefined) {
-      setSelected(pkt)
-      return
-    }
+    const needsRefetch = pkt.lite || pkt.body_string === undefined
     setSelected(pkt)
+    if (!needsRefetch) return
     try {
       const full = await api.getPacket(pkt.id)
       setSelected(full)
@@ -701,9 +688,21 @@ export default function Traffic() {
   }, [flowMode, packets, selected, selectPacket, selectedPkts, toggleSingleSelect, bulkDelete, resetPackets])
 
   useEffect(() => {
-    if (!selected?.id || !packetTableScrollRef.current) return
-    const row = packetTableScrollRef.current.querySelector(`tr[data-packet-id="${selected.id}"]`)
-    row?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+    const el = packetTableScrollRef.current
+    if (!selected?.id || !el) return
+    const row = el.querySelector(`tr[data-packet-id="${selected.id}"]`)
+    if (row) {
+      row.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+      return
+    }
+    // Row is outside the virtualized window — compute target offset by index.
+    const list = flowMode ? flowMode.packets : packets
+    const idx = list.findIndex((p) => p.id === selected.id)
+    if (idx < 0) return
+    const target = idx * ROW_H
+    if (target < el.scrollTop || target > el.scrollTop + el.clientHeight - ROW_H) {
+      el.scrollTo({ top: Math.max(0, target - el.clientHeight / 2), behavior: 'smooth' })
+    }
   }, [selected?.id])
 
   // Close quick rule panel when selecting a different packet
@@ -721,6 +720,34 @@ export default function Traffic() {
   // Use flow mode packets when active, otherwise normal packets
   const displayPackets = flowMode ? flowMode.packets : packets
   const displayTotal = flowMode ? flowMode.total : total
+
+  // ---- Row virtualization ----
+  // Render only the rows in (and just outside) the viewport. Saves React from
+  // reconciling thousands of <tr>s on every prepend/scroll.
+  const ROW_H = 32
+  const OVERSCAN = 10
+  const [scrollTop, setScrollTop] = useState(0)
+  const [viewportH, setViewportH] = useState(600)
+  useEffect(() => {
+    const el = packetTableScrollRef.current
+    if (!el) return
+    const updateH = () => setViewportH(el.clientHeight || 600)
+    const onScroll = () => setScrollTop(el.scrollTop)
+    updateH()
+    el.addEventListener('scroll', onScroll, { passive: true })
+    const ro = new ResizeObserver(updateH)
+    ro.observe(el)
+    return () => {
+      el.removeEventListener('scroll', onScroll)
+      ro.disconnect()
+    }
+  }, [])
+  const rowCount = displayPackets.length
+  const startIndex = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN)
+  const endIndex = Math.min(rowCount, Math.ceil((scrollTop + viewportH) / ROW_H) + OVERSCAN)
+  const topPad = startIndex * ROW_H
+  const bottomPad = Math.max(0, (rowCount - endIndex) * ROW_H)
+  const visiblePackets = displayPackets.slice(startIndex, endIndex)
 
   // FlagID highlight regex: built from the backend-provided matched values (typically 1-3).
   const flagidHighlightRegex = useMemo(() => {
@@ -749,11 +776,7 @@ export default function Traffic() {
   const headersRegex = [highlightRegex, highlightRuleInHeaders ? selectedRulePattern : ''].filter(Boolean).join('|')
   const bodyRegex = [highlightRegex, highlightRuleInBody ? selectedRulePattern : ''].filter(Boolean).join('|')
 
-  // Resolve service_id to service name
-  const serviceName = (id) => {
-    const svc = services.find((s) => s.id === id)
-    return svc ? svc.name : id
-  }
+  const { serviceName } = useServiceMap(services)
 
   return (
     <div className="p-4 flex flex-col h-full">
@@ -989,17 +1012,6 @@ export default function Traffic() {
               >
                 <span>&#9888;</span> Blocked
               </button>
-              <button
-                onClick={() => setShowWhitelisted((v) => !v)}
-                className={`text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 ${
-                  showWhitelisted
-                    ? 'bg-gray-700/60 text-gray-300 border border-gray-600/50'
-                    : 'bg-gray-800 text-gray-500 border border-gray-700 hover:text-gray-300'
-                }`}
-                title="Show traffic matched by whitelist rules (normally hidden)"
-              >
-                <span>&#10003;</span> Show whitelisted
-              </button>
             </div>
           </div>
         )}
@@ -1030,11 +1042,11 @@ export default function Traffic() {
                 </tr>
               </thead>
               <tbody>
-                {displayPackets.map((pkt) => {
-                  const isWL = pkt.is_whitelisted
-                  const rowBg = isWL
-                    ? 'opacity-40'
-                    : pkt.matched_rules?.length > 0
+                {topPad > 0 && (
+                  <tr aria-hidden="true" style={{ height: topPad }}><td colSpan="9" /></tr>
+                )}
+                {visiblePackets.map((pkt) => {
+                  const rowBg = pkt.matched_rules?.length > 0
                     ? 'bg-red-950/20'
                     : pkt.contains_flagid && pkt.flagged
                       ? 'bg-gradient-to-r from-yellow-950/30 to-teal-950/30'
@@ -1049,6 +1061,7 @@ export default function Traffic() {
                     key={pkt.id}
                     data-packet-id={pkt.id}
                     onClick={(e) => handleRowClick(pkt, e)}
+                    style={{ height: ROW_H }}
                     className={`group border-b border-gray-800/50 cursor-pointer transition-colors select-none ${
                       selectedPkts.has(pkt.id) ? 'bg-blue-950/30 hover:bg-blue-950/40' :
                       selected?.id === pkt.id ? 'bg-gray-800' : 'hover:bg-gray-900/80'
@@ -1088,7 +1101,6 @@ export default function Traffic() {
                         {hasDropAction(pkt) && <span className="text-red-400 text-xs" title="Dropped by rule">&#9888;</span>}
                         {hasAlertAction(pkt) && <span className="text-yellow-400 text-xs" title="Alert rule triggered">&#9888;</span>}
                         {pkt.contains_flagid && <span className="text-teal-400 text-xs" title="Contains flag ID">&#9881;</span>}
-                        {pkt.is_whitelisted && <span className="text-gray-500 text-[10px] px-1 bg-gray-800 rounded" title="Whitelisted — known-good traffic">wl</span>}
                         <button
                           onClick={(e) => { e.stopPropagation(); showFlow(pkt) }}
                           className="ml-auto text-[10px] font-semibold px-1.5 py-0.5 rounded bg-purple-950/40 text-purple-300/80 border border-purple-900/40 hover:bg-purple-900/50 hover:text-purple-200 cursor-pointer flex items-center gap-1 transition-colors"
@@ -1109,6 +1121,9 @@ export default function Traffic() {
                   </tr>
                   );
                 })}
+                {bottomPad > 0 && (
+                  <tr aria-hidden="true" style={{ height: bottomPad }}><td colSpan="9" /></tr>
+                )}
                 {displayPackets.length === 0 && (
                   <tr><td colSpan="9" className="text-center py-8 text-gray-600">No packets found</td></tr>
                 )}
@@ -1351,10 +1366,10 @@ export default function Traffic() {
                 )}
 
                 {selected.matched_rules?.length > 0 && (
-                  <div className={`border rounded px-2 py-1 ${selected.is_whitelisted ? 'bg-gray-800/40 border-gray-700/50' : 'bg-red-900/20 border-red-800/50'}`}>
-                    <span className={`text-xs font-medium ${selected.is_whitelisted ? 'text-gray-400' : 'text-red-400'}`}>Matched: </span>
+                  <div className="border rounded px-2 py-1 bg-red-900/20 border-red-800/50">
+                    <span className="text-xs font-medium text-red-400">Matched: </span>
                     {selected.matched_rules.map((r, i) => (
-                      <span key={r.id} className={`text-xs ${r.action === 'whitelist' ? 'text-gray-400' : 'text-red-300'}`}>
+                      <span key={r.id} className="text-xs text-red-300">
                         {i > 0 && ', '}
                         {r.name}
                         {r.action ? <span className="text-gray-500 ml-1">({r.action})</span> : null}

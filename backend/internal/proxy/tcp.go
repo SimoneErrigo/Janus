@@ -143,13 +143,7 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 // separate packet.
 func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.Service, sessionID string, srcIP string, srcPort int, dstIP string, dstPort int, dir sniffer.Direction, closeBoth func()) {
 	buf := make([]byte, 32*1024)
-	var engine *dropper.Engine
-	if m.ruleStore != nil {
-		engine = dropper.NewEngine(m.ruleStore)
-		if m.rulesCache != nil {
-			engine.SetCache(m.rulesCache)
-		}
-	}
+	engine := m.engineFor(svc)
 
 	for {
 		n, readErr := src.Read(buf)
@@ -213,22 +207,18 @@ func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.
 					MatchedFlagIDs: matchedFlagIDs,
 					FlagIDRound:    flagIDRound,
 				}
-				if err := m.packetStore.Insert(pkt); err != nil {
-					log.Printf("[%s] sniffer: failed to log TCP packet: %v", svc.Name, err)
-				}
-
+				alertTemplates := make([]*sniffer.Alert, 0, len(alertRules))
 				for _, rule := range alertRules {
-					alert := &sniffer.Alert{
-						PacketID:       pkt.ID,
+					alertTemplates = append(alertTemplates, &sniffer.Alert{
 						RuleID:         rule.ID,
 						ServiceID:      svc.ID,
 						SrcIP:          srcIP,
 						Timestamp:      now,
 						PatternMatched: rule.Pattern,
-					}
-					if err := m.packetStore.InsertAlert(alert); err != nil {
-						log.Printf("[%s] sniffer: failed to log TCP alert: %v", svc.Name, err)
-					}
+					})
+				}
+				if err := m.packetStore.Enqueue(pkt, alertTemplates); err != nil {
+					log.Printf("[%s] sniffer: failed to log TCP packet: %v", svc.Name, err)
 				}
 			}
 
@@ -287,7 +277,7 @@ func (m *Manager) sniffCopy(dst io.Writer, src io.Reader, svc *storage.Service, 
 					MatchedFlagIDs: matchedFlagIDs,
 					FlagIDRound:    flagIDRound,
 				}
-				if err := m.packetStore.Insert(pkt); err != nil {
+				if err := m.packetStore.Enqueue(pkt, nil); err != nil {
 					log.Printf("[%s] sniffer: failed to log TCP packet: %v", svc.Name, err)
 				}
 			}

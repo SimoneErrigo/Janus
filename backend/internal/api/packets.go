@@ -164,12 +164,8 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 		q.Dropped = &b
 	}
 
-	// Whitelisted packets are hidden by default unless show_whitelisted=true
-	if params.Get("show_whitelisted") == "true" || params.Get("show_whitelisted") == "1" {
-		// nil = no filter = show all (including whitelisted)
-	} else {
-		hide := false
-		q.Whitelisted = &hide
+	if v := params.Get("summary"); v == "true" || v == "1" {
+		q.Summary = true
 	}
 
 	// Per-user hide filters (client-sent): exclude_ids=comma,separated and hidden_before=RFC3339.

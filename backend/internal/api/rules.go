@@ -205,9 +205,9 @@ func validateRule(r *dropper.Rule) error {
 	}
 
 	switch r.Action {
-	case dropper.ActionDrop, dropper.ActionAlert, dropper.ActionBoth, dropper.ActionWhitelist:
+	case dropper.ActionDrop, dropper.ActionAlert, dropper.ActionBoth:
 	default:
-		return fmt.Errorf("action must be one of: drop, alert, both, whitelist")
+		return fmt.Errorf("action must be one of: drop, alert, both")
 	}
 
 	return nil

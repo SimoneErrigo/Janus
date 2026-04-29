@@ -23,10 +23,9 @@ const (
 type Action string
 
 const (
-	ActionDrop      Action = "drop"
-	ActionAlert     Action = "alert"
-	ActionBoth      Action = "both"
-	ActionWhitelist Action = "whitelist" // packet passes; marked as known-good, hidden by default
+	ActionDrop  Action = "drop"
+	ActionAlert Action = "alert"
+	ActionBoth  Action = "both"
 )
 
 // Rule represents a drop/alert rule for a service.

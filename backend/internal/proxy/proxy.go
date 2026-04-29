@@ -26,6 +26,8 @@ import (
 type Manager struct {
 	mu            sync.RWMutex
 	proxies       map[string]*runningProxy // service ID -> running proxy
+	engineMu      sync.RWMutex
+	engines       map[string]*dropper.Engine // service ID -> shared drop engine
 	packetStore   *sniffer.PacketStore
 	ruleStore     *dropper.RuleStore
 	flagRegex     *regexp.Regexp
@@ -46,11 +48,48 @@ type runningProxy struct {
 func NewManager(packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, flagRegex *regexp.Regexp, flagScanner *flagids.FlagScanner) *Manager {
 	return &Manager{
 		proxies:     make(map[string]*runningProxy),
+		engines:     make(map[string]*dropper.Engine),
 		packetStore: packetStore,
 		ruleStore:   ruleStore,
 		flagRegex:   flagRegex,
 		flagScanner: flagScanner,
 	}
+}
+
+// engineFor returns a shared drop engine for the given service, creating it on
+// first use. Reusing the engine across requests/connections preserves the
+// compiled-regex cache and avoids per-connection allocations on the hot path.
+// Uses a dedicated mutex so it can be called while m.mu is held by StartService.
+func (m *Manager) engineFor(svc *storage.Service) *dropper.Engine {
+	if m.ruleStore == nil {
+		return nil
+	}
+	m.engineMu.RLock()
+	if e := m.engines[svc.ID]; e != nil {
+		m.engineMu.RUnlock()
+		return e
+	}
+	m.engineMu.RUnlock()
+
+	m.engineMu.Lock()
+	defer m.engineMu.Unlock()
+	if e := m.engines[svc.ID]; e != nil {
+		return e
+	}
+	e := dropper.NewEngine(m.ruleStore)
+	if m.rulesCache != nil {
+		e.SetCache(m.rulesCache)
+	}
+	m.engines[svc.ID] = e
+	return e
+}
+
+// dropEngineCache drops the cached engine for the given service ID.
+// Called when a service is stopped/deleted so its engine can be GC'd.
+func (m *Manager) dropEngineCache(serviceID string) {
+	m.engineMu.Lock()
+	delete(m.engines, serviceID)
+	m.engineMu.Unlock()
 }
 
 // SetRulesCache sets the Redis cache for rule lookups on all new engines.
@@ -140,6 +179,7 @@ func (m *Manager) StopService(id string) error {
 	}
 
 	delete(m.proxies, id)
+	m.dropEngineCache(id)
 	log.Printf("Proxy stopped: %s", rp.service.Name)
 	return nil
 }
@@ -167,6 +207,7 @@ func (m *Manager) StopAll() {
 			rp.listener.Close()
 		}
 		delete(m.proxies, id)
+		m.dropEngineCache(id)
 		log.Printf("Proxy stopped: %s", rp.service.Name)
 	}
 }
@@ -217,13 +258,7 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 
 	var handler http.Handler = reverseProxy
 	if m.packetStore != nil {
-		var dropEngine *dropper.Engine
-		if m.ruleStore != nil {
-			dropEngine = dropper.NewEngine(m.ruleStore)
-			if m.rulesCache != nil {
-				dropEngine.SetCache(m.rulesCache)
-			}
-		}
+		dropEngine := m.engineFor(svc)
 		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine, m.flagRegex, m.flagScanner, m.currentFlagIDChecker, m.shouldCapture, m.shouldApplyFlagIDsOnIngest)
 	}
 
@@ -306,13 +341,7 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 
 	var handler http.Handler = reverseProxy
 	if m.packetStore != nil {
-		var dropEngine *dropper.Engine
-		if m.ruleStore != nil {
-			dropEngine = dropper.NewEngine(m.ruleStore)
-			if m.rulesCache != nil {
-				dropEngine.SetCache(m.rulesCache)
-			}
-		}
+		dropEngine := m.engineFor(svc)
 		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine, m.flagRegex, m.flagScanner, m.currentFlagIDChecker, m.shouldCapture, m.shouldApplyFlagIDsOnIngest)
 	}
 

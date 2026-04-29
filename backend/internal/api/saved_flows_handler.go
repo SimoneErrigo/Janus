@@ -77,7 +77,7 @@ func (s *Server) createSavedFlow(w http.ResponseWriter, r *http.Request) {
 		req.Name = "Flow #" + strconv.FormatInt(req.AnchorPacketID, 10)
 	}
 
-	// Resolve the flow from the anchor packet and snapshot its IDs
+	// Resolve the flow from the anchor packet and snapshot its full packets
 	packets, err := s.packetStore.QueryFlow(req.AnchorPacketID)
 	if err != nil {
 		http.Error(w, "flow query error: "+err.Error(), http.StatusInternalServerError)
@@ -96,7 +96,7 @@ func (s *Server) createSavedFlow(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:      time.Now(),
 		Notes:          req.Notes,
 	}
-	if err := s.packetStore.InsertSavedFlow(sf); err != nil {
+	if err := s.packetStore.InsertSavedFlow(sf, packets); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -110,16 +110,24 @@ func (s *Server) getSavedFlow(w http.ResponseWriter, r *http.Request, id int64) 
 		return
 	}
 
-	// Re-fetch packets by ID; gracefully handle deletions
-	packets := make([]*sniffer.Packet, 0, len(sf.PacketIDs))
+	// Prefer the snapshotted packets — they survive packet purges.
+	packets, err := s.packetStore.GetSavedFlowSnapshot(id)
+	if err != nil {
+		http.Error(w, "snapshot read error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	missingCount := 0
-	for _, pid := range sf.PacketIDs {
-		pkt, err := s.packetStore.GetPacketByID(pid)
-		if err != nil {
-			missingCount++
-			continue
+	if len(packets) == 0 {
+		// Legacy flow pinned before snapshots existed: fall back to live packets.
+		packets = make([]*sniffer.Packet, 0, len(sf.PacketIDs))
+		for _, pid := range sf.PacketIDs {
+			pkt, err := s.packetStore.GetPacketByID(pid)
+			if err != nil {
+				missingCount++
+				continue
+			}
+			packets = append(packets, pkt)
 		}
-		packets = append(packets, pkt)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{

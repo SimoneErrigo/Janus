@@ -1,66 +1,16 @@
-import { useState, useEffect, useCallback, useMemo, memo, useRef } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useInfiniteList } from '../hooks/useInfiniteList'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { api, subscribePacketStream } from '../api'
 import { hideParams, addHiddenIds } from '../userHidden'
+import HighlightedBodyBase from '../components/HighlightedBody'
+import { tryFormatJSON } from '../utils/formatting'
+import { useServiceMap } from '../hooks/useServiceMap'
 
-function toJSRegex(pattern) {
-  if (!pattern) return null
-  const cleaned = pattern.replace(/\(\?[ismUux]+\)/g, '')
-  if (!cleaned) return null
-  try {
-    return new RegExp(cleaned, 'gi')
-  } catch {
-    try {
-      return new RegExp(cleaned.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi')
-    } catch {
-      return null
-    }
-  }
-}
-
-const HighlightedBody = memo(function HighlightedBody({ text, pattern }) {
-  if (!text || !pattern) return <>{text}</>
-
-  const result = useMemo(() => {
-    try {
-      const re = toJSRegex(pattern)
-      if (!re) return null
-      const ranges = []
-      let m
-      while ((m = re.exec(text)) !== null) {
-        ranges.push({ start: m.index, end: m.index + m[0].length, text: m[0] })
-        if (m[0].length === 0) re.lastIndex++
-      }
-      if (ranges.length === 0) return null
-      const parts = []
-      let pos = 0
-      for (const r of ranges) {
-        if (r.start > pos) parts.push(<span key={`t${pos}`}>{text.slice(pos, r.start)}</span>)
-        parts.push(<mark key={`m${r.start}`} className="bg-red-500/40 text-red-200 rounded px-0.5">{r.text}</mark>)
-        pos = r.end
-      }
-      if (pos < text.length) parts.push(<span key={`t${pos}`}>{text.slice(pos)}</span>)
-      return parts
-    } catch {
-      return null
-    }
-  }, [text, pattern])
-
-  return <>{result ?? text}</>
-})
-
-function tryFormatJSON(str) {
-  if (!str) return { text: str, isJSON: false }
-  const trimmed = str.trim()
-  if ((trimmed[0] === '{' && trimmed[trimmed.length - 1] === '}') ||
-      (trimmed[0] === '[' && trimmed[trimmed.length - 1] === ']')) {
-    try {
-      return { text: JSON.stringify(JSON.parse(trimmed), null, 2), isJSON: true }
-    } catch {}
-  }
-  return { text: str, isJSON: false }
-}
+// Blocks uses red highlights to signal dropped traffic.
+const HighlightedBody = (props) => (
+  <HighlightedBodyBase {...props} colorClass="bg-red-500/40 text-red-200" />
+)
 
 function BlockedPacketDetail({ packet, rule }) {
   const formattedBody = useMemo(() => tryFormatJSON(packet.body_string), [packet.body_string])
@@ -241,10 +191,7 @@ export default function Blocks() {
     setFilters((f) => ({ ...f, [key]: value }))
   }
 
-  const serviceName = (id) => {
-    const svc = services.find((s) => s.id === id)
-    return svc ? svc.name : id
-  }
+  const { serviceName } = useServiceMap(services)
 
   // Find the first drop/both rule from the selected packet for highlighting
   const selectedRule = useMemo(() => {

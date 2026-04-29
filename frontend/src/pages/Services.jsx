@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { api } from '../api'
+import ErrorBanner from '../components/ErrorBanner'
 
 const protocols = ['http', 'https', 'h2', 'grpc', 'tcp']
 const tlsModes = ['', 'selfsigned', 'challenge']
@@ -67,7 +68,7 @@ export default function Services() {
         </button>
       </div>
 
-      {error && <div className="bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded mb-4">{error}</div>}
+      <ErrorBanner error={error} className="mb-4" />
 
       {editing && (
         <ServiceForm

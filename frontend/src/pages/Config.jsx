@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import { getTrafficNavKeys, saveTrafficNavKeys, keysToInputString, parseKeyList, defaultTrafficNavKeys } from '../trafficNavKeys'
+import ErrorBanner from '../components/ErrorBanner'
 
 export default function Config() {
   const [config, setConfig] = useState(null)
@@ -318,7 +319,7 @@ export default function Config() {
           <p className="text-xs text-gray-600 mt-1">Used by flow reconstruction to correlate related sessions in high-load traffic.</p>
         </div>
 
-        {error && <div className="bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded">{error}</div>}
+        <ErrorBanner error={error} />
         {saved && <div className="bg-green-900/30 border border-green-800 text-green-400 text-sm px-4 py-2 rounded">Configuration saved</div>}
 
         <button
@@ -350,7 +351,7 @@ export default function Config() {
             spellCheck={false}
           />
         </div>
-        {trafficNavError && <div className="bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded">{trafficNavError}</div>}
+        <ErrorBanner error={trafficNavError} />
         {trafficNavSaved && <div className="bg-green-900/30 border border-green-800 text-green-400 text-sm px-4 py-2 rounded">Shortcuts saved (this browser only)</div>}
         <div className="flex flex-wrap gap-2">
           <button
@@ -504,7 +505,7 @@ export default function Config() {
             </div>
           </div>
 
-          {flagIDError && <div className="bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded">{flagIDError}</div>}
+          <ErrorBanner error={flagIDError} />
           {flagIDSaved && <div className="bg-green-900/30 border border-green-800 text-green-400 text-sm px-4 py-2 rounded">Flag ID settings saved</div>}
 
           <button
@@ -603,7 +604,7 @@ export default function Config() {
             </div>
           </div>
 
-          {cleanupError && <div className="bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded">{cleanupError}</div>}
+          <ErrorBanner error={cleanupError} />
           {cleanupSaved && <div className="bg-green-900/30 border border-green-800 text-green-400 text-sm px-4 py-2 rounded">Cleanup settings saved</div>}
 
           {cleanupResult && (

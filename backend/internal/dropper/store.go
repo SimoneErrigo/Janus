@@ -59,10 +59,10 @@ func (s *RuleStore) ListRules(serviceID string) []*Rule {
 		}
 	}
 	sort.Slice(list, func(i, j int) bool {
-		if list[i].Name != list[j].Name {
-			return list[i].Name < list[j].Name
+		if list[i].Priority != list[j].Priority {
+			return list[i].Priority < list[j].Priority
 		}
-		return list[i].Priority < list[j].Priority
+		return list[i].Name < list[j].Name
 	})
 	return list
 }

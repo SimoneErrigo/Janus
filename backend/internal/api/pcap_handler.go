@@ -95,8 +95,6 @@ func (s *Server) ExportPcap(q sniffer.PacketQuery) (filename string, count int, 
 	if q.Limit <= 0 {
 		q.Limit = 100_000
 	}
-	// Never hide whitelisted packets in PCAP — export everything
-	q.Whitelisted = nil
 
 	packets, total, queryErr := s.packetStore.Query(q)
 	if queryErr != nil {

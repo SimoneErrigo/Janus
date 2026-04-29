@@ -121,10 +121,10 @@ const PacketDetail = memo(function PacketDetail({ packet, services, onClose, onC
           </div>
         )}
         {packet.matched_rules?.length > 0 && (
-          <div className={`border rounded px-2 py-1 ${packet.is_whitelisted ? 'bg-gray-800/40 border-gray-700/50' : 'bg-red-900/20 border-red-800/50'}`}>
-            <span className={`text-xs font-medium ${packet.is_whitelisted ? 'text-gray-400' : 'text-red-400'}`}>Matched: </span>
+          <div className="border rounded px-2 py-1 bg-red-900/20 border-red-800/50">
+            <span className="text-xs font-medium text-red-400">Matched: </span>
             {packet.matched_rules.map((r, i) => (
-              <span key={r.id} className={`text-xs ${r.action === 'whitelist' ? 'text-gray-400' : 'text-red-300'}`}>
+              <span key={r.id} className="text-xs text-red-300">
                 {i > 0 && ', '}{r.name}{r.action ? <span className="text-gray-500 ml-1">({r.action})</span> : null}
               </span>
             ))}

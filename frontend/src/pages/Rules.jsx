@@ -1,9 +1,11 @@
 import { useState, useEffect, useRef } from 'react'
 import { api } from '../api'
+import ErrorBanner from '../components/ErrorBanner'
+import { useServiceMap } from '../hooks/useServiceMap'
 
 const matchTypes = ['string', 'regex', 'bytes']
 const scopes = ['header', 'body', 'url', 'raw']
-const actions = ['drop', 'alert', 'both', 'whitelist']
+const actions = ['drop', 'alert', 'both']
 
 export default function Rules() {
   const [services, setServices] = useState([])
@@ -13,7 +15,7 @@ export default function Rules() {
   const [error, setError] = useState('')
   const [showPresets, setShowPresets] = useState(false)
   const [selectedIds, setSelectedIds] = useState(new Set())
-  const [actionFilter, setActionFilter] = useState('all') // 'all' | 'drop' | 'alert' | 'both' | 'whitelist'
+  const [actionFilter, setActionFilter] = useState('all') // 'all' | 'drop' | 'alert' | 'both'
   const ruleFormAnchorRef = useRef(null)
 
   useEffect(() => {
@@ -39,10 +41,7 @@ export default function Rules() {
     }
   }
 
-  const serviceName = (id) => {
-    const svc = services.find((s) => s.id === id)
-    return svc ? svc.name : id
-  }
+  const { serviceName } = useServiceMap(services)
 
   async function handleSave(rule, targetServiceIds) {
     setError('')
@@ -167,7 +166,7 @@ export default function Rules() {
         </div>
       </div>
 
-      {error && <div className="bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded mb-4">{error}</div>}
+      <ErrorBanner error={error} className="mb-4" />
 
       {showPresets && (
         <PresetPanel
@@ -197,7 +196,7 @@ export default function Rules() {
               </div>
               <div className="flex items-center gap-1 ml-auto">
                 <span className="text-xs text-gray-600 mr-1">Action:</span>
-                {['all', 'drop', 'alert', 'both', 'whitelist'].map((a) => (
+                {['all', 'drop', 'alert', 'both'].map((a) => (
                   <button
                     key={a}
                     onClick={() => setActionFilter(a)}
@@ -206,7 +205,6 @@ export default function Rules() {
                         ? a === 'drop' ? 'bg-red-900/50 text-red-300 border-red-700/50'
                           : a === 'alert' ? 'bg-orange-900/50 text-orange-300 border-orange-700/50'
                           : a === 'both' ? 'bg-purple-900/50 text-purple-300 border-purple-700/50'
-                          : a === 'whitelist' ? 'bg-gray-700/60 text-gray-200 border-gray-600/60'
                           : 'bg-cyan-900/50 text-cyan-300 border-cyan-700/50'
                         : 'bg-gray-800 text-gray-500 border-gray-700 hover:text-gray-300'
                     }`}
@@ -238,7 +236,6 @@ export default function Rules() {
                       rule.action === 'drop' ? 'bg-red-900/40 text-red-400' :
                       rule.action === 'alert' ? 'bg-orange-900/40 text-orange-400' :
                       rule.action === 'both' ? 'bg-purple-900/40 text-purple-400' :
-                      rule.action === 'whitelist' ? 'bg-gray-700/60 text-gray-400' :
                       'bg-gray-800 text-gray-400'
                     }`}>{rule.action || 'drop'}</span>
                     <span className="px-1.5 py-0.5 bg-gray-800 rounded mr-1">{rule.type}</span>
@@ -439,7 +436,7 @@ function PresetPanel({ services, defaultServiceId, onCreated, onCancel }) {
         })}
       </div>
 
-      {error && <div className="bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded mb-3">{error}</div>}
+      <ErrorBanner error={error} className="mb-3" />
       {result && (
         <div className="bg-green-900/30 border border-green-700/50 text-green-400 text-sm px-4 py-2 rounded mb-3">
           Created {result.created} rules{result.errors > 0 ? `, ${result.errors} errors` : ''}
@@ -540,11 +537,6 @@ function RuleForm({ rule, services, onSave, onCancel }) {
             {isFlagRule && (
               <div className="text-xs text-yellow-500 mt-1">
                 Flag rules must be alert-only. Dropping flags breaks the checker.
-              </div>
-            )}
-            {form.action === 'whitelist' && !isFlagRule && (
-              <div className="text-xs text-gray-500 mt-1">
-                Whitelist: matching packets pass through and are hidden from the Traffic view by default. Toggle "Show whitelisted" in Traffic to reveal them.
               </div>
             )}
           </div>

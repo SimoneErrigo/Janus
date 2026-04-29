@@ -62,7 +62,7 @@ export default function QuickRulePanel({ packet, services, onCreated, onCancel }
   if (success) {
     return (
       <div className="bg-green-900/30 border border-green-700/50 rounded p-2 text-xs text-green-400 flex items-center gap-2">
-        <span>&#10003;</span> Rule created for {selectedServices.length} service{selectedServices.length !== 1 ? 's' : ''} — traffic matching this pattern will be {action === 'alert' ? 'alerted' : action === 'whitelist' ? 'whitelisted' : action === 'both' ? 'alerted and dropped' : 'dropped'}
+        <span>&#10003;</span> Rule created for {selectedServices.length} service{selectedServices.length !== 1 ? 's' : ''} — traffic matching this pattern will be {action === 'alert' ? 'alerted' : action === 'both' ? 'alerted and dropped' : 'dropped'}
       </div>
     )
   }
@@ -75,7 +75,6 @@ export default function QuickRulePanel({ packet, services, onCreated, onCancel }
           <option value="drop">Drop</option>
           <option value="alert">Alert</option>
           <option value="both">Both</option>
-          <option value="whitelist">Whitelist</option>
         </select>
         <select value={type} onChange={e => setType(e.target.value)}
           className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-red-500">

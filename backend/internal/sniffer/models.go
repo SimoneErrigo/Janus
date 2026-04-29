@@ -90,7 +90,10 @@ type Packet struct {
 	ContainsFlagID bool              `json:"contains_flagid"`
 	MatchedFlagIDs []string          `json:"matched_flagids"`
 	FlagIDRound    int               `json:"flagid_round"`    // round of the AC automaton used to scan this packet
-	IsWhitelisted  bool              `json:"is_whitelisted"`  // matched a whitelist rule; hidden from Traffic by default
+
+	// Lite indicates this packet was returned from a summary list query without
+	// full headers/body. Clients should refetch by ID when full detail is needed.
+	Lite bool `json:"lite,omitempty"`
 }
 
 // FlagIDChecker checks if text contains any current flag ID value.
@@ -139,7 +142,7 @@ type PacketQuery struct {
 	ContainsFlagID  *bool  // nil = no filter, true = only with flagID, false = only without
 	HasMatchedRules *bool  // nil = no filter, true = only with matched rules, false = only without
 	Dropped         *bool  // nil = no filter, true = only packets dropped by a rule (action=drop|both)
-	Whitelisted     *bool  // nil = show all; false = exclude whitelisted (default in API); true = only whitelisted
+	Summary         bool   // when true, list query skips body/headers/matched_flagids and returns Lite packets
 	SortOrder       string // "asc" or "desc" (default "desc")
 	Limit           int
 	Offset          int

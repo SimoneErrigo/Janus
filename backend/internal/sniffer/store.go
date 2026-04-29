@@ -17,7 +17,13 @@ import (
 )
 
 // packetSelectCols is the standard column list for packet SELECTs.
-const packetSelectCols = "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, is_whitelisted"
+const packetSelectCols = "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged, contains_flagid, matched_flagids, flagid_round"
+
+// packetSummaryCols is the slim column list for list-view queries: skips
+// body (raw blob), body_string (returned truncated via substr below), and
+// matched_flagids JSON. Headers are still selected because the row cell
+// preview falls back to body_string substring when URL is empty.
+const packetSummaryCols = "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, substr(body_string, 1, 80), matched_rules, flagged, contains_flagid, flagid_round"
 
 // PacketStore handles SQLite persistence for captured packets.
 // Uses separate read/write connection pools for WAL-mode concurrency:
@@ -32,7 +38,26 @@ type PacketStore struct {
 	onChange func(PacketChangeKind, *Packet)
 
 	flowCorrelationWindowSec atomic.Int64
+
+	// Async batched writer for the proxy hot path. Enqueue() pushes here;
+	// a single goroutine drains and writes batches via multi-row INSERT.
+	queue   chan batchItem
+	stopCh  chan struct{}
+	doneCh  chan struct{}
 }
+
+// batchItem carries a packet and any alerts that must be linked to it.
+// The alerts have PacketID unset; the writer fills it in once the packet ID is known.
+type batchItem struct {
+	pkt    *Packet
+	alerts []*Alert
+}
+
+const (
+	packetQueueSize    = 8192
+	packetBatchMax     = 64
+	packetBatchFlushMs = 25
+)
 
 // NewPacketStore opens (or creates) the SQLite database at dataDir/packets.db.
 func NewPacketStore(dataDir string) (*PacketStore, error) {
@@ -63,8 +88,16 @@ func NewPacketStore(dataDir string) (*PacketStore, error) {
 		return nil, fmt.Errorf("migrating sqlite: %w", err)
 	}
 
-	ps := &PacketStore{db: db, rdb: rdb, dbPath: dbPath}
+	ps := &PacketStore{
+		db:     db,
+		rdb:    rdb,
+		dbPath: dbPath,
+		queue:  make(chan batchItem, packetQueueSize),
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+	}
 	ps.flowCorrelationWindowSec.Store(120)
+	go ps.runBatchWriter()
 	return ps, nil
 }
 
@@ -145,7 +178,6 @@ func migrate(db *sql.DB) error {
 		"ALTER TABLE packets ADD COLUMN matched_flagids TEXT NOT NULL DEFAULT '[]'",
 		"ALTER TABLE packets ADD COLUMN flagid_round INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE packets ADD COLUMN has_drop_match INTEGER NOT NULL DEFAULT 0",
-		"ALTER TABLE packets ADD COLUMN is_whitelisted INTEGER NOT NULL DEFAULT 0",
 	} {
 		db.Exec(col) // ignore "duplicate column" errors
 	}
@@ -154,7 +186,6 @@ func migrate(db *sql.DB) error {
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_session_id ON packets(session_id)")
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_contains_flagid ON packets(contains_flagid)")
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_has_drop_match ON packets(has_drop_match)")
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_is_whitelisted ON packets(is_whitelisted)")
 
 	// Composite index for the most common query: filter by service + sort by time
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_service_ts ON packets(service_id, timestamp DESC)")
@@ -200,6 +231,22 @@ func migrate(db *sql.DB) error {
 			created_at       TEXT    NOT NULL,
 			notes            TEXT    NOT NULL DEFAULT ''
 		);
+	`)
+	if err != nil {
+		return err
+	}
+
+	// Snapshot of full packet data per saved flow — survives packet purges so
+	// pinned flows remain inspectable after the packets table is wiped.
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS saved_flow_packets (
+			saved_flow_id INTEGER NOT NULL,
+			ordinal       INTEGER NOT NULL,
+			packet_id     INTEGER NOT NULL,
+			data          BLOB    NOT NULL,
+			PRIMARY KEY (saved_flow_id, ordinal)
+		);
+		CREATE INDEX IF NOT EXISTS idx_sfp_flow ON saved_flow_packets(saved_flow_id);
 	`)
 	if err != nil {
 		return err
@@ -259,17 +306,11 @@ func (s *PacketStore) Insert(p *Packet) error {
 		containsFlagIDInt = 1
 	}
 	hasDropMatchInt := 0
-	isWhitelistedInt := 0
 	for _, r := range p.MatchedRules {
 		switch r.Action {
 		case "drop", "both":
 			hasDropMatchInt = 1
-		case "whitelist":
-			isWhitelistedInt = 1
 		}
-	}
-	if p.IsWhitelisted {
-		isWhitelistedInt = 1
 	}
 
 	if p.MatchedFlagIDs == nil {
@@ -283,8 +324,8 @@ func (s *PacketStore) Insert(p *Packet) error {
 	res, err := s.execInsertRetry(`
 		INSERT INTO packets (service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port,
 			protocol, direction, method, url, status, headers, body, body_string,
-			matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, has_drop_match, is_whitelisted)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, has_drop_match)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ServiceID, p.SessionID,
 		p.Timestamp.UTC().Format(time.RFC3339Nano),
 		p.SrcIP, p.SrcPort,
@@ -294,7 +335,7 @@ func (s *PacketStore) Insert(p *Packet) error {
 		string(headersJSON),
 		p.Body, p.BodyString,
 		string(matchedRulesJSON), flaggedInt, containsFlagIDInt,
-		string(matchedFlagIDsJSON), p.FlagIDRound, hasDropMatchInt, isWhitelistedInt,
+		string(matchedFlagIDsJSON), p.FlagIDRound, hasDropMatchInt,
 	)
 	if err != nil {
 		return fmt.Errorf("inserting packet: %w", err)
@@ -304,6 +345,202 @@ func (s *PacketStore) Insert(p *Packet) error {
 	p.ID = id
 	s.emitChange(PacketChangeInsert, p)
 	return nil
+}
+
+// Enqueue submits a packet (and any linked alerts whose PacketID will be filled
+// in by the writer) to the async batched writer. Falls back to a synchronous
+// Insert if the queue is full or the writer has been shut down.
+func (s *PacketStore) Enqueue(pkt *Packet, alerts []*Alert) error {
+	if pkt == nil {
+		return nil
+	}
+	if len(pkt.Body) > 0 && pkt.BodyString == "" && utf8.Valid(pkt.Body) {
+		pkt.BodyString = string(pkt.Body)
+	}
+	if pkt.MatchedFlagIDs == nil {
+		pkt.MatchedFlagIDs = []string{}
+	}
+	if pkt.MatchedRules == nil {
+		pkt.MatchedRules = []MatchedRuleInfo{}
+	}
+	select {
+	case s.queue <- batchItem{pkt: pkt, alerts: alerts}:
+		return nil
+	default:
+	}
+	// Queue full — fall back to sync insert so we don't drop packets under load.
+	if err := s.Insert(pkt); err != nil {
+		return err
+	}
+	for _, a := range alerts {
+		a.PacketID = pkt.ID
+		if err := s.InsertAlert(a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *PacketStore) runBatchWriter() {
+	defer close(s.doneCh)
+	flushPeriod := time.Duration(packetBatchFlushMs) * time.Millisecond
+	ticker := time.NewTicker(flushPeriod)
+	defer ticker.Stop()
+
+	batch := make([]batchItem, 0, packetBatchMax)
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		s.flushBatch(batch)
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case <-s.stopCh:
+			// Drain remaining items before exiting
+			for {
+				select {
+				case it := <-s.queue:
+					batch = append(batch, it)
+					if len(batch) >= packetBatchMax {
+						flush()
+					}
+				default:
+					flush()
+					return
+				}
+			}
+		case it := <-s.queue:
+			batch = append(batch, it)
+			if len(batch) >= packetBatchMax {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+// flushBatch inserts a batch of packets in a single multi-row INSERT, then
+// inserts any linked alerts in a second multi-row INSERT. Falls back to
+// per-row inserts on error.
+func (s *PacketStore) flushBatch(batch []batchItem) {
+	if len(batch) == 0 {
+		return
+	}
+
+	// --- Build packet INSERT ---
+	const packetCols = 21
+	rowPlaceholder := "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+	placeholders := make([]string, len(batch))
+	args := make([]interface{}, 0, len(batch)*packetCols)
+	for i, it := range batch {
+		placeholders[i] = rowPlaceholder
+		p := it.pkt
+
+		headersJSON, err := json.Marshal(p.Headers)
+		if err != nil {
+			headersJSON = []byte("{}")
+		}
+		matchedRulesJSON, err := json.Marshal(p.MatchedRules)
+		if err != nil {
+			matchedRulesJSON = []byte("[]")
+		}
+		matchedFlagIDsJSON, err := json.Marshal(p.MatchedFlagIDs)
+		if err != nil {
+			matchedFlagIDsJSON = []byte("[]")
+		}
+
+		flaggedInt := 0
+		if p.Flagged {
+			flaggedInt = 1
+		}
+		containsFlagIDInt := 0
+		if p.ContainsFlagID {
+			containsFlagIDInt = 1
+		}
+		hasDropMatchInt := 0
+		for _, r := range p.MatchedRules {
+			switch r.Action {
+			case "drop", "both":
+				hasDropMatchInt = 1
+			}
+		}
+
+		args = append(args,
+			p.ServiceID, p.SessionID,
+			p.Timestamp.UTC().Format(time.RFC3339Nano),
+			p.SrcIP, p.SrcPort,
+			p.DstIP, p.DstPort,
+			p.Protocol, p.Direction,
+			p.Method, p.URL, p.Status,
+			string(headersJSON),
+			p.Body, p.BodyString,
+			string(matchedRulesJSON), flaggedInt, containsFlagIDInt,
+			string(matchedFlagIDsJSON), p.FlagIDRound, hasDropMatchInt,
+		)
+	}
+
+	query := `INSERT INTO packets (service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port,
+		protocol, direction, method, url, status, headers, body, body_string,
+		matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, has_drop_match)
+		VALUES ` + strings.Join(placeholders, ",")
+
+	res, err := s.execInsertRetry(query, args...)
+	if err != nil {
+		// Batch failed — fall back to one-by-one Insert (and InsertAlert) so we
+		// don't drop captures wholesale.
+		for _, it := range batch {
+			if ierr := s.Insert(it.pkt); ierr != nil {
+				continue
+			}
+			for _, a := range it.alerts {
+				a.PacketID = it.pkt.ID
+				_ = s.InsertAlert(a)
+			}
+		}
+		return
+	}
+
+	lastID, _ := res.LastInsertId()
+	firstID := lastID - int64(len(batch)) + 1
+	for i, it := range batch {
+		it.pkt.ID = firstID + int64(i)
+	}
+
+	// --- Build alerts INSERT ---
+	var alertPlaceholders []string
+	var alertArgs []interface{}
+	for _, it := range batch {
+		for _, a := range it.alerts {
+			a.PacketID = it.pkt.ID
+			alertPlaceholders = append(alertPlaceholders, "(?,?,?,?,?,?)")
+			alertArgs = append(alertArgs,
+				a.PacketID, a.RuleID, a.ServiceID, a.SrcIP,
+				a.Timestamp.UTC().Format(time.RFC3339Nano),
+				a.PatternMatched,
+			)
+		}
+	}
+	if len(alertPlaceholders) > 0 {
+		alertQuery := `INSERT INTO alerts (packet_id, rule_id, service_id, src_ip, timestamp, pattern_matched) VALUES ` +
+			strings.Join(alertPlaceholders, ",")
+		if _, err := s.execInsertRetry(alertQuery, alertArgs...); err != nil {
+			// Best-effort retry per-row so we don't lose alerts on a single bad input
+			for _, it := range batch {
+				for _, a := range it.alerts {
+					_ = s.InsertAlert(a)
+				}
+			}
+		}
+	}
+
+	// --- Notify SSE for each newly-inserted packet ---
+	for _, it := range batch {
+		s.emitChange(PacketChangeInsert, it.pkt)
+	}
 }
 
 // Query retrieves packets matching the given filters.
@@ -329,6 +566,10 @@ func (s *PacketStore) Query(q PacketQuery) ([]*Packet, int, error) {
 	}
 
 	selectCols := packetSelectCols
+	useSummary := q.Summary && !hasRegex
+	if useSummary {
+		selectCols = packetSummaryCols
+	}
 
 	if hasRegex {
 		// With regex: fetch all SQL-matching rows, filter in Go, then paginate
@@ -343,7 +584,13 @@ func (s *PacketStore) Query(q PacketQuery) ([]*Packet, int, error) {
 		where + " ORDER BY timestamp " + sortOrder + " LIMIT ? OFFSET ?"
 	queryArgs := append(args, limit, offset)
 
-	packets, err := s.scanPackets(querySQL, queryArgs)
+	var packets []*Packet
+	var err error
+	if useSummary {
+		packets, err = s.scanPacketsSummary(querySQL, queryArgs)
+	} else {
+		packets, err = s.scanPackets(querySQL, queryArgs)
+	}
 	if err != nil {
 		return nil, 0, err
 	}
@@ -467,7 +714,7 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 		var headersJSON string
 		var matchedRulesJSON string
 		var matchedFlagIDsJSON string
-		var flaggedInt, containsFlagIDInt, isWhitelistedInt int
+		var flaggedInt, containsFlagIDInt int
 		if err := rows.Scan(
 			&p.ID, &p.ServiceID, &p.SessionID, &ts,
 			&p.SrcIP, &p.SrcPort, &p.DstIP, &p.DstPort,
@@ -475,7 +722,7 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 			&p.Method, &p.URL, &p.Status,
 			&headersJSON, &p.Body, &p.BodyString,
 			&matchedRulesJSON, &flaggedInt, &containsFlagIDInt,
-			&matchedFlagIDsJSON, &p.FlagIDRound, &isWhitelistedInt,
+			&matchedFlagIDsJSON, &p.FlagIDRound,
 		); err != nil {
 			return nil, fmt.Errorf("scanning packet: %w", err)
 		}
@@ -483,7 +730,6 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 		p.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
 		p.Flagged = flaggedInt != 0
 		p.ContainsFlagID = containsFlagIDInt != 0
-		p.IsWhitelisted = isWhitelistedInt != 0
 
 		if headersJSON != "" && headersJSON != "{}" {
 			json.Unmarshal([]byte(headersJSON), &p.Headers)
@@ -513,6 +759,55 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 	return packets, nil
 }
 
+// scanPacketsSummary scans rows produced by SELECTing packetSummaryCols.
+// Returns Lite packets with body=nil, headers=nil, matched_flagids=[], and
+// body_string truncated to a short preview. Clients should refetch by ID
+// when the full body/headers are needed (UI does this on row click).
+func (s *PacketStore) scanPacketsSummary(querySQL string, args []interface{}) ([]*Packet, error) {
+	rows, err := s.rdb.Query(querySQL, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying packets: %w", err)
+	}
+	defer rows.Close()
+
+	var packets []*Packet
+	for rows.Next() {
+		p := &Packet{Lite: true}
+		var ts, bodyPreview, matchedRulesJSON string
+		var flaggedInt, containsFlagIDInt int
+		if err := rows.Scan(
+			&p.ID, &p.ServiceID, &p.SessionID, &ts,
+			&p.SrcIP, &p.SrcPort, &p.DstIP, &p.DstPort,
+			&p.Protocol, &p.Direction,
+			&p.Method, &p.URL, &p.Status,
+			&bodyPreview,
+			&matchedRulesJSON, &flaggedInt, &containsFlagIDInt,
+			&p.FlagIDRound,
+		); err != nil {
+			return nil, fmt.Errorf("scanning packet summary: %w", err)
+		}
+
+		p.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
+		p.Flagged = flaggedInt != 0
+		p.ContainsFlagID = containsFlagIDInt != 0
+		p.BodyString = bodyPreview
+
+		if matchedRulesJSON != "" && matchedRulesJSON != "[]" {
+			json.Unmarshal([]byte(matchedRulesJSON), &p.MatchedRules)
+		}
+		if p.MatchedRules == nil {
+			p.MatchedRules = []MatchedRuleInfo{}
+		}
+		p.MatchedFlagIDs = []string{}
+
+		packets = append(packets, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return packets, nil
+}
+
 // GetPacketByID returns a single packet by its ID.
 func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
 	selectCols := packetSelectCols
@@ -523,7 +818,7 @@ func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
 	var headersJSON string
 	var matchedRulesJSON string
 	var matchedFlagIDsJSON string
-	var flaggedInt, containsFlagIDInt, isWhitelistedInt int
+	var flaggedInt, containsFlagIDInt int
 	if err := row.Scan(
 		&p.ID, &p.ServiceID, &p.SessionID, &ts,
 		&p.SrcIP, &p.SrcPort, &p.DstIP, &p.DstPort,
@@ -531,7 +826,7 @@ func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
 		&p.Method, &p.URL, &p.Status,
 		&headersJSON, &p.Body, &p.BodyString,
 		&matchedRulesJSON, &flaggedInt, &containsFlagIDInt,
-		&matchedFlagIDsJSON, &p.FlagIDRound, &isWhitelistedInt,
+		&matchedFlagIDsJSON, &p.FlagIDRound,
 	); err != nil {
 		return nil, err
 	}
@@ -539,7 +834,6 @@ func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
 	p.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
 	p.Flagged = flaggedInt != 0
 	p.ContainsFlagID = containsFlagIDInt != 0
-	p.IsWhitelisted = isWhitelistedInt != 0
 
 	if headersJSON != "" && headersJSON != "{}" {
 		json.Unmarshal([]byte(headersJSON), &p.Headers)
@@ -685,13 +979,28 @@ func (s *PacketStore) ClearAlerts() error {
 
 // ---- Saved flows ----
 
-// InsertSavedFlow persists a new saved flow and populates its ID.
-func (s *PacketStore) InsertSavedFlow(sf *SavedFlow) error {
+// InsertSavedFlow persists a new saved flow along with a JSON snapshot of each
+// packet's full data, so the flow stays inspectable even after the packets
+// table is purged. PacketIDs is derived from the supplied packets.
+func (s *PacketStore) InsertSavedFlow(sf *SavedFlow, packets []*Packet) error {
+	if sf.PacketIDs == nil && packets != nil {
+		sf.PacketIDs = make([]int64, len(packets))
+		for i, p := range packets {
+			sf.PacketIDs[i] = p.ID
+		}
+	}
 	idsJSON, err := json.Marshal(sf.PacketIDs)
 	if err != nil {
 		return fmt.Errorf("marshalling packet_ids: %w", err)
 	}
-	res, err := s.db.Exec(
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning saved flow tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(
 		`INSERT INTO saved_flows (name, anchor_packet_id, packet_ids, created_by, created_at, notes)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		sf.Name, sf.AnchorPacketID, string(idsJSON), sf.CreatedBy,
@@ -701,7 +1010,56 @@ func (s *PacketStore) InsertSavedFlow(sf *SavedFlow) error {
 		return fmt.Errorf("inserting saved flow: %w", err)
 	}
 	sf.ID, _ = res.LastInsertId()
+
+	for i, p := range packets {
+		if p == nil {
+			continue
+		}
+		blob, jerr := json.Marshal(p)
+		if jerr != nil {
+			return fmt.Errorf("marshalling snapshot packet: %w", jerr)
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO saved_flow_packets (saved_flow_id, ordinal, packet_id, data)
+			 VALUES (?, ?, ?, ?)`,
+			sf.ID, i, p.ID, blob,
+		); err != nil {
+			return fmt.Errorf("inserting saved flow snapshot: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing saved flow: %w", err)
+	}
 	return nil
+}
+
+// GetSavedFlowSnapshot returns the snapshotted packets for a saved flow,
+// ordered as they were captured. Returns an empty slice if no snapshot exists
+// (legacy flows pinned before snapshots were introduced).
+func (s *PacketStore) GetSavedFlowSnapshot(flowID int64) ([]*Packet, error) {
+	rows, err := s.rdb.Query(
+		`SELECT data FROM saved_flow_packets WHERE saved_flow_id = ? ORDER BY ordinal ASC`,
+		flowID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("querying saved flow snapshot: %w", err)
+	}
+	defer rows.Close()
+
+	var packets []*Packet
+	for rows.Next() {
+		var blob []byte
+		if err := rows.Scan(&blob); err != nil {
+			return nil, fmt.Errorf("scanning saved flow snapshot: %w", err)
+		}
+		p := &Packet{}
+		if err := json.Unmarshal(blob, p); err != nil {
+			return nil, fmt.Errorf("decoding saved flow snapshot: %w", err)
+		}
+		packets = append(packets, p)
+	}
+	return packets, rows.Err()
 }
 
 // ListSavedFlows returns all saved flows ordered newest-first.
@@ -734,7 +1092,7 @@ func (s *PacketStore) GetSavedFlowByID(id int64) (*SavedFlow, error) {
 	return scanSavedFlow(row)
 }
 
-// DeleteSavedFlow removes a saved flow by ID.
+// DeleteSavedFlow removes a saved flow by ID along with its snapshotted packets.
 func (s *PacketStore) DeleteSavedFlow(id int64) error {
 	res, err := s.db.Exec("DELETE FROM saved_flows WHERE id = ?", id)
 	if err != nil {
@@ -744,6 +1102,8 @@ func (s *PacketStore) DeleteSavedFlow(id int64) error {
 	if n == 0 {
 		return fmt.Errorf("saved flow not found")
 	}
+	// Best-effort cleanup of the snapshot rows; leftover rows would just sit unused.
+	_, _ = s.db.Exec("DELETE FROM saved_flow_packets WHERE saved_flow_id = ?", id)
 	return nil
 }
 
@@ -1136,8 +1496,10 @@ func (s *PacketStore) DBSize() (int64, error) {
 	return total, nil
 }
 
-// Close closes the database.
+// Close stops the batched writer (draining any queued packets) and closes the database.
 func (s *PacketStore) Close() error {
+	close(s.stopCh)
+	<-s.doneCh
 	s.rdb.Close()
 	return s.db.Close()
 }
@@ -1570,13 +1932,6 @@ func buildWhere(q PacketQuery) (string, []interface{}) {
 	if q.Dropped != nil && *q.Dropped {
 		// Fast path: indexed column computed at ingestion time.
 		conditions = append(conditions, "has_drop_match = 1")
-	}
-	if q.Whitelisted != nil {
-		if *q.Whitelisted {
-			conditions = append(conditions, "is_whitelisted = 1")
-		} else {
-			conditions = append(conditions, "is_whitelisted = 0")
-		}
 	}
 	if q.HiddenBefore != nil {
 		conditions = append(conditions, "timestamp >= ?")

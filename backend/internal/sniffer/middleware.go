@@ -129,23 +129,18 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 			reqPacket.MatchedRules = []MatchedRuleInfo{}
 		}
 		if mustPersistReq {
-			if err := store.Insert(reqPacket); err != nil {
-				log.Printf("[%s] sniffer: failed to log request: %v", svc.Name, err)
-			}
-
-			// Insert alerts for alert/both rules
+			alertTemplates := make([]*Alert, 0, len(alertRules))
 			for _, rule := range alertRules {
-				alert := &Alert{
-					PacketID:       reqPacket.ID,
+				alertTemplates = append(alertTemplates, &Alert{
 					RuleID:         rule.ID,
 					ServiceID:      svc.ID,
 					SrcIP:          srcIP,
 					Timestamp:      start,
 					PatternMatched: rule.Pattern,
-				}
-				if err := store.InsertAlert(alert); err != nil {
-					log.Printf("[%s] sniffer: failed to log alert: %v", svc.Name, err)
-				}
+				})
+			}
+			if err := store.Enqueue(reqPacket, alertTemplates); err != nil {
+				log.Printf("[%s] sniffer: failed to log request: %v", svc.Name, err)
 			}
 		}
 
@@ -218,23 +213,19 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 			FlagIDRound:    respFlagIDRound,
 		}
 		if mustPersistResp {
-			if err := store.Insert(respPacket); err != nil {
-				log.Printf("[%s] sniffer: failed to log response: %v", svc.Name, err)
-			}
-
-			// Insert alerts for response-matched rules
+			alertTemplates := make([]*Alert, 0, len(respAlertRules))
+			respTime := time.Now()
 			for _, rule := range respAlertRules {
-				alert := &Alert{
-					PacketID:       respPacket.ID,
+				alertTemplates = append(alertTemplates, &Alert{
 					RuleID:         rule.ID,
 					ServiceID:      svc.ID,
 					SrcIP:          srcIP,
-					Timestamp:      time.Now(),
+					Timestamp:      respTime,
 					PatternMatched: rule.Pattern,
-				}
-				if err := store.InsertAlert(alert); err != nil {
-					log.Printf("[%s] sniffer: failed to log response alert: %v", svc.Name, err)
-				}
+				})
+			}
+			if err := store.Enqueue(respPacket, alertTemplates); err != nil {
+				log.Printf("[%s] sniffer: failed to log response: %v", svc.Name, err)
 			}
 		}
 	})
@@ -323,12 +314,10 @@ func flattenHeadersString(h http.Header) string {
 func flattenHeaders(h http.Header) map[string]string {
 	flat := make(map[string]string, len(h))
 	for k, v := range h {
-		flat[k] = v[0]
-		if len(v) > 1 {
+		if len(v) == 1 {
 			flat[k] = v[0]
-			for i := 1; i < len(v); i++ {
-				flat[k] += ", " + v[i]
-			}
+		} else {
+			flat[k] = strings.Join(v, ", ")
 		}
 	}
 	return flat
