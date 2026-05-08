@@ -166,6 +166,12 @@ type PacketQuery struct {
 	// HiddenBefore omits packets whose timestamp is earlier than this (user-level "Clear Packets").
 	ExcludeIDs   []int64
 	HiddenBefore *time.Time
+
+	// Q is an optional unified expression-language filter (the new DSL).
+	// When set, it is parsed and AND-combined with the legacy params above:
+	// pushable predicates extend the SQL WHERE; the rest is evaluated in Go
+	// after the fetch (same path as the regex residual).
+	Q string
 }
 
 

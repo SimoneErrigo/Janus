@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/SimoneErrigo/Janus/backend/internal/filter"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 )
 
@@ -77,6 +78,14 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 	q.ContainsBody = params.Get("contains_body")
 	q.ContainsHeaders = params.Get("contains_headers")
 	q.Regex = params.Get("regex")
+	q.Q = params.Get("q")
+	if q.Q != "" {
+		// Parse-validate up front so syntax errors come back as 400, not 500.
+		if _, err := filter.Compile(q.Q); err != nil {
+			http.Error(w, "invalid q expression: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 
 	// Negation filters
 	q.NotServiceID = params.Get("not_service_id")

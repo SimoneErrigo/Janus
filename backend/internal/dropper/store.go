@@ -19,6 +19,17 @@ type RuleStore struct {
 	filePath string
 	rules    map[string]*Rule // rule ID -> rule
 	onChange OnChangeFunc
+	// version is bumped on every rule mutation; the engine uses it to detect
+	// stale compiled bundles without scanning the rule list per packet.
+	version  int64
+}
+
+// Version returns the current rule-store version. Bumped after every
+// successful CreateRule/UpdateRule/DeleteRule call.
+func (s *RuleStore) Version() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.version
 }
 
 // NewRuleStore creates a new RuleStore that persists to the given data directory.
@@ -89,8 +100,14 @@ func (s *RuleStore) CreateRule(r *Rule) error {
 		return fmt.Errorf("rule with ID %q already exists", r.ID)
 	}
 	cp := *r
+	if cp.Expression == "" {
+		cp.Expression = DeriveExpression(&cp)
+	}
 	s.rules[r.ID] = &cp
 	err := s.save()
+	if err == nil {
+		s.version++
+	}
 	s.mu.Unlock()
 	if err == nil {
 		s.notifyChange(r.ServiceID)
@@ -107,8 +124,14 @@ func (s *RuleStore) UpdateRule(r *Rule) error {
 		return fmt.Errorf("rule with ID %q not found", r.ID)
 	}
 	cp := *r
+	if cp.Expression == "" {
+		cp.Expression = DeriveExpression(&cp)
+	}
 	s.rules[r.ID] = &cp
 	err := s.save()
+	if err == nil {
+		s.version++
+	}
 	s.mu.Unlock()
 	if err == nil {
 		s.notifyChange(r.ServiceID)
@@ -128,6 +151,9 @@ func (s *RuleStore) DeleteRule(id string) error {
 	serviceID := r.ServiceID
 	delete(s.rules, id)
 	err := s.save()
+	if err == nil {
+		s.version++
+	}
 	s.mu.Unlock()
 	if err == nil {
 		s.notifyChange(serviceID)
@@ -153,6 +179,9 @@ func (s *RuleStore) DeleteRules(ids []string) (int, error) {
 		return 0, nil
 	}
 	err := s.save()
+	if err == nil {
+		s.version++
+	}
 	s.mu.Unlock()
 	if err == nil {
 		for svcID := range affectedServices {
@@ -175,12 +204,26 @@ func (s *RuleStore) load() error {
 	if err := json.Unmarshal(data, &list); err != nil {
 		return fmt.Errorf("parsing rules file: %w", err)
 	}
+	migrated := false
 	for _, r := range list {
 		// Migration: existing rules without action default to "drop"
 		if r.Action == "" {
 			r.Action = ActionDrop
+			migrated = true
+		}
+		// Migration: derive Expression from legacy fields when missing.
+		if r.Expression == "" {
+			if expr := DeriveExpression(r); expr != "" {
+				r.Expression = expr
+				migrated = true
+			}
 		}
 		s.rules[r.ID] = r
+	}
+	if migrated {
+		if err := s.save(); err != nil {
+			return fmt.Errorf("persisting migrated rules: %w", err)
+		}
 	}
 	return nil
 }

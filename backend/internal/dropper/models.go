@@ -29,6 +29,11 @@ const (
 )
 
 // Rule represents a drop/alert rule for a service.
+//
+// During the Step 4 → Step 5 migration the rule carries both the legacy
+// (Type/Scope/Pattern) fields and the new unified Expression. The hot-path
+// engine still reads the legacy fields; Expression is the source of truth
+// for the frontend and will become the only matcher input in Step 5.
 type Rule struct {
 	ID        string    `json:"id"`
 	ServiceID string    `json:"service_id"`
@@ -36,10 +41,13 @@ type Rule struct {
 	Type      MatchType `json:"type"`
 	Scope     Scope     `json:"scope"`
 	Pattern   string    `json:"pattern"`
-	Priority  int       `json:"priority"`
-	Enabled   bool      `json:"enabled"`
-	Action    Action    `json:"action"`
-	CreatedBy string    `json:"created_by,omitempty"` // display name of the user who created this rule
+	// Expression is the unified DSL form of the rule. Populated automatically
+	// from legacy fields on load when missing.
+	Expression string `json:"expression,omitempty"`
+	Priority   int    `json:"priority"`
+	Enabled    bool   `json:"enabled"`
+	Action     Action `json:"action"`
+	CreatedBy  string `json:"created_by,omitempty"` // display name of the user who created this rule
 }
 
 // IsFlagRule returns true if this rule is an auto-generated flag rule.

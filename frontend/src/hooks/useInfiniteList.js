@@ -168,7 +168,8 @@ export function useInfiniteList({ fetchPage, pageSize = 50 }) {
       merged.sort((a, b) => (sortDesc ? b.id - a.id : a.id - b.id))
       return merged
     })
-    setTotal((t) => t + newItems.length)
+    // Do not adjust `total` here: backend total already accounts for these rows.
+    // A subsequent refresh/reset will reconcile counts precisely.
   }, [])
 
   return {

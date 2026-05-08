@@ -1,10 +1,10 @@
 package dropper
 
 import (
-	"encoding/hex"
-	"regexp"
-	"strings"
+	"log"
 	"sync"
+
+	"github.com/SimoneErrigo/Janus/backend/internal/filter"
 )
 
 // RulesCache is the interface the engine uses to read cached rules.
@@ -12,27 +12,32 @@ type RulesCache interface {
 	GetServiceRules(serviceID string) ([]*Rule, bool)
 }
 
-// Engine evaluates drop rules against request data.
+// Engine evaluates drop/alert rules against request data.
+//
+// The engine is expression-driven:
+//   - every rule is parsed once from rule.Expression to a closure;
+//   - all literal contains/icontains predicates of one service's enabled
+//     rules are batched into a single Aho-Corasick automaton via
+//     filter.Batcher, so the body/url/header/raw text is scanned once
+//     per packet regardless of how many rules a service has.
+//
+// The compiled bundle is cached and refreshed whenever the rule-store
+// version changes (notifyChange already runs on every CRUD).
 type Engine struct {
 	ruleStore *RuleStore
 	cache     RulesCache
-	// Cache compiled regexes
-	mu       sync.RWMutex
-	regexMap map[string]*regexp.Regexp
+
+	mu     sync.RWMutex
+	bundle *compiledBundle
 }
 
 // NewEngine creates a new drop engine.
 func NewEngine(ruleStore *RuleStore) *Engine {
-	return &Engine{
-		ruleStore: ruleStore,
-		regexMap:  make(map[string]*regexp.Regexp),
-	}
+	return &Engine{ruleStore: ruleStore}
 }
 
 // SetCache sets the Redis cache for rule lookups.
-func (e *Engine) SetCache(c RulesCache) {
-	e.cache = c
-}
+func (e *Engine) SetCache(c RulesCache) { e.cache = c }
 
 // MatchResult holds info about which rule matched.
 type MatchResult struct {
@@ -49,6 +54,21 @@ type HTTPRequest struct {
 	RawBytes  []byte // full raw bytes if available
 }
 
+// compiledBundle is the per-service hot-path artifact: one Aho-Corasick
+// scanner shared by every literal contains predicate, plus one closure
+// per rule.
+type compiledBundle struct {
+	version  int64
+	rules    []compiledRule
+	scanner  *filter.BatchScanner
+	hasBatch bool
+}
+
+type compiledRule struct {
+	rule      *Rule
+	predicate filter.EvalFunc
+}
+
 // listRules returns rules for a service, checking the cache first.
 func (e *Engine) listRules(serviceID string) []*Rule {
 	if e.cache != nil {
@@ -59,50 +79,78 @@ func (e *Engine) listRules(serviceID string) []*Rule {
 	return e.ruleStore.ListRules(serviceID)
 }
 
-// Evaluate checks all enabled rules for the service and returns the first match (by priority).
-func (e *Engine) Evaluate(req *HTTPRequest) MatchResult {
-	rules := e.listRules(req.ServiceID)
-	for _, rule := range rules {
-		if !rule.Enabled {
+// getBundle returns the compiled bundle for a service, recompiling when the
+// rule-store version has advanced.
+func (e *Engine) getBundle(serviceID string) *compiledBundle {
+	currentVersion := int64(0)
+	if e.ruleStore != nil {
+		currentVersion = e.ruleStore.Version()
+	}
+
+	e.mu.RLock()
+	b := e.bundle
+	e.mu.RUnlock()
+	if b != nil && b.version == currentVersion {
+		return b
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.bundle != nil && e.bundle.version == currentVersion {
+		return e.bundle
+	}
+
+	e.bundle = e.compile(serviceID, currentVersion)
+	return e.bundle
+}
+
+func (e *Engine) compile(serviceID string, version int64) *compiledBundle {
+	rules := e.listRules(serviceID)
+	bundle := &compiledBundle{version: version, rules: make([]compiledRule, 0, len(rules))}
+
+	batcher := filter.NewBatcher()
+	for _, r := range rules {
+		if !r.Enabled {
 			continue
 		}
-		if e.matches(rule, req) {
-			return MatchResult{Matched: true, Rule: rule}
-		}
-	}
-	return MatchResult{Matched: false}
-}
-
-// EvaluateAll checks all enabled rules for the service and returns every match.
-func (e *Engine) EvaluateAll(req *HTTPRequest) []Rule {
-	rules := e.listRules(req.ServiceID)
-	var matched []Rule
-	for _, rule := range rules {
-		if !rule.Enabled {
+		if r.Expression == "" {
+			log.Printf("rules engine: skipping rule %q (%s) — empty expression", r.ID, r.Name)
 			continue
 		}
-		if e.matches(rule, req) {
-			matched = append(matched, *rule)
+		ast, err := filter.Parse(r.Expression)
+		if err != nil {
+			log.Printf("rules engine: skipping rule %q (%s) — invalid expression %q (%v)", r.ID, r.Name, r.Expression, err)
+			continue
 		}
+		fn, err := filter.CompileEvalWith(ast, batcher)
+		if err != nil {
+			log.Printf("rules engine: skipping rule %q (%s) — compile failed (%v)", r.ID, r.Name, err)
+			continue
+		}
+		bundle.rules = append(bundle.rules, compiledRule{rule: r, predicate: fn})
 	}
-	return matched
+	bundle.scanner = batcher.Build()
+	bundle.hasBatch = bundle.scanner.PatternCount() > 0
+	return bundle
 }
 
-// EvalResult holds categorized rule matches.
-type EvalResult struct {
-	ShouldDrop bool   // true if any drop or both rule matched
-	DropRules  []Rule // rules with action=drop or both
-	AlertRules []Rule // rules with action=alert or both
-	AllMatched []Rule // all matched rules (all actions)
-}
-
-// EvaluateActions checks all enabled rules and categorizes matches by action.
+// EvaluateActions checks all enabled rules and returns categorized matches.
 func (e *Engine) EvaluateActions(req *HTTPRequest) EvalResult {
-	matched := e.EvaluateAll(req)
-	var result EvalResult
-	result.AllMatched = matched
+	bundle := e.getBundle(req.ServiceID)
+	view := newView(req)
+	var setView filter.PacketView = view
+	if bundle.hasBatch {
+		set := bundle.scanner.Scan(view)
+		setView = filter.Wrap(view, set)
+	}
 
-	for _, rule := range matched {
+	var result EvalResult
+	for _, cr := range bundle.rules {
+		if !cr.predicate(setView) {
+			continue
+		}
+		rule := *cr.rule
+		result.AllMatched = append(result.AllMatched, rule)
 		switch rule.Action {
 		case ActionDrop:
 			result.ShouldDrop = true
@@ -114,7 +162,6 @@ func (e *Engine) EvaluateActions(req *HTTPRequest) EvalResult {
 			result.DropRules = append(result.DropRules, rule)
 			result.AlertRules = append(result.AlertRules, rule)
 		default:
-			// Legacy rules without action default to drop
 			result.ShouldDrop = true
 			result.DropRules = append(result.DropRules, rule)
 		}
@@ -122,91 +169,25 @@ func (e *Engine) EvaluateActions(req *HTTPRequest) EvalResult {
 	return result
 }
 
-func (e *Engine) matches(rule *Rule, req *HTTPRequest) bool {
-	// Support comma-separated scopes (e.g. "body,header")
-	scopes := strings.Split(string(rule.Scope), ",")
-	for _, s := range scopes {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
-		}
-		if e.matchesScope(Scope(s), rule, req) {
-			return true
-		}
+// Evaluate returns the first matching rule (by priority). Kept for callers
+// that only need a single result.
+func (e *Engine) Evaluate(req *HTTPRequest) MatchResult {
+	res := e.EvaluateActions(req)
+	if len(res.AllMatched) == 0 {
+		return MatchResult{}
 	}
-	return false
+	return MatchResult{Matched: true, Rule: &res.AllMatched[0]}
 }
 
-func (e *Engine) matchesScope(scope Scope, rule *Rule, req *HTTPRequest) bool {
-	var target string
-	var targetBytes []byte
-
-	switch scope {
-	case ScopeHeader:
-		target = req.Headers
-	case ScopeBody:
-		target = string(req.Body)
-		targetBytes = req.Body
-	case ScopeURL:
-		target = req.URL
-	case ScopeRaw:
-		target = string(req.RawBytes)
-		targetBytes = req.RawBytes
-	default:
-		return false
-	}
-
-	switch rule.Type {
-	case MatchString:
-		return strings.Contains(target, rule.Pattern)
-	case MatchRegex:
-		return e.matchRegex(rule.Pattern, target)
-	case MatchBytes:
-		return e.matchBytes(rule.Pattern, targetBytes)
-	default:
-		return false
-	}
+// EvaluateAll returns every matching rule, copies of *Rule.
+func (e *Engine) EvaluateAll(req *HTTPRequest) []Rule {
+	return e.EvaluateActions(req).AllMatched
 }
 
-func (e *Engine) matchRegex(pattern, target string) bool {
-	re := e.getCompiledRegex(pattern)
-	if re == nil {
-		return false
-	}
-	return re.MatchString(target)
-}
-
-func (e *Engine) getCompiledRegex(pattern string) *regexp.Regexp {
-	e.mu.RLock()
-	re, ok := e.regexMap[pattern]
-	e.mu.RUnlock()
-	if ok {
-		return re
-	}
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	// Double-check after acquiring write lock
-	if re, ok := e.regexMap[pattern]; ok {
-		return re
-	}
-
-	compiled, err := regexp.Compile(pattern)
-	if err != nil {
-		return nil
-	}
-	e.regexMap[pattern] = compiled
-	return compiled
-}
-
-func (e *Engine) matchBytes(hexPattern string, target []byte) bool {
-	if len(target) == 0 {
-		return false
-	}
-	patternBytes, err := hex.DecodeString(hexPattern)
-	if err != nil {
-		return false
-	}
-	return strings.Contains(string(target), string(patternBytes))
+// EvalResult holds categorized rule matches.
+type EvalResult struct {
+	ShouldDrop bool   // true if any drop or both rule matched
+	DropRules  []Rule // rules with action=drop or both
+	AlertRules []Rule // rules with action=alert or both
+	AllMatched []Rule // all matched rules (all actions)
 }

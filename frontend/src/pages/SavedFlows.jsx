@@ -3,30 +3,8 @@ import { useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import { getTrafficNavKeys } from '../trafficNavKeys'
 import QuickRulePanel from '../components/QuickRulePanel'
-
-// ---- Clipboard helper (same pattern used in Traffic.jsx — works over plain HTTP) ----
-async function copyText(text) {
-  try {
-    if (navigator.clipboard?.writeText && window.isSecureContext) {
-      await navigator.clipboard.writeText(text)
-      return true
-    }
-  } catch {}
-  try {
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.setAttribute('readonly', '')
-    ta.style.position = 'fixed'
-    ta.style.top = '-9999px'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.select()
-    ta.setSelectionRange(0, text.length)
-    const ok = document.execCommand('copy')
-    document.body.removeChild(ta)
-    return ok
-  } catch { return false }
-}
+import { copyText } from '../utils/clipboard'
+import { tryFormatJSON } from '../utils/formatting'
 
 function base64ToBytes(b64) {
   if (!b64) return new Uint8Array()
@@ -36,16 +14,6 @@ function base64ToBytes(b64) {
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
     return bytes
   } catch { return new Uint8Array() }
-}
-
-function tryFormatJSON(str) {
-  if (!str) return { text: str, isJSON: false }
-  const trimmed = str.trim()
-  if ((trimmed[0] === '{' && trimmed[trimmed.length - 1] === '}') ||
-      (trimmed[0] === '[' && trimmed[trimmed.length - 1] === ']')) {
-    try { return { text: JSON.stringify(JSON.parse(trimmed), null, 2), isJSON: true } } catch {}
-  }
-  return { text: str, isJSON: false }
 }
 
 function fmtTime(iso) {

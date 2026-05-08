@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
+	"github.com/SimoneErrigo/Janus/backend/internal/filter"
 )
 
 func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
@@ -81,11 +82,10 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reject duplicate rules (same service + type + scope + pattern + action)
+	// Reject duplicate rules — same service + expression + action.
 	existing := s.ruleStore.ListRules(rule.ServiceID)
 	for _, e := range existing {
-		if e.Type == rule.Type && e.Scope == rule.Scope &&
-			e.Pattern == rule.Pattern && e.Action == rule.Action {
+		if e.Action == rule.Action && e.Expression == rule.Expression {
 			http.Error(w, fmt.Sprintf("duplicate rule: an identical rule already exists (id=%s, name=%q)", e.ID, e.Name), http.StatusConflict)
 			return
 		}
@@ -185,30 +185,16 @@ func validateRule(r *dropper.Rule) error {
 	if r.Name == "" {
 		return fmt.Errorf("name is required")
 	}
-	if r.Pattern == "" {
-		return fmt.Errorf("pattern is required")
+	if strings.TrimSpace(r.Expression) == "" {
+		return fmt.Errorf("expression is required")
 	}
-
-	switch r.Type {
-	case dropper.MatchString, dropper.MatchRegex, dropper.MatchBytes:
-	default:
-		return fmt.Errorf("type must be one of: string, regex, bytes")
+	if _, err := filter.Compile(r.Expression); err != nil {
+		return fmt.Errorf("invalid expression: %v", err)
 	}
-
-	// Validate scope — supports comma-separated multi-scope (e.g. "body,header")
-	for _, s := range strings.Split(string(r.Scope), ",") {
-		switch dropper.Scope(s) {
-		case dropper.ScopeHeader, dropper.ScopeBody, dropper.ScopeURL, dropper.ScopeRaw:
-		default:
-			return fmt.Errorf("scope must be one of: header, body, url, raw (comma-separated for multiple)")
-		}
-	}
-
 	switch r.Action {
 	case dropper.ActionDrop, dropper.ActionAlert, dropper.ActionBoth:
 	default:
 		return fmt.Errorf("action must be one of: drop, alert, both")
 	}
-
 	return nil
 }

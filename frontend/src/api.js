@@ -200,4 +200,8 @@ export const api = {
 
   // System stats
   getSystemStats: () => request('/system/stats'),
+
+  // Filter expression validation. Returns { ok: true } or
+  // { ok: false, error, position }.
+  validateFilter: (expression) => request('/filter/validate', { method: 'POST', body: { expression } }),
 };

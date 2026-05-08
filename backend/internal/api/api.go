@@ -93,6 +93,7 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/traffic/capture/stop", s.handleTrafficCaptureStop)
 	protected.HandleFunc("/api/traffic/capture/apply-flagids", s.handleTrafficCaptureApplyFlagIDs)
 	protected.HandleFunc("/api/system/stats", s.handleSystemStats)
+	protected.HandleFunc("/api/filter/validate", s.handleFilterValidate)
 	protected.HandleFunc("/api/session/active", s.handleSessionActive)
 	protected.HandleFunc("/api/flows/saved/", s.handleSavedFlowByID)
 	protected.HandleFunc("/api/flows/saved", s.handleSavedFlows)

@@ -8,8 +8,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/SimoneErrigo/Janus/backend/internal/filter"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 )
+
+// alertResidualCap is the maximum number of alerts the residual-filter path
+// pulls into memory in one go. Past this point users must narrow the legacy
+// alert filters (service / src / rule / time range) before applying `q`.
+const alertResidualCap = 5000
 
 func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -44,53 +50,120 @@ func (s *Server) handleAlertByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
+	params := r.URL.Query()
 	q := sniffer.AlertQuery{
-		ServiceID:    r.URL.Query().Get("service_id"),
-		RuleID:       r.URL.Query().Get("rule_id"),
-		SrcIP:        r.URL.Query().Get("src_ip"),
-		NotServiceID: r.URL.Query().Get("not_service_id"),
-		NotRuleID:    r.URL.Query().Get("not_rule_id"),
-		NotSrcIP:     r.URL.Query().Get("not_src_ip"),
+		ServiceID:    params.Get("service_id"),
+		RuleID:       params.Get("rule_id"),
+		SrcIP:        params.Get("src_ip"),
+		NotServiceID: params.Get("not_service_id"),
+		NotRuleID:    params.Get("not_rule_id"),
+		NotSrcIP:     params.Get("not_src_ip"),
 	}
 
-	if v := r.URL.Query().Get("time_from"); v != "" {
+	if v := params.Get("time_from"); v != "" {
 		if t, err := time.Parse(time.RFC3339, v); err == nil {
 			q.TimeFrom = &t
 		}
 	}
-	if v := r.URL.Query().Get("time_to"); v != "" {
+	if v := params.Get("time_to"); v != "" {
 		if t, err := time.Parse(time.RFC3339, v); err == nil {
 			q.TimeTo = &t
 		}
 	}
-	if v := r.URL.Query().Get("limit"); v != "" {
-		q.Limit, _ = strconv.Atoi(v)
+	pageLimit := 50
+	if v := params.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			pageLimit = n
+		}
 	}
-	if v := r.URL.Query().Get("offset"); v != "" {
-		q.Offset, _ = strconv.Atoi(v)
+	pageOffset := 0
+	if v := params.Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			pageOffset = n
+		}
 	}
 
-	alerts, total, err := s.packetStore.QueryAlerts(q)
+	// Optional unified expression filter — evaluated against the linked
+	// packet of each alert (alert rows alone don't carry body/url/etc.).
+	exprStr := strings.TrimSpace(params.Get("q"))
+	var exprEval filter.EvalFunc
+	if exprStr != "" {
+		fn, err := filter.Compile(exprStr)
+		if err != nil {
+			http.Error(w, "invalid q expression: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		exprEval = fn
+	}
+
+	if exprEval == nil {
+		// Fast path: SQL pagination with COUNT.
+		q.Limit = pageLimit
+		q.Offset = pageOffset
+		alerts, total, err := s.packetStore.QueryAlerts(q)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if alerts == nil {
+			alerts = []*sniffer.Alert{}
+		}
+		s.enrichAlerts(alerts)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"alerts": alerts,
+			"total":  total,
+		})
+		return
+	}
+
+	// Residual path: pull a bounded window, filter against linked packets,
+	// then slice for the requested page.
+	q.Limit = alertResidualCap
+	q.Offset = 0
+	allAlerts, _, err := s.packetStore.QueryAlerts(q)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if alerts == nil {
-		alerts = []*sniffer.Alert{}
+
+	filtered := make([]*sniffer.Alert, 0, len(allAlerts))
+	for _, a := range allAlerts {
+		pkt, err := s.packetStore.GetPacketByID(a.PacketID)
+		if err != nil || pkt == nil {
+			continue // packet was deleted/cleaned; alert is dangling
+		}
+		if !exprEval(sniffer.AsView(pkt)) {
+			continue
+		}
+		filtered = append(filtered, a)
 	}
 
-	// Enrich alerts with rule names and scopes from the rule store
+	total := len(filtered)
+	end := pageOffset + pageLimit
+	if pageOffset > total {
+		pageOffset = total
+	}
+	if end > total {
+		end = total
+	}
+	page := filtered[pageOffset:end]
+	if page == nil {
+		page = []*sniffer.Alert{}
+	}
+	s.enrichAlerts(page)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"alerts": page,
+		"total":  total,
+	})
+}
+
+func (s *Server) enrichAlerts(alerts []*sniffer.Alert) {
 	for _, a := range alerts {
 		if rule, ok := s.ruleStore.GetRule(a.RuleID); ok {
 			a.RuleName = rule.Name
 			a.MatchedScope = string(rule.Scope)
 		}
 	}
-
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"alerts": alerts,
-		"total":  total,
-	})
 }
 
 func (s *Server) getAlert(w http.ResponseWriter, r *http.Request, id int64) {

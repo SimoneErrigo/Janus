@@ -4,6 +4,7 @@ import { useNavigate, useLocation } from 'react-router-dom'
 import { api, subscribePacketStream } from '../api'
 import { addHiddenIds, getHiddenIds, getClearCursor, getHiddenAlertIds, addHiddenAlertIds } from '../userHidden'
 import HighlightedBody from '../components/HighlightedBody'
+import FilterExpression from '../components/FilterExpression'
 import { tryFormatJSON } from '../utils/formatting'
 import { useServiceMap } from '../hooks/useServiceMap'
 
@@ -79,20 +80,16 @@ export default function Alerts() {
   const [services, setServices] = useState([])
   const [selectedAlert, setSelectedAlert] = useState(null)
   const [linkedPacket, setLinkedPacket] = useState(null)
-  const [filters, setFilters] = useState({
-    service_id: '', rule_id: '', src_ip: '', limit: 50,
-  })
-  const [filterNegated, setFilterNegated] = useState({ service_id: false, src_ip: false })
+  const [expression, setExpression] = useState('')
   const [paused, setPaused] = useState(false)
   const pausedRef = useRef(false)
 
   const fetchPage = useCallback(async (offset, limit) => {
-    const params = { ...filters, limit, offset }
-    if (filterNegated.service_id && params.service_id) { params.not_service_id = params.service_id; delete params.service_id }
-    if (filterNegated.src_ip && params.src_ip) { params.not_src_ip = params.src_ip; delete params.src_ip }
+    const params = { limit, offset }
+    if (expression.trim()) params.q = expression
     const data = await api.listAlerts(params)
     return { items: data.alerts || [], total: data.total }
-  }, [filters, filterNegated])
+  }, [expression])
 
   const {
     items: alertsRaw,
@@ -156,13 +153,6 @@ export default function Alerts() {
     })()
   }, [location.state, location.pathname, navigate])
 
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if (!pausedRef.current) refreshAlerts()
-    }, 5000)
-    return () => clearInterval(interval)
-  }, [refreshAlerts])
-
   // Live refresh alerts only when streamed packets include alert-capable matches.
   useEffect(() => {
     const unsub = subscribePacketStream(
@@ -199,39 +189,13 @@ export default function Alerts() {
     }
   }
 
-  function setFilter(key, value) {
-    setFilters((f) => ({ ...f, [key]: value }))
-  }
-
   const { serviceName } = useServiceMap(services)
 
   return (
     <div className="p-4 flex flex-col h-full">
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex items-center justify-between mb-3">
         <h2 className="text-2xl font-semibold text-gray-100">Alerts</h2>
         <div className="flex items-center gap-3">
-          <div className="flex items-center gap-1">
-            <select
-              value={filters.service_id}
-              onChange={(e) => setFilter('service_id', e.target.value)}
-              className={`bg-gray-800 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none transition-colors border ${filterNegated.service_id && filters.service_id ? 'border-red-700/60 focus:border-red-500' : 'border-gray-700 focus:border-cyan-500'}`}
-            >
-              <option value="">All Services</option>
-              {services.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-            </select>
-            <button type="button" title="Toggle exclude mode" onClick={() => setFilterNegated(p => ({ ...p, service_id: !p.service_id }))}
-              className={`text-xs px-1.5 py-1 rounded cursor-pointer transition-colors ${filterNegated.service_id ? 'bg-red-900/60 text-red-400 border border-red-700/60' : 'text-gray-600 hover:text-gray-400 border border-transparent'}`}>≠</button>
-          </div>
-          <div className="flex items-center gap-1">
-            <input
-              value={filters.src_ip}
-              onChange={(e) => setFilter('src_ip', e.target.value)}
-              placeholder="Source IP..."
-              className={`bg-gray-800 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none transition-colors border w-36 ${filterNegated.src_ip && filters.src_ip ? 'border-red-700/60 focus:border-red-500' : 'border-gray-700 focus:border-cyan-500'}`}
-            />
-            <button type="button" title="Toggle exclude mode" onClick={() => setFilterNegated(p => ({ ...p, src_ip: !p.src_ip }))}
-              className={`text-xs px-1.5 py-1 rounded cursor-pointer transition-colors ${filterNegated.src_ip ? 'bg-red-900/60 text-red-400 border border-red-700/60' : 'text-gray-600 hover:text-gray-400 border border-transparent'}`}>≠</button>
-          </div>
           <button
             onClick={togglePause}
             className={`text-sm px-4 py-2 rounded transition-colors cursor-pointer ${
@@ -250,6 +214,15 @@ export default function Alerts() {
             Clear All
           </button>
         </div>
+      </div>
+
+      <div className="mb-3">
+        <FilterExpression
+          value={expression}
+          onChange={setExpression}
+          placeholder='Filter alerts by linked-packet attrs — e.g. service == "web" AND src in (10.0.0.0/8)'
+          compact
+        />
       </div>
 
       <div className="flex-1 flex gap-0 min-h-0">

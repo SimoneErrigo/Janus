@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/SimoneErrigo/Janus/backend/internal/filter"
 	_ "modernc.org/sqlite"
 )
 
@@ -544,10 +545,15 @@ func (s *PacketStore) flushBatch(batch []batchItem) {
 }
 
 // Query retrieves packets matching the given filters.
-// The regex filter is applied in Go after the SQL query for correct pagination.
+// The regex filter and any DSL-residual predicates are applied in Go after
+// the SQL query for correct pagination.
 func (s *PacketStore) Query(q PacketQuery) ([]*Packet, int, error) {
-	where, args := buildWhere(q)
+	where, args, residual, err := buildWhereAndResidual(q)
+	if err != nil {
+		return nil, 0, err
+	}
 	hasRegex := q.Regex != "" || q.NotRegex != ""
+	hasResidual := residual != nil
 
 	// Sort order
 	sortOrder := "DESC"
@@ -566,14 +572,14 @@ func (s *PacketStore) Query(q PacketQuery) ([]*Packet, int, error) {
 	}
 
 	selectCols := packetSelectCols
-	useSummary := q.Summary && !hasRegex
+	useSummary := q.Summary && !hasRegex && !hasResidual
 	if useSummary {
 		selectCols = packetSummaryCols
 	}
 
-	if hasRegex {
-		// With regex: fetch all SQL-matching rows, filter in Go, then paginate
-		return s.queryWithRegex(q, where, args, selectCols, sortOrder, limit, offset)
+	if hasRegex || hasResidual {
+		// Fetch all SQL-matching rows, filter in Go (regex + residual), paginate.
+		return s.queryWithGoFilter(q, where, args, selectCols, sortOrder, limit, offset, residual)
 	}
 
 	// Fetch the page first, then only run COUNT(*) if it's cheap. COUNT on LIKE
@@ -585,7 +591,6 @@ func (s *PacketStore) Query(q PacketQuery) ([]*Packet, int, error) {
 	queryArgs := append(args, limit, offset)
 
 	var packets []*Packet
-	var err error
 	if useSummary {
 		packets, err = s.scanPacketsSummary(querySQL, queryArgs)
 	} else {
@@ -632,8 +637,10 @@ func isExpensiveTextPredicate(q PacketQuery) bool {
 		q.URL != "" || q.NotURL != ""
 }
 
-// queryWithRegex fetches SQL-filtered rows, applies regex/not-regex in Go, then paginates.
-func (s *PacketStore) queryWithRegex(q PacketQuery, where string, args []interface{}, selectCols, sortOrder string, limit, offset int) ([]*Packet, int, error) {
+// queryWithGoFilter fetches SQL-filtered rows, applies regex/not-regex and any
+// DSL residual evaluator in Go, then paginates. Used whenever post-SQL
+// filtering is required.
+func (s *PacketStore) queryWithGoFilter(q PacketQuery, where string, args []interface{}, selectCols, sortOrder string, limit, offset int, residual filter.EvalFunc) ([]*Packet, int, error) {
 	var re, notRe *regexp.Regexp
 	if q.Regex != "" {
 		var err error
@@ -658,13 +665,16 @@ func (s *PacketStore) queryWithRegex(q PacketQuery, where string, args []interfa
 		return nil, 0, err
 	}
 
-	// Apply regex / not-regex filters
+	// Apply regex / not-regex / DSL-residual filters
 	var filtered []*Packet
 	for _, p := range allPackets {
 		if re != nil && !regexMatchesPacket(re, p) {
 			continue
 		}
 		if notRe != nil && regexMatchesPacket(notRe, p) {
+			continue
+		}
+		if residual != nil && !residual(AsView(p)) {
 			continue
 		}
 		filtered = append(filtered, p)
@@ -1798,6 +1808,33 @@ func headerSearchPattern(q string) string {
 		}
 	}
 	return "%" + q + "%"
+}
+
+// buildWhereAndResidual extends buildWhere with the DSL filter (q.Q).
+// Pushable predicates are AND-merged into the SQL WHERE; the rest are
+// returned as an in-process evaluator the caller runs after the fetch.
+func buildWhereAndResidual(q PacketQuery) (string, []interface{}, filter.EvalFunc, error) {
+	where, args := buildWhere(q)
+	if strings.TrimSpace(q.Q) == "" {
+		return where, args, nil, nil
+	}
+	ast, err := filter.Parse(q.Q)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("invalid q expression: %w", err)
+	}
+	c, err := filter.CompileSQL(ast)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("invalid q expression: %w", err)
+	}
+	if c.Where != "" {
+		if where == "" {
+			where = " WHERE " + c.Where
+		} else {
+			where += " AND " + c.Where
+		}
+		args = append(args, c.Args...)
+	}
+	return where, args, c.Residual, nil
 }
 
 func buildWhere(q PacketQuery) (string, []interface{}) {

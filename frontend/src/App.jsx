@@ -11,6 +11,7 @@ import Config from './pages/Config'
 import System from './pages/System'
 import SavedFlows from './pages/SavedFlows'
 import Logs from './pages/Logs'
+import FilterSandbox from './pages/FilterSandbox'
 
 function ProtectedRoute({ children }) {
   if (!hasToken()) return <Navigate to="/login" replace />
@@ -32,6 +33,7 @@ export default function App() {
         <Route path="system" element={<System />} />
         <Route path="logs" element={<Logs />} />
         <Route path="config" element={<Config />} />
+        <Route path="filter-sandbox" element={<FilterSandbox />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

@@ -32,7 +32,7 @@ export default function Layout() {
         const cfg = await api.getConfig()
         if (mounted) setTrafficMode(cfg?.traffic_mode || 'live')
       } catch {}
-    }, 10000)
+    }, 30000)
     return () => {
       mounted = false
       clearInterval(t)

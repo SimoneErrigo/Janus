@@ -1,11 +1,17 @@
 import { useState, useEffect, useRef } from 'react'
 import { api } from '../api'
 import ErrorBanner from '../components/ErrorBanner'
+import FilterExpression from '../components/FilterExpression'
 import { useServiceMap } from '../hooks/useServiceMap'
 
-const matchTypes = ['string', 'regex', 'bytes']
-const scopes = ['header', 'body', 'url', 'raw']
 const actions = ['drop', 'alert', 'both']
+
+// Compact one-line preview of a rule for the list view.
+function ruleSummary(rule) {
+  const expr = rule.expression || ''
+  if (!expr) return '(no expression)'
+  return expr.length > 90 ? expr.slice(0, 90) + '…' : expr
+}
 
 export default function Rules() {
   const [services, setServices] = useState([])
@@ -157,7 +163,7 @@ export default function Rules() {
             </button>
           )}
           <button
-            onClick={() => setEditing({ _isNew: true, service_id: selectedService === '_all' ? (services[0]?.id || '') : selectedService, name: '', type: 'string', scope: 'body', pattern: '', priority: 10, enabled: true, action: 'drop' })}
+            onClick={() => setEditing({ _isNew: true, service_id: selectedService === '_all' ? (services[0]?.id || '') : selectedService, name: '', expression: '', priority: 10, enabled: true, action: 'drop' })}
             disabled={!selectedService || services.length === 0}
             className="bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
           >
@@ -232,15 +238,13 @@ export default function Rules() {
                     {selectedService === '_all' && <span className="text-xs px-1.5 py-0.5 bg-cyan-900/40 text-cyan-400 rounded">{serviceName(rule.service_id)}</span>}
                   </div>
                   <div className="text-xs text-gray-500 mt-0.5 font-mono">
-                    <span className={`px-1.5 py-0.5 rounded mr-1 ${
+                    <span className={`px-1.5 py-0.5 rounded mr-2 ${
                       rule.action === 'drop' ? 'bg-red-900/40 text-red-400' :
                       rule.action === 'alert' ? 'bg-orange-900/40 text-orange-400' :
                       rule.action === 'both' ? 'bg-purple-900/40 text-purple-400' :
                       'bg-gray-800 text-gray-400'
                     }`}>{rule.action || 'drop'}</span>
-                    <span className="px-1.5 py-0.5 bg-gray-800 rounded mr-1">{rule.type}</span>
-                    <span className="px-1.5 py-0.5 bg-gray-800 rounded mr-2">{rule.scope}</span>
-                    <span className="text-gray-400">{rule.pattern.length > 60 ? rule.pattern.slice(0, 60) + '...' : rule.pattern}</span>
+                    <span className="text-gray-300">{ruleSummary(rule)}</span>
                     <span className="ml-2 text-gray-600">priority: {rule.priority}</span>
                     {rule.created_by && (
                       <span className="ml-2 text-gray-600">by: <span className="text-gray-500">{rule.created_by}</span></span>
@@ -461,7 +465,11 @@ function PresetPanel({ services, defaultServiceId, onCreated, onCancel }) {
 // ---- Rule Form (with multi-service for new rules) ----
 
 function RuleForm({ rule, services, onSave, onCancel }) {
-  const [form, setForm] = useState({ ...rule, action: rule.action || 'drop' })
+  const [form, setForm] = useState({
+    ...rule,
+    action: rule.action || 'drop',
+    expression: rule.expression || '',
+  })
   const [targetServices, setTargetServices] = useState([rule.service_id])
   const isFlagRule = form.id?.startsWith('flag-auto-')
   const allSelected = targetServices.length === services.length
@@ -480,10 +488,18 @@ function RuleForm({ rule, services, onSave, onCancel }) {
     setTargetServices(allSelected ? [form.service_id || services[0]?.id] : services.map(s => s.id))
   }
 
+  function handleSubmit() {
+    // Send expression as the canonical form. Legacy type/scope/pattern stay
+    // attached to the original rule object so the backend's duplicate-check
+    // and any non-migrated callers keep working — they're harmless because
+    // the rule store's auto-derive only kicks in when expression is empty.
+    onSave(form, form._isNew ? targetServices : null)
+  }
+
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 mb-4">
       <h3 className="text-lg font-medium text-gray-100 mb-4">{form._isNew ? 'New Rule' : 'Edit Rule'}</h3>
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-2 gap-4 mb-4">
         {form._isNew ? (
           <div className="col-span-2">
             <label className="block text-sm text-gray-400 mb-1">Services</label>
@@ -525,60 +541,40 @@ function RuleForm({ rule, services, onSave, onCancel }) {
         </div>
         <div>
           <label className="block text-sm text-gray-400 mb-1">Action</label>
-          <div className="relative">
-            <select
-              value={form.action}
-              onChange={(e) => set('action', e.target.value)}
-              disabled={isFlagRule}
-              className={`w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 ${isFlagRule ? 'opacity-60 cursor-not-allowed' : ''}`}
-            >
-              {actions.map((a) => <option key={a} value={a}>{a}</option>)}
-            </select>
-            {isFlagRule && (
-              <div className="text-xs text-yellow-500 mt-1">
-                Flag rules must be alert-only. Dropping flags breaks the checker.
-              </div>
-            )}
-          </div>
-        </div>
-        <div>
-          <label className="block text-sm text-gray-400 mb-1">Match Type</label>
-          <select value={form.type} onChange={(e) => set('type', e.target.value)}
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500">
-            {matchTypes.map((t) => <option key={t} value={t}>{t}</option>)}
+          <select
+            value={form.action}
+            onChange={(e) => set('action', e.target.value)}
+            disabled={isFlagRule}
+            className={`w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 ${isFlagRule ? 'opacity-60 cursor-not-allowed' : ''}`}
+          >
+            {actions.map((a) => <option key={a} value={a}>{a}</option>)}
           </select>
-        </div>
-        <div>
-          <label className="block text-sm text-gray-400 mb-1">Scope</label>
-          <div className="flex items-center gap-2 flex-wrap">
-            {scopes.map((s) => {
-              const active = (form.scope || '').split(',').includes(s)
-              return (
-                <button type="button" key={s} onClick={() => {
-                  const current = (form.scope || '').split(',').filter(Boolean)
-                  const next = active ? current.filter(x => x !== s) : [...current, s]
-                  if (next.length > 0) set('scope', next.join(','))
-                }}
-                  className={`text-xs px-2.5 py-1.5 rounded cursor-pointer transition-colors border ${active ? 'bg-cyan-900/50 text-cyan-400 border-cyan-700/50' : 'bg-gray-800 text-gray-500 border-gray-700 hover:text-gray-300'}`}>
-                  {s}
-                </button>
-              )
-            })}
-          </div>
-        </div>
-        <div className="col-span-2">
-          <label className="block text-sm text-gray-400 mb-1">Pattern</label>
-          <input value={form.pattern} onChange={(e) => set('pattern', e.target.value)} placeholder="Pattern to match"
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm font-mono focus:outline-none focus:border-cyan-500" />
-        </div>
-        <div className="flex items-center gap-2 col-span-2">
-          <input type="checkbox" checked={form.enabled} onChange={(e) => set('enabled', e.target.checked)} className="accent-cyan-500" id="rule-enabled" />
-          <label htmlFor="rule-enabled" className="text-sm text-gray-400">Enabled</label>
+          {isFlagRule && (
+            <div className="text-xs text-yellow-500 mt-1">
+              Flag rules must be alert-only. Dropping flags breaks the checker.
+            </div>
+          )}
         </div>
       </div>
-      <div className="flex gap-2 mt-4">
-        <button onClick={() => onSave(form, form._isNew ? targetServices : null)}
-          className="bg-cyan-600 hover:bg-cyan-500 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer">
+
+      <div className="mb-4">
+        <label className="block text-sm text-gray-400 mb-1">Match expression</label>
+        <FilterExpression
+          value={form.expression}
+          onChange={(v) => set('expression', v)}
+          placeholder='e.g. body contains "/api/admin" AND header.User-Agent contains "curl"'
+        />
+      </div>
+
+      <div className="flex items-center gap-2 mb-4">
+        <input type="checkbox" checked={form.enabled} onChange={(e) => set('enabled', e.target.checked)} className="accent-cyan-500" id="rule-enabled" />
+        <label htmlFor="rule-enabled" className="text-sm text-gray-400">Enabled</label>
+      </div>
+
+      <div className="flex gap-2">
+        <button onClick={handleSubmit}
+          disabled={!form.expression.trim() || !form.name.trim()}
+          className="bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer disabled:cursor-default">
           {form._isNew && targetServices.length > 1
             ? `Save (${targetServices.length} services)`
             : 'Save'}

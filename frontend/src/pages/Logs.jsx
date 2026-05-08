@@ -7,7 +7,7 @@ export default function Logs() {
         <div>
           <h2 className="text-sm font-medium text-gray-100">Container Logs (Dozzle)</h2>
           <p className="text-xs text-gray-600">
-            First-time access requires login with the <code className="text-gray-400">DOZZLE_PASSWORD</code> credential.
+            Dozzle runs on localhost only. Open it in a new tab.
           </p>
         </div>
         <a
@@ -20,12 +20,6 @@ export default function Logs() {
           Open in new tab ↗
         </a>
       </div>
-      <iframe
-        src={DOZZLE_URL}
-        title="Dozzle container logs"
-        className="flex-1 w-full bg-gray-950"
-        style={{ border: 'none' }}
-      />
     </div>
   )
 }

@@ -163,13 +163,6 @@ export default function Blocks() {
     setSelectedPacket(null)
   }
 
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if (!pausedRef.current) refreshBlocks()
-    }, 5000)
-    return () => clearInterval(interval)
-  }, [refreshBlocks])
-
   // Live refresh blocks only when streamed packets include drop-capable matches.
   useEffect(() => {
     const unsub = subscribePacketStream(
