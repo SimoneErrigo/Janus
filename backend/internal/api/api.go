@@ -10,6 +10,7 @@ import (
 	"github.com/SimoneErrigo/Janus/backend/internal/cleanup"
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
 	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
+	"github.com/SimoneErrigo/Janus/backend/internal/protodecode"
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
@@ -29,6 +30,7 @@ type Server struct {
 	packetHub      *PacketStreamHub
 	captureCtrl    *sniffer.CaptureController
 	sessionHub     *SessionHub
+	protoCache     *protodecode.Cache
 	mux            *http.ServeMux
 }
 
@@ -46,6 +48,7 @@ func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniff
 		packetHub:      packetHub,
 		captureCtrl:    captureCtrl,
 		sessionHub:     NewSessionHub(),
+		protoCache:     protodecode.NewCache(),
 		mux:            http.NewServeMux(),
 	}
 	s.routes()
@@ -69,6 +72,7 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/packets/flow/pcap", s.handleFlowPcap)
 	protected.HandleFunc("/api/packets/flow", s.handlePacketFlow)
 	protected.HandleFunc("/api/packets/exploit", s.handleExploitGen)
+	protected.HandleFunc("/api/packets/decoded", s.handlePacketDecoded)
 	protected.HandleFunc("/api/packets/bulk-delete", s.handlePacketsBulkDelete)
 	protected.HandleFunc("/api/packets/", s.handlePacketByID)
 	protected.HandleFunc("/api/packets", s.handlePackets)
@@ -212,6 +216,9 @@ func (s *Server) updateService(w http.ResponseWriter, r *http.Request, id string
 		return
 	}
 
+	// Drop any cached .proto descriptors so the next decode rebuilds them.
+	s.protoCache.Invalidate(svc.ID)
+
 	// Restart proxy if enabled, stop if disabled
 	if svc.Enabled {
 		if err := s.proxy.RestartService(&svc); err != nil {
@@ -232,6 +239,8 @@ func (s *Server) deleteService(w http.ResponseWriter, r *http.Request, id string
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
+
+	s.protoCache.Invalidate(id)
 
 	log.Printf("Service deleted: %s", id)
 	w.WriteHeader(http.StatusNoContent)

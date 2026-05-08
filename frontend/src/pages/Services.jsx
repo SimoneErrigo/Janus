@@ -8,7 +8,7 @@ const tlsModes = ['', 'selfsigned', 'challenge']
 const emptyService = {
   id: '', name: '', listen_addr: '', listen_port: '', target_addr: '',
   protocol: 'http', tls_mode: '', cert_file: '', key_file: '',
-  target_tls: false, enabled: true,
+  target_tls: false, proto_paths: [], enabled: true,
 }
 
 export default function Services() {
@@ -33,6 +33,9 @@ export default function Services() {
       const payload = {
         ...svc,
         listen_port: parseInt(svc.listen_port, 10),
+        proto_paths: Array.isArray(svc.proto_paths)
+          ? svc.proto_paths
+          : (svc.proto_paths || '').split('\n').map((p) => p.trim()).filter(Boolean),
       }
       if (svc._isNew) {
         await api.createService(payload)
@@ -115,6 +118,8 @@ function ServiceForm({ service, onSave, onCancel }) {
   }
 
   const needsTLS = ['https', 'h2', 'grpc'].includes(form.protocol)
+  const isGRPC = form.protocol === 'grpc'
+  const protoPathsText = Array.isArray(form.proto_paths) ? form.proto_paths.join('\n') : (form.proto_paths || '')
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 mb-4">
@@ -150,6 +155,21 @@ function ServiceForm({ service, onSave, onCancel }) {
               </>
             )}
           </>
+        )}
+        {isGRPC && (
+          <div className="col-span-2">
+            <label className="block text-sm text-gray-400 mb-1">
+              .proto File Paths
+              <span className="text-gray-600 ml-2 text-xs">one per line — used to decode gRPC bodies with field names</span>
+            </label>
+            <textarea
+              value={protoPathsText}
+              onChange={(e) => set('proto_paths', e.target.value)}
+              placeholder="/protos/cheesycheats.proto&#10;/protos/cheesycheatsAPI.proto"
+              rows={3}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm font-mono focus:outline-none focus:border-cyan-500 transition-colors"
+            />
+          </div>
         )}
         <div className="flex items-center gap-2 col-span-2">
           <input type="checkbox" checked={form.enabled} onChange={(e) => set('enabled', e.target.checked)} className="accent-cyan-500" id="enabled" />

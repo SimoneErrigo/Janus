@@ -566,7 +566,10 @@ func parseValueKeyMap(body []byte) map[string]string {
 // { "service_name": { "team_id": { "round_number": { "desc_key": "flag_id_value" } } } }
 // Returns: roundNum -> serviceName -> []flagIdValue
 func parseCyberChallengeRounded(body []byte) (map[int]map[string][]string, error) {
-	var raw map[string]map[string]map[string]map[string]string
+	// Use json.RawMessage at the leaf so we can accept strings, numbers,
+	// booleans, or arrays/objects (some challenges expose numeric user IDs
+	// or list-valued flag IDs). Each value is coerced to its string form.
+	var raw map[string]map[string]map[string]map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, err
 	}
@@ -574,7 +577,6 @@ func parseCyberChallengeRounded(body []byte) (map[int]map[string][]string, error
 	result := make(map[int]map[string][]string)
 	for serviceName, teams := range raw {
 		for _, rounds := range teams {
-			// Collect round numbers and sort for deterministic order
 			roundNums := make([]string, 0, len(rounds))
 			for r := range rounds {
 				roundNums = append(roundNums, r)
@@ -585,16 +587,18 @@ func parseCyberChallengeRounded(body []byte) (map[int]map[string][]string, error
 				descs := rounds[roundStr]
 				roundNum, err := strconv.Atoi(roundStr)
 				if err != nil {
-					continue // skip non-numeric round keys
+					continue
 				}
 				if result[roundNum] == nil {
 					result[roundNum] = make(map[string][]string)
 				}
 				seen := make(map[string]bool)
-				for _, val := range descs {
-					if val != "" && !seen[val] {
-						seen[val] = true
-						result[roundNum][serviceName] = append(result[roundNum][serviceName], val)
+				for _, raw := range descs {
+					for _, val := range flattenRawToStrings(raw) {
+						if val != "" && !seen[val] {
+							seen[val] = true
+							result[roundNum][serviceName] = append(result[roundNum][serviceName], val)
+						}
 					}
 				}
 			}
@@ -603,15 +607,62 @@ func parseCyberChallengeRounded(body []byte) (map[int]map[string][]string, error
 	return result, nil
 }
 
+// flattenRawToStrings converts a JSON value into one or more string forms.
+// Strings are returned as-is; numbers/bools are stringified; arrays and
+// objects are walked recursively so list-valued or nested flag IDs are
+// not silently dropped.
+func flattenRawToStrings(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	switch trimmed[0] {
+	case '"':
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return nil
+		}
+		return []string{s}
+	case '[':
+		var arr []json.RawMessage
+		if err := json.Unmarshal(raw, &arr); err != nil {
+			return nil
+		}
+		out := make([]string, 0, len(arr))
+		for _, item := range arr {
+			out = append(out, flattenRawToStrings(item)...)
+		}
+		return out
+	case '{':
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return nil
+		}
+		out := make([]string, 0, len(obj))
+		for _, item := range obj {
+			out = append(out, flattenRawToStrings(item)...)
+		}
+		return out
+	default:
+		// number, true, false → use the literal token
+		return []string{trimmed}
+	}
+}
+
 // parseSaarCTFRounded parses saarCTF's attack.json format:
-// {
-//   "teams": [ { "id": 1, "ip": "10.32.1.2", ... }, ... ],
-//   "flag_ids": {
-//     "service_1": {
-//       "10.32.1.2": { "15": ["u1","u2"], "16": "u3" }
-//     }
-//   }
-// }
+//
+//	{
+//	  "teams": [ { "id": 1, "ip": "10.32.1.2", ... }, ... ],
+//	  "flag_ids": {
+//	    "service_1": {
+//	      "10.32.1.2": { "15": ["u1","u2"], "16": "u3" }
+//	    }
+//	  }
+//	}
+//
 // teamID is interpreted as the numeric team id (from teams[].id). If teams are missing,
 // it falls back to using teamID as the map key under flag_ids (rare setups).
 func parseSaarCTFRounded(body []byte, teamID string) (map[int]map[string][]string, error) {
@@ -620,8 +671,8 @@ func parseSaarCTFRounded(body []byte, teamID string) (map[int]map[string][]strin
 		IP string `json:"ip"`
 	}
 	var raw struct {
-		Teams  []saarTeam                                                                  `json:"teams"`
-		FlagIDs map[string]map[string]map[string]json.RawMessage                           `json:"flag_ids"`
+		Teams   []saarTeam                                       `json:"teams"`
+		FlagIDs map[string]map[string]map[string]json.RawMessage `json:"flag_ids"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, err
@@ -680,10 +731,12 @@ func parseSaarCTFRounded(body []byte, teamID string) (map[int]map[string][]strin
 }
 
 // parseFaustCTFRounded parses FaustCTF's teams.json style:
-// {
-//   "teams": [123, 456, ...],
-//   "flag_ids": { "service1": { "123": ["a","b"], "789": ["x","y"] } }
-// }
+//
+//	{
+//	  "teams": [123, 456, ...],
+//	  "flag_ids": { "service1": { "123": ["a","b"], "789": ["x","y"] } }
+//	}
+//
 // The API has no round numbers, so all values are assigned to the "current round"
 // computed from competitionStart/roundDuration when available, otherwise round=1.
 func parseFaustCTFRounded(body []byte, teamID string, roundDuration time.Duration, competitionStart time.Time) (map[int]map[string][]string, error) {

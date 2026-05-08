@@ -9,6 +9,7 @@ import QuickRulePanel from '../components/QuickRulePanel'
 import FilterExpression from '../components/FilterExpression'
 import { tryFormatJSON } from '../utils/formatting'
 import { copyText } from '../utils/clipboard'
+import { decodeProtobuf, looksLikeProtobuf } from '../utils/protobufDecode'
 import { useServiceMap } from '../hooks/useServiceMap'
 import { parse as parseFilter, evaluate as evaluateFilter } from '../utils/filterAst'
 
@@ -104,6 +105,44 @@ const HighlightedText = memo(function HighlightedText({ text, contains, regex, f
 // Get the peer (external) IP from a packet
 function getPeerIP(pkt) {
   return pkt.direction === 'request' ? pkt.src_ip : pkt.dst_ip
+}
+
+// Render a decoded protobuf field tree.
+function ProtobufFields({ fields, depth = 0 }) {
+  return (
+    <div style={{ marginLeft: depth === 0 ? 0 : 12 }}>
+      {fields.map((f, i) => {
+        const tagColor = 'text-purple-400'
+        const typeColor = 'text-gray-500'
+        if (f.type === 'message') {
+          return (
+            <div key={i}>
+              <span className={tagColor}>{f.field}</span>
+              <span className={typeColor}> ({'message'}, {f.raw.length}B)</span>
+              <ProtobufFields fields={f.value} depth={depth + 1} />
+            </div>
+          )
+        }
+        let valueEl
+        if (f.type === 'string') {
+          valueEl = <span className="text-green-300">{JSON.stringify(f.value)}</span>
+        } else if (f.type === 'bytes') {
+          valueEl = <span className="text-yellow-300">0x{f.value} <span className="text-gray-500">({f.length}B)</span></span>
+        } else if (f.type === 'varint' || f.type === 'i64' || f.type === 'i32') {
+          valueEl = <span className="text-cyan-300">{String(f.value)}</span>
+        } else {
+          valueEl = <span>{String(f.value)}</span>
+        }
+        return (
+          <div key={i}>
+            <span className={tagColor}>{f.field}</span>
+            <span className={typeColor}> ({f.type}): </span>
+            {valueEl}
+          </div>
+        )
+      })}
+    </div>
+  )
 }
 
 // SSE packets carry only metadata — no body, no headers. If a parsed
@@ -803,6 +842,36 @@ export default function Traffic() {
     return tryFormatJSON(selected.body_string)
   }, [selected?.body_string])
 
+  // Local fallback: walk the wire format with no field names. Used when
+  // the server-side .proto decode is unavailable (no proto_paths, method
+  // not found, parse error, etc.).
+  const decodedProto = useMemo(() => {
+    if (!selected?.body) return null
+    if (formattedBody.isJSON) return null
+    const bytes = base64ToBytes(selected.body)
+    if (bytes.length === 0) return null
+    if (!looksLikeProtobuf(bytes)) return null
+    const result = decodeProtobuf(bytes)
+    if (!result.ok) return null
+    return result
+  }, [selected?.body, formattedBody.isJSON])
+
+  // Server-side decode using the configured .proto files. Resolves field
+  // names via the gRPC method signature.
+  const [decodedNamed, setDecodedNamed] = useState(null) // { method, message_type, frames: [{ json, error, bytes }] } or null
+  const [decodedNamedError, setDecodedNamedError] = useState('')
+  useEffect(() => {
+    setDecodedNamed(null)
+    setDecodedNamedError('')
+    if (!selected?.id) return
+    if (!decodedProto) return // body doesn't look like protobuf at all
+    let cancelled = false
+    api.decodePacket(selected.id)
+      .then((res) => { if (!cancelled) setDecodedNamed(res) })
+      .catch((err) => { if (!cancelled) setDecodedNamedError(err.message || String(err)) })
+    return () => { cancelled = true }
+  }, [selected?.id, decodedProto])
+
   const matchedRuleForHighlight = useMemo(() => {
     if (!selected?.matched_rules?.length) return null
     return selected.matched_rules.find((r) => r.pattern) || null
@@ -1441,6 +1510,63 @@ export default function Traffic() {
                         </span>
                       )}
                     </pre>
+                  </div>
+                )}
+
+                {decodedProto && (
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="text-gray-500 text-xs">Decoded</span>
+                      {decodedNamed ? (
+                        <>
+                          <span className="text-[10px] text-green-400 bg-green-900/30 px-1 py-0.5 rounded">
+                            {decodedNamed.message_type}
+                          </span>
+                          <span className="text-[10px] text-gray-600">{decodedNamed.method}</span>
+                        </>
+                      ) : (
+                        <>
+                          <span className="text-[10px] text-purple-400 bg-purple-900/30 px-1 py-0.5 rounded">
+                            {decodedProto.framing === 'grpc' ? 'gRPC / protobuf (raw)' : 'protobuf (raw)'}
+                          </span>
+                          {decodedNamedError && (
+                            <span className="text-[10px] text-gray-600" title={decodedNamedError}>
+                              named decode unavailable
+                            </span>
+                          )}
+                        </>
+                      )}
+                      {(decodedNamed?.frames?.length ?? decodedProto.frames.length) > 1 && (
+                        <span className="text-[10px] text-gray-600">{decodedNamed?.frames?.length ?? decodedProto.frames.length} frames</span>
+                      )}
+                    </div>
+                    <div className="bg-gray-800 rounded p-2 text-xs font-mono overflow-auto" style={{ maxHeight: '60vh' }}>
+                      {decodedNamed ? (
+                        decodedNamed.frames.map((frame, idx) => (
+                          <div key={idx} className={idx > 0 ? 'mt-2 pt-2 border-t border-gray-700' : ''}>
+                            {decodedNamed.frames.length > 1 && (
+                              <div className="text-gray-500 text-[10px] mb-1">frame {idx} ({frame.bytes}B)</div>
+                            )}
+                            {frame.json ? (
+                              <pre className="text-green-300 whitespace-pre-wrap break-all">
+                                <HighlightedText text={frame.json} regex={bodyRegex} flagidRegex={flagidHighlightRegex} />
+                              </pre>
+                            ) : (
+                              <div className="text-red-400">{frame.error || 'decode error'}</div>
+                            )}
+                          </div>
+                        ))
+                      ) : (
+                        decodedProto.frames.map((frame, idx) => (
+                          <div key={idx} className={idx > 0 ? 'mt-2 pt-2 border-t border-gray-700' : ''}>
+                            {decodedProto.frames.length > 1 && (
+                              <div className="text-gray-500 text-[10px] mb-1">frame {idx} ({frame.length}B)</div>
+                            )}
+                            <ProtobufFields fields={frame.fields} />
+                          </div>
+                        ))
+                      )}
+                    </div>
                   </div>
                 )}
               </div>

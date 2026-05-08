@@ -148,6 +148,7 @@ export const api = {
   bulkDeletePackets: (ids) => request('/packets/bulk-delete', { method: 'POST', body: { ids } }),
   getPacketFlow: (packetId) => request(`/packets/flow?packet_id=${packetId}`),
   generateExploit: (packetId) => request(`/packets/exploit?packet_id=${packetId}`),
+  decodePacket: (packetId) => request(`/packets/decoded?packet_id=${packetId}`),
 
   // Rules
   listRules: (serviceId) => {
