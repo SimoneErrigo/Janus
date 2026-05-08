@@ -145,6 +145,341 @@ function ProtobufFields({ fields, depth = 0 }) {
   )
 }
 
+// Build a single-quoted, escaped service-id literal for filter expressions.
+function quoteForFilter(s) {
+  return `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+}
+
+// Escape an arbitrary byte slice for use inside a `raw contains "..."`
+// expression (FILTERS.md syntax: printable ASCII verbatim, everything else
+// as `\xHH`). Same logic as the backend's bytesToFilterEscape — keep them
+// in sync.
+function escapeBytesForRaw(bytes) {
+  let out = ''
+  for (let i = 0; i < bytes.length; i++) {
+    const c = bytes[i]
+    if (c === 0x22 /* " */) out += '\\"'
+    else if (c === 0x5c /* \ */) out += '\\\\'
+    else if (c >= 0x20 && c <= 0x7e) out += String.fromCharCode(c)
+    else out += '\\x' + c.toString(16).padStart(2, '0')
+  }
+  return out
+}
+
+// Escape a UTF-8 string for use inside a `body contains "..."` expression.
+// Newlines stay as their `\n` escape so the predicate fits on one line and
+// is copy-pasteable between Traffic search and a rule.
+function escapeStringForFilter(s) {
+  return String(s)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t')
+}
+
+// Render a captured body as a hex+ASCII dump with byte-range selection. The
+// user clicks a byte to start, drags (or click+shift-click) to extend; the
+// "Filter on selection" button next to the dump uses the same action menu
+// as the Decoded panel so behavior is identical (Copy / Add / New rule).
+function HexView({ bytes, onSelectionAction }) {
+  const [start, setStart] = useState(null)
+  const [end, setEnd] = useState(null)
+  const dragging = useRef(false)
+
+  const sel = useMemo(() => {
+    if (start == null || end == null) return null
+    const a = Math.min(start, end)
+    const b = Math.max(start, end)
+    return { a, b }
+  }, [start, end])
+
+  const onByteDown = (i) => {
+    dragging.current = true
+    setStart(i)
+    setEnd(i)
+  }
+  const onByteEnter = (i) => {
+    if (dragging.current) setEnd(i)
+  }
+  useEffect(() => {
+    const stop = () => { dragging.current = false }
+    window.addEventListener('mouseup', stop)
+    return () => window.removeEventListener('mouseup', stop)
+  }, [])
+
+  // Render in 16-byte rows. For very large bodies we cap the dump to keep
+  // the panel responsive — the user can still copy full bytes via "Copy bytes".
+  const MAX_RENDER = 4096
+  const render = bytes.subarray(0, Math.min(bytes.length, MAX_RENDER))
+  const rows = []
+  for (let i = 0; i < render.length; i += 16) {
+    rows.push({ offset: i, slice: render.subarray(i, Math.min(render.length, i + 16)) })
+  }
+
+  const isSelected = (i) => sel != null && i >= sel.a && i <= sel.b
+  const selectionLen = sel ? sel.b - sel.a + 1 : 0
+
+  return (
+    <div className="text-[11px] font-mono">
+      <div className="flex items-center gap-2 mb-1">
+        <span className="text-gray-500">Hex</span>
+        <span className="text-gray-600">{bytes.length} bytes{render.length < bytes.length ? ` (showing ${render.length})` : ''}</span>
+        {sel && (
+          <span className="text-gray-500">
+            sel {sel.a}–{sel.b} ({selectionLen}B)
+          </span>
+        )}
+        <RawSelectionActionButton
+          disabled={!sel}
+          onAction={(kind) => {
+            if (!sel) return
+            const slice = bytes.subarray(sel.a, sel.b + 1)
+            const escaped = escapeBytesForRaw(slice)
+            const predicate = `raw contains "${escaped}"`
+            const labelHex = bytesToHex(slice, 8)
+            onSelectionAction(kind, predicate, `raw[${sel.a}:${sel.b + 1}]=${labelHex}`)
+          }}
+        />
+        {sel && (
+          <button
+            type="button"
+            onClick={() => { setStart(null); setEnd(null) }}
+            className="text-[10px] text-gray-500 hover:text-gray-300 underline cursor-pointer"
+          >
+            clear
+          </button>
+        )}
+      </div>
+      <div className="bg-gray-800 rounded p-2 overflow-auto" style={{ maxHeight: '40vh' }}>
+        {rows.map((row) => (
+          <div key={row.offset} className="flex gap-3 leading-5">
+            <span className="text-gray-600 select-none">{row.offset.toString(16).padStart(6, '0')}</span>
+            <span className="flex-1 flex flex-wrap">
+              {Array.from(row.slice).map((b, j) => {
+                const idx = row.offset + j
+                const sel = isSelected(idx)
+                return (
+                  <span
+                    key={j}
+                    onMouseDown={(e) => { e.preventDefault(); onByteDown(idx) }}
+                    onMouseEnter={() => onByteEnter(idx)}
+                    className={`px-0.5 cursor-pointer ${sel ? 'bg-cyan-700/60 text-cyan-100' : 'text-gray-300 hover:bg-gray-700'}`}
+                    title={`byte ${idx}: 0x${b.toString(16).padStart(2, '0')} (${b})`}
+                  >
+                    {b.toString(16).padStart(2, '0')}
+                  </span>
+                )
+              })}
+            </span>
+            <span className="text-gray-400">
+              {Array.from(row.slice).map((b, j) => {
+                const idx = row.offset + j
+                const sel = isSelected(idx)
+                const ch = (b >= 0x20 && b <= 0x7e) ? String.fromCharCode(b) : '.'
+                return (
+                  <span
+                    key={j}
+                    onMouseDown={(e) => { e.preventDefault(); onByteDown(idx) }}
+                    onMouseEnter={() => onByteEnter(idx)}
+                    className={`cursor-pointer ${sel ? 'bg-cyan-700/60 text-cyan-100' : ''}`}
+                  >
+                    {ch}
+                  </span>
+                )
+              })}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// Compact "filter ▾" button + dropdown menu for raw-byte / body-text
+// selections. Same three actions as the Decoded panel; the parent supplies
+// the already-built predicate string so this component is generic.
+function RawSelectionActionButton({ disabled, onAction }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => setOpen((v) => !v)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        className={`text-[10px] px-2 py-0.5 rounded border cursor-pointer ${
+          disabled
+            ? 'border-gray-800 text-gray-600 cursor-not-allowed'
+            : 'border-gray-700 bg-gray-900 text-gray-300 hover:text-cyan-300 hover:border-cyan-700'
+        }`}
+        title={disabled ? 'Select bytes (or text) first' : 'Use selection as filter'}
+      >
+        Filter on selection ▾
+      </button>
+      {open && !disabled && (
+        <div className="absolute right-0 top-full mt-1 z-30 w-48 bg-gray-900 border border-gray-700 rounded shadow-lg text-[11px]">
+          <button type="button" onMouseDown={(e) => { e.preventDefault(); setOpen(false); onAction('copy') }}
+            className="block w-full text-left px-2 py-1.5 hover:bg-gray-800 text-gray-200 cursor-pointer">
+            Copy filter
+          </button>
+          <button type="button" onMouseDown={(e) => { e.preventDefault(); setOpen(false); onAction('add') }}
+            className="block w-full text-left px-2 py-1.5 hover:bg-gray-800 text-gray-200 cursor-pointer">
+            Add to current filter
+          </button>
+          <button type="button" onMouseDown={(e) => { e.preventDefault(); setOpen(false); onAction('rule') }}
+            className="block w-full text-left px-2 py-1.5 hover:bg-gray-800 text-red-200 cursor-pointer">
+            New drop rule
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Render a server-decoded protobuf frame (whose body is a parsed JSON object)
+// as an interactive tree where each leaf field exposes an action menu:
+//   - Copy raw filter   → puts `raw contains "\xHH..."` on the clipboard
+//   - Add to filter     → appends the predicate to the Traffic expression
+//   - New drop rule     → navigates to /rules with the form pre-filled
+// Nested objects/arrays are rendered without action buttons because the
+// backend encoder needs a top-level field of the request message; clicking
+// a leaf nested inside a sub-message would require encoding a parent path
+// that the simple click-to-filter flow doesn't support yet.
+function DecodedJSONTree({ value, onLeafAction, depth = 0, parentKey = '' }) {
+  const pad = depth === 0 ? 0 : 12
+  if (value === null) return <span className="text-gray-500">null</span>
+  if (Array.isArray(value)) {
+    return (
+      <span>
+        <span className="text-gray-500">[</span>
+        {value.length === 0 ? null : (
+          <div style={{ marginLeft: pad }}>
+            {value.map((v, i) => (
+              <div key={i}>
+                <DecodedJSONTree value={v} onLeafAction={onLeafAction} depth={depth + 1} parentKey={parentKey} />
+                {i < value.length - 1 ? <span className="text-gray-500">,</span> : null}
+              </div>
+            ))}
+          </div>
+        )}
+        <span className="text-gray-500">]</span>
+      </span>
+    )
+  }
+  if (typeof value === 'object') {
+    const entries = Object.entries(value)
+    return (
+      <span>
+        <span className="text-gray-500">{'{'}</span>
+        {entries.length === 0 ? null : (
+          <div style={{ marginLeft: pad }}>
+            {entries.map(([k, v], i) => {
+              const isLeaf = v === null || typeof v !== 'object'
+              return (
+                <div key={k} className="group flex items-start gap-1">
+                  <div className="flex-1">
+                    <span className="text-cyan-400">"{k}"</span>
+                    <span className="text-gray-500">: </span>
+                    {isLeaf ? <DecodedLeafValue value={v} /> : <DecodedJSONTree value={v} onLeafAction={onLeafAction} depth={depth + 1} parentKey={k} />}
+                    {i < entries.length - 1 ? <span className="text-gray-500">,</span> : null}
+                  </div>
+                  {/* Action button only for top-level leaves: that's what the
+                      backend encoder can map back to a single field of the
+                      request/response message type. */}
+                  {isLeaf && depth === 0 && (
+                    <DecodedFieldActionButton field={k} value={v} onAction={onLeafAction} />
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )}
+        <span className="text-gray-500">{'}'}</span>
+      </span>
+    )
+  }
+  return <DecodedLeafValue value={value} />
+}
+
+// DecodedNamedFrameView renders a single server-decoded protobuf frame:
+// the interactive tree when the JSON parses, the original pretty-printed
+// text otherwise. Splitting it out keeps the try/catch out of the parent
+// component's JSX (eslint react-hooks/error-boundaries flags JSX inside
+// try/catch because rendering errors there don't propagate to boundaries).
+function DecodedNamedFrameView({ frameJSON, onLeafAction, fallbackHighlight }) {
+  const parsed = useMemo(() => {
+    try {
+      const v = JSON.parse(frameJSON)
+      return v && typeof v === 'object' ? v : null
+    } catch {
+      return null
+    }
+  }, [frameJSON])
+  if (parsed) {
+    return (
+      <div className="text-green-300 whitespace-pre-wrap break-all">
+        <DecodedJSONTree value={parsed} onLeafAction={onLeafAction} />
+      </div>
+    )
+  }
+  return (
+    <pre className="text-green-300 whitespace-pre-wrap break-all">
+      {fallbackHighlight}
+    </pre>
+  )
+}
+
+function DecodedLeafValue({ value }) {
+  if (typeof value === 'string') return <span className="text-green-300">{JSON.stringify(value)}</span>
+  if (typeof value === 'number') return <span className="text-cyan-300">{String(value)}</span>
+  if (typeof value === 'boolean') return <span className="text-purple-300">{String(value)}</span>
+  if (value === null) return <span className="text-gray-500">null</span>
+  return <span>{String(value)}</span>
+}
+
+function DecodedFieldActionButton({ field, value, onAction }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="relative shrink-0">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        className="opacity-0 group-hover:opacity-100 focus:opacity-100 text-[10px] px-1.5 py-0.5 rounded border border-gray-700 bg-gray-900 text-gray-400 hover:text-cyan-300 hover:border-cyan-700 cursor-pointer"
+        title={`Use "${field}" = ${JSON.stringify(value)} as a filter`}
+      >
+        filter ▾
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full mt-1 z-20 w-48 bg-gray-900 border border-gray-700 rounded shadow-lg text-[11px]">
+          <button
+            type="button"
+            onMouseDown={(e) => { e.preventDefault(); setOpen(false); onAction('copy', field, value) }}
+            className="block w-full text-left px-2 py-1.5 hover:bg-gray-800 text-gray-200 cursor-pointer"
+          >
+            Copy raw filter
+          </button>
+          <button
+            type="button"
+            onMouseDown={(e) => { e.preventDefault(); setOpen(false); onAction('add', field, value) }}
+            className="block w-full text-left px-2 py-1.5 hover:bg-gray-800 text-gray-200 cursor-pointer"
+          >
+            Add to current filter
+          </button>
+          <button
+            type="button"
+            onMouseDown={(e) => { e.preventDefault(); setOpen(false); onAction('rule', field, value) }}
+            className="block w-full text-left px-2 py-1.5 hover:bg-gray-800 text-red-200 cursor-pointer"
+          >
+            New drop rule
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // SSE packets carry only metadata — no body, no headers. If a parsed
 // expression touches any of those fields, client-side evaluation is
 // unreliable and we fall back to periodic server polling.
@@ -254,6 +589,10 @@ export default function Traffic() {
   // because they are either set programmatically (session_id during flow
   // mode) or are UI-only controls (sort/limit) that don't belong in the DSL.
   const [expression, setExpression] = useState('')
+  // Service quick-filter: chips above the expression input. Kept as a separate
+  // state so the user's typed expression isn't rewritten when toggling chips;
+  // we merge the two into `effectiveExpression` only when querying / parsing.
+  const [selectedServiceIDs, setSelectedServiceIDs] = useState(() => new Set())
   const [sessionFilter, setSessionFilter] = useState('')
   const [sortOrder, setSortOrder] = useState('desc')
   const [pageLimit] = useState(50)
@@ -336,13 +675,25 @@ export default function Traffic() {
   // hook's effect via fetchPage's dep list.
   const [hideVersion, setHideVersion] = useState(0)
 
+  // Combine the user's typed expression with the chip-selected services.
+  // The chips append `service in (...)` (or `service == ...` for one) so the
+  // user can keep editing their text expression without losing the chip state.
+  const effectiveExpression = useMemo(() => {
+    const e = expression.trim()
+    if (selectedServiceIDs.size === 0) return e
+    const ids = Array.from(selectedServiceIDs)
+    const list = ids.map((id) => `"${String(id).replace(/"/g, '\\"')}"`).join(', ')
+    const svcExpr = ids.length === 1 ? `service == ${list}` : `service in (${list})`
+    return e ? `(${e}) AND ${svcExpr}` : svcExpr
+  }, [expression, selectedServiceIDs])
+
   // fetchPage: called by the hook for each page load
   const fetchPage = useCallback(async (offset, limit) => {
     const params = { ...hideParams() }
     params.limit = limit
     params.offset = offset
     params.sort = sortOrder
-    if (expression.trim()) params.q = expression
+    if (effectiveExpression) params.q = effectiveExpression
     if (sessionFilter) params.session_id = sessionFilter
     if (flagFilter) params.flagged = 'true'
     if (flagIDFilter) params.contains_flagid = 'true'
@@ -350,7 +701,7 @@ export default function Traffic() {
     params.summary = '1'
     const data = await api.getPackets(params)
     return { items: data.packets || [], total: data.total }
-  }, [expression, sessionFilter, sortOrder, flagFilter, flagIDFilter, blockedFilter, hideVersion])
+  }, [effectiveExpression, sessionFilter, sortOrder, flagFilter, flagIDFilter, blockedFilter, hideVersion])
 
   const {
     items: packets,
@@ -364,13 +715,14 @@ export default function Traffic() {
   } = useInfiniteList({ fetchPage, pageSize: pageLimit })
 
   // Parse the user expression once per change. Memoized so the SSE filter
-  // doesn't reparse per packet.
+  // doesn't reparse per packet. Uses the merged expression so chip selections
+  // are also respected by the client-side SSE filter.
   const parsedExpression = useMemo(() => {
-    if (!expression.trim()) return { tree: null, residual: false }
-    const r = parseFilter(expression)
+    if (!effectiveExpression) return { tree: null, residual: false }
+    const r = parseFilter(effectiveExpression)
     if (!r.ok) return { tree: null, residual: true } // syntax errors → fall back to server
     return { tree: r.tree, residual: treeNeedsServerFilter(r.tree) }
-  }, [expression])
+  }, [effectiveExpression])
 
   // Whenever any predicate touches a field SSE doesn't carry (body/raw/header),
   // we fall back to periodic server polling instead of client-side eval.
@@ -781,7 +1133,7 @@ export default function Traffic() {
   useEffect(() => { setShowQuickRule(false) }, [selected?.id])
 
   const isFlowActive = !!flowMode || !!sessionFilter
-  const hasActiveFilter = !!expression.trim() || flagFilter || flagIDFilter || blockedFilter
+  const hasActiveFilter = !!expression.trim() || selectedServiceIDs.size > 0 || flagFilter || flagIDFilter || blockedFilter
 
   // Pull contains-style literals out of the parsed expression so the table
   // and detail panel can highlight matched substrings inline. Compound
@@ -871,6 +1223,103 @@ export default function Traffic() {
       .catch((err) => { if (!cancelled) setDecodedNamedError(err.message || String(err)) })
     return () => { cancelled = true }
   }, [selected?.id, decodedProto])
+
+  // Hex-view toggle — kept unobtrusive: hidden by default, click "Show hex"
+  // when the user wants to drag-select bytes and turn them into a filter.
+  const [showHex, setShowHex] = useState(false)
+  const selectedBytes = useMemo(() => base64ToBytes(selected?.body || ''), [selected?.body])
+
+  // Click-to-filter from the Decoded panel: encode the selected field via
+  // the backend (which has the .proto descriptors loaded) and either copy
+  // the resulting `raw contains "..."` predicate, append it to the current
+  // expression, or jump to the Rules page with the form pre-filled.
+  const [encodeStatus, setEncodeStatus] = useState('') // '', 'copied', 'added', 'error'
+
+  // Apply a fully-built predicate to one of the three actions (copy / add /
+  // new rule). Shared by raw-byte hex selection and body-text selection so
+  // those code paths don't reinvent the navigation/clipboard plumbing.
+  const applyFilterPredicate = useCallback((kind, predicate, ruleNameSuffix) => {
+    if (!predicate) return
+    if (kind === 'copy') {
+      copyText(predicate).then(() => setEncodeStatus('copied'))
+        .catch(() => setEncodeStatus('error'))
+    } else if (kind === 'add') {
+      setExpression((prev) => {
+        const e = (prev || '').trim()
+        return e ? `(${e}) AND ${predicate}` : predicate
+      })
+      setEncodeStatus('added')
+    } else if (kind === 'rule') {
+      const svcId = selected?.service_id
+      const svcPredicate = svcId ? `${quoteForFilter(svcId)}` : ''
+      const expression = svcId
+        ? `service == ${svcPredicate} AND ${predicate}`
+        : predicate
+      navigate('/rules', {
+        state: {
+          presetRule: {
+            service_id: svcId || '',
+            expression,
+            name: ruleNameSuffix || 'custom-rule',
+            action: 'drop',
+          },
+        },
+      })
+    }
+    setTimeout(() => setEncodeStatus(''), 2000)
+  }, [selected?.service_id, navigate])
+  const handleDecodedFieldAction = useCallback(async (kind, field, value) => {
+    if (!selected?.id || !decodedNamed?.method) return
+    try {
+      const res = await api.encodeProtoField({
+        service_id: selected.service_id,
+        method: decodedNamed.method,
+        direction: selected.direction,
+        field,
+        value,
+      })
+      const escaped = res?.escaped ?? ''
+      if (!escaped) throw new Error('encoder returned empty bytes')
+      const rawPredicate = `raw contains "${escaped}"`
+      // For "New drop rule" we want a more selective predicate scoped to the
+      // gRPC method, so we override the generic applyFilterPredicate path.
+      if (kind === 'rule') {
+        const urlPredicate = `url endswith "/${decodedNamed.method.split('/').pop()}"`
+        const svcPredicate = `service == ${quoteForFilter(selected.service_id)}`
+        navigate('/rules', {
+          state: {
+            presetRule: {
+              service_id: selected.service_id,
+              expression: `${svcPredicate} AND ${urlPredicate} AND ${rawPredicate}`,
+              name: `${decodedNamed.message_type}.${field}=${typeof value === 'string' ? value : JSON.stringify(value)}`,
+              action: 'drop',
+            },
+          },
+        })
+      } else {
+        applyFilterPredicate(kind, rawPredicate)
+      }
+    } catch (err) {
+      console.error('encode-field failed:', err)
+      setEncodeStatus('error')
+      setTimeout(() => setEncodeStatus(''), 2000)
+    }
+  }, [selected?.id, selected?.service_id, selected?.direction, decodedNamed, navigate, applyFilterPredicate])
+
+  // Body-text "Filter on selection": grabs whatever the user has highlighted
+  // in the Body panel and turns it into `body contains "<text>"`. No backend
+  // round-trip needed — text bodies are matched as-is.
+  const handleBodyTextSelection = useCallback((kind) => {
+    const sel = typeof window !== 'undefined' ? window.getSelection() : null
+    const text = sel ? sel.toString() : ''
+    if (!text.trim()) {
+      setEncodeStatus('error')
+      setTimeout(() => setEncodeStatus(''), 1500)
+      return
+    }
+    const predicate = `body contains "${escapeStringForFilter(text)}"`
+    applyFilterPredicate(kind, predicate, `body~${text.slice(0, 30)}`)
+  }, [applyFilterPredicate])
 
   const matchedRuleForHighlight = useMemo(() => {
     if (!selected?.matched_rules?.length) return null
@@ -1041,6 +1490,46 @@ export default function Traffic() {
         </button>
         {!filtersCollapsed && (
           <div className="space-y-2">
+            {services.length > 0 && (
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-[10px] uppercase tracking-wide text-gray-600 mr-1">Services</span>
+                {services.map((svc) => {
+                  const active = selectedServiceIDs.has(svc.id)
+                  return (
+                    <button
+                      key={svc.id}
+                      type="button"
+                      onClick={() => {
+                        setSelectedServiceIDs((prev) => {
+                          const next = new Set(prev)
+                          if (next.has(svc.id)) next.delete(svc.id)
+                          else next.add(svc.id)
+                          return next
+                        })
+                      }}
+                      className={`text-xs px-2 py-1 rounded border transition-colors cursor-pointer ${
+                        active
+                          ? 'bg-cyan-700/40 border-cyan-600 text-cyan-100'
+                          : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-600'
+                      }`}
+                      title={`Filter by service ${svc.name}`}
+                    >
+                      {active ? '✓ ' : ''}{svc.name}
+                    </button>
+                  )
+                })}
+                {selectedServiceIDs.size > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setSelectedServiceIDs(new Set())}
+                    className="text-[10px] text-gray-500 hover:text-gray-300 ml-1 cursor-pointer underline"
+                    title="Clear service filter"
+                  >
+                    clear
+                  </button>
+                )}
+              </div>
+            )}
             <FilterExpression
               value={expression}
               onChange={setExpression}
@@ -1330,7 +1819,7 @@ export default function Traffic() {
                   try {
                     const params = {}
                     if (sessionFilter) params.session_id = sessionFilter
-                    if (expression.trim()) params.q = expression
+                    if (effectiveExpression) params.q = effectiveExpression
                     const data = await api.pcapExport(params)
                     setPcapResult(data)
                   } catch (err) {
@@ -1500,6 +1989,22 @@ export default function Traffic() {
                           Copy bytes
                         </button>
                       )}
+                      {selected.body_string && (
+                        <RawSelectionActionButton
+                          disabled={false}
+                          onAction={(kind) => handleBodyTextSelection(kind)}
+                        />
+                      )}
+                      {selected.body && selectedBytes.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => setShowHex((v) => !v)}
+                          className={`text-[10px] cursor-pointer ${showHex ? 'text-cyan-400 hover:text-cyan-300' : 'text-gray-600 hover:text-gray-400'}`}
+                          title="Toggle hex+ASCII view with byte selection"
+                        >
+                          {showHex ? 'Hide hex' : 'Show hex'}
+                        </button>
+                      )}
                     </div>
                     <pre className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 overflow-auto whitespace-pre-wrap break-all" style={{ maxHeight: '60vh' }}>
                       {selected.body_string ? (
@@ -1510,6 +2015,14 @@ export default function Traffic() {
                         </span>
                       )}
                     </pre>
+                    {showHex && selectedBytes.length > 0 && (
+                      <div className="mt-2">
+                        <HexView
+                          bytes={selectedBytes}
+                          onSelectionAction={applyFilterPredicate}
+                        />
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -1548,9 +2061,13 @@ export default function Traffic() {
                               <div className="text-gray-500 text-[10px] mb-1">frame {idx} ({frame.bytes}B)</div>
                             )}
                             {frame.json ? (
-                              <pre className="text-green-300 whitespace-pre-wrap break-all">
-                                <HighlightedText text={frame.json} regex={bodyRegex} flagidRegex={flagidHighlightRegex} />
-                              </pre>
+                              <DecodedNamedFrameView
+                                frameJSON={frame.json}
+                                onLeafAction={handleDecodedFieldAction}
+                                fallbackHighlight={
+                                  <HighlightedText text={frame.json} regex={bodyRegex} flagidRegex={flagidHighlightRegex} />
+                                }
+                              />
                             ) : (
                               <div className="text-red-400">{frame.error || 'decode error'}</div>
                             )}
@@ -1578,6 +2095,9 @@ export default function Traffic() {
       {(loading || flowLoading) && <div className="fixed bottom-4 right-4 bg-gray-800 text-cyan-400 text-xs px-3 py-1.5 rounded-full">{flowLoading ? 'Reconstructing flow…' : 'Loading...'}</div>}
       {copyStatus === 'copied' && <div className="fixed bottom-4 right-4 bg-green-800 text-green-200 text-xs px-3 py-1.5 rounded-full z-50">Exploit copied to clipboard!</div>}
       {copyStatus === 'error' && <div className="fixed bottom-4 right-4 bg-red-800 text-red-200 text-xs px-3 py-1.5 rounded-full z-50">Failed to generate exploit</div>}
+      {encodeStatus === 'copied' && <div className="fixed bottom-4 right-4 bg-green-800 text-green-200 text-xs px-3 py-1.5 rounded-full z-50">Filter copied to clipboard!</div>}
+      {encodeStatus === 'added' && <div className="fixed bottom-4 right-4 bg-cyan-800 text-cyan-200 text-xs px-3 py-1.5 rounded-full z-50">Predicate added to filter</div>}
+      {encodeStatus === 'error' && <div className="fixed bottom-4 right-4 bg-red-800 text-red-200 text-xs px-3 py-1.5 rounded-full z-50">Failed to encode field</div>}
     </div>
   )
 }

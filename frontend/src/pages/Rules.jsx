@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import ErrorBanner from '../components/ErrorBanner'
 import FilterExpression from '../components/FilterExpression'
@@ -23,6 +24,8 @@ export default function Rules() {
   const [selectedIds, setSelectedIds] = useState(new Set())
   const [actionFilter, setActionFilter] = useState('all') // 'all' | 'drop' | 'alert' | 'both'
   const ruleFormAnchorRef = useRef(null)
+  const location = useLocation()
+  const navigate = useNavigate()
 
   useEffect(() => {
     api.listServices().then((data) => {
@@ -31,6 +34,26 @@ export default function Rules() {
       if (svcs.length > 0 && !selectedService) setSelectedService('_all')
     })
   }, [])
+
+  // Receive a pre-filled rule from another page (e.g. Traffic "New drop rule").
+  // We consume location.state and clear it so a back-navigation doesn't re-open
+  // the form. The form is opened immediately so the user only confirms + saves.
+  useEffect(() => {
+    const preset = location.state?.presetRule
+    if (!preset) return
+    setEditing({
+      _isNew: true,
+      service_id: preset.service_id || (services[0]?.id || ''),
+      name: preset.name || '',
+      expression: preset.expression || '',
+      priority: 10,
+      enabled: true,
+      action: preset.action || 'drop',
+    })
+    if (preset.service_id) setSelectedService(preset.service_id)
+    navigate(location.pathname, { replace: true, state: null })
+    setTimeout(() => ruleFormAnchorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
+  }, [location.state, location.pathname, navigate, services])
 
   useEffect(() => {
     loadRules()

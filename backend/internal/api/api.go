@@ -76,6 +76,7 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/packets/exploit", s.handleExploitGen)
 	protected.HandleFunc("/api/packets/decoded", s.handlePacketDecoded)
 	protected.HandleFunc("/api/protos", s.handleListProtos)
+	protected.HandleFunc("/api/protos/encode-field", s.handleProtoEncodeField)
 	protected.HandleFunc("/api/packets/bulk-delete", s.handlePacketsBulkDelete)
 	protected.HandleFunc("/api/packets/", s.handlePacketByID)
 	protected.HandleFunc("/api/packets", s.handlePackets)

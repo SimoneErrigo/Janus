@@ -136,6 +136,7 @@ export const api = {
 
   // .proto files auto-discovered under PROTO_DIR
   listProtoFiles: () => request('/protos'),
+  encodeProtoField: (data) => request('/protos/encode-field', { method: 'POST', body: data }),
 
   // Packets
   getPackets: (params) => {

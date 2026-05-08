@@ -202,6 +202,29 @@ type Frame struct {
 	Bytes int    `json:"bytes"`           // length of the inner protobuf payload
 }
 
+// ResolveMessageType loads the descriptors for serviceID/protoPaths and
+// returns the input or output message descriptor for the given gRPC method
+// URL. Used by callers that need the descriptor without doing a full body
+// decode (e.g. encoding a single field for click-to-filter).
+func (c *Cache) ResolveMessageType(serviceID string, protoPaths []string, url string, direction string) (*desc.MessageDescriptor, error) {
+	entry, err := c.load(serviceID, protoPaths)
+	if err != nil {
+		return nil, err
+	}
+	key, ok := MethodKeyFromURL(url)
+	if !ok {
+		return nil, fmt.Errorf("URL %q is not a valid gRPC path", url)
+	}
+	md, ok := entry.methods[key]
+	if !ok {
+		return nil, fmt.Errorf("method %q not found in configured .proto files", key)
+	}
+	if direction == "response" {
+		return md.GetOutputType(), nil
+	}
+	return md.GetInputType(), nil
+}
+
 // Decode resolves the method from URL, peels gRPC framing from body, and
 // decodes each frame as the method's input or output type (depending on
 // direction). The result includes per-frame JSON or per-frame errors.
