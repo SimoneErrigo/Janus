@@ -35,7 +35,7 @@ docker compose up -d
 - **Frontend dashboard:** `http://localhost:2999` (localhost-only)
 - **Backend API:** `http://localhost:8080` (localhost-only)
 - **Redis:** `127.0.0.1:6379` (internal only, not exposed to the competition network)
-- **Dozzle (container logs):** `http://localhost:9999` (internal only, bound to localhost)
+- **Dozzle (container logs):** `http://<host>:14000` (bound to `0.0.0.0`, password-protected — port configurable via `DOZZLE_PORT` in `.env`)
 
 ### Competition VM (Linux)
 
@@ -156,10 +156,37 @@ The **Config** page lets you update:
 
 ### 10. Container logs (Dozzle)
 
-The sidebar has a **Logs** link that opens [Dozzle](http://localhost:9999) in a new tab. Dozzle is a lightweight, read-only container log viewer that streams Docker container logs in real time. It shows all Janus containers (backend, frontend, redis, dozzle) and any other containers running on the host.
+The sidebar has a **Logs** link that opens Dozzle in a new tab using the same hostname you reached the dashboard with (e.g. `http://<VM_IP>:14000`). Dozzle is a lightweight, read-only container log viewer that streams Docker container logs in real time. It shows all Janus containers (backend, frontend, redis, dozzle) and any other containers running on the host.
 
-- Bound to `127.0.0.1:9999` only — not reachable from the competition network
-- No authentication required (localhost access only — if an attacker has local access to the VM, they already have full control)
+- Bound to `0.0.0.0:${DOZZLE_PORT:-14000}` so the team can reach it from the competition network. **Set a strong password** (instructions below) — anyone on the network with the password sees every container's logs.
+- The port is set via `DOZZLE_PORT` in `.env` (default `14000`). The frontend reads it at runtime from `GET /api/config`, so changing the port only requires editing `.env` and restarting; no rebuild.
+- Auth is `DOZZLE_AUTH_PROVIDER=simple`, reading users from `data/dozzle/users.yml`.
+
+#### Change the Dozzle password
+
+The project ships with `scripts/dozzle-hash.sh` which reads `DOZZLE_PASSWORD` from `.env`, bcrypt-hashes it via the official Dozzle image (no host deps), and writes `data/dozzle/users.yml`:
+
+```bash
+# 1. Edit .env — set a long random password (≥20 chars):
+#       DOZZLE_PASSWORD=<NEW_STRONG_PASSWORD>
+#
+# 2. Regenerate the hash file:
+./scripts/dozzle-hash.sh
+#
+# 3. Reload only Dozzle (no need to rebuild anything else):
+docker compose restart dozzle
+```
+
+The login username is `admin`. The hash file is mounted read-only into the container; rotating later just means rerunning the three steps.
+
+If you need to change only the port (credentials unchanged):
+
+```bash
+echo "DOZZLE_PORT=18080" >> .env       # or edit the existing line
+docker compose up -d dozzle            # republishes on the new port
+```
+
+The frontend reads `dozzle_port` from `GET /api/config` at runtime, so the **Logs** sidebar link picks up the new port without a rebuild.
 
 ### 11. Redis caching
 

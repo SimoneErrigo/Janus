@@ -145,7 +145,7 @@ func main() {
 	cleanupMgr.Start()
 
 	statsCollector := sysstat.NewCollector(packetStore, redisCache, cfg.DataDir)
-	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller, redisCache, statsCollector, packetHub, captureCtrl)
+	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller, redisCache, statsCollector, packetHub, captureCtrl, cfg.ProtoDir)
 
 	// Graceful shutdown
 	go func() {

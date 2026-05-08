@@ -32,6 +32,9 @@ type configResponse struct {
 	// PCAP export
 	PcapExportDir string `json:"pcap_export_dir"`
 	PcapAutoSave  bool   `json:"pcap_auto_save"`
+
+	// Dozzle
+	DozzlePort int `json:"dozzle_port"`
 }
 
 type configUpdateRequest struct {
@@ -91,6 +94,7 @@ func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 		FlowCorrelationWindowSec: cfg.FlowCorrelationWindowSec,
 		PcapExportDir:            cfg.PcapExportDir,
 		PcapAutoSave:             cfg.PcapAutoSave,
+		DozzlePort:               cfg.DozzlePort,
 	})
 }
 
@@ -226,5 +230,6 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 		FlowCorrelationWindowSec: cfg.FlowCorrelationWindowSec,
 		PcapExportDir:            cfg.PcapExportDir,
 		PcapAutoSave:             cfg.PcapAutoSave,
+		DozzlePort:               cfg.DozzlePort,
 	})
 }

@@ -281,12 +281,58 @@ func (s *PacketStore) execInsertRetry(query string, args ...interface{}) (sql.Re
 	return nil, err
 }
 
-// Insert stores a packet in the database.
-func (s *PacketStore) Insert(p *Packet) error {
-	// Auto-fill body_string if body is valid UTF-8
-	if len(p.Body) > 0 && p.BodyString == "" && utf8.Valid(p.Body) {
+// autoFillBodyString populates p.BodyString with the UTF-8 view of the body
+// when the body is valid UTF-8 and the caller hasn't already set it. Bodies
+// served with a binary Content-Type (gRPC, protobuf, octet-stream, …) are
+// left empty even when their bytes happen to be UTF-8 decodable: surfacing
+// raw protobuf wire bytes as a string only produces unreadable noise and
+// hides the structured "Decoded" view in the UI.
+func autoFillBodyString(p *Packet) {
+	if p == nil || len(p.Body) == 0 || p.BodyString != "" {
+		return
+	}
+	if isBinaryContentType(p.Headers) {
+		return
+	}
+	if utf8.Valid(p.Body) {
 		p.BodyString = string(p.Body)
 	}
+}
+
+// isBinaryContentType reports whether the headers declare a body format that
+// shouldn't be rendered as text (gRPC, protobuf, raw octets). The check is
+// case-insensitive and tolerant of "type/subtype; charset=…" suffixes.
+func isBinaryContentType(headers map[string]string) bool {
+	if len(headers) == 0 {
+		return false
+	}
+	var ct string
+	for k, v := range headers {
+		if strings.EqualFold(k, "Content-Type") {
+			ct = v
+			break
+		}
+	}
+	if ct == "" {
+		return false
+	}
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	switch {
+	case strings.HasPrefix(ct, "application/grpc"),
+		strings.HasPrefix(ct, "application/protobuf"),
+		strings.HasPrefix(ct, "application/x-protobuf"),
+		strings.HasPrefix(ct, "application/octet-stream"):
+		return true
+	}
+	return false
+}
+
+// Insert stores a packet in the database.
+func (s *PacketStore) Insert(p *Packet) error {
+	autoFillBodyString(p)
 
 	headersJSON, err := json.Marshal(p.Headers)
 	if err != nil {
@@ -355,9 +401,7 @@ func (s *PacketStore) Enqueue(pkt *Packet, alerts []*Alert) error {
 	if pkt == nil {
 		return nil
 	}
-	if len(pkt.Body) > 0 && pkt.BodyString == "" && utf8.Valid(pkt.Body) {
-		pkt.BodyString = string(pkt.Body)
-	}
+	autoFillBodyString(pkt)
 	if pkt.MatchedFlagIDs == nil {
 		pkt.MatchedFlagIDs = []string{}
 	}

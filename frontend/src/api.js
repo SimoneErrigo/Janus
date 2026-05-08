@@ -134,6 +134,9 @@ export const api = {
   updateService: (id, data) => request(`/services/${id}`, { method: 'PUT', body: data }),
   deleteService: (id) => request(`/services/${id}`, { method: 'DELETE' }),
 
+  // .proto files auto-discovered under PROTO_DIR
+  listProtoFiles: () => request('/protos'),
+
   // Packets
   getPackets: (params) => {
     const qs = new URLSearchParams();

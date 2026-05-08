@@ -31,11 +31,12 @@ type Server struct {
 	captureCtrl    *sniffer.CaptureController
 	sessionHub     *SessionHub
 	protoCache     *protodecode.Cache
+	protoDir       string
 	mux            *http.ServeMux
 }
 
 // NewServer creates a new API server.
-func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager, flagIDPoller *flagids.Poller, cacheClient *cache.Client, statsCollector *sysstat.Collector, packetHub *PacketStreamHub, captureCtrl *sniffer.CaptureController) *Server {
+func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager, flagIDPoller *flagids.Poller, cacheClient *cache.Client, statsCollector *sysstat.Collector, packetHub *PacketStreamHub, captureCtrl *sniffer.CaptureController, protoDir string) *Server {
 	s := &Server{
 		store:          store,
 		proxy:          proxyMgr,
@@ -49,6 +50,7 @@ func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniff
 		captureCtrl:    captureCtrl,
 		sessionHub:     NewSessionHub(),
 		protoCache:     protodecode.NewCache(),
+		protoDir:       protoDir,
 		mux:            http.NewServeMux(),
 	}
 	s.routes()
@@ -73,6 +75,7 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/packets/flow", s.handlePacketFlow)
 	protected.HandleFunc("/api/packets/exploit", s.handleExploitGen)
 	protected.HandleFunc("/api/packets/decoded", s.handlePacketDecoded)
+	protected.HandleFunc("/api/protos", s.handleListProtos)
 	protected.HandleFunc("/api/packets/bulk-delete", s.handlePacketsBulkDelete)
 	protected.HandleFunc("/api/packets/", s.handlePacketByID)
 	protected.HandleFunc("/api/packets", s.handlePackets)

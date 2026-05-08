@@ -12,6 +12,7 @@ services:
     volumes:
       - ./data:/data
       - ./certs:/certs
+      - ./protos:/protos
     ports:
       - "127.0.0.1:8080:8080"
       - "3000-3001:3000-3001"
@@ -53,7 +54,10 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./data/dozzle/users.yml:/data/users.yml:ro
     ports:
-      - "127.0.0.1:9999:8080"
+      # Exposed on 0.0.0.0 so the team can reach it from the competition
+      # network. Auth is handled by DOZZLE_AUTH_PROVIDER=simple — make sure
+      # data/dozzle/users.yml has a strong password (see README).
+      - "0.0.0.0:${DOZZLE_PORT:-14000}:8080"
     environment:
       DOZZLE_HOSTNAME: janus-logs
       DOZZLE_NO_ANALYTICS: "true"

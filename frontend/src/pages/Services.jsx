@@ -112,14 +112,41 @@ export default function Services() {
 
 function ServiceForm({ service, onSave, onCancel }) {
   const [form, setForm] = useState(service)
+  const [discoveredProtos, setDiscoveredProtos] = useState({ dir: '', files: [] })
 
   function set(field, value) {
     setForm((f) => ({ ...f, [field]: value }))
   }
 
   const needsTLS = ['https', 'h2', 'grpc'].includes(form.protocol)
-  const isGRPC = form.protocol === 'grpc'
+  // gRPC is HTTP/2 with protobuf bodies; allow proto_paths for both since users
+  // sometimes configure their service as `h2` even when carrying gRPC traffic.
+  const supportsProtos = form.protocol === 'grpc' || form.protocol === 'h2'
   const protoPathsText = Array.isArray(form.proto_paths) ? form.proto_paths.join('\n') : (form.proto_paths || '')
+  const selectedProtoSet = new Set(
+    Array.isArray(form.proto_paths)
+      ? form.proto_paths
+      : protoPathsText.split('\n').map((p) => p.trim()).filter(Boolean)
+  )
+
+  useEffect(() => {
+    if (!supportsProtos) return
+    let cancelled = false
+    api.listProtoFiles()
+      .then((data) => { if (!cancelled) setDiscoveredProtos(data || { dir: '', files: [] }) })
+      .catch(() => { /* picker is optional, silent on failure */ })
+    return () => { cancelled = true }
+  }, [supportsProtos])
+
+  function toggleDiscoveredProto(path) {
+    const current = Array.isArray(form.proto_paths)
+      ? [...form.proto_paths]
+      : protoPathsText.split('\n').map((p) => p.trim()).filter(Boolean)
+    const idx = current.indexOf(path)
+    if (idx >= 0) current.splice(idx, 1)
+    else current.push(path)
+    set('proto_paths', current)
+  }
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 mb-4">
@@ -156,19 +183,54 @@ function ServiceForm({ service, onSave, onCancel }) {
             )}
           </>
         )}
-        {isGRPC && (
+        {supportsProtos && (
           <div className="col-span-2">
             <label className="block text-sm text-gray-400 mb-1">
               .proto File Paths
-              <span className="text-gray-600 ml-2 text-xs">one per line — used to decode gRPC bodies with field names</span>
+              <span className="text-gray-600 ml-2 text-xs">
+                one per line — used to decode protobuf/gRPC bodies with field names.
+                Leave empty to auto-discover from {discoveredProtos.dir || '/protos'}.
+              </span>
             </label>
             <textarea
               value={protoPathsText}
               onChange={(e) => set('proto_paths', e.target.value)}
-              placeholder="/protos/cheesycheats.proto&#10;/protos/cheesycheatsAPI.proto"
+              placeholder={`${discoveredProtos.dir || '/protos'}/cheesycheats.proto`}
               rows={3}
               className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm font-mono focus:outline-none focus:border-cyan-500 transition-colors"
             />
+            {discoveredProtos.files.length > 0 ? (
+              <div className="mt-2">
+                <div className="text-xs text-gray-500 mb-1">
+                  Available in {discoveredProtos.dir} (click to toggle):
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {discoveredProtos.files.map((p) => {
+                    const selected = selectedProtoSet.has(p)
+                    return (
+                      <button
+                        key={p}
+                        type="button"
+                        onClick={() => toggleDiscoveredProto(p)}
+                        className={`text-xs px-2 py-1 rounded border font-mono transition-colors cursor-pointer ${
+                          selected
+                            ? 'bg-cyan-700/40 border-cyan-600 text-cyan-100'
+                            : 'bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-600'
+                        }`}
+                        title={p}
+                      >
+                        {selected ? '✓ ' : '+ '}{p}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            ) : (
+              <div className="mt-2 text-xs text-gray-600">
+                No .proto files found in {discoveredProtos.dir || '/protos'}.
+                Drop them into the mounted volume and they'll appear here (and be used as fallback).
+              </div>
+            )}
           </div>
         )}
         <div className="flex items-center gap-2 col-span-2">
