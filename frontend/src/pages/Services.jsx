@@ -8,7 +8,7 @@ const tlsModes = ['', 'selfsigned', 'challenge']
 const emptyService = {
   id: '', name: '', listen_addr: '', listen_port: '', target_addr: '',
   protocol: 'http', tls_mode: '', cert_file: '', key_file: '',
-  target_tls: false, proto_paths: [], enabled: true,
+  target_tls: false, proto_paths: [], protocol_id: '', enabled: true,
 }
 
 export default function Services() {
@@ -113,6 +113,15 @@ export default function Services() {
 function ServiceForm({ service, onSave, onCancel }) {
   const [form, setForm] = useState(service)
   const [discoveredProtos, setDiscoveredProtos] = useState({ dir: '', files: [] })
+  const [customProtocols, setCustomProtocols] = useState([])
+
+  useEffect(() => {
+    let cancelled = false
+    api.listProtocols()
+      .then((list) => { if (!cancelled) setCustomProtocols(list || []) })
+      .catch(() => { /* picker is optional */ })
+    return () => { cancelled = true }
+  }, [])
 
   function set(field, value) {
     setForm((f) => ({ ...f, [field]: value }))
@@ -233,6 +242,22 @@ function ServiceForm({ service, onSave, onCancel }) {
             )}
           </div>
         )}
+        <div className="col-span-2">
+          <label className="block text-sm text-gray-400 mb-1">
+            Custom Protocol (decoder)
+            <span className="text-gray-600 ml-2 text-xs">
+              binds a user-defined protocol so packets are rendered as a structured tree instead of hex
+            </span>
+          </label>
+          <select
+            value={form.protocol_id || ''}
+            onChange={(e) => set('protocol_id', e.target.value)}
+            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
+          >
+            <option value="">— None —</option>
+            {customProtocols.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </div>
         <div className="flex items-center gap-2 col-span-2">
           <input type="checkbox" checked={form.enabled} onChange={(e) => set('enabled', e.target.checked)} className="accent-cyan-500" id="enabled" />
           <label htmlFor="enabled" className="text-sm text-gray-400">Enabled (start proxy immediately)</label>

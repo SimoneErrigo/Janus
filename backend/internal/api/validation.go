@@ -13,14 +13,26 @@ func validateService(svc *storage.Service) error {
 	if svc.Name == "" {
 		return fmt.Errorf("name is required")
 	}
-	if svc.ListenAddr == "" {
-		return fmt.Errorf("listen_addr is required")
-	}
-	if svc.ListenPort <= 0 || svc.ListenPort > 65535 {
-		return fmt.Errorf("listen_port must be between 1 and 65535")
-	}
-	if svc.TargetAddr == "" {
-		return fmt.Errorf("target_addr is required")
+
+	// Proxy fields are required only when the service is enabled (the proxy
+	// actually tries to listen). Disabled services — including the virtual
+	// ones auto-created by PCAP import — carry empty addresses because
+	// they're just packet containers, not proxy targets. Re-enabling such a
+	// service later forces the user to fill in the fields at that moment.
+	if svc.Enabled {
+		if svc.ListenAddr == "" {
+			return fmt.Errorf("listen_addr is required when service is enabled")
+		}
+		if svc.ListenPort <= 0 || svc.ListenPort > 65535 {
+			return fmt.Errorf("listen_port must be between 1 and 65535 when service is enabled")
+		}
+		if svc.TargetAddr == "" {
+			return fmt.Errorf("target_addr is required when service is enabled")
+		}
+	} else if svc.ListenPort < 0 || svc.ListenPort > 65535 {
+		// Partial config is fine on disabled services, but reject obviously
+		// out-of-range port numbers so we don't store garbage.
+		return fmt.Errorf("listen_port must be between 0 and 65535")
 	}
 
 	switch svc.Protocol {
@@ -30,8 +42,8 @@ func validateService(svc *storage.Service) error {
 		return fmt.Errorf("protocol must be one of: http, https, h2, grpc, tcp")
 	}
 
-	// TLS validation
-	if svc.Protocol == storage.ProtocolHTTPS || svc.Protocol == storage.ProtocolHTTP2 || svc.Protocol == storage.ProtocolGRPC {
+	// TLS validation also only matters if the proxy will actually start.
+	if svc.Enabled && (svc.Protocol == storage.ProtocolHTTPS || svc.Protocol == storage.ProtocolHTTP2 || svc.Protocol == storage.ProtocolGRPC) {
 		switch svc.TLSMode {
 		case storage.TLSModeSelfSigned, storage.TLSModeChallenge:
 			// valid

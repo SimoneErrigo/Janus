@@ -342,6 +342,16 @@ func (s *Server) handlePcapImport(w http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 
 	serviceID := strings.TrimSpace(r.FormValue("service_id"))
+	// protocol_id is optional. When supplied, it's bound to the (existing
+	// or auto-created) service so imported packets are auto-decoded with
+	// the chosen custom protocol — same behavior as the live capture path.
+	protocolID := strings.TrimSpace(r.FormValue("protocol_id"))
+	if protocolID != "" {
+		if _, ok := s.store.GetProtocol(protocolID); !ok {
+			http.Error(w, "protocol_id not found", http.StatusBadRequest)
+			return
+		}
+	}
 	if serviceID == "" {
 		// Create a virtual service named pcap:<filename>
 		raw := make([]byte, 6)
@@ -354,6 +364,7 @@ func (s *Server) handlePcapImport(w http.ResponseWriter, r *http.Request) {
 			ListenPort: 0,
 			TargetAddr: "",
 			Protocol:   storage.ProtocolTCP,
+			ProtocolID: protocolID,
 			Enabled:    false,
 		}
 		if err := s.store.CreateService(svc); err != nil {
@@ -361,11 +372,22 @@ func (s *Server) handlePcapImport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		serviceID = newID
-		log.Printf("PCAP import: created virtual service %s for %s", newID, header.Filename)
+		log.Printf("PCAP import: created virtual service %s for %s (protocol=%q)", newID, header.Filename, protocolID)
 	} else {
-		if _, ok := s.store.GetService(serviceID); !ok {
+		svc, ok := s.store.GetService(serviceID)
+		if !ok {
 			http.Error(w, "service_id not found", http.StatusBadRequest)
 			return
+		}
+		// Only update the binding when the import explicitly carries one;
+		// an empty form field leaves the existing binding untouched so we
+		// don't accidentally clear protocols set up earlier.
+		if protocolID != "" && svc.ProtocolID != protocolID {
+			svc.ProtocolID = protocolID
+			if err := s.store.UpdateService(svc); err != nil {
+				http.Error(w, "failed to bind protocol: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 	}
 

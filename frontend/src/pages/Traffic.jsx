@@ -145,6 +145,66 @@ function ProtobufFields({ fields, depth = 0 }) {
   )
 }
 
+// CustomDecodedFields renders a tree decoded by the user-defined custom
+// protocol decoder (Step 14). It mirrors ProtobufFields visually but the
+// shape comes from internal/customdecode.DecodedField (name, type, value,
+// hex, enum, sub, error). Dispatch results carry an `enum` label and a
+// nested `sub` array; byte-shaped fields put their content in `hex`.
+function CustomDecodedFields({ fields, depth = 0 }) {
+  return (
+    <div style={{ marginLeft: depth === 0 ? 0 : 12 }}>
+      {fields.map((f, i) => {
+        const nameCls = 'text-purple-400'
+        const typeCls = 'text-gray-500'
+        if (f.error) {
+          return (
+            <div key={i}>
+              <span className={nameCls}>{f.name}</span>
+              <span className={typeCls}> ({f.type}): </span>
+              <span className="text-red-400">{f.error}</span>
+            </div>
+          )
+        }
+        if (f.sub && f.sub.length) {
+          return (
+            <div key={i}>
+              <span className={nameCls}>{f.name}</span>
+              <span className={typeCls}> ({f.type}{f.enum ? ` → ${f.enum}` : ''})</span>
+              <CustomDecodedFields fields={f.sub} depth={depth + 1} />
+            </div>
+          )
+        }
+        let valueEl
+        if (f.hex !== undefined && f.hex !== '') {
+          valueEl = <span className="text-yellow-300 break-all">0x{f.hex}</span>
+        } else if (f.enum) {
+          valueEl = (
+            <>
+              <span className="text-green-300">{f.enum}</span>
+              <span className="text-gray-500"> ({String(f.value)})</span>
+            </>
+          )
+        } else if (typeof f.value === 'string') {
+          valueEl = <span className="text-green-300">{JSON.stringify(f.value)}</span>
+        } else if (typeof f.value === 'number' || typeof f.value === 'boolean') {
+          valueEl = <span className="text-cyan-300">{String(f.value)}</span>
+        } else if (f.value === undefined || f.value === null) {
+          valueEl = <span className="text-gray-500">∅</span>
+        } else {
+          valueEl = <span>{String(f.value)}</span>
+        }
+        return (
+          <div key={i}>
+            <span className={nameCls}>{f.name}</span>
+            <span className={typeCls}> ({f.type}): </span>
+            {valueEl}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 // Build a single-quoted, escaped service-id literal for filter expressions.
 function quoteForFilter(s) {
   return `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
@@ -556,6 +616,10 @@ export default function Traffic() {
   const navigate = useNavigate()
   const location = useLocation()
   const [services, setServices] = useState([])
+  const [customProtocols, setCustomProtocols] = useState([])
+  const [decodedCustom, setDecodedCustom] = useState(null) // { protocol, direction, fields, trailing_hex } or null
+  const [decodedCustomError, setDecodedCustomError] = useState('')
+  const [customProtocolOverride, setCustomProtocolOverride] = useState('') // empty = use service-bound
   const [activeSessions, setActiveSessions] = useState([])
   const [selected, setSelected] = useState(null)
   const [flowMode, setFlowMode] = useState(null) // { packetId, packets, total }
@@ -649,6 +713,7 @@ export default function Traffic() {
 
   useEffect(() => {
     api.listServices().then((data) => setServices(data || []))
+    api.listProtocols().then((data) => setCustomProtocols(data || [])).catch(() => {})
     api.getConfig().then((cfg) => {
       if (cfg?.flag_regex) setFlagRegex(cfg.flag_regex)
       setFlagIDEnabled(!!cfg?.flagid_enabled)
@@ -1223,6 +1288,32 @@ export default function Traffic() {
       .catch((err) => { if (!cancelled) setDecodedNamedError(err.message || String(err)) })
     return () => { cancelled = true }
   }, [selected?.id, decodedProto])
+
+  // Reset the custom-protocol override whenever the user clicks a different
+  // packet — overrides are scoped to a single inspection, not sticky.
+  useEffect(() => { setCustomProtocolOverride('') }, [selected?.id])
+
+  // Service-bound protocol for the currently selected packet, if any.
+  const boundCustomProtocolID = useMemo(() => {
+    if (!selected?.service_id) return ''
+    const svc = services.find((s) => s.id === selected.service_id)
+    return svc?.protocol_id || ''
+  }, [selected?.service_id, services])
+
+  // Effective protocol to render: explicit override wins, then the
+  // service-bound one, otherwise we don't fetch anything.
+  const effectiveCustomProtocolID = customProtocolOverride || boundCustomProtocolID
+
+  useEffect(() => {
+    setDecodedCustom(null)
+    setDecodedCustomError('')
+    if (!selected?.id || !effectiveCustomProtocolID) return
+    let cancelled = false
+    api.decodePacketCustom(selected.id, effectiveCustomProtocolID)
+      .then((res) => { if (!cancelled) setDecodedCustom(res) })
+      .catch((err) => { if (!cancelled) setDecodedCustomError(err.message || String(err)) })
+    return () => { cancelled = true }
+  }, [selected?.id, effectiveCustomProtocolID])
 
   // Hex-view toggle — kept unobtrusive: hidden by default, click "Show hex"
   // when the user wants to drag-select bytes and turn them into a filter.
@@ -2021,6 +2112,56 @@ export default function Traffic() {
                           bytes={selectedBytes}
                           onSelectionAction={applyFilterPredicate}
                         />
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {(boundCustomProtocolID || customProtocols.length > 0) && (
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2 mb-1 flex-wrap">
+                      <span className="text-gray-500 text-xs">Decoded (custom protocol)</span>
+                      {decodedCustom && (
+                        <span className="text-[10px] text-cyan-300 bg-cyan-900/30 px-1 py-0.5 rounded">
+                          {decodedCustom.protocol}
+                        </span>
+                      )}
+                      <select
+                        value={customProtocolOverride}
+                        onChange={(e) => setCustomProtocolOverride(e.target.value)}
+                        className="text-[10px] bg-gray-800 border border-gray-700 rounded px-1.5 py-0.5 text-gray-300 focus:outline-none focus:border-cyan-500"
+                        title={boundCustomProtocolID ? 'Override the protocol bound to this service' : 'Decode this packet with a custom protocol'}
+                      >
+                        <option value="">{boundCustomProtocolID ? '— bound —' : '— pick a protocol —'}</option>
+                        {customProtocols.map((p) => (
+                          <option key={p.id} value={p.id}>Decode with: {p.name}</option>
+                        ))}
+                      </select>
+                      {decodedCustomError && (
+                        <span className="text-[10px] text-red-400" title={decodedCustomError}>
+                          decode error
+                        </span>
+                      )}
+                    </div>
+                    {decodedCustom && (
+                      <div className="bg-gray-800 rounded p-2 text-xs font-mono overflow-auto" style={{ maxHeight: '60vh' }}>
+                        {(decodedCustom.messages || []).map((msg, idx, arr) => (
+                          <div key={idx} className={idx > 0 ? 'mt-2 pt-2 border-t border-gray-700' : ''}>
+                            {arr.length > 1 && (
+                              <div className="text-gray-500 text-[10px] mb-1">message {idx + 1} of {arr.length}</div>
+                            )}
+                            <CustomDecodedFields fields={msg || []} />
+                          </div>
+                        ))}
+                        {decodedCustom.trailing_hex && (
+                          <div className="mt-2 pt-2 border-t border-gray-700">
+                            <span className="text-gray-500">trailing bytes: </span>
+                            <span className="text-gray-300 break-all">{decodedCustom.trailing_hex}</span>
+                          </div>
+                        )}
+                        {decodedCustom.error && (
+                          <div className="mt-2 text-red-400">{decodedCustom.error}</div>
+                        )}
                       </div>
                     )}
                   </div>

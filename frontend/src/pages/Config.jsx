@@ -40,9 +40,11 @@ export default function Config() {
   const navigate = useNavigate()
   const [importFile, setImportFile] = useState(null)
   const [importServiceID, setImportServiceID] = useState('')
+  const [importProtocolID, setImportProtocolID] = useState('')
   const [importStatus, setImportStatus] = useState(null) // {state, packets_imported, service_id, error}
   const [importError, setImportError] = useState('')
   const [services, setServices] = useState([])
+  const [protocols, setProtocols] = useState([])
   const importFileRef = useRef(null)
 
   useEffect(() => {
@@ -51,6 +53,7 @@ export default function Config() {
     loadFlagIDData()
     api.listPcapFiles().then(d => setPcapFiles(d?.files || [])).catch(() => {})
     api.listServices().then(d => setServices(d || [])).catch(() => {})
+    api.listProtocols().then(d => setProtocols(d || [])).catch(() => {})
   }, [])
 
   async function startPcapImport(e) {
@@ -61,7 +64,7 @@ export default function Config() {
       return
     }
     try {
-      const { import_id, service_id } = await api.pcapImport(importFile, importServiceID)
+      const { import_id, service_id } = await api.pcapImport(importFile, importServiceID, importProtocolID)
       setImportStatus({ state: 'running', packets_imported: 0, service_id })
       const poll = async () => {
         try {
@@ -765,6 +768,24 @@ export default function Config() {
               <option value="">(create new virtual service named pcap:&lt;filename&gt;)</option>
               {services.map(s => (
                 <option key={s.id} value={s.id}>{s.name}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">
+              Custom protocol (decoder)
+              <span className="text-gray-600 ml-2 text-xs">
+                bound to the (existing or virtual) service so packets are auto-decoded
+              </span>
+            </label>
+            <select
+              value={importProtocolID}
+              onChange={(e) => setImportProtocolID(e.target.value)}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
+            >
+              <option value="">— None —</option>
+              {protocols.map(p => (
+                <option key={p.id} value={p.id}>{p.name}</option>
               ))}
             </select>
           </div>

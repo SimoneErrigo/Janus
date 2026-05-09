@@ -11,6 +11,7 @@ import Config from './pages/Config'
 import System from './pages/System'
 import SavedFlows from './pages/SavedFlows'
 import Logs from './pages/Logs'
+import Protocols from './pages/Protocols'
 import FilterSandbox from './pages/FilterSandbox'
 
 function ProtectedRoute({ children }) {
@@ -27,6 +28,7 @@ export default function App() {
         <Route path="services" element={<Services />} />
         <Route path="traffic" element={<Traffic />} />
         <Route path="rules" element={<Rules />} />
+        <Route path="protocols" element={<Protocols />} />
         <Route path="alerts" element={<Alerts />} />
         <Route path="blocks" element={<Blocks />} />
         <Route path="saved-flows" element={<SavedFlows />} />

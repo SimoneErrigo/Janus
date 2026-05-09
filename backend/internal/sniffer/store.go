@@ -179,9 +179,19 @@ func migrate(db *sql.DB) error {
 		"ALTER TABLE packets ADD COLUMN matched_flagids TEXT NOT NULL DEFAULT '[]'",
 		"ALTER TABLE packets ADD COLUMN flagid_round INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE packets ADD COLUMN has_drop_match INTEGER NOT NULL DEFAULT 0",
+		// inserted_at tracks when the row was added to *this* DB, distinct
+		// from the wire timestamp. Cleanup-by-age uses it so imports of old
+		// PCAPs aren't immediately wiped just because their capture clock
+		// is in the past.
+		"ALTER TABLE packets ADD COLUMN inserted_at TEXT NOT NULL DEFAULT ''",
 	} {
 		db.Exec(col) // ignore "duplicate column" errors
 	}
+
+	// One-time backfill: rows present before the inserted_at column existed
+	// get inserted_at = timestamp so the cutoff comparison stays meaningful
+	// for them. New inserts populate the column directly.
+	db.Exec("UPDATE packets SET inserted_at = timestamp WHERE inserted_at = ''")
 
 	// Create indexes for columns added by migrations (must run after ALTER TABLE)
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_session_id ON packets(session_id)")
@@ -196,6 +206,9 @@ func migrate(db *sql.DB) error {
 
 	// Index for smart backfill: find packets scanned with older AC automaton
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_flagid_round ON packets(flagid_round, timestamp)")
+
+	// Cleanup-by-age and cleanup-by-size both order on inserted_at.
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_inserted_at ON packets(inserted_at)")
 
 	// Backfill existing rows once after migration.
 	// A row is considered dropped if any matched rule has action drop/both.
@@ -368,11 +381,13 @@ func (s *PacketStore) Insert(p *Packet) error {
 		matchedFlagIDsJSON = []byte("[]")
 	}
 
+	insertedAt := time.Now().UTC().Format(time.RFC3339Nano)
 	res, err := s.execInsertRetry(`
 		INSERT INTO packets (service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port,
 			protocol, direction, method, url, status, headers, body, body_string,
-			matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, has_drop_match)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, has_drop_match,
+			inserted_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ServiceID, p.SessionID,
 		p.Timestamp.UTC().Format(time.RFC3339Nano),
 		p.SrcIP, p.SrcPort,
@@ -383,6 +398,7 @@ func (s *PacketStore) Insert(p *Packet) error {
 		p.Body, p.BodyString,
 		string(matchedRulesJSON), flaggedInt, containsFlagIDInt,
 		string(matchedFlagIDsJSON), p.FlagIDRound, hasDropMatchInt,
+		insertedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("inserting packet: %w", err)
@@ -477,10 +493,11 @@ func (s *PacketStore) flushBatch(batch []batchItem) {
 	}
 
 	// --- Build packet INSERT ---
-	const packetCols = 21
-	rowPlaceholder := "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+	const packetCols = 22
+	rowPlaceholder := "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 	placeholders := make([]string, len(batch))
 	args := make([]interface{}, 0, len(batch)*packetCols)
+	insertedAt := time.Now().UTC().Format(time.RFC3339Nano)
 	for i, it := range batch {
 		placeholders[i] = rowPlaceholder
 		p := it.pkt
@@ -525,12 +542,14 @@ func (s *PacketStore) flushBatch(batch []batchItem) {
 			p.Body, p.BodyString,
 			string(matchedRulesJSON), flaggedInt, containsFlagIDInt,
 			string(matchedFlagIDsJSON), p.FlagIDRound, hasDropMatchInt,
+			insertedAt,
 		)
 	}
 
 	query := `INSERT INTO packets (service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port,
 		protocol, direction, method, url, status, headers, body, body_string,
-		matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, has_drop_match)
+		matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, has_drop_match,
+		inserted_at)
 		VALUES ` + strings.Join(placeholders, ",")
 
 	res, err := s.execInsertRetry(query, args...)
@@ -1254,19 +1273,21 @@ func (s *PacketStore) PurgeDroppedPackets() (int64, error) {
 	return n, nil
 }
 
-// DeleteOlderThan deletes packets and their alerts older than the given time.
-// Returns the number of rows deleted from each table.
+// DeleteOlderThan deletes packets (and their alerts) whose *insertion time*
+// is older than the given cutoff. Cleanup uses inserted_at — not the wire
+// timestamp — so importing an old PCAP doesn't immediately make every row
+// eligible for deletion just because the capture clock is in the past.
 func (s *PacketStore) DeleteOlderThan(before time.Time) (packetsDeleted, alertsDeleted int64, err error) {
 	ts := before.UTC().Format(time.RFC3339Nano)
 
 	// Delete alerts for packets that will be removed
-	res, err := s.db.Exec("DELETE FROM alerts WHERE packet_id IN (SELECT id FROM packets WHERE timestamp < ?)", ts)
+	res, err := s.db.Exec("DELETE FROM alerts WHERE packet_id IN (SELECT id FROM packets WHERE inserted_at < ?)", ts)
 	if err != nil {
 		return 0, 0, fmt.Errorf("deleting old alerts: %w", err)
 	}
 	alertsDeleted, _ = res.RowsAffected()
 
-	res, err = s.db.Exec("DELETE FROM packets WHERE timestamp < ?", ts)
+	res, err = s.db.Exec("DELETE FROM packets WHERE inserted_at < ?", ts)
 	if err != nil {
 		return 0, alertsDeleted, fmt.Errorf("deleting old packets: %w", err)
 	}
@@ -1287,11 +1308,13 @@ func (s *PacketStore) DeleteOldestUntilSize(maxSizeBytes int64) (packetsDeleted,
 			return packetsDeleted, alertsDeleted, nil
 		}
 
-		// Delete a batch of oldest packets
+		// Delete a batch of oldest packets — ordering by inserted_at so the
+		// "oldest" set is what was added to this DB first, not what was
+		// captured first on the wire.
 		const batchSize = 1000
 		res, execErr := s.db.Exec(`
 			DELETE FROM alerts WHERE packet_id IN (
-				SELECT id FROM packets ORDER BY timestamp ASC LIMIT ?
+				SELECT id FROM packets ORDER BY inserted_at ASC LIMIT ?
 			)`, batchSize)
 		if execErr != nil {
 			return packetsDeleted, alertsDeleted, fmt.Errorf("batch deleting alerts: %w", execErr)
@@ -1299,7 +1322,7 @@ func (s *PacketStore) DeleteOldestUntilSize(maxSizeBytes int64) (packetsDeleted,
 		ad, _ := res.RowsAffected()
 		alertsDeleted += ad
 
-		res, execErr = s.db.Exec("DELETE FROM packets WHERE id IN (SELECT id FROM packets ORDER BY timestamp ASC LIMIT ?)", batchSize)
+		res, execErr = s.db.Exec("DELETE FROM packets WHERE id IN (SELECT id FROM packets ORDER BY inserted_at ASC LIMIT ?)", batchSize)
 		if execErr != nil {
 			return packetsDeleted, alertsDeleted, fmt.Errorf("batch deleting packets: %w", execErr)
 		}

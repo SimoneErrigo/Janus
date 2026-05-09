@@ -103,11 +103,12 @@ export const api = {
     const token = localStorage.getItem('janus_token') || '';
     return `/api/packets/flow/pcap?packet_id=${packetId}&token=${encodeURIComponent(token)}`;
   },
-  pcapImport: async (file, serviceId) => {
+  pcapImport: async (file, serviceId, protocolId) => {
     const token = getToken();
     const fd = new FormData();
     fd.append('file', file);
     if (serviceId) fd.append('service_id', serviceId);
+    if (protocolId) fd.append('protocol_id', protocolId);
     const res = await fetch(BASE + '/pcap/import', {
       method: 'POST',
       headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -137,6 +138,18 @@ export const api = {
   // .proto files auto-discovered under PROTO_DIR
   listProtoFiles: () => request('/protos'),
   encodeProtoField: (data) => request('/protos/encode-field', { method: 'POST', body: data }),
+
+  // Custom decoder protocols (Step 14)
+  listProtocols: () => request('/protocols'),
+  getProtocol: (id) => request(`/protocols/${id}`),
+  createProtocol: (data) => request('/protocols', { method: 'POST', body: data }),
+  updateProtocol: (id, data) => request(`/protocols/${id}`, { method: 'PUT', body: data }),
+  deleteProtocol: (id) => request(`/protocols/${id}`, { method: 'DELETE' }),
+  decodePacketCustom: (packetId, protocolId) => {
+    const qs = new URLSearchParams({ packet_id: String(packetId) });
+    if (protocolId) qs.set('protocol_id', protocolId);
+    return request(`/packets/decoded-custom?${qs.toString()}`);
+  },
 
   // Packets
   getPackets: (params) => {
