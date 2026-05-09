@@ -111,7 +111,7 @@ RULES = [
     {
         "name": "CMDi: reverse shell shapes",
         "expression": r'body matches "(?i)(bash\\s+-i|nc\\s+-e|/dev/tcp/|mkfifo\\s+/tmp/|python\\s+-c.+socket)"',
-        "action": "drop",
+        "action": "alert",
         "service": "all",
     },
 
@@ -120,25 +120,25 @@ RULES = [
         "name": "Path traversal: ../ or encoded variants in URL",
         # `c:[/\\]windows` is encoded as `c:[/\\\\]windows` (DSL backslash escape).
         "expression": r'url matches "(?i)(\\.\\./|\\.\\.\\\\|%2e%2e/|%2e%2e%2f|\\.\\.%2f|%252e%252e)"',
-        "action": "drop",
+        "action": "alert",
         "service": "all",
     },
     {
         "name": "LFI: /etc/passwd, /proc/self, win.ini probes",
         "expression": r'url matches "(?i)(/etc/passwd|/proc/self|/var/log|c:[/\\\\]windows|win\\.ini|boot\\.ini)" OR body matches "(?i)(/etc/passwd|/proc/self/environ)"',
-        "action": "drop",
+        "action": "aler",
         "service": "all",
     },
     {
         "name": "Sensitive file probing (.env / .git / .aws / .ssh)",
         "expression": r'url matches "(?i)/(\\.env(\\.[a-z0-9_]+)?|\\.git/|\\.aws/|\\.ssh/|\\.htaccess|\\.htpasswd|\\.svn/)"',
-        "action": "drop",
+        "action": "alert",
         "service": "all",
     },
     {
         "name": "Common admin/scan paths",
         "expression": r'url matches "(?i)/(phpmyadmin|wp-login\\.php|wp-admin/|xmlrpc\\.php|administrator/|server-status|server-info|cgi-bin/|adminer\\.php|/manager/html)"',
-        "action": "drop",
+        "action": "alert",
         "service": "all",
     },
 
@@ -204,7 +204,7 @@ RULES = [
     {
         "name": "Scanner UA (sqlmap/nikto/nuclei/nmap/wpscan/acunetix/etc.)",
         "expression": r'header.User-Agent matches "(?i)(sqlmap|nikto|nuclei|nmap\\s|masscan|wpscan|acunetix|w3af|whatweb|dirbuster|gobuster|feroxbuster|ffuf)"',
-        "action": "drop",
+        "action": "alert",
         "service": "all",
     },
     {
