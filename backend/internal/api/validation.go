@@ -2,13 +2,25 @@ package api
 
 import (
 	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
 
+// serviceIDPattern restricts service IDs to characters that survive URL paths
+// and JSON round-trips without surprises. Whitespace, BOMs and zero-width
+// characters slip through json.Unmarshal silently and break later map lookups
+// (LIST returns the service but UPDATE/DELETE 404s on the URL-derived key).
+var serviceIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
 func validateService(svc *storage.Service) error {
+	svc.ID = strings.TrimSpace(svc.ID)
 	if svc.ID == "" {
 		return fmt.Errorf("id is required")
+	}
+	if !serviceIDPattern.MatchString(svc.ID) {
+		return fmt.Errorf("id must match %s", serviceIDPattern.String())
 	}
 	if svc.Name == "" {
 		return fmt.Errorf("name is required")
