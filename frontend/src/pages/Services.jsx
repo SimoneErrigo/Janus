@@ -87,7 +87,10 @@ export default function Services() {
             <div className="flex items-center gap-4">
               <div className={`w-2.5 h-2.5 rounded-full ${svc.enabled ? 'bg-green-500' : 'bg-gray-600'}`} />
               <div>
-                <div className="font-medium text-gray-100">{svc.name}</div>
+                <div className="font-medium text-gray-100">
+                  {svc.name}
+                  <span className="ml-2 text-xs text-gray-500 font-mono">({svc.id})</span>
+                </div>
                 <div className="text-xs text-gray-500 mt-0.5">
                   {svc.listen_addr}:{svc.listen_port} &rarr; {svc.target_addr}
                   <span className="ml-2 px-1.5 py-0.5 bg-gray-800 rounded text-gray-400">{svc.protocol}</span>

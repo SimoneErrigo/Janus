@@ -1096,13 +1096,20 @@ export default function Traffic() {
 
   // Select a packet — fetch full detail if it's a lite/summary packet or
   // came from SSE (no body_string). Lite packets carry a `lite: true` flag.
+  // The selectionTokenRef counter race-protects against a slow getPacket from
+  // an earlier click overwriting a newer selection (also: if the user clicks
+  // the SAME packet again, the older inflight fetch is invalidated so it
+  // can't land after the second fetch and clobber the newer body).
+  const selectionTokenRef = useRef(0)
   const selectPacket = useCallback(async (pkt) => {
     if (!pkt) return
+    const token = ++selectionTokenRef.current
     const needsRefetch = pkt.lite || pkt.body_string === undefined
     setSelected(pkt)
     if (!needsRefetch) return
     try {
       const full = await api.getPacket(pkt.id)
+      if (selectionTokenRef.current !== token) return
       setSelected(full)
     } catch {}
   }, [])
@@ -1277,6 +1284,12 @@ export default function Traffic() {
   // names via the gRPC method signature.
   const [decodedNamed, setDecodedNamed] = useState(null) // { method, message_type, frames: [{ json, error, bytes }] } or null
   const [decodedNamedError, setDecodedNamedError] = useState('')
+  // Depend on selected?.body (a stable base64 string) rather than the
+  // decodedProto memo: the memo is recomputed into a NEW object reference on
+  // each body change, but if any earlier render also produced a new ref this
+  // effect could miss the actual transition (undef → defined). Keying off the
+  // body directly guarantees a re-run as soon as getPacket fills it in. We
+  // still gate the fetch on decodedProto so non-protobuf bodies aren't sent.
   useEffect(() => {
     setDecodedNamed(null)
     setDecodedNamedError('')
@@ -1287,7 +1300,7 @@ export default function Traffic() {
       .then((res) => { if (!cancelled) setDecodedNamed(res) })
       .catch((err) => { if (!cancelled) setDecodedNamedError(err.message || String(err)) })
     return () => { cancelled = true }
-  }, [selected?.id, decodedProto])
+  }, [selected?.id, selected?.body])
 
   // Reset the custom-protocol override whenever the user clicks a different
   // packet — overrides are scoped to a single inspection, not sticky.
@@ -1308,12 +1321,13 @@ export default function Traffic() {
     setDecodedCustom(null)
     setDecodedCustomError('')
     if (!selected?.id || !effectiveCustomProtocolID) return
+    if (!selected?.body) return // wait until the body has been fetched
     let cancelled = false
     api.decodePacketCustom(selected.id, effectiveCustomProtocolID)
       .then((res) => { if (!cancelled) setDecodedCustom(res) })
       .catch((err) => { if (!cancelled) setDecodedCustomError(err.message || String(err)) })
     return () => { cancelled = true }
-  }, [selected?.id, effectiveCustomProtocolID])
+  }, [selected?.id, selected?.body, effectiveCustomProtocolID])
 
   // Hex-view toggle — kept unobtrusive: hidden by default, click "Show hex"
   // when the user wants to drag-select bytes and turn them into a filter.
@@ -1484,7 +1498,9 @@ export default function Traffic() {
       {pinDialog && (
         <div className="mb-2 bg-gray-900 border border-purple-700/50 rounded-lg px-4 py-3 flex flex-col gap-2">
           <div className="flex items-center gap-3">
-            <span className="text-sm text-purple-300 font-medium">Save flow</span>
+            <span className="text-sm text-purple-300 font-medium">
+              {pinDialog.packetIds ? `Save selection (${pinDialog.packetIds.length} packets)` : 'Save flow'}
+            </span>
             <input
               autoFocus
               value={pinDialog.name}
@@ -1503,14 +1519,21 @@ export default function Traffic() {
             <button
               disabled={pinDialog.saving}
               onClick={async () => {
-                if (!pinDialog.anchorId) return
+                const isSelection = !!pinDialog.packetIds
+                if (!isSelection && !pinDialog.anchorId) return
+                if (isSelection && pinDialog.packetIds.length === 0) return
                 setPinDialog((d) => ({ ...d, saving: true, error: '' }))
                 try {
-                  await api.createSavedFlow({
-                    anchor_packet_id: pinDialog.anchorId,
-                    name: pinDialog.name.trim() || `Flow #${pinDialog.anchorId}`,
+                  const fallbackName = isSelection
+                    ? `Selection (${pinDialog.packetIds.length} packets)`
+                    : `Flow #${pinDialog.anchorId}`
+                  const payload = {
+                    name: pinDialog.name.trim() || fallbackName,
                     notes: pinDialog.notes.trim(),
-                  })
+                  }
+                  if (isSelection) payload.packet_ids = pinDialog.packetIds
+                  else payload.anchor_packet_id = pinDialog.anchorId
+                  await api.createSavedFlow(payload)
                   setPinDialog(null)
                   setPinToast('Saved!')
                   setTimeout(() => setPinToast(null), 2000)
@@ -1806,6 +1829,36 @@ export default function Traffic() {
           {selectedPkts.size > 0 && (
             <div className="flex items-center gap-3 px-3 py-2 bg-blue-950/40 border-t border-blue-800/40 text-sm">
               <span className="text-blue-300 text-xs font-medium">{selectedPkts.size} packet{selectedPkts.size !== 1 ? 's' : ''} selected</span>
+              <button
+                onClick={() => setPinDialog({
+                  packetIds: Array.from(selectedPkts),
+                  name: '',
+                  notes: '',
+                  saving: false,
+                  error: '',
+                })}
+                title="Pin selected packets as a saved flow (works across different sessions/IPs)"
+                className="text-xs px-3 py-1 bg-purple-800/50 hover:bg-purple-700/60 text-purple-200 rounded cursor-pointer transition-colors"
+              >
+                Pin {selectedPkts.size}
+              </button>
+              <button
+                onClick={async () => {
+                  const ids = Array.from(selectedPkts)
+                  try {
+                    const res = await api.pcapExportSelection(ids)
+                    setPinToast(`PCAP saved: ${res.filename} (${res.packet_count} packets)`)
+                    setTimeout(() => setPinToast(null), 3500)
+                  } catch (err) {
+                    setPinToast(`PCAP save failed: ${err.message}`)
+                    setTimeout(() => setPinToast(null), 3500)
+                  }
+                }}
+                title="Save selected packets to a .pcap file (visible in Config → PCAP files)"
+                className="text-xs px-3 py-1 bg-cyan-800/50 hover:bg-cyan-700/60 text-cyan-200 rounded cursor-pointer transition-colors"
+              >
+                Save PCAP
+              </button>
               <button
                 onClick={bulkDelete}
                 title="Hide from your view (per-user; teammates unaffected)"

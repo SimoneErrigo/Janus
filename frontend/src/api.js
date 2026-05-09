@@ -93,6 +93,7 @@ export const api = {
 
   // PCAP export
   pcapExport: (params) => request('/pcap/export', { method: 'POST', body: params || {} }),
+  pcapExportSelection: (ids) => request('/pcap/export-selection', { method: 'POST', body: { ids } }),
   listPcapFiles: () => request('/pcap/files'),
   deletePcapFile: (name) => request(`/pcap/files/${encodeURIComponent(name)}`, { method: 'DELETE' }),
   pcapDownloadUrl: (name) => {

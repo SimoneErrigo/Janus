@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -219,6 +220,78 @@ func (s *Server) handlePcapExport(w http.ResponseWriter, r *http.Request) {
 		"filename":      filename,
 		"packet_count":  count,
 		"size_bytes":    size,
+	})
+}
+
+// POST /api/pcap/export-selection
+// Body: {"ids": [int64, ...]} — exports a .pcap file containing exactly the
+// listed packets (sorted by timestamp asc). The file is written to the pcap
+// dir like /api/pcap/export so it shows up in the files list.
+func (s *Server) handlePcapExportSelection(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body.IDs) == 0 {
+		http.Error(w, "ids is required", http.StatusBadRequest)
+		return
+	}
+
+	packets := make([]*sniffer.Packet, 0, len(body.IDs))
+	for _, id := range body.IDs {
+		pkt, err := s.packetStore.GetPacketByID(id)
+		if err != nil {
+			continue
+		}
+		packets = append(packets, pkt)
+	}
+	if len(packets) == 0 {
+		http.Error(w, "no packets found for the given ids", http.StatusNotFound)
+		return
+	}
+	sort.SliceStable(packets, func(i, j int) bool {
+		return packets[i].Timestamp.Before(packets[j].Timestamp)
+	})
+
+	dir, err := pcapDir()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	ts := time.Now().UTC().Format("20060102-150405")
+	filename := fmt.Sprintf("janus-selection-%s.pcap", ts)
+	fullPath := filepath.Join(dir, filename)
+
+	f, err := os.Create(fullPath)
+	if err != nil {
+		http.Error(w, "creating file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+	if err := januspcap.WritePcap(f, packets); err != nil {
+		os.Remove(fullPath)
+		http.Error(w, "writing pcap: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	info, _ := f.Stat()
+	size := int64(0)
+	if info != nil {
+		size = info.Size()
+	}
+	log.Printf("[user=%s] action=pcap-export-selection count=%d file=%s",
+		DisplayNameFromRequest(r), len(packets), filename)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"filename":     filename,
+		"packet_count": len(packets),
+		"size_bytes":   size,
 	})
 }
 

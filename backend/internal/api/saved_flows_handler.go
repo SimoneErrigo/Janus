@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -61,31 +62,64 @@ func (s *Server) listSavedFlows(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) createSavedFlow(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		AnchorPacketID int64  `json:"anchor_packet_id"`
-		Name           string `json:"name"`
-		Notes          string `json:"notes"`
+		AnchorPacketID int64   `json:"anchor_packet_id"`
+		PacketIDs      []int64 `json:"packet_ids"`
+		Name           string  `json:"name"`
+		Notes          string  `json:"notes"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if req.AnchorPacketID == 0 {
-		http.Error(w, "anchor_packet_id is required", http.StatusBadRequest)
+	if req.AnchorPacketID == 0 && len(req.PacketIDs) == 0 {
+		http.Error(w, "anchor_packet_id or packet_ids is required", http.StatusBadRequest)
 		return
-	}
-	if req.Name == "" {
-		req.Name = "Flow #" + strconv.FormatInt(req.AnchorPacketID, 10)
 	}
 
-	// Resolve the flow from the anchor packet and snapshot its full packets
-	packets, err := s.packetStore.QueryFlow(req.AnchorPacketID)
-	if err != nil {
-		http.Error(w, "flow query error: "+err.Error(), http.StatusInternalServerError)
-		return
+	var packets []*sniffer.Packet
+	var ids []int64
+
+	if len(req.PacketIDs) > 0 {
+		// Pin an arbitrary selection of packets — they don't need to belong to
+		// the same logical flow. Snapshot in chronological order.
+		packets = make([]*sniffer.Packet, 0, len(req.PacketIDs))
+		for _, pid := range req.PacketIDs {
+			pkt, err := s.packetStore.GetPacketByID(pid)
+			if err != nil {
+				continue
+			}
+			packets = append(packets, pkt)
+		}
+		if len(packets) == 0 {
+			http.Error(w, "no packets found for the given ids", http.StatusNotFound)
+			return
+		}
+		sort.SliceStable(packets, func(i, j int) bool {
+			return packets[i].Timestamp.Before(packets[j].Timestamp)
+		})
+		if req.AnchorPacketID == 0 {
+			req.AnchorPacketID = packets[0].ID
+		}
+		ids = make([]int64, len(packets))
+		for i, p := range packets {
+			ids[i] = p.ID
+		}
+	} else {
+		// Resolve the flow from the anchor packet and snapshot its full packets
+		var err error
+		packets, err = s.packetStore.QueryFlow(req.AnchorPacketID)
+		if err != nil {
+			http.Error(w, "flow query error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		ids = make([]int64, len(packets))
+		for i, p := range packets {
+			ids[i] = p.ID
+		}
 	}
-	ids := make([]int64, len(packets))
-	for i, p := range packets {
-		ids[i] = p.ID
+
+	if req.Name == "" {
+		req.Name = "Flow #" + strconv.FormatInt(req.AnchorPacketID, 10)
 	}
 
 	sf := &sniffer.SavedFlow{

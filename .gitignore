@@ -46,3 +46,6 @@ frontend/dist/
 # Editor/IDE
 # .idea/
 # .vscode/
+
+__pycache__/
+*.pyc

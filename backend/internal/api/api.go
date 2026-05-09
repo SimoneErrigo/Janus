@@ -109,6 +109,7 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/flows/saved/", s.handleSavedFlowByID)
 	protected.HandleFunc("/api/flows/saved", s.handleSavedFlows)
 	protected.HandleFunc("/api/pcap/export", s.handlePcapExport)
+	protected.HandleFunc("/api/pcap/export-selection", s.handlePcapExportSelection)
 	protected.HandleFunc("/api/pcap/files/", s.handlePcapFile)
 	protected.HandleFunc("/api/pcap/files", s.handlePcapListFiles)
 	protected.HandleFunc("/api/pcap/import", s.handlePcapImport)
