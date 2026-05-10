@@ -14,7 +14,7 @@ In a CTF A/D competition, each team runs vulnerable services on a VM. Opponents 
 2. Configure Janus to listen on the original ports
 3. Janus proxies traffic transparently, logs every packet, and can drop malicious requests
 
-**Supported protocols:** HTTP/1.1, HTTPS/TLS, HTTP/2, gRPC, raw TCP
+**Supported protocols:** HTTP/1.1, HTTPS/TLS, HTTP/2, gRPC, raw TCP (with optional custom binary decoders)
 
 ## Quick start
 
@@ -34,8 +34,8 @@ docker compose up -d
 
 - **Frontend dashboard:** `http://localhost:2999` (localhost-only)
 - **Backend API:** `http://localhost:8080` (localhost-only)
-- **Redis:** `127.0.0.1:6379` (internal only, not exposed to the competition network)
-- **Dozzle (container logs):** `http://<host>:14000` (bound to `0.0.0.0`, password-protected — port configurable via `DOZZLE_PORT` in `.env`)
+- **Redis:** `127.0.0.1:6379` (internal only)
+- **Dozzle (container logs):** `http://<host>:14000` (password-protected — port via `DOZZLE_PORT`)
 
 ### Competition VM (Linux)
 
@@ -45,13 +45,13 @@ On Linux competition VMs, Janus often needs to bind many “service ports” (or
 docker compose -f docker-compose.yml -f docker-compose-competition.yml up --build -d
 ```
 
-### macOS development note (why ports are published)
+### macOS development note
 
-On macOS, Docker runs inside a VM (no true `--network host`). If you want to test the reverse proxy from your host (or another machine) you must **publish the service ports you want Janus to listen on** via Docker port mappings. That’s why `docker-compose.yml` publishes a small port range for proxied services.
+On macOS, Docker runs inside a VM (no true `--network host`). To test the reverse proxy from your host you must **publish the service ports** via Docker port mappings — that's why `docker-compose.yml` publishes a small port range.
 
 ### 3. Login
 
-Open the dashboard and login with `TEAM_PASSWORD`.
+Open the dashboard and login with `TEAM_PASSWORD`. Each session picks a display name; the sidebar shows who else is currently online.
 
 ### 4. Add services
 
@@ -66,147 +66,123 @@ From the **Services** page, add each challenge service:
 | Target Address | `127.0.0.1:9080` |
 | Protocol       | `http`           |
 
-Enable the service and Janus will start proxying immediately.
+Optionally bind a **custom binary protocol** (defined in the Protocols page) or a `.proto` file (gRPC). Enable the service and Janus will start proxying immediately.
 
 ### 5. Monitor traffic
 
 The **Traffic** page shows all captured packets with real-time updates via SSE (Server-Sent Events):
 
-- **Live streaming** — new packets appear instantly without polling; a **Pause/Resume** button lets you freeze the view while inspecting traffic
-- Filter by service, source/destination IP, protocol
-- Text search (`contains`) or regex search
-- **Contains Flag** filter — shows packets matching the flag regex (yellow highlight)
-- **Contains my Flag IDs** filter — shows packets containing your team's current flag ID values (teal highlight)
-- Packets with both a flag and a flag ID display a combined yellow-to-teal gradient
-- Flag regex matches are always highlighted in yellow in the detail panel; flag ID values in teal
-- Click a packet to see full headers, body, and matched rules
+- **Live streaming** — new packets appear instantly; a **Pause/Resume** button freezes the view while you inspect
+- **Unified filter expression** — single language for `body`, `header.X`, `url`, `method`, `status`, `src/dst/peer` (CIDR), `flagged`, `contains_flagid`, `dropped`, with `AND` / `OR` / `NOT`. See [FILTERS.md](FILTERS.md)
+- **Contains Flag** filter highlights packets matching the flag regex (yellow)
+- **Contains my Flag IDs** filter highlights packets carrying your team's current flag IDs (teal)
+- Click a packet to see full headers, body, matched rules, and decoded payload (gRPC / custom protocol)
+- Bulk-select packets to delete or export them as a PCAP
 
 #### Live vs Static mode
 
-Janus supports two traffic modes (configurable from the **Config** page):
+Configurable from the **Config** page:
 
-- **Live** (default): continuous capture, SSE streaming enabled, periodic flagId fetch + automatic smart backfill, auto-cleanup policies enabled.
-- **Static**: manual capture start/stop (useful for offline analysis or when you want to “freeze” ingestion), periodic flagId fetch/backfill is disabled, and auto-cleanup policies are disabled to avoid deleting evidence while reviewing.
+- **Live** (default): continuous capture, SSE streaming, periodic flag ID fetch + automatic backfill, auto-cleanup enabled.
+- **Static**: manual capture **start/stop** (Traffic page button), manual "Apply Flag IDs" rescan, cleanup disabled — useful for offline analysis without losing evidence.
 
 ### 6. Copy Exploit
 
-When you spot an interesting attack in the Traffic page, you can turn it into a reusable exploit with one click:
+When you spot an interesting attack, turn it into a reusable exploit with one click:
 
 1. Select any packet from a captured attack
 2. Click **"Exploit"** in the detail panel (or **"Copy Exploit"** in the flow banner)
 3. A ready-to-use Python script is copied to your clipboard
 
-The generated exploit is compatible with [exploitfarm](https://github.com/pwnzer0tt1/exploitfarm) and includes:
+The generated exploit is compatible with [exploitfarm](https://github.com/pwnzer0tt1/exploitfarm) and includes `get_flagids(host)` and `exploit(host)` with the full reconstructed flow (`requests` for HTTP, `pwntools` for TCP).
 
-- `get_flagids(host)` to fetch flag IDs from the CyberChallenge scoreboard
-- `exploit(host)` with the full reconstructed attack flow
-- `requests` + `session()` for HTTP services, `pwntools` for TCP services
+**Flow reconstruction** correlates packets across multiple TCP connections via Bearer tokens, session cookies, or peer IP.
 
-**Flow reconstruction** automatically tries to correlate packets across multiple TCP connections using Bearer tokens, session cookies (`Cookie`/`Set-Cookie`), or peer IP when no session identifiers exist.
+### 7. Drop & alert rules
 
-### 7. Drop rules
+From the **Rules** page, write rules using the same filter expression as Traffic:
 
-From the **Rules** page, create rules to block malicious requests:
+```text
+method == "POST" AND url contains "/login" AND body matches "(?i)(union|--|or 1=1)"
+header.User-Agent matches "(?i)(sqlmap|nikto|nuclei)"
+```
 
-- **String match** — exact substring in header/body/url
-- **Regex match** — regex pattern
-- **Byte sequence** — hex-encoded bytes for raw TCP
-
-Each rule can have an action: **drop** (block), **alert** (log only), or **both**.
-
-Flag and flag ID detection is handled automatically at the packet level (via the flag scanner and Aho-Corasick matcher) — no per-service flag rules are needed.
+Each rule has an action: **drop** (block), **alert** (log only), or **both**. Flag and flag-ID detection is automatic — no per-service flag rules needed.
 
 #### Attack Presets
 
-Click **Presets** to open a library of ready-made rules for common CTF attack patterns. Select categories and individual rules, choose which services to apply them to, and create them in bulk. Available categories:
+**Presets** opens a library of ready-made rules for common CTF attack patterns. Pick categories and individual rules, choose target services, and create them in bulk. Categories: SQLi, XSS, Path Traversal, Command Injection, XXE, SSTI, PHP/Python/Node.js code exec, SSRF, Deserialization, Auth Bypass, NoSQLi, IDOR, Web Shells, File Upload, Flag Exfiltration.
 
-| Category              | Examples                                                              |
-| --------------------- | --------------------------------------------------------------------- |
-| SQL Injection         | UNION SELECT, blind SLEEP/BENCHMARK, stacked queries, SQLite-specific |
-| XSS                   | script tags, event handlers, javascript: URI                          |
-| Path Traversal        | dot-dot-slash, /etc/passwd, /proc/self, null byte                     |
-| Command Injection     | shell metacharacters, reverse shells, IFS bypass                      |
-| XXE                   | DOCTYPE, ENTITY, SYSTEM file/http                                     |
-| SSTI                  | Jinja2 `{{ }}` / `{% %}`, `${...}`, dunder chains                     |
-| PHP                   | code execution, eval/assert, wrappers, deserialization                |
-| Python                | os/subprocess, eval/exec, pickle, dunder chains                       |
-| Node.js               | child_process, eval/Function, prototype pollution                     |
-| Flag Exfiltration     | curl/wget outbound, nc/ncat, DNS exfil, base64 pipe                   |
-| SSRF                  | internal IPs, localhost, metadata endpoints, file/gopher/dict schemes |
-| Deserialization       | Java serialized objects, gadget chains, Python pickle, .NET           |
-| Auth Bypass           | JWT none/confusion, admin params, mass assignment                     |
-| NoSQL Injection       | $gt/$ne operators, $where JS, $or bypass                              |
-| IDOR / Access Control | sequential ID scan, admin paths, method override                      |
-| Web Shell / Backdoor  | known shells, cmd params, suspicious User-Agents                      |
-| File Upload           | PHP extensions, double extensions, null byte, SVG XSS                 |
+### 8. Custom protocols
 
-### 8. Alerts
+The **Protocols** page lets you define **custom binary protocols** (length-prefixed strings, fixed-width ints, enums with dispatched payloads, computed-length blobs, etc.). Bind a protocol to a TCP service and Janus auto-decodes every packet body into a structured tree, viewable in the Traffic detail panel. For gRPC services, drop `.proto` files into the mounted `protos/` folder (or set `proto_paths` on the service) and Janus does the same with protobuf.
 
-The **Alerts** page shows real-time alerts triggered by rules with `alert` or `both` action. Each alert shows the source IP, service, matched rule, and links to the full packet detail.
+### 9. Alerts & Blocks
 
-### 9. Configuration
+- **Alerts** — packets matched by rules with `alert` or `both` action. Filterable, sortable, links to the full packet.
+- **Blocks** — packets actually dropped (`drop` / `both`). Same filter language; useful for auditing what your rules are killing.
+
+### 10. Saved Flows
+
+From the Traffic detail panel you can **pin** a flow (or an arbitrary selection of packets) to the **Saved Flows** page. Pinned flows snapshot the packets so they survive cleanup and can be reviewed/exported later.
+
+### 11. PCAP import / export
+
+- **Export** the current Traffic filter, a selection, or a single flow as a `.pcap`
+- **Import** an existing `.pcap` and bind it to a (real or virtual) service to inspect it inside Janus
+- Auto-save can dump every static-mode capture window to disk
+- Files live under `PCAP_EXPORT_DIR` (default `data/pcap/`) and are listed/downloadable from the Traffic page
+
+### 12. Filter Sandbox
+
+The **Filter Sandbox** page lets you craft a filter expression against a sample packet and watch it evaluate live — handy for debugging complex rules before saving them.
+
+### 13. System
+
+The **System** page shows VM resource usage (CPU, RAM, disk, DB size, Redis). Auto-refreshed every few seconds.
+
+### 14. Configuration
 
 The **Config** page lets you update:
 
-- Team password, flag regex, traffic mode, flow correlation window
-- Auto-cleanup policies (max age, max DB size) — cleanup runs every 1 minute
-- Flag ID polling settings (format, API URL, team ID, poll interval, round duration, competition start, keep rounds) — with a manual "Refresh Now" button (backfill runs automatically after each fetch)
-- Competition timing: round duration, competition start time, number of rounds to keep
-- A "Run cleanup now" button, "Clear Packets" button (deletes all packets but keeps config), and current DB size display
+- Team password, flag regex, traffic mode (live/static), flow correlation window
+- Auto-cleanup policies (max age, max DB size) — runs every minute
+- Flag ID polling (format, API URL, team ID, poll interval, round duration, competition start, keep rounds) with a manual "Refresh Now" button
+- PCAP export directory and auto-save toggle
+- "Run cleanup now", "Clear Packets", "Purge Dropped" buttons and current DB size
 
-### 10. Container logs (Dozzle)
+### 15. Container logs (Dozzle)
 
-The sidebar has a **Logs** link that opens Dozzle in a new tab using the same hostname you reached the dashboard with (e.g. `http://<VM_IP>:14000`). Dozzle is a lightweight, read-only container log viewer that streams Docker container logs in real time. It shows all Janus containers (backend, frontend, redis, dozzle) and any other containers running on the host.
-
-- Bound to `0.0.0.0:${DOZZLE_PORT:-14000}` so the team can reach it from the competition network. **Set a strong password** (instructions below) — anyone on the network with the password sees every container's logs.
-- The port is set via `DOZZLE_PORT` in `.env` (default `14000`). The frontend reads it at runtime from `GET /api/config`, so changing the port only requires editing `.env` and restarting; no rebuild.
-- Auth is `DOZZLE_AUTH_PROVIDER=simple`, reading users from `data/dozzle/users.yml`.
+Sidebar **Logs** link opens Dozzle (lightweight read-only container log viewer) at `http://<VM_IP>:${DOZZLE_PORT}`. The frontend reads the port from `GET /api/config` at runtime, so changing `DOZZLE_PORT` in `.env` only requires a `docker compose up -d dozzle`.
 
 #### Change the Dozzle password
-
-The project ships with `scripts/dozzle-hash.sh` which reads `DOZZLE_PASSWORD` from `.env`, bcrypt-hashes it via the official Dozzle image (no host deps), and writes `data/dozzle/users.yml`:
 
 ```bash
 # 1. Edit .env — set a long random password (≥20 chars):
 #       DOZZLE_PASSWORD=<NEW_STRONG_PASSWORD>
-#
-# 2. Regenerate the hash file:
+# 2. Regenerate the bcrypt hash file:
 ./scripts/dozzle-hash.sh
-#
-# 3. Reload only Dozzle (no need to rebuild anything else):
+# 3. Reload only Dozzle:
 docker compose restart dozzle
 ```
 
-The login username is `admin`. The hash file is mounted read-only into the container; rotating later just means rerunning the three steps.
+Login username is `admin`. The hash file is mounted read-only.
 
-If you need to change only the port (credentials unchanged):
+### 16. Redis caching
 
-```bash
-echo "DOZZLE_PORT=18080" >> .env       # or edit the existing line
-docker compose up -d dozzle            # republishes on the new port
-```
-
-The frontend reads `dozzle_port` from `GET /api/config` at runtime, so the **Logs** sidebar link picks up the new port without a rebuild.
-
-### 11. Redis caching
-
-Redis is used as a performance cache for the rules evaluation hot path:
-
-- **Rules evaluation** — rules are cached per service; the cache is invalidated automatically whenever a rule is created, updated, or deleted
-
-Redis is never the source of truth. If Redis is unreachable, Janus falls back to the persistent store transparently with no loss of correctness.
+Redis is used as a performance cache for the rules-evaluation hot path (cache invalidated on every rule create/update/delete). Redis is never the source of truth: if it's unreachable, Janus falls back to the persistent store transparently with no loss of correctness.
 
 ## Performance
 
-Janus is designed to handle high-throughput CTF traffic (60+ teams, 8-hour matches). Key optimizations in this version:
+Janus is designed to handle high-throughput CTF traffic (60+ teams, 8-hour matches). Key optimizations:
 
-- **SQLite WAL mode** with separate read/write connection pools — readers never block writers, writers never block readers
-- **Aho-Corasick automaton** (via `petar-dambovaliev/aho-corasick`) for O(text_length) multi-pattern flag ID matching instead of per-value `strings.Contains` loops
-- **Optimized flag scanner** — parses known CTF flag regex patterns (e.g. `[A-Z0-9]{31}=`, `FLAG{.*}`) into byte-level scanners that avoid regexp overhead on the hot path
-- **Smart backfill** — after each flag ID refresh, only re-scans packets from the last 60 seconds (the "limbo" window between round start and fetch completion), not the entire DB
-- **Round-aware flag IDs** — keeps only the last N rounds of flag IDs in memory; old rounds are pruned automatically
-- **SSE streaming** — new packets are pushed to the frontend via Server-Sent Events with 100ms batching, eliminating the 1-second polling overhead
-- **SQLITE_BUSY retry** — INSERT operations retry with exponential backoff to handle contention between proxy traffic and backfill writes
+- **SQLite WAL mode** with separate read/write connection pools — readers never block writers
+- **Aho-Corasick automaton** for O(text_length) multi-pattern flag ID matching
+- **Optimized flag scanner** — known CTF flag patterns compiled into byte-level scanners that bypass `regexp` overhead
+- **Smart backfill** — after each flag ID refresh, only re-scans packets from the last 60 seconds
+- **Round-aware flag IDs** — keeps only the last N rounds in memory
+- **SSE streaming** — new packets pushed with 100 ms batching, no polling
+- **SQLITE_BUSY retry** — INSERTs retry with exponential backoff under contention
 
 ## Development (without Docker)
 
@@ -229,35 +205,117 @@ The Vite dev server proxies `/api` requests to `localhost:8080`.
 
 ## API
 
-All endpoints (except `/api/login`) require a `Bearer` token in the `Authorization` header or a `?token=` query parameter (for EventSource/SSE).
+All endpoints (except `/api/login`) require a `Bearer` token in the `Authorization` header or a `?token=` query parameter (for SSE / file downloads).
 
-| Method         | Endpoint                           | Description                                                                                                                                                                                 |
-| -------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| POST           | `/api/login`                       | Authenticate with team password                                                                                                                                                             |
-| GET            | `/api/services`                    | List services                                                                                                                                                                               |
-| POST           | `/api/services`                    | Create service                                                                                                                                                                              |
-| GET/PUT/DELETE | `/api/services/{id}`               | Get/update/delete service                                                                                                                                                                   |
-| GET            | `/api/packets?...`                 | Query packets (filters: `service_id`, `service_name`, `src_ip`, `dst_ip`, `protocol`, `time_from`, `time_to`, `contains`, `regex`, `flagged`, `contains_flagid`, `sort`, `limit`, `offset`) |
-| GET            | `/api/packets/stream`              | SSE stream of new packets and metadata-change notifications                                                                                                                                 |
-| GET            | `/api/packets/flow?packet_id=X`    | Reconstruct full attack flow from a packet                                                                                                                                                  |
-| GET            | `/api/packets/exploit?packet_id=X` | Generate Python exploit skeleton from flow                                                                                                                                                  |
-| GET            | `/api/rules?service_id=...`        | List drop/alert rules                                                                                                                                                                       |
-| POST           | `/api/rules`                       | Create rule                                                                                                                                                                                 |
-| GET/PUT/DELETE | `/api/rules/{id}`                  | Get/update/delete rule                                                                                                                                                                      |
-| GET            | `/api/rules/presets`               | List available attack preset categories                                                                                                                                                     |
-| POST           | `/api/rules/presets/apply`         | Apply selected presets to services (`{ service_ids, selected }`)                                                                                                                            |
-| GET            | `/api/alerts`                      | List alerts (filters: `service_id`, `rule_id`, `src_ip`, `time_from`, `time_to`)                                                                                                            |
-| GET            | `/api/alerts/{id}`                 | Get alert detail                                                                                                                                                                            |
-| DELETE         | `/api/alerts`                      | Clear all alerts                                                                                                                                                                            |
-| GET/PUT        | `/api/config`                      | Read/update configuration                                                                                                                                                                   |
-| GET/PUT        | `/api/config/cleanup`              | Read/update cleanup settings                                                                                                                                                                |
-| POST           | `/api/cleanup/run`                 | Trigger immediate cleanup                                                                                                                                                                   |
-| POST           | `/api/cleanup/purge`               | Delete all packets and alerts                                                                                                                                                               |
-| POST           | `/api/cleanup/purge-packets`       | Delete all packets (keeps config)                                                                                                                                                           |
-| GET            | `/api/flagids`                     | Current flag ID map                                                                                                                                                                         |
-| GET            | `/api/flagids/status`              | Flag ID poller status (includes current round, keep rounds)                                                                                                                                 |
-| POST           | `/api/flagids/refresh`             | Trigger immediate flag ID fetch (backfill runs automatically)                                                                                                                               |
-| GET            | `/api/system/stats`                | VM resource metrics (CPU, RAM, disk, DB size, Redis)                                                                                                                                        |
+The `q=` parameter on `/api/packets` and `/api/alerts` accepts the unified filter expression language documented in [FILTERS.md](FILTERS.md). Legacy per-field params (`contains`, `regex`, `src_ip`, …) are still supported.
+
+### Auth & sessions
+
+| Method | Endpoint              | Description                                           |
+| ------ | --------------------- | ----------------------------------------------------- |
+| POST   | `/api/login`          | Authenticate with team password, returns Bearer token |
+| GET    | `/api/session/active` | List currently online users (heartbeat-based)         |
+
+### Services
+
+| Method         | Endpoint             | Description                  |
+| -------------- | -------------------- | ---------------------------- |
+| GET / POST     | `/api/services`      | List / create a service      |
+| GET/PUT/DELETE | `/api/services/{id}` | Get / update / delete by ID  |
+
+### Packets & flows
+
+| Method     | Endpoint                           | Description                                                       |
+| ---------- | ---------------------------------- | ----------------------------------------------------------------- |
+| GET        | `/api/packets`                     | Query packets (`q=`, plus legacy filters, `sort`, `limit`, `offset`) |
+| GET/DELETE | `/api/packets/{id}`                | Get or delete a single packet                                     |
+| POST       | `/api/packets/bulk-delete`         | Delete a list of packet IDs                                       |
+| GET        | `/api/packets/stream`              | SSE stream of new packets and metadata changes                    |
+| GET        | `/api/packets/flow?packet_id=X`    | Reconstruct full attack flow from a packet                        |
+| GET        | `/api/packets/flow/pcap?packet_id=X` | Download the flow as a `.pcap` file                             |
+| GET        | `/api/packets/exploit?packet_id=X` | Generate Python exploit skeleton from the flow                    |
+| GET        | `/api/packets/decoded?packet_id=X` | Decode a gRPC/protobuf body using `.proto` files                  |
+| GET        | `/api/packets/decoded-custom?packet_id=X` | Decode a TCP body using the service's custom protocol      |
+
+### Rules & presets
+
+| Method         | Endpoint                   | Description                                  |
+| -------------- | -------------------------- | -------------------------------------------- |
+| GET / POST     | `/api/rules`               | List / create drop & alert rules             |
+| GET/PUT/DELETE | `/api/rules/{id}`          | Get / update / delete a rule                 |
+| POST           | `/api/rules/bulk-delete`   | Delete a list of rule IDs                    |
+| GET            | `/api/rules/presets`       | List attack preset categories                |
+| POST           | `/api/rules/presets/apply` | Apply selected presets to services           |
+
+### Custom protocols
+
+| Method         | Endpoint              | Description                                              |
+| -------------- | --------------------- | -------------------------------------------------------- |
+| GET / POST     | `/api/protocols`      | List / create a custom binary protocol definition        |
+| GET/PUT/DELETE | `/api/protocols/{id}` | Get / update / delete a protocol                         |
+| GET            | `/api/protos`         | List `.proto` files auto-discovered under `PROTO_DIR`    |
+| POST           | `/api/protos/encode-field` | Encode a JSON field value back to protobuf bytes    |
+
+### Alerts & blocks
+
+| Method | Endpoint           | Description                                  |
+| ------ | ------------------ | -------------------------------------------- |
+| GET    | `/api/alerts`      | List alerts (same filter language as packets) |
+| GET    | `/api/alerts/{id}` | Get alert detail                             |
+| DELETE | `/api/alerts`      | Clear all alerts                             |
+
+### Saved flows
+
+| Method     | Endpoint                | Description                                                |
+| ---------- | ----------------------- | ---------------------------------------------------------- |
+| GET / POST | `/api/flows/saved`      | List / pin a flow (anchor packet or arbitrary selection)   |
+| GET/DELETE | `/api/flows/saved/{id}` | Get full snapshot / delete a saved flow                    |
+
+### Traffic capture (static mode)
+
+| Method | Endpoint                           | Description                                            |
+| ------ | ---------------------------------- | ------------------------------------------------------ |
+| GET    | `/api/traffic/capture`             | Capture status (mode, capturing, current window)       |
+| POST   | `/api/traffic/capture/start`       | Start a capture window (static mode)                   |
+| POST   | `/api/traffic/capture/stop`        | Stop the current capture                               |
+| POST   | `/api/traffic/capture/apply-flagids` | Re-scan captured packets with current flag IDs       |
+
+### PCAP
+
+| Method     | Endpoint                    | Description                                                |
+| ---------- | --------------------------- | ---------------------------------------------------------- |
+| POST       | `/api/pcap/export`          | Export packets matching a filter to a `.pcap` file         |
+| POST       | `/api/pcap/export-selection`| Export an explicit list of packet IDs                      |
+| GET        | `/api/pcap/files`           | List saved PCAP files                                      |
+| GET/DELETE | `/api/pcap/files/{name}`    | Download / delete a PCAP file                              |
+| POST       | `/api/pcap/import`          | Multipart upload of a `.pcap` (binds to a service)         |
+| GET        | `/api/pcap/import/{id}`     | Progress of an ongoing import                              |
+
+### Config & cleanup
+
+| Method  | Endpoint                       | Description                                  |
+| ------- | ------------------------------ | -------------------------------------------- |
+| GET/PUT | `/api/config`                  | Read / update general configuration          |
+| GET/PUT | `/api/config/cleanup`          | Read / update cleanup policies               |
+| POST    | `/api/cleanup/run`             | Trigger immediate cleanup                    |
+| POST    | `/api/cleanup/purge`           | Delete **all** packets and alerts            |
+| POST    | `/api/cleanup/purge-packets`   | Delete all packets (keeps config)            |
+| POST    | `/api/cleanup/purge-dropped`   | Delete only dropped/blocked packets          |
+
+### Flag IDs
+
+| Method | Endpoint                | Description                                                          |
+| ------ | ----------------------- | -------------------------------------------------------------------- |
+| GET    | `/api/flagids`          | Current flag ID map                                                  |
+| GET    | `/api/flagids/status`   | Poller status (current round, keep rounds, last fetch)               |
+| POST   | `/api/flagids/refresh`  | Trigger immediate flag ID fetch (auto-backfill follows)              |
+
+### System & filter
+
+| Method | Endpoint                | Description                                              |
+| ------ | ----------------------- | -------------------------------------------------------- |
+| GET    | `/api/system/stats`     | VM resource metrics (CPU, RAM, disk, DB size, Redis)     |
+| POST   | `/api/filter/validate`  | Validate a filter expression — `{ ok, error?, position? }` |
 
 > **Note:** Backfill is fully automatic — after every flag ID fetch, Janus re-scans packets from the last 60 seconds using the Aho-Corasick automaton. No manual backfill endpoint is exposed.
 
