@@ -26,6 +26,7 @@ export const FIELD_GROUPS = [
       { name: 'url',       type: 'string', desc: 'Request URL/path' },
       { name: 'method',    type: 'string', desc: 'HTTP method' },
       { name: 'status',    type: 'int',    desc: 'HTTP status code' },
+      { name: 'round',     type: 'int',    desc: 'Scoreboard round' },
       { name: 'direction', type: 'string', desc: 'request | response' },
       { name: 'header',    type: 'header', desc: 'Header value (with optional sub-name)' },
     ],
@@ -581,6 +582,7 @@ function readField(pr, p) {
     case 'url':             return p.url ?? ''
     case 'method':          return p.method ?? ''
     case 'status':          return p.status ?? 0
+    case 'round':           return p.round ?? p.flagid_round ?? 0
     case 'proto':           return p.protocol ?? ''
     case 'service':         return p.service_id ?? ''
     case 'direction':       return p.direction ?? ''

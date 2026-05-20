@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+const (
+	roundFetchGrace      = time.Second
+	roundCatchupInterval = 2 * time.Second
+)
+
 // Poller periodically fetches flag IDs from the competition API.
 type Poller struct {
 	mu       sync.RWMutex
@@ -66,16 +71,20 @@ type PollerConfig struct {
 
 // Status holds the poller's current state.
 type Status struct {
-	Enabled      bool      `json:"enabled"`
-	APIURL       string    `json:"api_url"`
-	TeamID       string    `json:"team_id"`
-	Format       string    `json:"format"`
-	LastFetch    time.Time `json:"last_fetch"`
-	NextFetch    time.Time `json:"next_fetch"`
-	LastError    string    `json:"last_error,omitempty"`
-	PollInterval int       `json:"poll_interval_seconds"`
-	CurrentRound int       `json:"current_round"`
-	KeepRounds   int       `json:"keep_rounds"`
+	Enabled          bool      `json:"enabled"`
+	APIURL           string    `json:"api_url"`
+	TeamID           string    `json:"team_id"`
+	Format           string    `json:"format"`
+	LastFetch        time.Time `json:"last_fetch"`
+	NextFetch        time.Time `json:"next_fetch"`
+	LastError        string    `json:"last_error,omitempty"`
+	PollInterval     int       `json:"poll_interval_seconds"`
+	CurrentRound     int       `json:"current_round"`
+	ClockRound       int       `json:"clock_round"`
+	FlagIDRound      int       `json:"flagids_round"`
+	KeepRounds       int       `json:"keep_rounds"`
+	RoundDurationSec int       `json:"round_duration_seconds,omitempty"`
+	CompetitionStart string    `json:"competition_start,omitempty"` // RFC3339
 }
 
 // NewPoller creates a flag ID poller.
@@ -228,22 +237,34 @@ func (p *Poller) GetStatus() Status {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
+	now := time.Now()
 	var nextFetch time.Time
 	if !p.lastFetch.IsZero() {
-		nextFetch = p.lastFetch.Add(p.interval)
+		nextFetch = now.Add(p.nextFetchDelayLocked(now))
 	}
 
+	var startStr string
+	if !p.competitionStart.IsZero() {
+		startStr = p.competitionStart.Format(time.RFC3339)
+	}
+
+	clockRound := p.roundForTimeLocked(now)
+
 	return Status{
-		Enabled:      p.enabled,
-		APIURL:       p.apiURL,
-		TeamID:       p.teamID,
-		Format:       p.format,
-		LastFetch:    p.lastFetch,
-		NextFetch:    nextFetch,
-		LastError:    p.lastError,
-		PollInterval: int(p.interval.Seconds()),
-		CurrentRound: p.currentRound,
-		KeepRounds:   p.keepRounds,
+		Enabled:          p.enabled,
+		APIURL:           p.apiURL,
+		TeamID:           p.teamID,
+		Format:           p.format,
+		LastFetch:        p.lastFetch,
+		NextFetch:        nextFetch,
+		LastError:        p.lastError,
+		PollInterval:     int(p.interval.Seconds()),
+		CurrentRound:     p.currentRound,
+		ClockRound:       clockRound,
+		FlagIDRound:      p.currentRound,
+		KeepRounds:       p.keepRounds,
+		RoundDurationSec: int(p.roundDuration.Seconds()),
+		CompetitionStart: startStr,
 	}
 }
 
@@ -272,6 +293,72 @@ func (p *Poller) CurrentRound() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.currentRound
+}
+
+// RoundForTime computes the scoreboard round that a given timestamp falls
+// into, using competition_start + round_duration. Returns 0 when the poller
+// has not been configured with both fields, or when the timestamp predates
+// the competition start. This is used by the API layer to annotate packets
+// with their round at serve time so the frontend doesn't need to do its own
+// date math or poll for round transitions.
+func (p *Poller) RoundForTime(t time.Time) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.roundForTimeLocked(t)
+}
+
+func (p *Poller) roundForTimeLocked(t time.Time) int {
+	if p.competitionStart.IsZero() || p.roundDuration <= 0 {
+		return 0
+	}
+	if t.Before(p.competitionStart) {
+		return 0
+	}
+	return int(t.Sub(p.competitionStart)/p.roundDuration) + 1
+}
+
+// RoundBounds returns the [start, end) time interval of the given scoreboard
+// round, computed from competitionStart + roundDuration. The third return
+// value is false when the poller has not been configured with both fields or
+// when round is non-positive.
+func (p *Poller) RoundBounds(round int) (time.Time, time.Time, bool) {
+	if round <= 0 {
+		return time.Time{}, time.Time{}, false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.competitionStart.IsZero() || p.roundDuration <= 0 {
+		return time.Time{}, time.Time{}, false
+	}
+	start := p.competitionStart.Add(time.Duration(round-1) * p.roundDuration)
+	end := start.Add(p.roundDuration)
+	return start, end, true
+}
+
+func (p *Poller) nextFetchDelayLocked(now time.Time) time.Duration {
+	delay := p.interval
+	clockRound := p.roundForTimeLocked(now)
+	if clockRound > p.currentRound {
+		delay = minDuration(delay, roundCatchupInterval)
+	}
+	if !p.competitionStart.IsZero() && p.roundDuration > 0 && !now.Before(p.competitionStart) {
+		elapsed := now.Sub(p.competitionStart)
+		nextBoundary := p.competitionStart.Add((elapsed/p.roundDuration + 1) * p.roundDuration).Add(roundFetchGrace)
+		if untilBoundary := nextBoundary.Sub(now); untilBoundary > 0 {
+			delay = minDuration(delay, untilBoundary)
+		}
+	}
+	if delay <= 0 {
+		return roundCatchupInterval
+	}
+	return delay
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // ContainsFlagID checks if the given text contains any current flag ID value.
@@ -307,18 +394,16 @@ func (p *Poller) loop() {
 
 	p.fetch()
 
-	p.mu.RLock()
-	interval := p.interval
-	p.mu.RUnlock()
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
 	for {
+		p.mu.RLock()
+		delay := p.nextFetchDelayLocked(time.Now())
+		p.mu.RUnlock()
+		timer := time.NewTimer(delay)
 		select {
 		case <-stopCh:
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			p.fetch()
 		}
 	}

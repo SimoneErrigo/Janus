@@ -116,6 +116,8 @@ function tryDecodeMessage(buf) {
 
 // Detect gRPC framing and peel it. Returns an array of frames (each a
 // Uint8Array of the inner protobuf bytes) or null if no framing detected.
+// Compressed frames are returned as null entries so the caller can still
+// signal "framing was present" without losing the frame count.
 function peelGRPCFrames(bytes) {
   const frames = []
   let pos = 0
@@ -125,9 +127,13 @@ function peelGRPCFrames(bytes) {
     if (compressed !== 0 && compressed !== 1) return null
     const view = new DataView(bytes.buffer, bytes.byteOffset + pos + 1, 4)
     const len = view.getUint32(0, false)
-    if (compressed === 1) return null // can't decode compressed without knowing the algo
     if (pos + 5 + len > bytes.length) return null
-    frames.push(bytes.subarray(pos + 5, pos + 5 + len))
+    if (compressed === 1) {
+      // can't decode compressed without knowing the algo, but framing is valid
+      frames.push(null)
+    } else {
+      frames.push(bytes.subarray(pos + 5, pos + 5 + len))
+    }
     pos += 5 + len
   }
   if (frames.length === 0) return null
@@ -135,7 +141,12 @@ function peelGRPCFrames(bytes) {
 }
 
 // Public entry point: takes raw bytes (Uint8Array), returns
-// { ok, frames: [{ fields, length }], raw } or { ok: false, reason }.
+// { ok, frames: [{ fields, length, error? }], raw } or { ok: false, reason }.
+//
+// When gRPC framing is detected but the inner protobuf can't be parsed (e.g.
+// when descriptors are needed), we still return ok:true with placeholder
+// frames so the UI surfaces the "Decoded" section and the server-side decode
+// (which has the .proto descriptors) gets a chance to fill it in.
 export function decodeProtobuf(bytes) {
   if (!bytes || bytes.length === 0) {
     return { ok: false, reason: 'empty' }
@@ -146,8 +157,19 @@ export function decodeProtobuf(bytes) {
   if (grpcFrames) {
     const frames = []
     for (const f of grpcFrames) {
+      if (f === null) {
+        // compressed frame — leave empty so the panel still shows
+        frames.push({ fields: [], length: 0, error: 'compressed frame — server decode required' })
+        continue
+      }
       const fields = f.length > 0 ? tryDecodeMessage(f) : []
-      if (!fields) return { ok: false, reason: 'gRPC framing detected but inner protobuf failed to parse' }
+      if (!fields) {
+        // Inner parse failed: keep the frame but mark the error so the
+        // server-side decode (with .proto descriptors) can still render
+        // here and the user isn't left staring at a blank panel.
+        frames.push({ fields: [], length: f.length, error: 'inner protobuf needs .proto descriptors to decode' })
+        continue
+      }
       frames.push({ fields, length: f.length })
     }
     return { ok: true, framing: 'grpc', frames }
@@ -163,6 +185,13 @@ export function decodeProtobuf(bytes) {
 
 // Quick sniff: does this look like protobuf/gRPC at all? Used to decide
 // whether to surface the "Decoded" view.
+//
+// The non-grpc fallback path runs a full wire-format walk, which is O(N) but
+// recurses into every LEN field. We cap the size we try synchronously so
+// huge non-protobuf blobs (e.g. multi-MB images that happen to start with a
+// printable byte) can't freeze the main thread.
+const SYNC_DECODE_CAP_BYTES = 256 * 1024 // 256 KiB
+
 export function looksLikeProtobuf(bytes) {
   if (!bytes || bytes.length < 2) return false
   // gRPC framing fingerprint: byte 0 is 0 or 1, length matches
@@ -174,7 +203,31 @@ export function looksLikeProtobuf(bytes) {
       if (5 + len === bytes.length || 5 + len <= bytes.length) return true
     }
   }
+  // Above the synchronous-decode cap we don't try the heuristic walk: if
+  // it's really protobuf, the server-side decode will still kick in via
+  // hasGRPCFraming/URL heuristics in the caller. Better to skip than to
+  // freeze the UI on a huge non-protobuf blob.
+  if (bytes.length > SYNC_DECODE_CAP_BYTES) return false
   // Otherwise: try a tentative decode
   const r = tryDecodeMessage(bytes)
   return r !== null
+}
+
+// Returns true iff bytes is a well-formed sequence of gRPC frames (each
+// [1B flag][4B BE length][length bytes]). This is a lighter, allocation-
+// free check used to decide whether to attempt a server-side decode even
+// when the local (descriptor-less) decode produced nothing.
+export function hasGRPCFraming(bytes) {
+  if (!bytes || bytes.length < 5) return false
+  let pos = 0
+  while (pos < bytes.length) {
+    if (pos + 5 > bytes.length) return false
+    const c = bytes[pos]
+    if (c !== 0 && c !== 1) return false
+    const view = new DataView(bytes.buffer, bytes.byteOffset + pos + 1, 4)
+    const len = view.getUint32(0, false)
+    if (pos + 5 + len > bytes.length) return false
+    pos += 5 + len
+  }
+  return pos === bytes.length
 }

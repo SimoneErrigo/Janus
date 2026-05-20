@@ -84,15 +84,6 @@ func main() {
 	// Populate Redis rules cache on startup
 	redisCache.PopulateRules(ruleStore)
 
-	packetHub := api.NewPacketStreamHub()
-	packetStore.SetPacketChangeListener(func(kind sniffer.PacketChangeKind, pkt *sniffer.Packet) {
-		if kind == sniffer.PacketChangeInsert && pkt != nil {
-			packetHub.PushPacket(pkt)
-		} else {
-			packetHub.Notify()
-		}
-	})
-
 	// Parse competition start time if configured
 	var competitionStart time.Time
 	if cfg.CompetitionStart != "" {
@@ -108,6 +99,20 @@ func main() {
 		cfg.FlagIDAPIURL, cfg.OurTeamID, cfg.FlagIDPollInterval, cfg.FlagIDEnabled, cfg.FlagIDFormat,
 		cfg.RoundDurationSec, competitionStart, cfg.KeepRounds,
 	)
+	packetStore.SetRoundResolver(flagIDPoller.RoundForTime)
+
+	// Hub created after the poller so streamed packets carry their round
+	// (computed from competition_start + round_duration). Pushed packets
+	// happen via the listener below — but no packets flow yet because the
+	// proxy services aren't started until further down.
+	packetHub := api.NewPacketStreamHub(flagIDPoller)
+	packetStore.SetPacketChangeListener(func(kind sniffer.PacketChangeKind, pkt *sniffer.Packet) {
+		if kind == sniffer.PacketChangeInsert && pkt != nil {
+			packetHub.PushPacket(pkt)
+		} else {
+			packetHub.Notify()
+		}
+	})
 	flagIDPoller.SetOnFetch(func(currentRound int) {
 		if captureCtrl.Mode() != sniffer.TrafficModeLive {
 			return

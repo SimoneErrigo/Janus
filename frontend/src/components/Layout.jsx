@@ -10,6 +10,7 @@ const navItems = [
   { to: '/alerts', label: 'Alerts', icon: AlertIcon },
   { to: '/blocks', label: 'Blocks', icon: BlockIcon },
   { to: '/saved-flows', label: 'Saved Flows', icon: BookmarkIcon },
+  { to: '/round-diff', label: 'Round Diff', icon: DiffIcon },
   { to: '/system', label: 'System', icon: SystemIcon },
   { to: '/logs', label: 'Logs', icon: LogsIcon },
   { to: '/config', label: 'Config', icon: GearIcon },
@@ -225,6 +226,14 @@ function BookmarkIcon(props) {
   return (
     <svg {...props} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+    </svg>
+  )
+}
+
+function DiffIcon(props) {
+  return (
+    <svg {...props} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 7h10" /><path d="M4 17h10" /><path d="M17 4l3 3-3 3" /><path d="M17 14l3 3-3 3" />
     </svg>
   )
 }

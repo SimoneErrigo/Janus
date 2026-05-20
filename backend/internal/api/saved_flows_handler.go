@@ -163,6 +163,7 @@ func (s *Server) getSavedFlow(w http.ResponseWriter, r *http.Request, id int64) 
 			packets = append(packets, pkt)
 		}
 	}
+	s.annotateRounds(packets)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"flow":          sf,

@@ -209,6 +209,7 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 	if packets == nil {
 		packets = []*sniffer.Packet{}
 	}
+	s.annotateRounds(packets)
 
 	limit := q.Limit
 	if limit <= 0 {
@@ -245,6 +246,7 @@ func (s *Server) handlePacketByID(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "packet not found", http.StatusNotFound)
 			return
 		}
+		s.annotateRound(pkt)
 		writeJSON(w, http.StatusOK, pkt)
 
 	case http.MethodDelete:
@@ -318,6 +320,7 @@ func (s *Server) handlePacketFlow(w http.ResponseWriter, r *http.Request) {
 	if packets == nil {
 		packets = []*sniffer.Packet{}
 	}
+	s.annotateRounds(packets)
 
 	writeJSON(w, http.StatusOK, paginatedPackets{
 		Packets: packets,

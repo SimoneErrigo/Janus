@@ -221,8 +221,13 @@ func (s *Server) handlePacketDecodedCustom(w http.ResponseWriter, r *http.Reques
 	}
 	pkt, err := s.packetStore.GetPacketByID(pid)
 	if err != nil {
-		http.Error(w, "packet not found", http.StatusNotFound)
-		return
+		// Saved-flow snapshot fallback (see proto_decode_handler.go).
+		if snap, snapErr := s.packetStore.GetPacketByIDFromSnapshots(pid); snapErr == nil {
+			pkt = snap
+		} else {
+			http.Error(w, "packet not found", http.StatusNotFound)
+			return
+		}
 	}
 
 	protoID := r.URL.Query().Get("protocol_id")

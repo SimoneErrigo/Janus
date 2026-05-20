@@ -38,13 +38,15 @@ type PacketStore struct {
 	muChange sync.RWMutex
 	onChange func(PacketChangeKind, *Packet)
 
+	roundResolver func(time.Time) int
+
 	flowCorrelationWindowSec atomic.Int64
 
 	// Async batched writer for the proxy hot path. Enqueue() pushes here;
 	// a single goroutine drains and writes batches via multi-row INSERT.
-	queue   chan batchItem
-	stopCh  chan struct{}
-	doneCh  chan struct{}
+	queue  chan batchItem
+	stopCh chan struct{}
+	doneCh chan struct{}
 }
 
 // batchItem carries a packet and any alerts that must be linked to it.
@@ -115,6 +117,23 @@ func (s *PacketStore) flowCorrelationWindow() time.Duration {
 		sec = 120
 	}
 	return time.Duration(sec) * time.Second
+}
+
+// SetRoundResolver annotates packets read from storage with the scoreboard
+// round derived from their timestamp. When unset, views fall back to
+// flagid_round for backward compatibility.
+func (s *PacketStore) SetRoundResolver(fn func(time.Time) int) {
+	s.roundResolver = fn
+}
+
+func (s *PacketStore) annotateRound(p *Packet) {
+	if p == nil || s.roundResolver == nil {
+		return
+	}
+	p.Round = s.roundResolver(p.Timestamp)
+	if p.Round == 0 && p.FlagIDRound > 0 {
+		p.Round = p.FlagIDRound
+	}
 }
 
 // SetPacketChangeListener is called when new packets are inserted or metadata is bulk-updated
@@ -200,6 +219,11 @@ func migrate(db *sql.DB) error {
 
 	// Composite index for the most common query: filter by service + sort by time
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_service_ts ON packets(service_id, timestamp DESC)")
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_flagged_ts ON packets(flagged, timestamp DESC)")
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_contains_flagid_ts ON packets(contains_flagid, timestamp DESC)")
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_drop_ts ON packets(has_drop_match, timestamp DESC)")
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_direction_ts ON packets(direction, timestamp DESC)")
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_src_ts ON packets(src_ip, timestamp DESC)")
 
 	// Composite index for backfill: find recent unmarked packets quickly
 	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_backfill ON packets(contains_flagid, timestamp)")
@@ -251,7 +275,10 @@ func migrate(db *sql.DB) error {
 	}
 
 	// Snapshot of full packet data per saved flow — survives packet purges so
-	// pinned flows remain inspectable after the packets table is wiped.
+	// pinned flows remain inspectable after the packets table is wiped. The
+	// secondary index on packet_id supports GetPacketByIDFromSnapshots so the
+	// gRPC/custom-protocol decode endpoints can resolve a snapshotted packet
+	// without scanning the whole table.
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS saved_flow_packets (
 			saved_flow_id INTEGER NOT NULL,
@@ -261,6 +288,7 @@ func migrate(db *sql.DB) error {
 			PRIMARY KEY (saved_flow_id, ordinal)
 		);
 		CREATE INDEX IF NOT EXISTS idx_sfp_flow ON saved_flow_packets(saved_flow_id);
+		CREATE INDEX IF NOT EXISTS idx_sfp_packet ON saved_flow_packets(packet_id);
 	`)
 	if err != nil {
 		return err
@@ -823,6 +851,7 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 			p.MatchedFlagIDs = []string{}
 		}
 
+		s.annotateRound(p)
 		packets = append(packets, p)
 	}
 
@@ -873,6 +902,7 @@ func (s *PacketStore) scanPacketsSummary(querySQL string, args []interface{}) ([
 		}
 		p.MatchedFlagIDs = []string{}
 
+		s.annotateRound(p)
 		packets = append(packets, p)
 	}
 	if err := rows.Err(); err != nil {
@@ -923,6 +953,7 @@ func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
 	if p.MatchedFlagIDs == nil {
 		p.MatchedFlagIDs = []string{}
 	}
+	s.annotateRound(p)
 
 	return p, nil
 }
@@ -1105,6 +1136,27 @@ func (s *PacketStore) InsertSavedFlow(sf *SavedFlow, packets []*Packet) error {
 		return fmt.Errorf("committing saved flow: %w", err)
 	}
 	return nil
+}
+
+// GetPacketByIDFromSnapshots returns a single packet by ID by searching the
+// saved-flow snapshot table. Used as a fallback when the live `packets` row
+// has been purged but the packet is still available through a saved flow —
+// without this the decode endpoints (gRPC / custom protocol) couldn't render
+// inside the Saved Flows page once live packets get cleaned up.
+func (s *PacketStore) GetPacketByIDFromSnapshots(id int64) (*Packet, error) {
+	row := s.rdb.QueryRow(
+		`SELECT data FROM saved_flow_packets WHERE packet_id = ? LIMIT 1`,
+		id,
+	)
+	var blob []byte
+	if err := row.Scan(&blob); err != nil {
+		return nil, err
+	}
+	p := &Packet{}
+	if err := json.Unmarshal(blob, p); err != nil {
+		return nil, fmt.Errorf("decoding saved flow snapshot: %w", err)
+	}
+	return p, nil
 }
 
 // GetSavedFlowSnapshot returns the snapshotted packets for a saved flow,
@@ -1365,6 +1417,7 @@ func (s *PacketStore) SmartBackfillFlagIDs(checker FlagIDChecker, currentRound i
 		type pktUpdate struct {
 			id      int64
 			matched []string
+			round   int
 		}
 		var updates []pktUpdate
 		var markProcessed []int64 // packets with no match, just update flagid_round
@@ -1383,7 +1436,7 @@ func (s *PacketStore) SmartBackfillFlagIDs(checker FlagIDChecker, currentRound i
 				for i, m := range matches {
 					vals[i] = m.FlagID
 				}
-				updates = append(updates, pktUpdate{id: id, matched: vals})
+				updates = append(updates, pktUpdate{id: id, matched: vals, round: roundFromFlagIDMatches(matches, currentRound)})
 			} else {
 				markProcessed = append(markProcessed, id)
 			}
@@ -1401,7 +1454,7 @@ func (s *PacketStore) SmartBackfillFlagIDs(checker FlagIDChecker, currentRound i
 			allOps = append(allOps, u)
 		}
 		for _, id := range markProcessed {
-			allOps = append(allOps, pktUpdate{id: id, matched: nil})
+			allOps = append(allOps, pktUpdate{id: id, matched: nil, round: currentRound})
 		}
 
 		for chunkStart := 0; chunkStart < len(allOps); chunkStart += updateChunk {
@@ -1418,13 +1471,13 @@ func (s *PacketStore) SmartBackfillFlagIDs(checker FlagIDChecker, currentRound i
 					mjson, _ := json.Marshal(op.matched)
 					_, err = tx.Exec(
 						"UPDATE packets SET contains_flagid = 1, matched_flagids = ?, flagid_round = ? WHERE id = ?",
-						string(mjson), currentRound, op.id,
+						string(mjson), op.round, op.id,
 					)
 					total++
 				} else {
 					_, err = tx.Exec(
 						"UPDATE packets SET flagid_round = ? WHERE id = ?",
-						currentRound, op.id,
+						op.round, op.id,
 					)
 				}
 				if err != nil {
@@ -1477,6 +1530,7 @@ func (s *PacketStore) BackfillFlagIDsWindow(checker FlagIDChecker, currentRound 
 		type pktUpdate struct {
 			id      int64
 			matched []string
+			round   int
 		}
 		var updates []pktUpdate
 		var markProcessed []int64
@@ -1500,7 +1554,7 @@ func (s *PacketStore) BackfillFlagIDsWindow(checker FlagIDChecker, currentRound 
 				for i, m := range matches {
 					vals[i] = m.FlagID
 				}
-				updates = append(updates, pktUpdate{id: id, matched: vals})
+				updates = append(updates, pktUpdate{id: id, matched: vals, round: roundFromFlagIDMatches(matches, currentRound)})
 			} else {
 				markProcessed = append(markProcessed, id)
 			}
@@ -1515,7 +1569,7 @@ func (s *PacketStore) BackfillFlagIDsWindow(checker FlagIDChecker, currentRound 
 		allOps := make([]pktUpdate, 0, batchCount)
 		allOps = append(allOps, updates...)
 		for _, id := range markProcessed {
-			allOps = append(allOps, pktUpdate{id: id})
+			allOps = append(allOps, pktUpdate{id: id, round: currentRound})
 		}
 
 		for chunkStart := 0; chunkStart < len(allOps); chunkStart += updateChunk {
@@ -1532,13 +1586,13 @@ func (s *PacketStore) BackfillFlagIDsWindow(checker FlagIDChecker, currentRound 
 					mjson, _ := json.Marshal(op.matched)
 					_, err = tx.Exec(
 						"UPDATE packets SET contains_flagid = 1, matched_flagids = ?, flagid_round = ? WHERE id = ?",
-						string(mjson), currentRound, op.id,
+						string(mjson), op.round, op.id,
 					)
 					total++
 				} else {
 					_, err = tx.Exec(
 						"UPDATE packets SET flagid_round = ? WHERE id = ?",
-						currentRound, op.id,
+						op.round, op.id,
 					)
 				}
 				if err != nil {

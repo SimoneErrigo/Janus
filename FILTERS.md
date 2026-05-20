@@ -75,6 +75,8 @@ body matches ".{4000,}"                  # unusually large body
 raw contains "\xDE\xAD\xBE\xEF"          # hex bytes
 raw contains "\x00\x00\x00\x01ATTACK"
 raw startswith "\x16\x03"                # TLS handshake
+round == 12                              # packets from scoreboard round 12
+round in (10, 11, 12)
 ```
 
 ---
@@ -189,7 +191,7 @@ true      false                                  # booleans
 | Group | Fields |
 |-------|--------|
 | Content | `body`, `raw` |
-| HTTP | `url`, `method`, `status`, `direction`, `header`, `header.<name>` |
+| HTTP | `url`, `method`, `status`, `round`, `direction`, `header`, `header.<name>` |
 | Network | `service`, `proto`, `src`, `dst`, `peer`, `sport`, `dport` |
 | Flags | `flagged`, `contains_flagid`, `dropped` |
 

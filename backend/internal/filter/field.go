@@ -4,6 +4,7 @@ package filter
 // Implementations:
 //   - sniffer.Packet (residual eval after a SQL fetch)
 //   - dropper.HTTPRequest (hot-path rule eval)
+//
 // Adapters live in the calling packages so internal/filter has no Janus-specific deps.
 type PacketView interface {
 	BodyString() string
@@ -11,6 +12,7 @@ type PacketView interface {
 	URL() string
 	Method() string
 	Status() int
+	Round() int
 	Protocol() string
 	ServiceID() string
 	Direction() string
@@ -82,6 +84,7 @@ var fields = map[string]Field{
 	"url":             {Name: "url", Type: TypeString, SQLColumn: "url"},
 	"method":          {Name: "method", Type: TypeString, SQLColumn: "method"},
 	"status":          {Name: "status", Type: TypeInt, SQLColumn: "status"},
+	"round":           {Name: "round", Type: TypeInt, SQLColumn: ""},
 	"proto":           {Name: "proto", Type: TypeString, SQLColumn: "protocol"},
 	"service":         {Name: "service", Type: TypeString, SQLColumn: "service_id"},
 	"direction":       {Name: "direction", Type: TypeString, SQLColumn: "direction"},
@@ -162,6 +165,8 @@ func readInt(p PacketView, field string) int64 {
 	switch field {
 	case "status":
 		return int64(p.Status())
+	case "round":
+		return int64(p.Round())
 	case "sport":
 		return int64(p.SrcPort())
 	case "dport":

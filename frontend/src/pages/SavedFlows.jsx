@@ -5,6 +5,16 @@ import { getTrafficNavKeys } from '../trafficNavKeys'
 import QuickRulePanel from '../components/QuickRulePanel'
 import { copyText } from '../utils/clipboard'
 import { tryFormatJSON } from '../utils/formatting'
+import {
+  ProtobufFields,
+  CustomDecodedFields,
+  DecodedNamedFrameViewReadOnly,
+} from '../components/DecodedFields'
+import {
+  decodeProtobuf,
+  looksLikeProtobuf,
+  hasGRPCFraming,
+} from '../utils/protobufDecode'
 
 function base64ToBytes(b64) {
   if (!b64) return new Uint8Array()
@@ -27,13 +37,83 @@ function flowPcapUrl(anchorPacketId) {
 
 // ---- Packet detail panel (reused per flow column) ----
 
-const PacketDetail = memo(function PacketDetail({ packet, services, onClose, onCopyExploit, copyStatus }) {
+const PacketDetail = memo(function PacketDetail({ packet, services, customProtocols, onClose, onCopyExploit, copyStatus }) {
   const [showQuickRule, setShowQuickRule] = useState(false)
+  // Server-side decoded gRPC frames (resolved via the service's .proto files).
+  const [decodedNamed, setDecodedNamed] = useState(null)
+  const [decodedNamedError, setDecodedNamedError] = useState('')
+  // Server-side decoded custom binary protocol frames.
+  const [decodedCustom, setDecodedCustom] = useState(null)
+  const [decodedCustomError, setDecodedCustomError] = useState('')
+  // Manual override for the custom-protocol decoder. Resets when the user
+  // switches packets so we don't carry an override across selections.
+  const [customProtocolOverride, setCustomProtocolOverride] = useState('')
 
   // Close the rule panel when switching to a different packet.
   useEffect(() => { setShowQuickRule(false) }, [packet?.id])
+  useEffect(() => { setCustomProtocolOverride('') }, [packet?.id])
 
   const formattedBody = useMemo(() => tryFormatJSON(packet?.body_string || ''), [packet?.body_string])
+
+  // Local descriptor-less protobuf walk (raw fallback). Mirrors Traffic.jsx.
+  const decodedProto = useMemo(() => {
+    if (!packet?.body) return null
+    if (formattedBody.isJSON) return null
+    const bytes = base64ToBytes(packet.body)
+    if (bytes.length === 0) return null
+    if (!looksLikeProtobuf(bytes)) return null
+    const result = decodeProtobuf(bytes)
+    if (!result.ok) return null
+    return result
+  }, [packet?.body, formattedBody.isJSON])
+
+  // Permissive predicate: trigger server-side decode for any body that has
+  // gRPC framing or a gRPC-shaped URL, even when the local walk gave up.
+  const mayBeGRPC = useMemo(() => {
+    if (!packet?.body) return false
+    if (formattedBody.isJSON) return false
+    if (decodedProto) return true
+    const bytes = base64ToBytes(packet.body)
+    if (hasGRPCFraming(bytes)) return true
+    const url = packet?.url || ''
+    if (url && /^\/[A-Za-z_][\w.]*\/[A-Za-z_]\w*(?:\?|$)/.test(url)) return true
+    return false
+  }, [packet?.body, packet?.url, formattedBody.isJSON, decodedProto])
+
+  // Server-side gRPC decode.
+  useEffect(() => {
+    setDecodedNamed(null)
+    setDecodedNamedError('')
+    if (!packet?.id) return
+    if (!mayBeGRPC) return
+    let cancelled = false
+    api.decodePacket(packet.id)
+      .then((res) => { if (!cancelled) setDecodedNamed(res) })
+      .catch((err) => { if (!cancelled) setDecodedNamedError(err.message || String(err)) })
+    return () => { cancelled = true }
+  }, [packet?.id, packet?.body, mayBeGRPC])
+
+  // Bound custom protocol from the owning service, plus any override.
+  const boundCustomProtocolID = useMemo(() => {
+    if (!packet?.service_id || !services) return ''
+    const svc = services.find((s) => s.id === packet.service_id)
+    return svc?.protocol_id || ''
+  }, [packet?.service_id, services])
+
+  const effectiveCustomProtocolID = customProtocolOverride || boundCustomProtocolID
+
+  useEffect(() => {
+    setDecodedCustom(null)
+    setDecodedCustomError('')
+    if (!packet?.id || !effectiveCustomProtocolID) return
+    if (!packet?.body) return
+    let cancelled = false
+    api.decodePacketCustom(packet.id, effectiveCustomProtocolID)
+      .then((res) => { if (!cancelled) setDecodedCustom(res) })
+      .catch((err) => { if (!cancelled) setDecodedCustomError(err.message || String(err)) })
+    return () => { cancelled = true }
+  }, [packet?.id, packet?.body, effectiveCustomProtocolID])
+
   if (!packet) return null
   return (
     <div className="flex-shrink-0 w-96 bg-gray-900 border-l border-gray-800 overflow-auto">
@@ -125,6 +205,134 @@ const PacketDetail = memo(function PacketDetail({ packet, services, onClose, onC
             </pre>
           </div>
         )}
+
+        {/* Decoded — custom binary protocol */}
+        {(boundCustomProtocolID || (customProtocols && customProtocols.length > 0)) && (
+          <div>
+            <div className="flex items-center gap-2 mb-1 flex-wrap">
+              <span className="text-gray-500 text-xs">Decoded (custom protocol)</span>
+              {decodedCustom && (
+                <span className="text-[10px] text-cyan-300 bg-cyan-900/30 px-1 py-0.5 rounded">
+                  {decodedCustom.protocol}
+                </span>
+              )}
+              <select
+                value={customProtocolOverride}
+                onChange={(e) => setCustomProtocolOverride(e.target.value)}
+                className="text-[10px] bg-gray-800 border border-gray-700 rounded px-1.5 py-0.5 text-gray-300 focus:outline-none focus:border-cyan-500"
+                title={boundCustomProtocolID ? 'Override the protocol bound to this service' : 'Decode this packet with a custom protocol'}
+              >
+                <option value="">{boundCustomProtocolID ? '— bound —' : '— pick a protocol —'}</option>
+                {(customProtocols || []).map((p) => (
+                  <option key={p.id} value={p.id}>Decode with: {p.name}</option>
+                ))}
+              </select>
+              {decodedCustomError && (
+                <span className="text-[10px] text-red-400" title={decodedCustomError}>
+                  decode error
+                </span>
+              )}
+            </div>
+            {decodedCustom && (
+              <div className="bg-gray-800 rounded p-2 text-xs font-mono overflow-auto" style={{ maxHeight: '55vh' }}>
+                {(decodedCustom.messages || []).map((msg, idx, arr) => (
+                  <div key={idx} className={idx > 0 ? 'mt-2 pt-2 border-t border-gray-700' : ''}>
+                    {arr.length > 1 && (
+                      <div className="text-gray-500 text-[10px] mb-1">message {idx + 1} of {arr.length}</div>
+                    )}
+                    <CustomDecodedFields fields={msg || []} />
+                  </div>
+                ))}
+                {decodedCustom.trailing_hex && (
+                  <div className="mt-2 pt-2 border-t border-gray-700">
+                    <span className="text-gray-500">trailing bytes: </span>
+                    <span className="text-gray-300 break-all">{decodedCustom.trailing_hex}</span>
+                  </div>
+                )}
+                {decodedCustom.error && (
+                  <div className="mt-2 text-red-400">{decodedCustom.error}</div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Decoded — gRPC / protobuf */}
+        {(decodedProto || decodedNamed || (mayBeGRPC && (decodedNamedError || decodedNamed === null))) && (
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-gray-500 text-xs">Decoded</span>
+              {decodedNamed ? (
+                <>
+                  <span className="text-[10px] text-green-400 bg-green-900/30 px-1 py-0.5 rounded">
+                    {decodedNamed.message_type}
+                  </span>
+                  <span className="text-[10px] text-gray-600">{decodedNamed.method}</span>
+                </>
+              ) : decodedProto ? (
+                <>
+                  <span className="text-[10px] text-purple-400 bg-purple-900/30 px-1 py-0.5 rounded">
+                    {decodedProto.framing === 'grpc' ? 'gRPC / protobuf (raw)' : 'protobuf (raw)'}
+                  </span>
+                  {decodedNamedError && (
+                    <span className="text-[10px] text-gray-600" title={decodedNamedError}>
+                      named decode unavailable
+                    </span>
+                  )}
+                </>
+              ) : (
+                <>
+                  <span className="text-[10px] text-gray-400 bg-gray-800/60 px-1 py-0.5 rounded">
+                    {decodedNamedError ? 'decode failed' : 'decoding…'}
+                  </span>
+                  {decodedNamedError && (
+                    <span className="text-[10px] text-red-400" title={decodedNamedError}>
+                      {decodedNamedError.length > 80 ? decodedNamedError.slice(0, 77) + '…' : decodedNamedError}
+                    </span>
+                  )}
+                </>
+              )}
+              {(decodedNamed?.frames?.length ?? decodedProto?.frames?.length ?? 0) > 1 && (
+                <span className="text-[10px] text-gray-600">{decodedNamed?.frames?.length ?? decodedProto?.frames?.length} frames</span>
+              )}
+            </div>
+            <div className="bg-gray-800 rounded p-2 text-xs font-mono overflow-auto" style={{ maxHeight: '55vh' }}>
+              {decodedNamed ? (
+                decodedNamed.frames.map((frame, idx) => (
+                  <div key={idx} className={idx > 0 ? 'mt-2 pt-2 border-t border-gray-700' : ''}>
+                    {decodedNamed.frames.length > 1 && (
+                      <div className="text-gray-500 text-[10px] mb-1">frame {idx} ({frame.bytes}B)</div>
+                    )}
+                    {frame.json ? (
+                      <DecodedNamedFrameViewReadOnly frameJSON={frame.json} />
+                    ) : (
+                      <div className="text-red-400">{frame.error || 'decode error'}</div>
+                    )}
+                  </div>
+                ))
+              ) : decodedProto ? (
+                decodedProto.frames.map((frame, idx) => (
+                  <div key={idx} className={idx > 0 ? 'mt-2 pt-2 border-t border-gray-700' : ''}>
+                    {decodedProto.frames.length > 1 && (
+                      <div className="text-gray-500 text-[10px] mb-1">frame {idx} ({frame.length}B)</div>
+                    )}
+                    {frame.error && frame.fields.length === 0 ? (
+                      <div className="text-gray-500 italic">{frame.error}</div>
+                    ) : (
+                      <ProtobufFields fields={frame.fields} />
+                    )}
+                  </div>
+                ))
+              ) : (
+                <div className="text-gray-500 italic">
+                  {decodedNamedError
+                    ? 'No .proto descriptors and inner body could not be parsed locally.'
+                    : 'Waiting for server-side decode…'}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )
@@ -132,7 +340,7 @@ const PacketDetail = memo(function PacketDetail({ packet, services, onClose, onC
 
 // ---- Single-flow inspector: list on left, selected packet detail on right ----
 
-function FlowInspector({ flowData, services, diffSet, onNavigate, onCopyExploit, copyStatus, isFocused, onFocus }) {
+function FlowInspector({ flowData, services, customProtocols, diffSet, onNavigate, onCopyExploit, copyStatus, isFocused, onFocus }) {
   const { flow, packets, missing_count: missing } = flowData
   const [selectedId, setSelectedId] = useState(null)
   const selected = useMemo(() => packets.find((p) => p.id === selectedId) || null, [packets, selectedId])
@@ -250,6 +458,7 @@ function FlowInspector({ flowData, services, diffSet, onNavigate, onCopyExploit,
           <PacketDetail
             packet={selected}
             services={services}
+            customProtocols={customProtocols}
             onClose={() => setSelectedId(null)}
             onCopyExploit={onCopyExploit}
             copyStatus={copyStatus}
@@ -273,9 +482,11 @@ export default function SavedFlows() {
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [copyStatus, setCopyStatus] = useState(null)
   const [services, setServices] = useState([])
+  const [customProtocols, setCustomProtocols] = useState([])
   const [focusedFlowId, setFocusedFlowId] = useState(null)
 
   useEffect(() => { api.listServices().then((d) => setServices(d || [])).catch(() => {}) }, [])
+  useEffect(() => { api.listProtocols().then((d) => setCustomProtocols(d || [])).catch(() => {}) }, [])
 
   const loadFlows = useCallback(async () => {
     setLoading(true)
@@ -492,6 +703,7 @@ export default function SavedFlows() {
           <FlowInspector
             flowData={loadedSelected[0]}
             services={services}
+            customProtocols={customProtocols}
             diffSet={null}
             onNavigate={openInTraffic}
             onCopyExploit={handleCopyExploit}
@@ -505,6 +717,7 @@ export default function SavedFlows() {
             <FlowInspector
               flowData={loadedSelected[0]}
               services={services}
+              customProtocols={customProtocols}
               diffSet={diffSets[0]}
               onNavigate={openInTraffic}
               onCopyExploit={handleCopyExploit}
@@ -516,6 +729,7 @@ export default function SavedFlows() {
             <FlowInspector
               flowData={loadedSelected[1]}
               services={services}
+              customProtocols={customProtocols}
               diffSet={diffSets[1]}
               onNavigate={openInTraffic}
               onCopyExploit={handleCopyExploit}

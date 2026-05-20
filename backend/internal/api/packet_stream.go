@@ -36,13 +36,31 @@ type packetEvent struct {
 	MatchedRules   []packetRuleEvent `json:"matched_rules"`
 	Flagged        bool              `json:"flagged"`
 	ContainsFlagID bool              `json:"contains_flagid"`
+	FlagIDRound    int               `json:"flagid_round,omitempty"`
 	BodySize       int               `json:"body_size"`
+	// Round computed from the poller's competition_start + round_duration.
+	// Same field name as the bulk REST API so the frontend can read it
+	// uniformly regardless of which transport delivered the packet.
+	Round int `json:"round,omitempty"`
 }
 
-func toPacketEvent(p *sniffer.Packet) packetEvent {
+// RoundResolver provides a packet's scoreboard round from its timestamp.
+// The flagids.Poller satisfies this so we can avoid an import cycle.
+type RoundResolver interface {
+	RoundForTime(time.Time) int
+}
+
+func toPacketEvent(p *sniffer.Packet, rr RoundResolver) packetEvent {
 	rules := make([]packetRuleEvent, 0, len(p.MatchedRules))
 	for _, r := range p.MatchedRules {
 		rules = append(rules, packetRuleEvent{ID: r.ID, Name: r.Name, Action: r.Action})
+	}
+	var round int
+	if rr != nil {
+		round = rr.RoundForTime(p.Timestamp)
+	}
+	if round == 0 && p.FlagIDRound > 0 {
+		round = p.FlagIDRound
 	}
 	return packetEvent{
 		ID: p.ID, ServiceID: p.ServiceID, SessionID: p.SessionID,
@@ -50,7 +68,8 @@ func toPacketEvent(p *sniffer.Packet) packetEvent {
 		DstIP: p.DstIP, DstPort: p.DstPort, Protocol: p.Protocol,
 		Direction: p.Direction, Method: p.Method, URL: p.URL, Status: p.Status,
 		MatchedRules: rules, Flagged: p.Flagged,
-		ContainsFlagID: p.ContainsFlagID, BodySize: len(p.Body),
+		ContainsFlagID: p.ContainsFlagID, FlagIDRound: p.FlagIDRound, BodySize: len(p.Body),
+		Round: round,
 	}
 }
 
@@ -65,6 +84,10 @@ type PacketStreamHub struct {
 	bufMu  sync.Mutex
 	buffer []packetEvent
 
+	// Computes the round number for a packet's timestamp. Optional —
+	// when nil the event's Round stays 0 and the frontend renders "—".
+	roundResolver RoundResolver
+
 	metaDirty atomic.Int32 // 1 = metadata changed, trigger refresh
 	stop      chan struct{}
 }
@@ -76,10 +99,15 @@ type sseMessage struct {
 
 const streamInterval = 100 * time.Millisecond
 
-func NewPacketStreamHub() *PacketStreamHub {
+// NewPacketStreamHub creates a hub that fans out new packets via SSE.
+// rr is optional: when non-nil, each pushed packet is annotated with its
+// scoreboard round so the frontend can render the Round column without
+// polling.
+func NewPacketStreamHub(rr RoundResolver) *PacketStreamHub {
 	h := &PacketStreamHub{
-		subs: make(map[chan sseMessage]struct{}),
-		stop: make(chan struct{}),
+		subs:          make(map[chan sseMessage]struct{}),
+		roundResolver: rr,
+		stop:          make(chan struct{}),
 	}
 	go h.loop()
 	return h
@@ -90,7 +118,7 @@ func (h *PacketStreamHub) PushPacket(pkt *sniffer.Packet) {
 	if h == nil || pkt == nil {
 		return
 	}
-	evt := toPacketEvent(pkt)
+	evt := toPacketEvent(pkt, h.roundResolver)
 	h.bufMu.Lock()
 	h.buffer = append(h.buffer, evt)
 	h.bufMu.Unlock()

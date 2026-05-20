@@ -73,7 +73,7 @@ Optionally bind a **custom binary protocol** (defined in the Protocols page) or 
 The **Traffic** page shows all captured packets with real-time updates via SSE (Server-Sent Events):
 
 - **Live streaming** — new packets appear instantly; a **Pause/Resume** button freezes the view while you inspect
-- **Unified filter expression** — single language for `body`, `header.X`, `url`, `method`, `status`, `src/dst/peer` (CIDR), `flagged`, `contains_flagid`, `dropped`, with `AND` / `OR` / `NOT`. See [FILTERS.md](FILTERS.md)
+- **Unified filter expression** — single language for `body`, `header.X`, `url`, `method`, `status`, `round`, `src/dst/peer` (CIDR), `flagged`, `contains_flagid`, `dropped`, with `AND` / `OR` / `NOT`. See [FILTERS.md](FILTERS.md)
 - **Contains Flag** filter highlights packets matching the flag regex (yellow)
 - **Contains my Flag IDs** filter highlights packets carrying your team's current flag IDs (teal)
 - Click a packet to see full headers, body, matched rules, and decoded payload (gRPC / custom protocol)

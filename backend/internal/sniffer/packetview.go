@@ -19,11 +19,17 @@ func (v packetView) BodyBytes() []byte  { return v.p.Body }
 func (v packetView) URL() string        { return v.p.URL }
 func (v packetView) Method() string     { return v.p.Method }
 func (v packetView) Status() int        { return v.p.Status }
-func (v packetView) Protocol() string   { return v.p.Protocol }
-func (v packetView) ServiceID() string  { return v.p.ServiceID }
-func (v packetView) Direction() string  { return string(v.p.Direction) }
-func (v packetView) SrcIP() string      { return v.p.SrcIP }
-func (v packetView) DstIP() string      { return v.p.DstIP }
+func (v packetView) Round() int {
+	if v.p.Round > 0 {
+		return v.p.Round
+	}
+	return v.p.FlagIDRound
+}
+func (v packetView) Protocol() string  { return v.p.Protocol }
+func (v packetView) ServiceID() string { return v.p.ServiceID }
+func (v packetView) Direction() string { return string(v.p.Direction) }
+func (v packetView) SrcIP() string     { return v.p.SrcIP }
+func (v packetView) DstIP() string     { return v.p.DstIP }
 func (v packetView) PeerIP() string {
 	if v.p.Direction == DirectionResponse {
 		return v.p.DstIP

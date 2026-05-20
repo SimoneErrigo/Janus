@@ -91,6 +91,13 @@ type Packet struct {
 	MatchedFlagIDs []string          `json:"matched_flagids"`
 	FlagIDRound    int               `json:"flagid_round"`    // round of the AC automaton used to scan this packet
 
+	// Round is the scoreboard round this packet falls into, computed from the
+	// poller's competition_start + round_duration. Populated at serve time
+	// (not stored in the DB) so the frontend can render a Round column
+	// without doing client-side date math or polling. Zero when the poller
+	// hasn't been configured.
+	Round int `json:"round,omitempty"`
+
 	// Lite indicates this packet was returned from a summary list query without
 	// full headers/body. Clients should refetch by ID when full detail is needed.
 	Lite bool `json:"lite,omitempty"`

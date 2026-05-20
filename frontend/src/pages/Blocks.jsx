@@ -4,6 +4,7 @@ import { useNavigate, useLocation } from 'react-router-dom'
 import { api, subscribePacketStream } from '../api'
 import { hideParams, addHiddenIds } from '../userHidden'
 import HighlightedBodyBase from '../components/HighlightedBody'
+import FilterExpression from '../components/FilterExpression'
 import { tryFormatJSON } from '../utils/formatting'
 import { useServiceMap } from '../hooks/useServiceMap'
 
@@ -103,17 +104,19 @@ export default function Blocks() {
   const [filters, setFilters] = useState({
     service_id: '', src_ip: '', limit: 50,
   })
+  const [expression, setExpression] = useState('')
   const [filterNegated, setFilterNegated] = useState({ service_id: false, src_ip: false })
   const [paused, setPaused] = useState(false)
   const pausedRef = useRef(false)
 
   const fetchPage = useCallback(async (offset, limit) => {
     const params = { ...filters, ...hideParams(), dropped: 'true', sort: 'desc', limit, offset }
+    if (expression.trim()) params.q = expression
     if (filterNegated.service_id && params.service_id) { params.not_service_id = params.service_id; delete params.service_id }
     if (filterNegated.src_ip && params.src_ip) { params.not_src_ip = params.src_ip; delete params.src_ip }
     const data = await api.getPackets(params)
     return { items: data.packets || [], total: data.total }
-  }, [filters, filterNegated])
+  }, [filters, expression, filterNegated])
 
   const {
     items: packets,
@@ -238,6 +241,15 @@ export default function Blocks() {
             Clear All
           </button>
         </div>
+      </div>
+
+      <div className="mb-3">
+        <FilterExpression
+          value={expression}
+          onChange={setExpression}
+          placeholder='Filter blocked packets — e.g. round == 12 AND direction == "request"'
+          compact
+        />
       </div>
 
       <div className="flex-1 flex gap-0 min-h-0">

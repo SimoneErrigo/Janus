@@ -398,9 +398,9 @@ export default function Config() {
         <div className="flex items-center justify-between">
           <h3 className="text-lg font-medium text-gray-100">Flag IDs</h3>
           <div className="flex items-center gap-2">
-            {form.flagid_enabled && flagIDStatus?.current_round > 0 && (
+            {form.flagid_enabled && (flagIDStatus?.clock_round || flagIDStatus?.current_round) > 0 && (
               <span className="text-xs px-2 py-0.5 rounded bg-cyan-900/40 text-cyan-400 font-mono">
-                Round {flagIDStatus.current_round}
+                Round {flagIDStatus.clock_round || flagIDStatus.current_round}
               </span>
             )}
             <span className={`text-xs px-2 py-0.5 rounded ${form.flagid_enabled ? 'bg-emerald-900/40 text-emerald-400' : 'bg-gray-800 text-gray-500'}`}>
@@ -535,8 +535,12 @@ export default function Config() {
                   <span className="text-cyan-400 font-mono">{flagIDCountdown || '...'}</span>
                 </div>
                 <div>
-                  <span className="text-gray-500">Current round: </span>
-                  <span className="text-cyan-400 font-mono">{flagIDStatus.current_round || '—'}</span>
+                  <span className="text-gray-500">Live round: </span>
+                  <span className="text-cyan-400 font-mono">{flagIDStatus.clock_round || flagIDStatus.current_round || '—'}</span>
+                </div>
+                <div>
+                  <span className="text-gray-500">Flag IDs through: </span>
+                  <span className="text-teal-400 font-mono">{flagIDStatus.flagids_round || flagIDStatus.current_round || '—'}</span>
                 </div>
                 <div>
                   <span className="text-gray-500">Keeping: </span>

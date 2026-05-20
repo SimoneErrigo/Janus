@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/cache"
 	"github.com/SimoneErrigo/Janus/backend/internal/cleanup"
@@ -12,6 +13,7 @@ import (
 	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
 	"github.com/SimoneErrigo/Janus/backend/internal/protodecode"
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
+	"github.com/SimoneErrigo/Janus/backend/internal/rounddiff"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 	"github.com/SimoneErrigo/Janus/backend/internal/sysstat"
@@ -32,6 +34,7 @@ type Server struct {
 	sessionHub     *SessionHub
 	protoCache     *protodecode.Cache
 	protoDir       string
+	roundDiffCache *rounddiff.Cache
 	mux            *http.ServeMux
 }
 
@@ -51,6 +54,7 @@ func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniff
 		sessionHub:     NewSessionHub(),
 		protoCache:     protodecode.NewCache(),
 		protoDir:       protoDir,
+		roundDiffCache: rounddiff.NewCache(128, 30*time.Minute),
 		mux:            http.NewServeMux(),
 	}
 	s.routes()
@@ -60,6 +64,29 @@ func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniff
 // Handler returns the HTTP handler for this server.
 func (s *Server) Handler() http.Handler {
 	return corsMiddleware(s.mux)
+}
+
+// annotateRound fills the `Round` field on a packet from competition timing,
+// falling back to the round of a matched Flag ID when timing is unavailable.
+func (s *Server) annotateRound(p *sniffer.Packet) {
+	if p == nil || s.flagIDPoller == nil {
+		return
+	}
+	p.Round = s.flagIDPoller.RoundForTime(p.Timestamp)
+	if p.Round == 0 && p.FlagIDRound > 0 {
+		p.Round = p.FlagIDRound
+	}
+}
+
+// annotateRounds is the slice form, used by every endpoint that returns a
+// list of packets.
+func (s *Server) annotateRounds(pkts []*sniffer.Packet) {
+	if s.flagIDPoller == nil {
+		return
+	}
+	for _, p := range pkts {
+		s.annotateRound(p)
+	}
 }
 
 func (s *Server) routes() {
@@ -114,6 +141,7 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/pcap/files", s.handlePcapListFiles)
 	protected.HandleFunc("/api/pcap/import", s.handlePcapImport)
 	protected.HandleFunc("/api/pcap/import/", s.handlePcapImportStatus)
+	protected.HandleFunc("/api/round-diff", s.handleRoundDiff)
 
 	s.mux.Handle("/api/", s.authMiddleware(protected))
 }

@@ -223,4 +223,13 @@ export const api = {
   // Filter expression validation. Returns { ok: true } or
   // { ok: false, error, position }.
   validateFilter: (expression) => request('/filter/validate', { method: 'POST', body: { expression } }),
+
+  // Round diff — backend-computed novelty + suspicion analysis between two rounds.
+  getRoundDiff: (params) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '') qs.set(k, v);
+    });
+    return request(`/round-diff?${qs.toString()}`);
+  },
 };

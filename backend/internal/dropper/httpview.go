@@ -21,6 +21,7 @@ func (v httpRequestView) BodyBytes() []byte  { return v.req.Body }
 func (v httpRequestView) URL() string        { return v.req.URL }
 func (v httpRequestView) Method() string     { return "" }
 func (v httpRequestView) Status() int        { return 0 }
+func (v httpRequestView) Round() int         { return 0 }
 func (v httpRequestView) Protocol() string   { return "" }
 func (v httpRequestView) ServiceID() string  { return v.req.ServiceID }
 func (v httpRequestView) Direction() string  { return "" }
@@ -53,8 +54,8 @@ func (v httpRequestView) Header(name string) string {
 	return ""
 }
 
-func (v httpRequestView) HeadersText() string    { return v.req.Headers }
-func (v httpRequestView) RawBytes() []byte       { return v.req.RawBytes }
-func (v httpRequestView) Flagged() bool          { return false }
-func (v httpRequestView) ContainsFlagID() bool   { return false }
-func (v httpRequestView) Dropped() bool          { return false }
+func (v httpRequestView) HeadersText() string  { return v.req.Headers }
+func (v httpRequestView) RawBytes() []byte     { return v.req.RawBytes }
+func (v httpRequestView) Flagged() bool        { return false }
+func (v httpRequestView) ContainsFlagID() bool { return false }
+func (v httpRequestView) Dropped() bool        { return false }

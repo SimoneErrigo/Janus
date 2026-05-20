@@ -33,7 +33,7 @@ function LinkedPacketDetail({ packet, pattern, scope }) {
         <div><span className="text-gray-500">Src </span><span className="text-gray-300 font-mono">{packet.src_ip}:{packet.src_port}</span></div>
         <div><span className="text-gray-500">Dst </span><span className="text-gray-300 font-mono">{packet.dst_ip}:{packet.dst_port}</span></div>
         {packet.method && <div><span className="text-gray-500">Method </span><span className="text-gray-300">{packet.method}</span></div>}
-        {packet.status_code > 0 && <div><span className="text-gray-500">Status </span><span className="text-gray-300">{packet.status_code}</span></div>}
+        {packet.status > 0 && <div><span className="text-gray-500">Status </span><span className="text-gray-300">{packet.status}</span></div>}
       </div>
 
       {packet.url && (

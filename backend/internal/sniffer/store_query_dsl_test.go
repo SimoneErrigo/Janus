@@ -14,6 +14,12 @@ func setupQueryDSLStore(t *testing.T) *PacketStore {
 	t.Cleanup(func() { store.Close() })
 
 	now := time.Now().UTC().Truncate(time.Second)
+	store.SetRoundResolver(func(ts time.Time) int {
+		if ts.Before(now) {
+			return 0
+		}
+		return int(ts.Sub(now)/time.Second) + 1
+	})
 	insert := func(pkt *Packet) {
 		if err := store.Insert(pkt); err != nil {
 			t.Fatal(err)
@@ -48,6 +54,20 @@ func setupQueryDSLStore(t *testing.T) *PacketStore {
 		Headers: map[string]string{"X-Test": "pluto"},
 	})
 	return store
+}
+
+func TestQueryDSL_RoundResidual(t *testing.T) {
+	store := setupQueryDSLStore(t)
+
+	pkts := runQ(t, store, `round == 1`)
+	if len(pkts) != 2 {
+		t.Errorf("round 1: got %d, want 2", len(pkts))
+	}
+
+	pkts = runQ(t, store, `round in (2, 3)`)
+	if len(pkts) != 2 {
+		t.Errorf("round in (2, 3): got %d, want 2", len(pkts))
+	}
 }
 
 func runQ(t *testing.T, store *PacketStore, q string) []*Packet {

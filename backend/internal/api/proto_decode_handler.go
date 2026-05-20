@@ -34,8 +34,14 @@ func (s *Server) handlePacketDecoded(w http.ResponseWriter, r *http.Request) {
 
 	pkt, err := s.packetStore.GetPacketByID(id)
 	if err != nil {
-		http.Error(w, "packet not found", http.StatusNotFound)
-		return
+		// Fall back to the saved-flow snapshot so pinned packets can still
+		// be decoded after the live row has been purged by cleanup.
+		if snap, snapErr := s.packetStore.GetPacketByIDFromSnapshots(id); snapErr == nil {
+			pkt = snap
+		} else {
+			http.Error(w, "packet not found", http.StatusNotFound)
+			return
+		}
 	}
 
 	svc, ok := s.store.GetService(pkt.ServiceID)

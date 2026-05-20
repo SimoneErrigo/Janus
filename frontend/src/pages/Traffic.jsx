@@ -9,7 +9,7 @@ import QuickRulePanel from '../components/QuickRulePanel'
 import FilterExpression from '../components/FilterExpression'
 import { tryFormatJSON } from '../utils/formatting'
 import { copyText } from '../utils/clipboard'
-import { decodeProtobuf, looksLikeProtobuf } from '../utils/protobufDecode'
+import { decodeProtobuf, looksLikeProtobuf, hasGRPCFraming } from '../utils/protobufDecode'
 import { useServiceMap } from '../hooks/useServiceMap'
 import { parse as parseFilter, evaluate as evaluateFilter } from '../utils/filterAst'
 
@@ -711,6 +711,11 @@ export default function Traffic() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Flag ID poller status (current_round, round_duration, competition_start).
+  // Used to surface "Round N" next to the flow banner so the operator knows
+  // which scoreboard round the flow they're inspecting belongs to.
+  const [flagIDStatus, setFlagIDStatus] = useState(null)
+
   useEffect(() => {
     api.listServices().then((data) => setServices(data || []))
     api.listProtocols().then((data) => setCustomProtocols(data || [])).catch(() => {})
@@ -720,7 +725,26 @@ export default function Traffic() {
       setTrafficMode(cfg?.traffic_mode || 'live')
     }).catch(() => {})
     api.getCaptureStatus().then(setCaptureStatus).catch(() => {})
+    api.getFlagIDStatus().then(setFlagIDStatus).catch(() => {})
   }, [])
+
+  // Compute the round number for a given timestamp using the poller's
+  // competition_start + round_duration_seconds. Only used to derive the
+  // "live now" current-round badge during idle periods — the per-packet
+  // round always comes from the backend (pkt.round).
+  const roundForTimestamp = useCallback((iso) => {
+    if (iso == null || iso === '') return null
+    const startStr = flagIDStatus?.competition_start
+    const dur = flagIDStatus?.round_duration_seconds
+    if (!startStr || !dur) return null
+    const start = Date.parse(startStr)
+    const t = typeof iso === 'number' ? iso : Date.parse(iso)
+    if (Number.isNaN(start) || Number.isNaN(t)) return null
+    if (t < start) return null
+    return Math.floor((t - start) / (dur * 1000)) + 1
+  }, [flagIDStatus])
+
+  const [currentRound, setCurrentRound] = useState(null)
 
   useEffect(() => {
     if (trafficMode !== 'static') return
@@ -778,6 +802,48 @@ export default function Traffic() {
     refresh: refreshPackets,
     reset: resetPackets,
   } = useInfiniteList({ fetchPage, pageSize: pageLimit })
+
+  // Live current-round badge. This must run after useInfiniteList initializes
+  // `packets`; otherwise a hard refresh renders the component while `packets`
+  // is still in the temporal dead zone and the Traffic page goes blank.
+  useEffect(() => {
+    const compute = () => {
+      const latestPktRound = packets[0]?.round
+      if (latestPktRound && latestPktRound > 0) {
+        const startStr = flagIDStatus?.competition_start
+        const dur = flagIDStatus?.round_duration_seconds
+        let r = latestPktRound
+        if (startStr && dur) {
+          const start = Date.parse(startStr)
+          if (!Number.isNaN(start)) {
+            const liveR = Math.floor((Date.now() - start) / (dur * 1000)) + 1
+            if (liveR > r) r = liveR
+          }
+        }
+        setCurrentRound((prev) => (prev === r ? prev : r))
+        return
+      }
+      const startStr = flagIDStatus?.competition_start
+      const dur = flagIDStatus?.round_duration_seconds
+      if (startStr && dur) {
+        const start = Date.parse(startStr)
+        const now = Date.now()
+        if (!Number.isNaN(start) && now >= start) {
+          const r = Math.floor((now - start) / (dur * 1000)) + 1
+          setCurrentRound((prev) => (prev === r ? prev : r))
+          return
+        }
+      }
+      const fallbackRound = flagIDStatus?.clock_round || flagIDStatus?.current_round
+      const fallback = (fallbackRound && fallbackRound > 0)
+        ? fallbackRound
+        : null
+      setCurrentRound((prev) => (prev === fallback ? prev : fallback))
+    }
+    compute()
+    const t = setInterval(compute, 1000)
+    return () => clearInterval(t)
+  }, [flagIDStatus?.competition_start, flagIDStatus?.round_duration_seconds, flagIDStatus?.clock_round, flagIDStatus?.current_round, packets])
 
   // Parse the user expression once per change. Memoized so the SSE filter
   // doesn't reparse per packet. Uses the merged expression so chip selections
@@ -911,6 +977,16 @@ export default function Traffic() {
 
   function toggleBlockedFilter() {
     setBlockedFilter((prev) => !prev)
+  }
+
+  function addQuickFilter(predicate) {
+    if (!predicate) return
+    setExpression((prev) => {
+      const e = (prev || '').trim()
+      const norm = e.replace(/\s+/g, ' ')
+      if (norm.includes(predicate)) return e
+      return e ? `(${e}) AND ${predicate}` : predicate
+    })
   }
 
   function togglePause() {
@@ -1280,27 +1356,45 @@ export default function Traffic() {
     return result
   }, [selected?.body, formattedBody.isJSON])
 
+  // Predicate used to decide whether to try the server-side .proto decode.
+  // It's intentionally more permissive than `decodedProto`: gRPC framing is
+  // detected without inner-message parsing, and gRPC-shaped URLs (the path
+  // is "/pkg.Service/Method") also trigger a decode attempt. This way the
+  // server, which has the .proto descriptors, can still resolve the body
+  // even when the descriptor-less local walk gave up.
+  const mayBeGRPC = useMemo(() => {
+    if (!selected?.body) return false
+    if (formattedBody.isJSON) return false
+    if (decodedProto) return true
+    const bytes = base64ToBytes(selected.body)
+    if (hasGRPCFraming(bytes)) return true
+    // gRPC method path "/<pkg>.<Service>/<Method>" — usually paired with a
+    // grpc-* content-type, but the URL alone is a decent signal.
+    const url = selected?.url || ''
+    if (url && /^\/[A-Za-z_][\w.]*\/[A-Za-z_]\w*(?:\?|$)/.test(url)) return true
+    return false
+  }, [selected?.body, selected?.url, formattedBody.isJSON, decodedProto])
+
   // Server-side decode using the configured .proto files. Resolves field
   // names via the gRPC method signature.
   const [decodedNamed, setDecodedNamed] = useState(null) // { method, message_type, frames: [{ json, error, bytes }] } or null
   const [decodedNamedError, setDecodedNamedError] = useState('')
   // Depend on selected?.body (a stable base64 string) rather than the
   // decodedProto memo: the memo is recomputed into a NEW object reference on
-  // each body change, but if any earlier render also produced a new ref this
-  // effect could miss the actual transition (undef → defined). Keying off the
-  // body directly guarantees a re-run as soon as getPacket fills it in. We
-  // still gate the fetch on decodedProto so non-protobuf bodies aren't sent.
+  // each body change. We gate on `mayBeGRPC` (lenient) so the server still
+  // gets a chance when the local walk fails, which fixes the case where the
+  // panel used to stay empty for grpc bodies without working local parse.
   useEffect(() => {
     setDecodedNamed(null)
     setDecodedNamedError('')
     if (!selected?.id) return
-    if (!decodedProto) return // body doesn't look like protobuf at all
+    if (!mayBeGRPC) return // body doesn't look like protobuf/grpc at all
     let cancelled = false
     api.decodePacket(selected.id)
       .then((res) => { if (!cancelled) setDecodedNamed(res) })
       .catch((err) => { if (!cancelled) setDecodedNamedError(err.message || String(err)) })
     return () => { cancelled = true }
-  }, [selected?.id, selected?.body])
+  }, [selected?.id, selected?.body, mayBeGRPC])
 
   // Reset the custom-protocol override whenever the user clicks a different
   // packet — overrides are scoped to a single inspection, not sticky.
@@ -1463,6 +1557,32 @@ export default function Traffic() {
               </>
             )}
           </span>
+          {(() => {
+            // Prefer the round of the flow's anchor packet — that field is
+            // already populated by the backend, so no client math is needed.
+            // Fall back to the locally-derived current round (1 Hz timer
+            // over the cached config) when the anchor packet doesn't carry
+            // one.
+            const anchorPkt = flowMode
+              ? (flowMode.packets || []).find((p) => p.id === flowMode.packetId) || (flowMode.packets || [])[0]
+              : (selected || (packets || [])[0])
+            const fromPkt = (anchorPkt?.round && anchorPkt.round > 0)
+              ? anchorPkt.round
+              : (anchorPkt?.flagid_round && anchorPkt.flagid_round > 0 ? anchorPkt.flagid_round : null)
+            const round = fromPkt ?? currentRound
+            if (round == null) return null
+            return (
+              <span
+                className="text-xs bg-teal-900/40 text-teal-300 border border-teal-700/60 rounded px-2 py-0.5"
+                title={fromPkt != null ? 'Round attached to the flow anchor packet (backend)' : 'Live round derived from competition_start + round_duration'}
+              >
+                Round <span className="font-mono font-medium">{round}</span>
+                {flowMode && currentRound != null && currentRound !== fromPkt && fromPkt != null && (
+                  <span className="ml-1 text-teal-500/70 text-[10px]">/ now {currentRound}</span>
+                )}
+              </span>
+            )
+          })()}
           <button
             onClick={() => copyExploit(flowMode ? flowMode.packetId : selected?.id)}
             disabled={copyStatus === 'copying'}
@@ -1685,6 +1805,38 @@ export default function Traffic() {
               >
                 <span>&#9888;</span> Blocked
               </button>
+              <button
+                onClick={() => addQuickFilter('direction == "request"')}
+                className="text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 bg-gray-800 text-gray-400 border border-gray-700 hover:text-blue-300"
+              >
+                REQ
+              </button>
+              <button
+                onClick={() => addQuickFilter('direction == "response"')}
+                className="text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 bg-gray-800 text-gray-400 border border-gray-700 hover:text-green-300"
+              >
+                RES
+              </button>
+              {currentRound != null && (
+                <button
+                  onClick={() => addQuickFilter(`round == ${currentRound}`)}
+                  className="text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 bg-gray-800 text-gray-400 border border-gray-700 hover:text-teal-300"
+                >
+                  Round {currentRound}
+                </button>
+              )}
+              <button
+                onClick={() => addQuickFilter('flagged AND NOT dropped')}
+                className="text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 bg-gray-800 text-gray-400 border border-gray-700 hover:text-yellow-300"
+              >
+                Leaks
+              </button>
+              <button
+                onClick={() => addQuickFilter('contains_flagid AND direction == "request"')}
+                className="text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 bg-gray-800 text-gray-400 border border-gray-700 hover:text-teal-300"
+              >
+                FlagID probes
+              </button>
               <select
                 value={sortOrder}
                 onChange={(e) => setSortOrder(e.target.value)}
@@ -1713,6 +1865,8 @@ export default function Traffic() {
                         className="text-gray-600 hover:text-gray-400 cursor-pointer text-xs leading-none">✕</button>
                     )}
                   </th>
+                  <th className="px-2 py-2 font-medium w-16" title="Packet ID">#</th>
+                  <th className="px-2 py-2 font-medium w-14" title="Scoreboard round (from competition_start + round_duration)">Round</th>
                   <th className="px-3 py-2 font-medium">Time</th>
                   <th className="px-3 py-2 font-medium">Service</th>
                   <th className="px-3 py-2 font-medium">Dir</th>
@@ -1725,7 +1879,7 @@ export default function Traffic() {
               </thead>
               <tbody>
                 {topPad > 0 && (
-                  <tr aria-hidden="true" style={{ height: topPad }}><td colSpan="9" /></tr>
+                  <tr aria-hidden="true" style={{ height: topPad }}><td colSpan="11" /></tr>
                 )}
                 {visiblePackets.map((pkt) => {
                   const rowBg = pkt.matched_rules?.length > 0
@@ -1760,6 +1914,23 @@ export default function Traffic() {
                           selectedPkts.has(pkt.id) ? 'opacity-100' : 'opacity-40 group-hover:opacity-90'
                         }`}
                       />
+                    </td>
+                    <td className="px-2 py-1.5 text-gray-500 font-mono text-[11px] tabular-nums whitespace-nowrap" title={`packet id ${pkt.id}`}>
+                      #{pkt.id}
+                    </td>
+                    <td className="px-2 py-1.5 font-mono text-[11px] tabular-nums whitespace-nowrap">
+                      {(() => {
+                        // Backend computes the round from the packet timestamp
+                        // (competition_start + round_duration) and ships it in
+                        // every packet response, including SSE. The frontend
+                        // just renders it — no polling, no client-side math.
+                        // Fall back to the legacy flagid_round if the new
+                        // field isn't present (older snapshots, etc.).
+                        const v = pkt.round > 0 ? pkt.round : (pkt.flagid_round > 0 ? pkt.flagid_round : null)
+                        return v != null
+                          ? <span className="text-teal-400">{v}</span>
+                          : <span className="text-gray-700">—</span>
+                      })()}
                     </td>
                     <td className="px-3 py-1.5 text-gray-400 whitespace-nowrap font-mono text-xs">
                       {new Date(pkt.timestamp).toLocaleTimeString()}
@@ -1804,17 +1975,17 @@ export default function Traffic() {
                   );
                 })}
                 {bottomPad > 0 && (
-                  <tr aria-hidden="true" style={{ height: bottomPad }}><td colSpan="9" /></tr>
+                  <tr aria-hidden="true" style={{ height: bottomPad }}><td colSpan="11" /></tr>
                 )}
                 {displayPackets.length === 0 && (
-                  <tr><td colSpan="9" className="text-center py-8 text-gray-600">No packets found</td></tr>
+                  <tr><td colSpan="11" className="text-center py-8 text-gray-600">No packets found</td></tr>
                 )}
               </tbody>
               {/* Infinite scroll sentinel — only shown outside flow mode */}
               {!flowMode && (
                 <tfoot>
                   <tr>
-                    <td colSpan="9" className="py-3 text-center text-xs text-gray-700">
+                    <td colSpan="11" className="py-3 text-center text-xs text-gray-700">
                       <span ref={packetSentinelRef}>
                         {loading ? 'Loading…' : (!hasMore && packets.length > 0) ? '— end —' : ''}
                       </span>
@@ -2220,7 +2391,7 @@ export default function Traffic() {
                   </div>
                 )}
 
-                {decodedProto && (
+                {(decodedProto || decodedNamed || (mayBeGRPC && (decodedNamedError || decodedNamed === null))) && (
                   <div className="flex-1">
                     <div className="flex items-center gap-2 mb-1">
                       <span className="text-gray-500 text-xs">Decoded</span>
@@ -2231,7 +2402,7 @@ export default function Traffic() {
                           </span>
                           <span className="text-[10px] text-gray-600">{decodedNamed.method}</span>
                         </>
-                      ) : (
+                      ) : decodedProto ? (
                         <>
                           <span className="text-[10px] text-purple-400 bg-purple-900/30 px-1 py-0.5 rounded">
                             {decodedProto.framing === 'grpc' ? 'gRPC / protobuf (raw)' : 'protobuf (raw)'}
@@ -2242,9 +2413,20 @@ export default function Traffic() {
                             </span>
                           )}
                         </>
+                      ) : (
+                        <>
+                          <span className="text-[10px] text-gray-400 bg-gray-800/60 px-1 py-0.5 rounded">
+                            {decodedNamedError ? 'decode failed' : 'decoding…'}
+                          </span>
+                          {decodedNamedError && (
+                            <span className="text-[10px] text-red-400" title={decodedNamedError}>
+                              {decodedNamedError.length > 80 ? decodedNamedError.slice(0, 77) + '…' : decodedNamedError}
+                            </span>
+                          )}
+                        </>
                       )}
-                      {(decodedNamed?.frames?.length ?? decodedProto.frames.length) > 1 && (
-                        <span className="text-[10px] text-gray-600">{decodedNamed?.frames?.length ?? decodedProto.frames.length} frames</span>
+                      {(decodedNamed?.frames?.length ?? decodedProto?.frames?.length ?? 0) > 1 && (
+                        <span className="text-[10px] text-gray-600">{decodedNamed?.frames?.length ?? decodedProto?.frames?.length} frames</span>
                       )}
                     </div>
                     <div className="bg-gray-800 rounded p-2 text-xs font-mono overflow-auto" style={{ maxHeight: '60vh' }}>
@@ -2267,15 +2449,25 @@ export default function Traffic() {
                             )}
                           </div>
                         ))
-                      ) : (
+                      ) : decodedProto ? (
                         decodedProto.frames.map((frame, idx) => (
                           <div key={idx} className={idx > 0 ? 'mt-2 pt-2 border-t border-gray-700' : ''}>
                             {decodedProto.frames.length > 1 && (
                               <div className="text-gray-500 text-[10px] mb-1">frame {idx} ({frame.length}B)</div>
                             )}
-                            <ProtobufFields fields={frame.fields} />
+                            {frame.error && frame.fields.length === 0 ? (
+                              <div className="text-gray-500 italic">{frame.error}</div>
+                            ) : (
+                              <ProtobufFields fields={frame.fields} />
+                            )}
                           </div>
                         ))
+                      ) : (
+                        <div className="text-gray-500 italic">
+                          {decodedNamedError
+                            ? 'No .proto descriptors and inner body could not be parsed locally.'
+                            : 'Waiting for server-side decode…'}
+                        </div>
                       )}
                     </div>
                   </div>

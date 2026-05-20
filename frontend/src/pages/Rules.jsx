@@ -494,6 +494,12 @@ function RuleForm({ rule, services, onSave, onCancel }) {
     expression: rule.expression || '',
   })
   const [targetServices, setTargetServices] = useState([rule.service_id])
+  const [preview, setPreview] = useState(null)
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const [previewError, setPreviewError] = useState('')
+  const [previewPacket, setPreviewPacket] = useState(null)
+  const [previewPacketError, setPreviewPacketError] = useState('')
+  const [previewLimit, setPreviewLimit] = useState(10)
   const isFlagRule = form.id?.startsWith('flag-auto-')
   const allSelected = targetServices.length === services.length
 
@@ -517,6 +523,52 @@ function RuleForm({ rule, services, onSave, onCancel }) {
     // and any non-migrated callers keep working — they're harmless because
     // the rule store's auto-derive only kicks in when expression is empty.
     onSave(form, form._isNew ? targetServices : null)
+  }
+
+  async function previewRule(limit = previewLimit) {
+    const expr = form.expression.trim()
+    if (!expr) return
+    setPreviewLoading(true)
+    setPreviewError('')
+    setPreview(null)
+    setPreviewPacket(null)
+    try {
+      const svcIds = form._isNew ? targetServices : [form.service_id]
+      const scoped = svcIds.filter(Boolean)
+      const targets = scoped.length > 0 ? scoped : ['']
+      const results = await Promise.all(targets.map((svcId) =>
+        api.getPackets({
+          q: expr,
+          service_id: svcId,
+          sort: 'desc',
+          limit,
+          summary: '1',
+        }).then((res) => ({ svcId, res }))
+      ))
+      const packets = results.flatMap((r) => r.res.packets || [])
+      const total = results.reduce((sum, r) => sum + (r.res.total || 0), 0)
+      setPreview({ total, packets })
+    } catch (err) {
+      setPreviewError(err.message)
+    } finally {
+      setPreviewLoading(false)
+    }
+  }
+
+  function loadMorePreview() {
+    const next = previewLimit + 25
+    setPreviewLimit(next)
+    previewRule(next)
+  }
+
+  async function inspectPreviewPacket(id) {
+    setPreviewPacketError('')
+    try {
+      const pkt = await api.getPacket(id)
+      setPreviewPacket(pkt)
+    } catch (err) {
+      setPreviewPacketError(err.message)
+    }
   }
 
   return (
@@ -587,6 +639,73 @@ function RuleForm({ rule, services, onSave, onCancel }) {
           onChange={(v) => set('expression', v)}
           placeholder='e.g. body contains "/api/admin" AND header.User-Agent contains "curl"'
         />
+      </div>
+
+      <div className="mb-4 bg-gray-950/60 border border-gray-800 rounded p-3">
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              setPreviewLimit(10)
+              previewRule(10)
+            }}
+            disabled={!form.expression.trim() || previewLoading}
+            className="bg-gray-800 hover:bg-gray-700 disabled:bg-gray-800 disabled:text-gray-600 text-gray-200 text-xs px-3 py-1.5 rounded transition-colors cursor-pointer disabled:cursor-default"
+          >
+            {previewLoading ? 'Testing...' : 'Test on captured packets'}
+          </button>
+          {preview && <span className="text-xs text-gray-400">Matches: <span className="text-cyan-300 font-mono">{preview.total}</span></span>}
+          {preview && <span className="text-xs text-gray-500">shown: {preview.packets.length}</span>}
+          {previewError && <span className="text-xs text-red-400">{previewError}</span>}
+        </div>
+        {preview?.packets?.length > 0 && (
+          <div className="mt-2 overflow-auto max-h-80">
+            <table className="w-full text-xs">
+              <tbody>
+                {preview.packets.map((p) => (
+                  <tr key={p.id} onClick={() => inspectPreviewPacket(p.id)}
+                    className={`border-t border-gray-800/60 cursor-pointer hover:bg-gray-900/80 ${previewPacket?.id === p.id ? 'bg-cyan-950/20' : ''}`}>
+                    <td className="py-1 pr-2 text-gray-500 font-mono">#{p.id}</td>
+                    <td className="py-1 pr-2 text-gray-400">{p.direction}</td>
+                    <td className="py-1 pr-2 text-gray-400">{p.method || p.status || '-'}</td>
+                    <td className="py-1 pr-2 text-gray-500 font-mono">{p.src_ip}</td>
+                    <td className="py-1 text-gray-300 truncate max-w-md">{p.url || p.body_string || '(no preview)'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {preview && preview.packets.length < preview.total && (
+          <button
+            type="button"
+            onClick={loadMorePreview}
+            disabled={previewLoading}
+            className="mt-2 bg-gray-800 hover:bg-gray-700 disabled:bg-gray-800 disabled:text-gray-600 text-gray-300 text-xs px-3 py-1.5 rounded cursor-pointer"
+          >
+            Load more packets
+          </button>
+        )}
+        {previewPacketError && <div className="text-xs text-red-400 mt-2">{previewPacketError}</div>}
+        {previewPacket && (
+          <div className="mt-3 border-t border-gray-800 pt-3 text-xs">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-gray-400">Packet <span className="font-mono text-cyan-300">#{previewPacket.id}</span></span>
+              <button type="button" onClick={() => setPreviewPacket(null)} className="text-gray-500 hover:text-gray-300 cursor-pointer">close</button>
+            </div>
+            <div className="grid grid-cols-2 gap-2 mb-2 text-gray-400">
+              <div>Dir <span className="text-gray-200">{previewPacket.direction}</span></div>
+              <div>Status <span className="text-gray-200">{previewPacket.status || '-'}</span></div>
+              <div>Src <span className="font-mono text-gray-300">{previewPacket.src_ip}:{previewPacket.src_port}</span></div>
+              <div>Dst <span className="font-mono text-gray-300">{previewPacket.dst_ip}:{previewPacket.dst_port}</span></div>
+            </div>
+            {previewPacket.url && <div className="bg-gray-800 rounded p-2 mb-2 font-mono text-gray-300 break-all">{previewPacket.method} {previewPacket.url}</div>}
+            <div className="grid grid-cols-2 gap-2">
+              <pre className="bg-gray-800 rounded p-2 text-gray-300 overflow-auto whitespace-pre-wrap break-all max-h-56">{JSON.stringify(previewPacket.headers || {}, null, 2)}</pre>
+              <pre className="bg-gray-800 rounded p-2 text-gray-300 overflow-auto whitespace-pre-wrap break-all max-h-56">{previewPacket.body_string || '(empty body)'}</pre>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="flex items-center gap-2 mb-4">

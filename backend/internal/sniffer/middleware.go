@@ -18,8 +18,21 @@ import (
 
 const maxBodyCapture = 1 << 20 // 1 MB
 
+func roundFromFlagIDMatches(matches []flagids.FlagMatch, fallback int) int {
+	round := 0
+	for _, m := range matches {
+		if m.Round > round {
+			round = m.Round
+		}
+	}
+	if round > 0 {
+		return round
+	}
+	return fallback
+}
+
 // CheckFlagID checks whether any of the packet content contains a current flag ID value.
-// Returns the boolean flag, the list of matched flag ID string values, and the current round number.
+// Returns the boolean flag, the list of matched flag ID string values, and the matched round when available.
 func CheckFlagID(checker FlagIDChecker, url, headers string, body []byte) (bool, []string, int) {
 	if checker == nil {
 		return false, nil, 0
@@ -36,7 +49,7 @@ func CheckFlagID(checker FlagIDChecker, url, headers string, body []byte) (bool,
 	for i, m := range matches {
 		vals[i] = m.FlagID
 	}
-	return true, vals, checker.CurrentRound()
+	return true, vals, roundFromFlagIDMatches(matches, checker.CurrentRound())
 }
 
 // HTTPMiddleware returns an http.Handler that logs requests/responses and evaluates drop rules.

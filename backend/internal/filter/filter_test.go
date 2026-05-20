@@ -8,22 +8,23 @@ import (
 // fakePacket is a deterministic PacketView for tests.
 type fakePacket struct {
 	body, url, method, proto, svc, dir, src, dst string
-	status, sport, dport                         int
+	status, round, sport, dport                  int
 	headers                                      map[string]string
 	flagged, hasFlagID, dropped                  bool
 	raw                                          []byte
 }
 
-func (f *fakePacket) BodyString() string  { return f.body }
-func (f *fakePacket) BodyBytes() []byte   { return []byte(f.body) }
-func (f *fakePacket) URL() string         { return f.url }
-func (f *fakePacket) Method() string      { return f.method }
-func (f *fakePacket) Status() int         { return f.status }
-func (f *fakePacket) Protocol() string    { return f.proto }
-func (f *fakePacket) ServiceID() string   { return f.svc }
-func (f *fakePacket) Direction() string   { return f.dir }
-func (f *fakePacket) SrcIP() string       { return f.src }
-func (f *fakePacket) DstIP() string       { return f.dst }
+func (f *fakePacket) BodyString() string { return f.body }
+func (f *fakePacket) BodyBytes() []byte  { return []byte(f.body) }
+func (f *fakePacket) URL() string        { return f.url }
+func (f *fakePacket) Method() string     { return f.method }
+func (f *fakePacket) Status() int        { return f.status }
+func (f *fakePacket) Round() int         { return f.round }
+func (f *fakePacket) Protocol() string   { return f.proto }
+func (f *fakePacket) ServiceID() string  { return f.svc }
+func (f *fakePacket) Direction() string  { return f.dir }
+func (f *fakePacket) SrcIP() string      { return f.src }
+func (f *fakePacket) DstIP() string      { return f.dst }
 func (f *fakePacket) PeerIP() string {
 	if f.dir == "request" {
 		return f.src
@@ -70,6 +71,7 @@ func basePacket() *fakePacket {
 		src:     "10.0.5.7",
 		dst:     "10.0.0.1",
 		status:  200,
+		round:   7,
 		sport:   54321,
 		dport:   8080,
 		headers: map[string]string{"User-Agent": "curl/7.0", "Authorization": "Bearer abc123", "X-Test": "pluto"},
@@ -121,6 +123,9 @@ func TestPredicate_BasicOps(t *testing.T) {
 		{`status >= 200`, true},
 		{`status < 300`, true},
 		{`status > 999`, false},
+		{`round == 7`, true},
+		{`round in (6, 7, 8)`, true},
+		{`round < 7`, false},
 		{`proto == "https"`, true},
 		{`service == "checker"`, true},
 		{`direction == "request"`, true},
@@ -226,9 +231,9 @@ func TestLogical_Symbols(t *testing.T) {
 	cases := map[string]bool{
 		`body contains "pippo" && method == "POST"`: true,
 		`method == "GET" || method == "POST"`:       true,
-		`!flagged`:    true,
-		`~ flagged`:   true,
-		`!(method == "GET")`: true,
+		`!flagged`:                                  true,
+		`~ flagged`:                                 true,
+		`!(method == "GET")`:                        true,
 	}
 	for expr, want := range cases {
 		got := mustEval(t, expr, p)
@@ -252,13 +257,13 @@ func TestComplex_UserExample(t *testing.T) {
 
 func TestParse_Errors(t *testing.T) {
 	cases := []string{
-		`body contains`,                // missing value
-		`body weird "x"`,               // unknown op (parsed as ident? -- ensures error path)
-		`(body contains "x"`,           // unbalanced paren
-		`body contains "unterminated`,  // unterminated string
-		`status > "abc"`,               // type mismatch
-		`body > 5`,                     // numeric op on string field
-		`unknown_field == "x"`,         // unknown field
+		`body contains`,                 // missing value
+		`body weird "x"`,                // unknown op (parsed as ident? -- ensures error path)
+		`(body contains "x"`,            // unbalanced paren
+		`body contains "unterminated`,   // unterminated string
+		`status > "abc"`,                // type mismatch
+		`body > 5`,                      // numeric op on string field
+		`unknown_field == "x"`,          // unknown field
 		`body matches "(invalid regex"`, // invalid regex
 	}
 	for _, src := range cases {
