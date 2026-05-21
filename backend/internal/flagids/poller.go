@@ -938,15 +938,8 @@ func parseForcADRounded(body []byte, teamID string, roundDuration time.Duration,
 		for _, msg := range vals {
 			for _, v := range flattenRawToStrings(msg) {
 				appendVal(v)
-				// Some ForcAD services return JSON-encoded strings (e.g. easyblog2:
-				// {"username": "...", "filename": "..."}). Try parsing the string
-				// content and extract its leaf values too, so the matcher hits the
-				// actual identifiers used by the service rather than the wrapper.
-				trimmed := strings.TrimSpace(v)
-				if len(trimmed) >= 2 && (trimmed[0] == '{' || trimmed[0] == '[') {
-					for _, leaf := range flattenRawToStrings(json.RawMessage(trimmed)) {
-						appendVal(leaf)
-					}
+				for _, alt := range expandForcADValue(v) {
+					appendVal(alt)
 				}
 			}
 		}
@@ -1021,4 +1014,105 @@ func resolveForcADTeamKey(teamID string, keys map[string]struct{}) string {
 		return contains[0]
 	}
 	return ""
+}
+
+// expandForcADValue returns additional matcher candidates derived from a raw
+// ForcAD flag-id value. The original value is added by the caller; this helper
+// produces alternates so the Aho-Corasick matcher hits identifiers that appear
+// "naked" or differently encoded in service traffic.
+//
+// Two transforms are applied:
+//
+//  1. JSON-in-string: if the value looks like a JSON object/array, parse it
+//     and yield every leaf string (covers easyblog1/easyblog2 that store
+//     {"username": "..."} or {"username": "...", "filename": "..."}).
+//
+//  2. label-prefixed identifier(s): the value is split on ", " into segments
+//     (handles "user: X, poll_id: Y"); each segment is then split on ": " or
+//     ":" so we get the bare identifier. When the identifier is short
+//     (< matcher min length, e.g. seaOfHackerz "user_id:436") we also emit
+//     URL/JSON variants of the full pair so the matcher can hit
+//     "user_id=436", `"user_id":436`, `"user_id": 436` in traffic.
+func expandForcADValue(v string) []string {
+	var out []string
+	trimmed := strings.TrimSpace(v)
+	if len(trimmed) >= 2 && (trimmed[0] == '{' || trimmed[0] == '[') {
+		for _, leaf := range flattenRawToStrings(json.RawMessage(trimmed)) {
+			if leaf == "" || leaf == v {
+				continue
+			}
+			out = append(out, leaf)
+			// A JSON leaf can still be a "label: id" pair — handle it too.
+			out = append(out, extractLabelSegments(leaf)...)
+		}
+		return out
+	}
+	return extractLabelSegments(v)
+}
+
+// extractLabelSegments yields the identifiers embedded in a value formatted as
+// one or more "label: value" or "label:value" pairs separated by ", ".
+//
+// For each pair we always emit the trailing identifier. If the identifier is
+// shorter than 6 characters (matcher floor), we also emit URL/JSON variants
+// of the full pair so short numeric IDs still have a chance of matching real
+// traffic that uses query-string or JSON formatting.
+func extractLabelSegments(s string) []string {
+	var out []string
+	for _, raw := range strings.Split(s, ", ") {
+		seg := strings.TrimSpace(raw)
+		if seg == "" {
+			continue
+		}
+
+		label, value, ok := splitLabelValue(seg)
+		if !ok {
+			continue
+		}
+		if value != "" && value != s {
+			out = append(out, value)
+		}
+		// Short values risk getting filtered by the matcher's 6-char floor —
+		// emit qualified variants the gameserver might use in traffic.
+		if len(value) > 0 && len(value) < 6 && isLabelWord(label) {
+			out = append(out,
+				label+"="+value,
+				`"`+label+`":`+value,
+				`"`+label+`": `+value,
+			)
+		}
+	}
+	return out
+}
+
+// splitLabelValue splits "<label>: <value>" or "<label>:<value>" into its
+// parts. Returns ok=false if no plausible label/value boundary is found, or if
+// the label is not a clean identifier (avoids splitting things like
+// "10.0.0.1:1234" or "2026-05-21T15:00:00Z").
+func splitLabelValue(seg string) (string, string, bool) {
+	// Prefer ": " (with space) — it's the cleanest separator.
+	if idx := strings.Index(seg, ": "); idx > 0 {
+		return seg[:idx], strings.TrimSpace(seg[idx+2:]), true
+	}
+	// Fall back to ":" without space, but only if the label looks like a
+	// word (a-zA-Z0-9_), to avoid mangling IPs, timestamps, URLs.
+	if idx := strings.Index(seg, ":"); idx > 0 {
+		label := seg[:idx]
+		if isLabelWord(label) {
+			return label, strings.TrimSpace(seg[idx+1:]), true
+		}
+	}
+	return "", "", false
+}
+
+func isLabelWord(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-') {
+			return false
+		}
+	}
+	return true
 }
