@@ -2080,6 +2080,10 @@ func buildWhere(q PacketQuery) (string, []interface{}) {
 			conditions = append(conditions, "contains_flagid = 0")
 		}
 	}
+	if q.FlagIDRound != nil {
+		conditions = append(conditions, "flagid_round = ?")
+		args = append(args, *q.FlagIDRound)
+	}
 	if q.HasMatchedRules != nil {
 		if *q.HasMatchedRules {
 			conditions = append(conditions, "matched_rules != '[]'")

@@ -11,12 +11,12 @@ import (
 // Stats summarises a packet set per round (the small box on top of each
 // service card in the UI).
 type Stats struct {
-	Total    int `json:"total"`
-	Req      int `json:"req"`
-	Res      int `json:"res"`
-	Flagged  int `json:"flagged"`
-	FlagIDs  int `json:"flagids"`
-	Dropped  int `json:"dropped"`
+	Total   int `json:"total"`
+	Req     int `json:"req"`
+	Res     int `json:"res"`
+	Flagged int `json:"flagged"`
+	FlagIDs int `json:"flagids"`
+	Dropped int `json:"dropped"`
 }
 
 // RouteDelta describes how the volume of a single route changed between A
@@ -45,13 +45,27 @@ type NovelPacket struct {
 	Status        int            `json:"status,omitempty"`
 	TwinPacketID  int64          `json:"twin_packet_id,omitempty"`
 	Diff          []DiffOp       `json:"diff,omitempty"`
+	ChangeFields  []string       `json:"change_fields,omitempty"`
+	FieldDiffs    []FieldDiff    `json:"field_diffs,omitempty"`
+}
+
+// FieldDiff is the visual, field-level difference between a packet in round A
+// and its closest packet in round B. It is intentionally generic: it does not
+// depend on attack presets, only on captured packet contents.
+type FieldDiff struct {
+	Field     string   `json:"field"`
+	Label     string   `json:"label"`
+	Diff      []DiffOp `json:"diff,omitempty"`
+	BeforeLen int      `json:"before_len,omitempty"`
+	AfterLen  int      `json:"after_len,omitempty"`
+	Truncated bool     `json:"truncated,omitempty"`
 }
 
 // SuspiciousBucket aggregates every packet whose payload matches the same
 // combination of suspicion tags. Always surfaced regardless of novelty so
 // repeat attacks across rounds remain visible.
 type SuspiciousBucket struct {
-	Key     string         `json:"key"`     // human-readable bucket label
+	Key     string         `json:"key"` // human-readable bucket label
 	Tags    []SuspicionTag `json:"tags"`
 	Scope   string         `json:"scope"`
 	Count   int            `json:"count"`
@@ -89,6 +103,7 @@ type Options struct {
 	IncludeDiff       bool // when true, attach diff ops to each novel packet
 	MaxDiffTokensSide int  // safety cap on token count per side of the diff (default 1500)
 	MaxNovelTokens    int  // cap on novel-tokens list per packet (default 12)
+	MaxFieldChars     int  // cap per side for visual field diffs (default 12000)
 	MinScore          float64
 }
 
@@ -105,6 +120,9 @@ func Compute(roundA, roundB int, packetsA, packetsB []*sniffer.Packet, opts Opti
 	if opts.MaxNovelTokens <= 0 {
 		opts.MaxNovelTokens = 12
 	}
+	if opts.MaxFieldChars <= 0 {
+		opts.MaxFieldChars = 12000
+	}
 
 	res := Result{
 		RoundA:         roundA,
@@ -117,17 +135,14 @@ func Compute(roundA, roundB int, packetsA, packetsB []*sniffer.Packet, opts Opti
 	// Bucket every packet by its normalised route key, separately per round.
 	routesA := groupByRoute(packetsA)
 	routesB := groupByRoute(packetsB)
+	kindsA := groupByKind(packetsA)
 
 	// Per-route token multisets — the corpus we test "novelty" against.
 	corpusA := make(map[string]TokenMultiset, len(routesA))
 	for k, pkts := range routesA {
 		m := TokenMultiset{}
 		for _, p := range pkts {
-			m.Add(p.BodyString)
-			m.Add(p.URL)
-			for _, hv := range p.Headers {
-				m.Add(hv)
-			}
+			m.Add(packetNoveltyText(p))
 		}
 		corpusA[k] = m
 	}
@@ -136,14 +151,19 @@ func Compute(roundA, roundB int, packetsA, packetsB []*sniffer.Packet, opts Opti
 	// canonical routeKey above (so /flag/12345 and /flag/67890 collapse).
 	res.NewRoutes, res.GoneRoutes, res.ChangedRoutes = computeRouteDeltas(routesA, routesB)
 
-	// Walk every B packet and score it against its route's corpus in A.
+	// Walk every B packet and diff its captured contents against the closest
+	// A-side packet. Suspicion presets are computed later as a secondary view;
+	// this is the generic round-to-round packet-content comparison.
 	type scored struct {
-		p     *sniffer.Packet
-		route string
-		score float64
-		toks  []string
-		scope string
-		body  string
+		p       *sniffer.Packet
+		twin    *sniffer.Packet
+		route   string
+		score   float64
+		toks    []string
+		scope   string
+		preview string
+		diffs   []FieldDiff
+		fields  []string
 	}
 	cands := make([]scored, 0, len(packetsB))
 	for _, p := range packetsB {
@@ -154,19 +174,22 @@ func Compute(roundA, roundB int, packetsA, packetsB []*sniffer.Packet, opts Opti
 			// itself to avoid scoring against an empty corpus.
 			corpus = TokenMultiset{}
 		}
-		// Prefer the body when present, fall back to URL, then headers.
-		body, scope := pickBestPayload(p)
-		if body == "" {
+		twin := pickTwinPacket(twinPool(routesA, kindsA, p), p)
+		fieldDiffs, changeFields, meaningful := packetFieldDiffs(twin, p, opts)
+		if !meaningful {
 			continue
 		}
-		score, novel, total := NoveltyScore(corpus, body, opts.MaxNovelTokens)
-		if total < 4 {
-			continue // payloads too short to score meaningfully
-		}
+
+		body, scope := previewField(fieldDiffs, p)
+		novelScore, novel, _ := NoveltyScore(corpus, packetNoveltyText(p), opts.MaxNovelTokens)
+		score := maxFloat(packetChangeScore(twin, p), novelScore)
 		if score < opts.MinScore {
 			continue
 		}
-		cands = append(cands, scored{p: p, route: route, score: score, toks: novel, scope: scope, body: body})
+		cands = append(cands, scored{
+			p: p, twin: twin, route: route, score: score, toks: novel,
+			scope: scope, preview: body, diffs: fieldDiffs, fields: changeFields,
+		})
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
 		if cands[i].score != cands[j].score {
@@ -185,21 +208,28 @@ func Compute(roundA, roundB int, packetsA, packetsB []*sniffer.Packet, opts Opti
 			RouteKey:      c.route,
 			Score:         c.score,
 			NovelTokens:   c.toks,
-			SuspicionTags: SuspicionTags(c.body),
+			SuspicionTags: SuspicionTags(comparablePacketText(c.p, false)),
 			Scope:         c.scope,
 			Direction:     string(c.p.Direction),
-			Preview:       stripNonPrintable(c.body, 320),
+			Preview:       stripNonPrintable(c.preview, 320),
 			URL:           c.p.URL,
 			Method:        c.p.Method,
 			Status:        c.p.Status,
+			ChangeFields:  c.fields,
+		}
+		if c.twin != nil {
+			np.TwinPacketID = c.twin.ID
 		}
 		if opts.IncludeDiff {
-			twin, twinBody := pickTwin(routesA[c.route], c.p, c.body)
-			if twin != nil {
-				np.TwinPacketID = twin.ID
-				bToks := Tokenize(c.body)
-				aToks := Tokenize(twinBody)
-				np.Diff = TokenDiff(aToks, bToks, opts.MaxDiffTokensSide)
+			np.FieldDiffs = c.diffs
+			for _, fd := range c.diffs {
+				if fd.Field == "body" {
+					np.Diff = fd.Diff
+					break
+				}
+			}
+			if len(np.Diff) == 0 && len(c.diffs) > 0 {
+				np.Diff = c.diffs[0].Diff
 			}
 		}
 		res.NovelPackets = append(res.NovelPackets, np)
@@ -207,6 +237,29 @@ func Compute(roundA, roundB int, packetsA, packetsB []*sniffer.Packet, opts Opti
 
 	// Suspicious bucket aggregation across round B regardless of novelty.
 	res.Suspicious = buildSuspiciousBuckets(packetsB)
+
+	// Force every slice on the wire to be a non-nil empty array. Go's JSON
+	// encoder serialises a nil slice as `null`, and the frontend destructures
+	// each field with `= []` defaults — but JS destructuring defaults only
+	// trigger on `undefined`, not on `null`. A null here makes the UI throw
+	// during render (e.g. `items.length` on RouteList), which without an
+	// error boundary blanks the whole page. Cheap to fix, very confusing if
+	// you don't know to look here.
+	if res.NewRoutes == nil {
+		res.NewRoutes = []RouteDelta{}
+	}
+	if res.GoneRoutes == nil {
+		res.GoneRoutes = []RouteDelta{}
+	}
+	if res.ChangedRoutes == nil {
+		res.ChangedRoutes = []RouteDelta{}
+	}
+	if res.NovelPackets == nil {
+		res.NovelPackets = []NovelPacket{}
+	}
+	if res.Suspicious == nil {
+		res.Suspicious = []SuspiciousBucket{}
+	}
 
 	return res
 }
@@ -300,6 +353,33 @@ func groupByRoute(pkts []*sniffer.Packet) map[string][]*sniffer.Packet {
 	return out
 }
 
+func groupByKind(pkts []*sniffer.Packet) map[string][]*sniffer.Packet {
+	out := make(map[string][]*sniffer.Packet, 16)
+	for _, p := range pkts {
+		k := kindKey(p)
+		out[k] = append(out[k], p)
+	}
+	return out
+}
+
+func kindKey(p *sniffer.Packet) string {
+	if p == nil {
+		return ""
+	}
+	parts := []string{p.Protocol, string(p.Direction)}
+	if p.Method != "" {
+		parts = append(parts, p.Method)
+	}
+	return strings.Join(parts, " ")
+}
+
+func twinPool(routes map[string][]*sniffer.Packet, kinds map[string][]*sniffer.Packet, p *sniffer.Packet) []*sniffer.Packet {
+	if pkts := routes[routeKey(p)]; len(pkts) > 0 {
+		return pkts
+	}
+	return kinds[kindKey(p)]
+}
+
 func computeRouteDeltas(a, b map[string][]*sniffer.Packet) (newR, gone, changed []RouteDelta) {
 	keys := make(map[string]struct{}, len(a)+len(b))
 	for k := range a {
@@ -373,6 +453,328 @@ func pickBestPayload(p *sniffer.Packet) (string, string) {
 		}
 	}
 	return "", ""
+}
+
+func packetFieldDiffs(a, b *sniffer.Packet, opts Options) ([]FieldDiff, []string, bool) {
+	fields := []struct {
+		name       string
+		label      string
+		before     string
+		after      string
+		meaningful bool
+	}{
+		{name: "url", label: "URL", before: requestLine(a), after: requestLine(b), meaningful: true},
+		{name: "status", label: "Status", before: statusText(a), after: statusText(b), meaningful: true},
+		{name: "headers", label: "Headers", before: headersText(a, false), after: headersText(b, false), meaningful: headersText(a, true) != headersText(b, true)},
+		{name: "body", label: "Body", before: bodyText(a), after: bodyText(b), meaningful: true},
+	}
+
+	out := make([]FieldDiff, 0, len(fields))
+	changed := make([]string, 0, len(fields))
+	meaningfulChanged := false
+	for _, f := range fields {
+		if f.before == f.after {
+			continue
+		}
+		before, after, truncated := truncatePair(f.before, f.after, opts.MaxFieldChars)
+		out = append(out, FieldDiff{
+			Field:     f.name,
+			Label:     f.label,
+			Diff:      TextDiff(before, after, opts.MaxDiffTokensSide),
+			BeforeLen: len(f.before),
+			AfterLen:  len(f.after),
+			Truncated: truncated,
+		})
+		changed = append(changed, f.name)
+		if f.meaningful {
+			meaningfulChanged = true
+		}
+	}
+	return out, changed, meaningfulChanged
+}
+
+func requestLine(p *sniffer.Packet) string {
+	if p == nil {
+		return ""
+	}
+	if p.Method == "" && p.URL == "" {
+		return ""
+	}
+	if p.Method == "" {
+		return p.URL
+	}
+	if p.URL == "" {
+		return p.Method
+	}
+	return p.Method + " " + p.URL
+}
+
+func statusText(p *sniffer.Packet) string {
+	if p == nil || p.Status == 0 {
+		return ""
+	}
+	return itoa(p.Status)
+}
+
+func bodyText(p *sniffer.Packet) string {
+	if p == nil {
+		return ""
+	}
+	return p.BodyString
+}
+
+var noisyHeaderNames = map[string]bool{
+	"connection":        true,
+	"content-length":    true,
+	"date":              true,
+	"keep-alive":        true,
+	"server":            true,
+	"transfer-encoding": true,
+}
+
+func headersText(p *sniffer.Packet, significantOnly bool) string {
+	if p == nil || len(p.Headers) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(p.Headers))
+	for k := range p.Headers {
+		if significantOnly && noisyHeaderNames[strings.ToLower(k)] {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return strings.ToLower(keys[i]) < strings.ToLower(keys[j])
+	})
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteString(": ")
+		b.WriteString(p.Headers[k])
+		b.WriteByte('\n')
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func truncatePair(a, b string, maxChars int) (string, string, bool) {
+	if maxChars <= 0 {
+		return a, b, false
+	}
+	ta, aCut := truncateString(a, maxChars)
+	tb, bCut := truncateString(b, maxChars)
+	return ta, tb, aCut || bCut
+}
+
+func truncateString(s string, maxChars int) (string, bool) {
+	if len(s) <= maxChars {
+		return s, false
+	}
+	if maxChars <= len("…") {
+		return "…", true
+	}
+	return s[:maxChars-len("…")] + "…", true
+}
+
+func previewField(diffs []FieldDiff, p *sniffer.Packet) (string, string) {
+	preferred := []string{"body", "url", "headers", "status"}
+	for _, want := range preferred {
+		for _, fd := range diffs {
+			if fd.Field == want {
+				switch want {
+				case "body":
+					return bodyText(p), "body"
+				case "url":
+					return requestLine(p), "url"
+				case "headers":
+					return headersText(p, false), "header"
+				case "status":
+					return statusText(p), "status"
+				}
+			}
+		}
+	}
+	body, scope := pickBestPayload(p)
+	return body, scope
+}
+
+func comparablePacketText(p *sniffer.Packet, significantHeadersOnly bool) string {
+	if p == nil {
+		return ""
+	}
+	var b strings.Builder
+	if v := requestLine(p); v != "" {
+		b.WriteString("url ")
+		b.WriteString(v)
+		b.WriteByte('\n')
+	}
+	if v := statusText(p); v != "" {
+		b.WriteString("status ")
+		b.WriteString(v)
+		b.WriteByte('\n')
+	}
+	if v := headersText(p, significantHeadersOnly); v != "" {
+		b.WriteString("headers\n")
+		b.WriteString(v)
+		b.WriteByte('\n')
+	}
+	if p.BodyString != "" {
+		b.WriteString("body\n")
+		b.WriteString(p.BodyString)
+	}
+	return b.String()
+}
+
+func packetNoveltyText(p *sniffer.Packet) string {
+	if p == nil {
+		return ""
+	}
+	parts := make([]string, 0, 4)
+	if v := requestLine(p); v != "" {
+		parts = append(parts, v)
+	}
+	if v := statusText(p); v != "" {
+		parts = append(parts, v)
+	}
+	if v := headersText(p, true); v != "" {
+		parts = append(parts, v)
+	}
+	if p.BodyString != "" {
+		parts = append(parts, p.BodyString)
+	}
+	return strings.Join(parts, "\n")
+}
+
+func packetChangeScore(a, b *sniffer.Packet) float64 {
+	if a == nil {
+		if comparablePacketText(b, true) == "" {
+			return 0
+		}
+		return 1
+	}
+	weighted := []struct {
+		weight float64
+		before string
+		after  string
+	}{
+		{0.25, requestLine(a), requestLine(b)},
+		{0.05, statusText(a), statusText(b)},
+		{0.15, headersText(a, true), headersText(b, true)},
+		{0.55, bodyText(a), bodyText(b)},
+	}
+	var score float64
+	for _, f := range weighted {
+		score += f.weight * exactChangeScore(f.before, f.after)
+	}
+	return score
+}
+
+func pickTwinPacket(aPkts []*sniffer.Packet, b *sniffer.Packet) *sniffer.Packet {
+	if len(aPkts) == 0 {
+		return nil
+	}
+	bText := comparablePacketText(b, true)
+	var best *sniffer.Packet
+	bestSim := -1.0
+	for _, p := range aPkts {
+		sim := exactSimilarity(comparablePacketText(p, true), bText)
+		if sim > bestSim {
+			bestSim = sim
+			best = p
+		}
+	}
+	if best == nil {
+		return aPkts[0]
+	}
+	return best
+}
+
+func exactSimilarity(a, b string) float64 {
+	if a == "" && b == "" {
+		return 1
+	}
+	ta := exactTokenCounts(a)
+	tb := exactTokenCounts(b)
+	if len(ta) == 0 || len(tb) == 0 {
+		return 0
+	}
+	common := 0
+	totalA := 0
+	totalB := 0
+	for tok, ca := range ta {
+		totalA += ca
+		if cb := tb[tok]; cb > 0 {
+			if ca < cb {
+				common += ca
+			} else {
+				common += cb
+			}
+		}
+	}
+	for _, cb := range tb {
+		totalB += cb
+	}
+	union := totalA + totalB - common
+	if union <= 0 {
+		return 0
+	}
+	return float64(common) / float64(union)
+}
+
+func exactChangeScore(a, b string) float64 {
+	if a == b {
+		return 0
+	}
+	ta := exactTokenCounts(a)
+	tb := exactTokenCounts(b)
+	if len(ta) == 0 || len(tb) == 0 {
+		return 1
+	}
+	common := 0
+	totalA := 0
+	totalB := 0
+	for tok, ca := range ta {
+		totalA += ca
+		if cb := tb[tok]; cb > 0 {
+			if ca < cb {
+				common += ca
+			} else {
+				common += cb
+			}
+		}
+	}
+	for _, cb := range tb {
+		totalB += cb
+	}
+	denom := totalA
+	if totalB > denom {
+		denom = totalB
+	}
+	if denom == 0 {
+		return 1
+	}
+	score := float64(denom-common) / float64(denom)
+	if score == 0 {
+		return 0.02
+	}
+	return score
+}
+
+func exactTokenCounts(s string) map[string]int {
+	out := make(map[string]int, 16)
+	for _, tok := range VisualTokenize(s) {
+		if strings.TrimSpace(tok) == "" {
+			continue
+		}
+		out[tok]++
+	}
+	return out
+}
+
+func maxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func queryString(url string) string {

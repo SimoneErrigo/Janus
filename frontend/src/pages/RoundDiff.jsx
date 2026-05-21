@@ -1,41 +1,112 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import ErrorBanner from '../components/ErrorBanner'
 
-// All the heavy lifting (tokenisation, novelty scoring, twin selection,
-// char-level diff, suspicion tagging, route grouping) now lives in the Go
-// backend at /api/round-diff. This page just renders the result and exposes
-// inspect / open-flow actions on every packet referenced.
+// All the heavy lifting (packet-content diffing, tokenisation, twin selection,
+// suspicion tagging, route grouping) now lives in the Go backend at
+// /api/round-diff. This page renders the result and exposes inspect / open-flow
+// actions on every packet referenced.
+
+const ROUND_DIFF_MEMORY_KEY = 'janus.roundDiff.memory.v1'
+let roundDiffMemoryCache = null
+
+function loadRoundDiffMemory() {
+  if (roundDiffMemoryCache) return roundDiffMemoryCache
+  if (typeof window === 'undefined') return null
+  try {
+    const raw = window.sessionStorage.getItem(ROUND_DIFF_MEMORY_KEY)
+    if (!raw) return null
+    const data = JSON.parse(raw)
+    return data && typeof data === 'object' ? { ...data, rows: [], packet: null } : null
+  } catch (err) {
+    console.warn('Failed to restore round diff memory:', err)
+    return null
+  }
+}
+
+function saveRoundDiffMemory(data) {
+  roundDiffMemoryCache = data
+  if (typeof window === 'undefined') return
+  try {
+    const lightweight = {
+      selected: data.selected,
+      round_a: data.round_a,
+      round_b: data.round_b,
+      include_diff: data.include_diff,
+      top_k: data.top_k,
+      expanded_ids: data.expanded_ids,
+      scroll_top: data.scroll_top,
+    }
+    window.sessionStorage.setItem(ROUND_DIFF_MEMORY_KEY, JSON.stringify(lightweight))
+  } catch (err) {
+    console.warn('Failed to save round diff memory:', err)
+  }
+}
 
 export default function RoundDiff() {
   const navigate = useNavigate()
+  const initialMemoryRef = useRef(loadRoundDiffMemory())
+  const memory = initialMemoryRef.current
   const [services, setServices] = useState([])
-  const [selected, setSelected] = useState([])
-  const [roundA, setRoundA] = useState('')
-  const [roundB, setRoundB] = useState('')
-  const [includeDiff, setIncludeDiff] = useState(true)
-  const [topK, setTopK] = useState(24)
-  const [rows, setRows] = useState([])
-  const [packet, setPacket] = useState(null)
+  const [selected, setSelected] = useState(() => Array.isArray(memory?.selected) ? memory.selected : [])
+  const [roundA, setRoundA] = useState(() => memory?.round_a || '')
+  const [roundB, setRoundB] = useState(() => memory?.round_b || '')
+  const [includeDiff, setIncludeDiff] = useState(() => memory?.include_diff !== false)
+  const [topK, setTopK] = useState(() => memory?.top_k || 24)
+  const [rows, setRows] = useState(() => Array.isArray(memory?.rows) ? memory.rows : [])
+  const [packet, setPacket] = useState(() => memory?.packet || null)
+  const [expandedIds, setExpandedIds] = useState(() => new Set(Array.isArray(memory?.expanded_ids) ? memory.expanded_ids : []))
   const [packetError, setPacketError] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const resultsScrollRef = useRef(null)
+  const scrollTopRef = useRef(Number(memory?.scroll_top) || 0)
 
   useEffect(() => {
     api.listServices().then((svcs) => {
       const list = svcs || []
       setServices(list)
-      setSelected(list.slice(0, 2).map((s) => s.id))
+      setSelected((prev) => {
+        const valid = prev.filter((id) => list.some((svc) => svc.id === id))
+        if (valid.length > 0) return valid.slice(0, 2)
+        return list.slice(0, 2).map((s) => s.id)
+      })
     }).catch((err) => setError(err.message))
     api.getFlagIDStatus().then((st) => {
       const cur = st?.clock_round || st?.current_round
       if (cur > 1) {
-        setRoundA(String(cur - 1))
-        setRoundB(String(cur))
+        setRoundA((prev) => prev || String(cur - 1))
+        setRoundB((prev) => prev || String(cur))
       }
-    }).catch(() => {})
+    }).catch((err) => console.warn('Failed to load flag ID status:', err))
   }, [])
+
+  const memoryData = useMemo(() => ({
+    selected,
+    round_a: roundA,
+    round_b: roundB,
+    include_diff: includeDiff,
+    top_k: topK,
+    rows,
+    packet,
+    expanded_ids: Array.from(expandedIds),
+    scroll_top: scrollTopRef.current,
+  }), [selected, roundA, roundB, includeDiff, topK, rows, packet, expandedIds])
+
+  function memorySnapshot() {
+    return { ...memoryData, scroll_top: scrollTopRef.current }
+  }
+
+  useEffect(() => {
+    saveRoundDiffMemory(memoryData)
+  }, [memoryData])
+
+  useEffect(() => {
+    const el = resultsScrollRef.current
+    if (!el || !rows.length) return
+    el.scrollTop = scrollTopRef.current
+  }, [rows.length])
 
   const canRun = useMemo(
     () => selected.length > 0 && Number(roundA) > 0 && Number(roundB) > 0,
@@ -61,6 +132,7 @@ export default function RoundDiff() {
   }
 
   function openFlow(id) {
+    saveRoundDiffMemory(memorySnapshot())
     navigate('/traffic', {
       state: {
         openFlowForPacketId: id,
@@ -74,6 +146,7 @@ export default function RoundDiff() {
     setLoading(true)
     setError('')
     setPacket(null)
+    setExpandedIds(new Set())
     try {
       const results = await Promise.all(selected.map((svcId) =>
         api.getRoundDiff({
@@ -90,6 +163,20 @@ export default function RoundDiff() {
     } finally {
       setLoading(false)
     }
+  }
+
+  function toggleExpanded(packetId) {
+    setExpandedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(packetId)) next.delete(packetId)
+      else next.add(packetId)
+      return next
+    })
+  }
+
+  function rememberScroll(e) {
+    scrollTopRef.current = e.currentTarget.scrollTop
+    saveRoundDiffMemory(memorySnapshot())
   }
 
   return (
@@ -151,7 +238,11 @@ export default function RoundDiff() {
 
       <ErrorBanner error={error || packetError} className="mb-4" />
 
-      <div className={`${oneService ? 'grid grid-cols-1' : 'grid grid-cols-1 xl:grid-cols-2'} gap-4 overflow-auto`}>
+      <div
+        ref={resultsScrollRef}
+        onScroll={rememberScroll}
+        className={`${oneService ? 'grid grid-cols-1' : 'grid grid-cols-1 xl:grid-cols-2'} gap-4 overflow-auto`}
+      >
         {rows.map((r) => (
           <ServiceCard
             key={r.service_id}
@@ -160,6 +251,8 @@ export default function RoundDiff() {
             roundB={roundB}
             onInspect={inspectPacket}
             onFlow={openFlow}
+            expandedIds={expandedIds}
+            onToggleExpanded={toggleExpanded}
           />
         ))}
         {!loading && rows.length === 0 && (
@@ -193,10 +286,17 @@ export default function RoundDiff() {
   )
 }
 
-function ServiceCard({ data, roundA, roundB, onInspect, onFlow }) {
+function ServiceCard({ data, roundA, roundB, onInspect, onFlow, expandedIds, onToggleExpanded }) {
   if (!data) return null
-  const { stats_a: sa, stats_b: sb, novel_packets: novels = [], suspicious_in_b: suspicious = [],
-    new_routes: newR = [], gone_routes: goneR = [], changed_routes: changedR = [] } = data
+  // Keep the view tolerant of older backend responses that may serialize empty
+  // Go slices as null.
+  const sa = data.stats_a
+  const sb = data.stats_b
+  const novels = data.novel_packets || []
+  const suspicious = data.suspicious_in_b || []
+  const newR = data.new_routes || []
+  const goneR = data.gone_routes || []
+  const changedR = data.changed_routes || []
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
       <div className="flex items-center justify-between mb-3">
@@ -211,9 +311,15 @@ function ServiceCard({ data, roundA, roundB, onInspect, onFlow }) {
         <StatsBox label={`Round ${roundB}`} stats={sb} />
       </div>
 
-      <SuspiciousSection items={suspicious} onInspect={onInspect} onFlow={onFlow} />
+      <ContentDiffSection
+        items={novels}
+        onInspect={onInspect}
+        onFlow={onFlow}
+        expandedIds={expandedIds}
+        onToggleExpanded={onToggleExpanded}
+      />
 
-      <NovelSection items={novels} onInspect={onInspect} onFlow={onFlow} />
+      <SuspiciousSection items={suspicious} onInspect={onInspect} onFlow={onFlow} />
 
       <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3">
         <RouteList title="New route patterns" items={newR} primary="count_b" color="text-emerald-300" />
@@ -244,10 +350,10 @@ function StatsBox({ label, stats }) {
 function SuspiciousSection({ items, onInspect, onFlow }) {
   if (!items || items.length === 0) return null
   return (
-    <div className="mb-4 bg-red-950/20 border border-red-900/50 rounded p-3">
+    <div className="mt-4 mb-2 bg-red-950/10 border border-red-900/40 rounded p-3">
       <div className="flex items-center justify-between mb-2">
-        <span className="text-sm text-red-200">Suspicious payloads ({items.length} buckets)</span>
-        <span className="text-[10px] uppercase tracking-wide text-red-400/70">attack-shape matches in round B</span>
+        <span className="text-sm text-red-200">Preset matches ({items.length} buckets)</span>
+        <span className="text-[10px] uppercase tracking-wide text-red-400/70">secondary signal in round B</span>
       </div>
       <div className="space-y-1 max-h-72 overflow-auto">
         {items.map((b) => (
@@ -275,35 +381,43 @@ function SuspiciousSection({ items, onInspect, onFlow }) {
   )
 }
 
-function NovelSection({ items, onInspect, onFlow }) {
+function ContentDiffSection({ items, onInspect, onFlow, expandedIds, onToggleExpanded }) {
   if (!items || items.length === 0) {
     return (
       <div className="text-xs text-gray-600">
-        No novel packets vs round A — every payload in round B shares its tokens with prior traffic.
+        No packet content changes found between these rounds.
       </div>
     )
   }
   return (
     <div className="mb-2">
-      <div className="text-sm text-gray-300 mb-2">Most novel packets in round B ({items.length})</div>
+      <div className="text-sm text-gray-300 mb-2">Packet content diffs in round B ({items.length})</div>
       <div className="space-y-2 max-h-[36rem] overflow-auto">
         {items.map((it) => (
-          <NovelPacketRow key={it.packet_id} item={it} onInspect={onInspect} onFlow={onFlow} />
+          <ContentDiffRow
+            key={it.packet_id}
+            item={it}
+            onInspect={onInspect}
+            onFlow={onFlow}
+            expanded={expandedIds?.has(it.packet_id)}
+            onToggleExpanded={() => onToggleExpanded(it.packet_id)}
+          />
         ))}
       </div>
     </div>
   )
 }
 
-function NovelPacketRow({ item, onInspect, onFlow }) {
-  const [expanded, setExpanded] = useState(false)
+function ContentDiffRow({ item, onInspect, onFlow, expanded, onToggleExpanded }) {
   const pct = Math.round((item.score || 0) * 100)
   const tags = item.suspicion_tags || []
+  const fields = item.change_fields || []
+  const fieldDiffs = item.field_diffs || []
   return (
     <div className="bg-gray-950/50 border border-gray-800 rounded p-2 text-xs">
       <div className="flex items-center justify-between gap-2 mb-1">
         <div className="flex items-center gap-2 min-w-0">
-          <button onClick={() => setExpanded((v) => !v)} className="text-gray-500 hover:text-gray-300 cursor-pointer font-mono w-4">
+          <button onClick={onToggleExpanded} className="text-gray-500 hover:text-gray-300 cursor-pointer font-mono w-4">
             {expanded ? '▼' : '▶'}
           </button>
           <span className="font-mono text-cyan-300 truncate">{item.route_key}</span>
@@ -313,11 +427,19 @@ function NovelPacketRow({ item, onInspect, onFlow }) {
         </div>
         <div className="flex items-center gap-2 whitespace-nowrap">
           <span className={`font-mono ${pct >= 50 ? 'text-red-300' : pct >= 20 ? 'text-amber-300' : 'text-gray-400'}`}>{pct}%</span>
-          <span className="text-gray-600">{item.scope}</span>
           <button onClick={() => onInspect(item.packet_id)} className="text-cyan-300 hover:text-cyan-200 font-mono cursor-pointer">#{item.packet_id}</button>
           <button onClick={() => onFlow(item.packet_id)} className="text-purple-300 hover:text-purple-200 cursor-pointer">flow</button>
         </div>
       </div>
+      {fields.length > 0 && (
+        <div className="flex items-center gap-1 mb-1 flex-wrap">
+          {fields.map((f) => (
+            <span key={f} className="px-1.5 py-0.5 rounded bg-cyan-950/40 border border-cyan-900/50 text-cyan-200 font-mono text-[10px]">
+              {f}
+            </span>
+          ))}
+        </div>
+      )}
       {item.novel_tokens?.length > 0 && (
         <div className="text-[11px] text-gray-500 mb-1">
           novel: <span className="font-mono text-amber-200">{item.novel_tokens.join(' · ')}</span>
@@ -326,14 +448,55 @@ function NovelPacketRow({ item, onInspect, onFlow }) {
       <div className="font-mono text-gray-400 break-all whitespace-pre-wrap text-[11px] line-clamp-2">
         {item.preview}
       </div>
-      {expanded && item.diff && item.diff.length > 0 && (
-        <DiffViewer ops={item.diff} twinPacketId={item.twin_packet_id} onInspect={onInspect} onFlow={onFlow} />
-      )}
-      {expanded && (!item.diff || item.diff.length === 0) && (
-        <div className="mt-2 text-[11px] text-gray-600 italic">
-          No twin found in round A for this route — every byte is new.
+      {expanded && fieldDiffs.length > 0 && (
+        <div className="mt-2 space-y-2">
+          <TwinHeader twinPacketId={item.twin_packet_id} onInspect={onInspect} onFlow={onFlow} />
+          {fieldDiffs.map((fd) => (
+            <FieldDiffViewer key={fd.field} fieldDiff={fd} />
+          ))}
         </div>
       )}
+      {expanded && fieldDiffs.length === 0 && item.diff && item.diff.length > 0 && (
+        <DiffViewer ops={item.diff} twinPacketId={item.twin_packet_id} onInspect={onInspect} onFlow={onFlow} />
+      )}
+      {expanded && fieldDiffs.length === 0 && (!item.diff || item.diff.length === 0) && (
+        <div className="mt-2 text-[11px] text-gray-600 italic">
+          No inline diff was returned. Inspect the packet to view the full capture.
+        </div>
+      )}
+    </div>
+  )
+}
+
+function TwinHeader({ twinPacketId, onInspect, onFlow }) {
+  return (
+    <div className="flex items-center justify-between text-[10px] uppercase tracking-wide text-gray-600">
+      <span>Diff vs closest round-A packet</span>
+      {twinPacketId > 0 ? (
+        <span className="flex items-center gap-2">
+          <button onClick={() => onInspect(twinPacketId)} className="text-cyan-400 hover:text-cyan-200 font-mono cursor-pointer">#{twinPacketId}</button>
+          <button onClick={() => onFlow(twinPacketId)} className="text-purple-400 hover:text-purple-200 cursor-pointer">flow</button>
+        </span>
+      ) : (
+        <span className="text-gray-700">new in round B</span>
+      )}
+    </div>
+  )
+}
+
+function FieldDiffViewer({ fieldDiff }) {
+  const ops = fieldDiff.diff || []
+  return (
+    <div className="bg-gray-900/60 border border-gray-800 rounded p-2">
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-[11px] text-gray-300">{fieldDiff.label || fieldDiff.field}</span>
+        {fieldDiff.truncated && (
+          <span className="text-[10px] text-amber-400">
+            truncated {fieldDiff.before_len || 0} → {fieldDiff.after_len || 0}
+          </span>
+        )}
+      </div>
+      <DiffOps ops={ops} />
     </div>
   )
 }
@@ -350,27 +513,34 @@ function DiffViewer({ ops, twinPacketId, onInspect, onFlow }) {
           </span>
         )}
       </div>
-      <div className="font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-all">
-        {ops.map((op, i) => {
-          if (op.op === 'eq') return <span key={i} className="text-gray-400">{op.text}</span>
-          if (op.op === 'ins') return <span key={i} className="bg-emerald-900/40 text-emerald-200 rounded px-0.5">{op.text}</span>
-          if (op.op === 'del') return <span key={i} className="bg-red-900/40 text-red-200 line-through rounded px-0.5">{op.text}</span>
-          return null
-        })}
-      </div>
+      <DiffOps ops={ops} />
+    </div>
+  )
+}
+
+function DiffOps({ ops }) {
+  return (
+    <div className="font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-all">
+      {ops.map((op, i) => {
+        if (op.op === 'eq') return <span key={i} className="text-gray-400">{op.text}</span>
+        if (op.op === 'ins') return <span key={i} className="bg-emerald-900/40 text-emerald-200 rounded px-0.5">{op.text}</span>
+        if (op.op === 'del') return <span key={i} className="bg-red-900/40 text-red-200 line-through rounded px-0.5">{op.text}</span>
+        return null
+      })}
     </div>
   )
 }
 
 function RouteList({ title, items, primary, color }) {
+  const list = items || []
   return (
     <div>
       <div className="text-xs text-gray-500 mb-1">{title}</div>
-      {items.length === 0 ? (
+      {list.length === 0 ? (
         <div className="text-xs text-gray-700">No change</div>
       ) : (
         <div className="space-y-1 max-h-60 overflow-auto">
-          {items.map((it) => (
+          {list.map((it) => (
             <div key={it.key} className="flex items-center justify-between gap-3 text-xs bg-gray-800/40 rounded px-2 py-1">
               <span className={`${color} font-mono truncate`}>{it.key}</span>
               <span className="text-gray-500">{it[primary]}</span>
@@ -383,14 +553,15 @@ function RouteList({ title, items, primary, color }) {
 }
 
 function RouteDeltaList({ title, items }) {
+  const list = items || []
   return (
     <div>
       <div className="text-xs text-gray-500 mb-1">{title}</div>
-      {items.length === 0 ? (
+      {list.length === 0 ? (
         <div className="text-xs text-gray-700">No change</div>
       ) : (
         <div className="space-y-1 max-h-60 overflow-auto">
-          {items.map((it) => {
+          {list.map((it) => {
             const delta = (it.count_b || 0) - (it.count_a || 0)
             return (
               <div key={it.key} className="flex items-center justify-between gap-3 text-xs bg-gray-800/40 rounded px-2 py-1">

@@ -625,7 +625,7 @@ export default function Traffic() {
   const [flowMode, setFlowMode] = useState(null) // { packetId, packets, total }
   /** Packet id used when entering flow (API or session fallback); restored on Clear flow */
   const flowEntryPacketIdRef = useRef(null)
-  /** When opening flow from Alerts/Blocks, Clear flow navigates back and restores selection */
+  /** When opening flow from another view, Clear flow navigates back and restores context */
   const flowReturnContextRef = useRef(null)
   const packetTableScrollRef = useRef(null)
   const [filtersCollapsed, setFiltersCollapsed] = useState(false)
@@ -1206,15 +1206,19 @@ export default function Traffic() {
       navigate('/blocks', { state: { restoreBlockedPacketId: ret.packetId } })
       return
     }
+    if (ret?.path === '/round-diff') {
+      navigate('/round-diff', { state: { restoreRoundDiff: true } })
+      return
+    }
     if (anchorId != null) selectPacket({ id: anchorId })
   }, [selectPacket, navigate])
 
-  // Open flow when navigated from Alerts / Blocks with state
+  // Open flow when navigated from another view with state.
   useEffect(() => {
     const pid = location.state?.openFlowForPacketId
     if (pid == null) return
     const fr = location.state?.flowReturn
-    if (fr && (fr.path === '/alerts' || fr.path === '/blocks')) {
+    if (fr && (fr.path === '/alerts' || fr.path === '/blocks' || fr.path === '/round-diff')) {
       flowReturnContextRef.current = fr
     }
     navigate(location.pathname, { replace: true, state: {} })

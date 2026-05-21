@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
@@ -20,38 +21,74 @@ const roundPacketLimit = 10000
 // The second return value indicates whether the SQL limit was hit (i.e. the
 // round had more packets than we could load).
 func (s *Server) fetchRoundPackets(serviceID string, round int) ([]*sniffer.Packet, bool, error) {
-	q := sniffer.PacketQuery{
+	base := sniffer.PacketQuery{
 		ServiceID: serviceID,
 		SortOrder: "asc",
 		Limit:     roundPacketLimit,
 	}
-	if s.flagIDPoller != nil {
-		if start, end, ok := s.flagIDPoller.RoundBounds(round); ok {
-			q.TimeFrom = &start
-			q.TimeTo = &end
-		} else {
-			q.Q = "round == " + strconv.Itoa(round)
+	byID := make(map[int64]*sniffer.Packet, roundPacketLimit)
+	truncated := false
+	run := func(q sniffer.PacketQuery) error {
+		pkts, total, err := s.packetStore.Query(q)
+		if err != nil {
+			return err
 		}
-	} else {
-		q.Q = "round == " + strconv.Itoa(round)
-	}
-	pkts, total, err := s.packetStore.Query(q)
-	if err != nil {
-		return nil, false, err
-	}
-	s.annotateRounds(pkts)
-	if q.Q == "" {
-		// We pushed the filter to SQL via timestamps; double-check Round in
-		// case the poller config moved since insertion.
-		filtered := pkts[:0]
+		s.annotateRounds(pkts)
 		for _, p := range pkts {
-			if p.Round == round {
-				filtered = append(filtered, p)
+			if p.Round == round || p.FlagIDRound == round {
+				byID[p.ID] = p
 			}
 		}
-		pkts = filtered
+		if len(pkts) >= roundPacketLimit || total > roundPacketLimit {
+			truncated = true
+		}
+		return nil
 	}
-	truncated := len(pkts) >= roundPacketLimit || total > roundPacketLimit
+
+	usedTimeBounds := false
+	if s.flagIDPoller != nil {
+		if start, end, ok := s.flagIDPoller.RoundBounds(round); ok {
+			q := base
+			q.TimeFrom = &start
+			q.TimeTo = &end
+			if err := run(q); err != nil {
+				return nil, false, err
+			}
+			usedTimeBounds = true
+		}
+	}
+
+	// Historical rows carry the persisted scanner round even if the current
+	// competition-start config changed later. Union it with the timestamp
+	// window so very old rounds do not disappear from round-diff.
+	qFlagRound := base
+	qFlagRound.FlagIDRound = &round
+	if err := run(qFlagRound); err != nil {
+		return nil, false, err
+	}
+
+	if !usedTimeBounds && len(byID) == 0 {
+		q := base
+		q.Q = "round == " + strconv.Itoa(round)
+		if err := run(q); err != nil {
+			return nil, false, err
+		}
+	}
+
+	pkts := make([]*sniffer.Packet, 0, len(byID))
+	for _, p := range byID {
+		pkts = append(pkts, p)
+	}
+	sort.SliceStable(pkts, func(i, j int) bool {
+		if pkts[i].Timestamp.Equal(pkts[j].Timestamp) {
+			return pkts[i].ID < pkts[j].ID
+		}
+		return pkts[i].Timestamp.Before(pkts[j].Timestamp)
+	})
+	if len(pkts) > roundPacketLimit {
+		pkts = pkts[:roundPacketLimit]
+		truncated = true
+	}
 	return pkts, truncated, nil
 }
 
@@ -102,10 +139,22 @@ func (s *Server) handleRoundDiff(w http.ResponseWriter, r *http.Request) {
 		IncludeDiff: includeDiff,
 	}
 
+	// Cache only rounds the scoreboard has fully moved past. Open/current
+	// rounds can still receive packets, so cached empty results would hide
+	// captures that arrive later.
+	currentRound := 0
+	if s.flagIDPoller != nil {
+		currentRound = s.flagIDPoller.RoundForTime(time.Now())
+		if currentRound == 0 {
+			currentRound = s.flagIDPoller.CurrentRound()
+		}
+	}
+	bothClosed := currentRound > 0 && roundA < currentRound && roundB < currentRound
+
 	// Honour If-None-Match for the cached result so the frontend can poll
 	// the same diff cheaply.
 	etag := `"` + cacheKey.String() + `"`
-	if s.roundDiffCache != nil {
+	if bothClosed && s.roundDiffCache != nil {
 		if cached := s.roundDiffCache.Get(cacheKey); cached != nil {
 			if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
 				w.WriteHeader(http.StatusNotModified)
@@ -142,12 +191,18 @@ func (s *Server) handleRoundDiff(w http.ResponseWriter, r *http.Request) {
 		result.Truncated = true
 	}
 
-	if s.roundDiffCache != nil {
+	if bothClosed && s.roundDiffCache != nil {
 		s.roundDiffCache.Put(cacheKey, &result)
 	}
 
 	w.Header().Set("ETag", etag)
-	w.Header().Set("X-Round-Diff-Cache", "miss")
+	cacheState := "miss"
+	if !bothClosed {
+		// Surfaced in DevTools so it's obvious why the same query keeps
+		// recomputing: the round is still open.
+		cacheState = "bypass-open-round"
+	}
+	w.Header().Set("X-Round-Diff-Cache", cacheState)
 	w.Header().Set("X-Round-Diff-Compute-Ms", strconv.FormatInt(time.Since(start).Milliseconds(), 10))
 	writeJSON(w, http.StatusOK, result)
 }

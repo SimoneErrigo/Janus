@@ -79,6 +79,8 @@ round == 12                              # packets from scoreboard round 12
 round in (10, 11, 12)
 ```
 
+`round` is the operator-facing round field. Janus computes it from `competition_start + round_duration`; for historical packets where timing metadata is unavailable, it falls back to the persisted flag-ID scan round.
+
 ---
 
 ## Boolean shortcuts

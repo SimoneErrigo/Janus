@@ -126,22 +126,28 @@ The **Protocols** page lets you define **custom binary protocols** (length-prefi
 
 From the Traffic detail panel you can **pin** a flow (or an arbitrary selection of packets) to the **Saved Flows** page. Pinned flows snapshot the packets so they survive cleanup and can be reviewed/exported later.
 
-### 11. PCAP import / export
+### 11. Round Diff
+
+The **Round Diff** page compares two scoreboard rounds for one or two services. It is content-based, not preset-based: Janus pairs each packet in round B with the closest packet from round A and shows visual field diffs for URL, headers, status, and body. Preset attack-shape matches are still shown as a secondary signal.
+
+Opening a packet flow from Round Diff preserves the view state, including selected services, rounds, loaded results, expanded diffs, inspector packet, and scroll position, so you can return without losing your place.
+
+### 12. PCAP import / export
 
 - **Export** the current Traffic filter, a selection, or a single flow as a `.pcap`
 - **Import** an existing `.pcap` and bind it to a (real or virtual) service to inspect it inside Janus
 - Auto-save can dump every static-mode capture window to disk
 - Files live under `PCAP_EXPORT_DIR` (default `data/pcap/`) and are listed/downloadable from the Traffic page
 
-### 12. Filter Sandbox
+### 13. Filter Sandbox
 
 The **Filter Sandbox** page lets you craft a filter expression against a sample packet and watch it evaluate live — handy for debugging complex rules before saving them.
 
-### 13. System
+### 14. System
 
 The **System** page shows VM resource usage (CPU, RAM, disk, DB size, Redis). Auto-refreshed every few seconds.
 
-### 14. Configuration
+### 15. Configuration
 
 The **Config** page lets you update:
 
@@ -151,7 +157,7 @@ The **Config** page lets you update:
 - PCAP export directory and auto-save toggle
 - "Run cleanup now", "Clear Packets", "Purge Dropped" buttons and current DB size
 
-### 15. Container logs (Dozzle)
+### 16. Container logs (Dozzle)
 
 Sidebar **Logs** link opens Dozzle (lightweight read-only container log viewer) at `http://<VM_IP>:${DOZZLE_PORT}`. The frontend reads the port from `GET /api/config` at runtime, so changing `DOZZLE_PORT` in `.env` only requires a `docker compose up -d dozzle`.
 
@@ -168,7 +174,7 @@ docker compose restart dozzle
 
 Login username is `admin`. The hash file is mounted read-only.
 
-### 16. Redis caching
+### 17. Redis caching
 
 Redis is used as a performance cache for the rules-evaluation hot path (cache invalidated on every rule create/update/delete). Redis is never the source of truth: if it's unreachable, Janus falls back to the persistent store transparently with no loss of correctness.
 
@@ -236,6 +242,24 @@ The `q=` parameter on `/api/packets` and `/api/alerts` accepts the unified filte
 | GET        | `/api/packets/exploit?packet_id=X` | Generate Python exploit skeleton from the flow                    |
 | GET        | `/api/packets/decoded?packet_id=X` | Decode a gRPC/protobuf body using `.proto` files                  |
 | GET        | `/api/packets/decoded-custom?packet_id=X` | Decode a TCP body using the service's custom protocol      |
+
+### Round diff
+
+| Method | Endpoint | Description |
+| ------ | -------- | ----------- |
+| GET | `/api/round-diff?service_id=S&round_a=A&round_b=B` | Compare two rounds for a service and return content diffs for round B packets |
+
+Query parameters:
+
+| Name | Required | Description |
+| ---- | -------- | ----------- |
+| `service_id` | yes | Service ID to compare |
+| `round_a` | yes | Baseline scoreboard round |
+| `round_b` | yes | Round to inspect against the baseline |
+| `top_k` | no | Max changed packets to return, `1..200` (default `24`) |
+| `include_diff` | no | `1`/`true` includes inline field diffs; `0`/`false` returns summary metadata only |
+
+The response includes `stats_a`, `stats_b`, `new_routes`, `gone_routes`, `changed_routes`, `suspicious_in_b`, and `novel_packets`. Each `novel_packets[]` entry includes packet metadata, `twin_packet_id`, `change_fields`, and, when `include_diff` is enabled, `field_diffs[]` entries for changed `url`, `headers`, `status`, and `body` fields. Closed-round results are cached; current/open rounds bypass the cache so late-arriving packets are not hidden.
 
 ### Rules & presets
 

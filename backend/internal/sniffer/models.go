@@ -89,7 +89,7 @@ type Packet struct {
 	Flagged        bool              `json:"flagged"`
 	ContainsFlagID bool              `json:"contains_flagid"`
 	MatchedFlagIDs []string          `json:"matched_flagids"`
-	FlagIDRound    int               `json:"flagid_round"`    // round of the AC automaton used to scan this packet
+	FlagIDRound    int               `json:"flagid_round"` // round of the AC automaton used to scan this packet
 
 	// Round is the scoreboard round this packet falls into, computed from the
 	// poller's competition_start + round_duration. Populated at serve time
@@ -147,6 +147,7 @@ type PacketQuery struct {
 	Regex           string // regex search across body, headers, url
 	Flagged         *bool  // nil = no filter, true = only flagged, false = only unflagged
 	ContainsFlagID  *bool  // nil = no filter, true = only with flagID, false = only without
+	FlagIDRound     *int   // persisted round assigned by flag-ID scanning/backfill
 	HasMatchedRules *bool  // nil = no filter, true = only with matched rules, false = only without
 	Dropped         *bool  // nil = no filter, true = only packets dropped by a rule (action=drop|both)
 	Summary         bool   // when true, list query skips body/headers/matched_flagids and returns Lite packets
@@ -155,14 +156,14 @@ type PacketQuery struct {
 	Offset          int
 
 	// Negation filters — same semantics as their positive counterparts but inverted.
-	NotServiceID string
-	NotSrcIP     string
-	NotDstIP     string
-	NotProtocol  string
-	NotMethod    string
-	NotDirection string
-	NotPeerIP    string
-	NotURL       string
+	NotServiceID       string
+	NotSrcIP           string
+	NotDstIP           string
+	NotProtocol        string
+	NotMethod          string
+	NotDirection       string
+	NotPeerIP          string
+	NotURL             string
 	NotContains        string // excludes packets whose body/headers/url contain this substring (legacy)
 	NotContainsBody    string // excludes packets whose body_string contains this substring
 	NotContainsHeaders string // excludes packets whose headers contain this (supports "Name: Value")
@@ -180,5 +181,3 @@ type PacketQuery struct {
 	// after the fetch (same path as the regex residual).
 	Q string
 }
-
-
