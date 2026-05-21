@@ -135,6 +135,15 @@ export const api = {
   createService: (data) => request('/services', { method: 'POST', body: data }),
   updateService: (id, data) => request(`/services/${id}`, { method: 'PUT', body: data }),
   deleteService: (id) => request(`/services/${id}`, { method: 'DELETE' }),
+  // Returns { [serviceId]: { service_id, state, running, last_error?, last_attempt? } }
+  // for every proxy the backend has registered. Reflects the *real* listener
+  // health, not just the configured enabled flag.
+  getServicesStatus: () => request('/proxy/statuses'),
+  // Kicks the bind-retry loop for one service to run immediately. Useful
+  // right after rebuilding the underlying docker container.
+  retryService: (id) => request(`/services/${id}/retry`, { method: 'POST' }),
+  // Kicks every retrying proxy in one call.
+  retryAllServices: () => request('/proxy/retry-all', { method: 'POST' }),
 
   // .proto files auto-discovered under PROTO_DIR
   listProtoFiles: () => request('/protos'),

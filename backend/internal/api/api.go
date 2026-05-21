@@ -97,6 +97,12 @@ func (s *Server) routes() {
 	protected := http.NewServeMux()
 	protected.HandleFunc("/api/services", s.handleServices)
 	protected.HandleFunc("/api/services/", s.handleServiceByID)
+	// Proxy listener health / retry controls. Kept under /api/proxy/ rather
+	// than /api/services/ so the path can't ever be shadowed by a service
+	// whose ID happens to be "status" or "retry-all" (validateService allows
+	// both spellings).
+	protected.HandleFunc("/api/proxy/statuses", s.handleServicesStatus)
+	protected.HandleFunc("/api/proxy/retry-all", s.handleServicesRetryAll)
 	protected.HandleFunc("/api/packets/stream", s.handlePacketStream)
 	protected.HandleFunc("/api/packets/flow/pcap", s.handleFlowPcap)
 	protected.HandleFunc("/api/packets/flow", s.handlePacketFlow)
@@ -174,12 +180,30 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleServiceByID(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/api/services/")
-	if id == "" {
+	rest := strings.TrimPrefix(r.URL.Path, "/api/services/")
+	if rest == "" {
 		http.Error(w, "missing service ID", http.StatusBadRequest)
 		return
 	}
 
+	// Subpath actions: /api/services/{id}/{action}. Today the only supported
+	// action is /retry, which kicks the bind-retry loop immediately. Adding
+	// new actions just means another case here — keeps URL layout REST-y
+	// without forcing us to register a new prefix mux entry per verb.
+	if idx := strings.Index(rest, "/"); idx >= 0 {
+		id := rest[:idx]
+		action := rest[idx+1:]
+		switch action {
+		case "retry":
+			s.handleServiceRetry(w, r, id)
+			return
+		default:
+			http.Error(w, "unknown action", http.StatusNotFound)
+			return
+		}
+	}
+
+	id := rest
 	switch r.Method {
 	case http.MethodGet:
 		s.getService(w, r, id)
@@ -190,6 +214,51 @@ func (s *Server) handleServiceByID(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// handleServicesStatus returns a map of serviceID -> proxy.Status so the UI
+// can render real listener state (running / retrying + last bind error)
+// instead of just the configured "enabled" flag.
+func (s *Server) handleServicesStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	statuses := s.proxy.AllStatuses()
+	out := make(map[string]proxy.Status, len(statuses))
+	for _, st := range statuses {
+		out[st.ServiceID] = st
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleServiceRetry kicks the bind-retry loop for a single service to run
+// immediately. Use case: user just rebuilt the underlying container and
+// doesn't want to wait for the next 1s tick. Idempotent — kicks are
+// coalesced inside the manager.
+func (s *Server) handleServiceRetry(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.proxy.IsRegistered(id) {
+		http.Error(w, "service not found", http.StatusNotFound)
+		return
+	}
+	s.proxy.KickRetry(id) // false just means "already running" — not an error
+	st, _ := s.proxy.Status(id)
+	writeJSON(w, http.StatusOK, st)
+}
+
+// handleServicesRetryAll nudges every retrying proxy in one call. Cheap
+// fallback for the user when they've rebuilt several containers at once.
+func (s *Server) handleServicesRetryAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	n := s.proxy.KickAllRetries()
+	writeJSON(w, http.StatusOK, map[string]int{"kicked": n})
 }
 
 func (s *Server) listServices(w http.ResponseWriter, r *http.Request) {

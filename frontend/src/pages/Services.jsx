@@ -11,12 +11,39 @@ const emptyService = {
   target_tls: false, proto_paths: [], protocol_id: '', enabled: true,
 }
 
+// Status polling cadence. Kept short because the whole point of the new
+// retry machinery is to surface bind failures fast — a stale dot in the UI
+// would defeat that. 2s is cheap (one tiny GET) and matches the backend's
+// 1s retry tick so the user sees the green flip almost immediately after a
+// container rebuild.
+const STATUS_POLL_MS = 2000
+
 export default function Services() {
   const [services, setServices] = useState([])
+  const [statuses, setStatuses] = useState({}) // serviceId -> proxy.Status
   const [editing, setEditing] = useState(null) // null or service object
   const [error, setError] = useState('')
+  const [retrying, setRetrying] = useState({}) // serviceId -> bool (button busy)
 
   useEffect(() => { loadServices() }, [])
+
+  // Poll real listener state in the background. We keep this separate from
+  // loadServices() so service edits don't reset the poll cycle and so an
+  // intermittent status fetch error doesn't blow away the service list.
+  useEffect(() => {
+    let cancelled = false
+    async function tick() {
+      try {
+        const data = await api.getServicesStatus()
+        if (!cancelled) setStatuses(data || {})
+      } catch {
+        // network blips are fine — next tick will recover
+      }
+    }
+    tick()
+    const id = setInterval(tick, STATUS_POLL_MS)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [])
 
   async function loadServices() {
     try {
@@ -24,6 +51,15 @@ export default function Services() {
       setServices(data || [])
     } catch (err) {
       setError(err.message)
+    }
+  }
+
+  async function refreshStatuses() {
+    try {
+      const data = await api.getServicesStatus()
+      setStatuses(data || {})
+    } catch {
+      // see comment in the poll effect
     }
   }
 
@@ -44,6 +80,7 @@ export default function Services() {
       }
       setEditing(null)
       loadServices()
+      refreshStatuses()
     } catch (err) {
       setError(err.message)
     }
@@ -54,21 +91,57 @@ export default function Services() {
     try {
       await api.deleteService(id)
       loadServices()
+      refreshStatuses()
     } catch (err) {
       setError(err.message)
     }
   }
 
+  async function handleRetry(id) {
+    setRetrying((r) => ({ ...r, [id]: true }))
+    try {
+      const st = await api.retryService(id)
+      // Optimistically merge — the next poll will sync the rest.
+      if (st && st.service_id) setStatuses((s) => ({ ...s, [st.service_id]: st }))
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setRetrying((r) => ({ ...r, [id]: false }))
+    }
+  }
+
+  async function handleRetryAll() {
+    try {
+      await api.retryAllServices()
+      refreshStatuses()
+    } catch (err) {
+      setError(err.message)
+    }
+  }
+
+  const retryingCount = Object.values(statuses).filter((s) => s && s.state === 'retrying').length
+
   return (
     <div className="p-6">
       <div className="flex items-center justify-between mb-6">
         <h2 className="text-2xl font-semibold text-gray-100">Services</h2>
-        <button
-          onClick={() => setEditing({ ...emptyService, _isNew: true })}
-          className="bg-cyan-600 hover:bg-cyan-500 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
-        >
-          + Add Service
-        </button>
+        <div className="flex items-center gap-2">
+          {retryingCount > 0 && (
+            <button
+              onClick={handleRetryAll}
+              title="Trigger an immediate bind retry for every proxy that's currently in the retrying state"
+              className="bg-amber-700 hover:bg-amber-600 text-white text-sm px-3 py-2 rounded transition-colors cursor-pointer"
+            >
+              Retry all ({retryingCount})
+            </button>
+          )}
+          <button
+            onClick={() => setEditing({ ...emptyService, _isNew: true })}
+            className="bg-cyan-600 hover:bg-cyan-500 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
+          >
+            + Add Service
+          </button>
+        </div>
       </div>
 
       <ErrorBanner error={error} className="mb-4" />
@@ -82,29 +155,67 @@ export default function Services() {
       )}
 
       <div className="space-y-3">
-        {services.map((svc) => (
-          <div key={svc.id} className="bg-gray-900 border border-gray-800 rounded-lg p-4 flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <div className={`w-2.5 h-2.5 rounded-full ${svc.enabled ? 'bg-green-500' : 'bg-gray-600'}`} />
-              <div>
-                <div className="font-medium text-gray-100">
-                  {svc.name}
-                  <span className="ml-2 text-xs text-gray-500 font-mono">({svc.id})</span>
-                </div>
-                <div className="text-xs text-gray-500 mt-0.5">
-                  {svc.listen_addr}:{svc.listen_port} &rarr; {svc.target_addr}
-                  <span className="ml-2 px-1.5 py-0.5 bg-gray-800 rounded text-gray-400">{svc.protocol}</span>
-                  {svc.tls_mode && <span className="ml-1 px-1.5 py-0.5 bg-gray-800 rounded text-gray-400">TLS: {svc.tls_mode}</span>}
-                  {svc.target_tls && <span className="ml-1 px-1.5 py-0.5 bg-yellow-900/40 rounded text-yellow-400">Backend TLS</span>}
+        {services.map((svc) => {
+          // Three visual states for the indicator dot:
+          //   - disabled service (gray)
+          //   - enabled + listener running (green)
+          //   - enabled + bind failing/retrying (red, with bind error in tooltip)
+          // Falling back to "gray" if we have no status yet (first paint before
+          // the poll completes) avoids a misleading green flash for failed proxies.
+          const st = statuses[svc.id]
+          const isRetrying = svc.enabled && st && st.state === 'retrying'
+          const isRunning = svc.enabled && st && st.state === 'running'
+          let dotClass = 'bg-gray-600'
+          if (isRunning) dotClass = 'bg-green-500'
+          else if (isRetrying) dotClass = 'bg-red-500 animate-pulse'
+          else if (svc.enabled && !st) dotClass = 'bg-gray-500'
+          const dotTitle = !svc.enabled
+            ? 'Service disabled'
+            : isRunning
+              ? 'Listener bound and serving'
+              : isRetrying
+                ? `Bind retrying — ${st.last_error || 'no error reported'}`
+                : 'Waiting for status…'
+          return (
+            <div key={svc.id} className="bg-gray-900 border border-gray-800 rounded-lg p-4 flex items-center justify-between">
+              <div className="flex items-center gap-4">
+                <div className={`w-2.5 h-2.5 rounded-full ${dotClass}`} title={dotTitle} />
+                <div>
+                  <div className="font-medium text-gray-100">
+                    {svc.name}
+                    <span className="ml-2 text-xs text-gray-500 font-mono">({svc.id})</span>
+                    {isRetrying && (
+                      <span className="ml-2 px-1.5 py-0.5 bg-red-900/40 rounded text-red-300 text-xs">retrying bind</span>
+                    )}
+                  </div>
+                  <div className="text-xs text-gray-500 mt-0.5">
+                    {svc.listen_addr}:{svc.listen_port} &rarr; {svc.target_addr}
+                    <span className="ml-2 px-1.5 py-0.5 bg-gray-800 rounded text-gray-400">{svc.protocol}</span>
+                    {svc.tls_mode && <span className="ml-1 px-1.5 py-0.5 bg-gray-800 rounded text-gray-400">TLS: {svc.tls_mode}</span>}
+                    {svc.target_tls && <span className="ml-1 px-1.5 py-0.5 bg-yellow-900/40 rounded text-yellow-400">Backend TLS</span>}
+                  </div>
+                  {isRetrying && st.last_error && (
+                    <div className="text-xs text-red-400 mt-1 font-mono break-all">{st.last_error}</div>
+                  )}
                 </div>
               </div>
+              <div className="flex items-center gap-2">
+                {isRetrying && (
+                  <button
+                    onClick={() => handleRetry(svc.id)}
+                    disabled={!!retrying[svc.id]}
+                    title="Trigger a bind retry now instead of waiting for the next 1s tick"
+                    className="text-amber-400 hover:text-amber-300 text-sm px-3 py-1 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {retrying[svc.id] ? 'Retrying…' : 'Retry now'}
+                  </button>
+                )}
+                <button onClick={() => setEditing(svc)} className="text-gray-400 hover:text-cyan-400 text-sm px-3 py-1 cursor-pointer">Edit</button>
+                <button onClick={() => handleDelete(svc.id)} className="text-gray-400 hover:text-red-400 text-sm px-3 py-1 cursor-pointer">Delete</button>
+              </div>
             </div>
-            <div className="flex items-center gap-2">
-              <button onClick={() => setEditing(svc)} className="text-gray-400 hover:text-cyan-400 text-sm px-3 py-1 cursor-pointer">Edit</button>
-              <button onClick={() => handleDelete(svc.id)} className="text-gray-400 hover:text-red-400 text-sm px-3 py-1 cursor-pointer">Delete</button>
-            </div>
-          </div>
-        ))}
+          )
+        })}
         {services.length === 0 && !editing && (
           <p className="text-gray-600 text-center py-8">No services configured. Add one to get started.</p>
         )}
