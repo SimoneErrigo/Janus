@@ -32,6 +32,7 @@ SKIP_DIRS = {
     ".git",
     ".idea",
     ".vscode",
+    "Janus",
     "__pycache__",
     "backend",
     "certs",
@@ -181,10 +182,10 @@ def remove_janus_comment(tail: str) -> str:
     return f" # {' | '.join(keep)}" if keep else ""
 
 
-def discover_compose_files(root: Path, include_root: bool) -> list[Path]:
+def discover_compose_files(root: Path, include_root: bool, exclude_dirs: set[str]) -> list[Path]:
     files: list[Path] = []
     for current, dirs, filenames in os.walk(root):
-        dirs[:] = [name for name in dirs if name not in SKIP_DIRS and not name.startswith(".")]
+        dirs[:] = [name for name in dirs if name not in exclude_dirs and not name.startswith(".")]
         current_path = Path(current)
         for filename in filenames:
             if filename not in COMPOSE_NAMES:
@@ -412,15 +413,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--restore", action="store_true", help="restore mappings saved in janus inline comments")
     parser.add_argument("--include-root", action="store_true", help="also patch compose files in the current directory")
     parser.add_argument("--dry-run", action="store_true", help="show changes without writing files")
+    parser.add_argument(
+        "--exclude-dir",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="directory name to exclude from recursive scans (can be used multiple times)",
+    )
     parser.add_argument("--min-port", type=int, default=PORT_MIN, help=f"lowest random start port (default: {PORT_MIN})")
     parser.add_argument("--max-port", type=int, default=PORT_MAX, help=f"highest allowed port (default: {PORT_MAX})")
     parser.add_argument("--start-port", type=int, help="fixed first port; otherwise chosen randomly inside the range")
     return parser.parse_args(argv)
 
 
-def compose_targets(paths: list[Path], include_root: bool) -> list[Path]:
+def compose_targets(paths: list[Path], include_root: bool, exclude_dirs: set[str]) -> list[Path]:
     if not paths:
-        return discover_compose_files(Path.cwd(), include_root)
+        return discover_compose_files(Path.cwd(), include_root, exclude_dirs)
 
     targets: list[Path] = []
     for path in paths:
@@ -431,7 +439,7 @@ def compose_targets(paths: list[Path], include_root: bool) -> list[Path]:
                 continue
             targets.append(path)
         elif path.is_dir():
-            targets.extend(discover_compose_files(path, include_root=True))
+            targets.extend(discover_compose_files(path, include_root=True, exclude_dirs=exclude_dirs))
         else:
             print(f"  skip {path}: path does not exist")
     return sorted(set(targets))
@@ -443,7 +451,8 @@ def main(argv: list[str]) -> int:
         print("error: --min-port must be <= --max-port", file=sys.stderr)
         return 2
 
-    targets = compose_targets(args.paths, args.include_root)
+    exclude_dirs = SKIP_DIRS | set(args.exclude_dir)
+    targets = compose_targets(args.paths, args.include_root, exclude_dirs)
     if not targets:
         print("No compose files found.")
         return 0
