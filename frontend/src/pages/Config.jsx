@@ -429,7 +429,9 @@ export default function Config() {
               value={form.flagid_api_url || ''}
               onChange={(e) => set('flagid_api_url', e.target.value)}
               className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm font-mono focus:outline-none focus:border-cyan-500 transition-colors"
-              placeholder="e.g. http://10.10.0.1:8080/api/flagids"
+              placeholder={form.flagid_format === 'forcad'
+                ? 'e.g. http://10.0.0.1/api/client/attack_data/'
+                : 'e.g. http://10.10.0.1:8080/api/flagids'}
             />
             <p className="text-xs text-gray-600 mt-1">URL of the competition flag ID API endpoint</p>
           </div>
@@ -441,8 +443,15 @@ export default function Config() {
                 value={form.flagid_team_id || ''}
                 onChange={(e) => set('flagid_team_id', e.target.value)}
                 className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 transition-colors"
-                placeholder="e.g. team_1"
+                placeholder="e.g. 3 or 10.0.0.3"
               />
+              {form.flagid_format === 'forcad' && (
+                <p className="text-xs text-gray-600 mt-1">
+                  ForcAD: team number (e.g. <span className="font-mono">3</span>) or full IP
+                  (e.g. <span className="font-mono">10.0.0.3</span>). Janus auto-resolves
+                  the matching IP key in the response.
+                </p>
+              )}
             </div>
             <div>
               <label className="block text-sm text-gray-400 mb-1">Poll Interval (s)</label>

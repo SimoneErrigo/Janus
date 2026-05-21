@@ -417,7 +417,10 @@ func (p *Poller) fetch() {
 	p.mu.RUnlock()
 
 	url := apiURL
-	if teamID != "" {
+	// ForcAD's /flag_ids endpoint returns every team's flag IDs in one document
+	// and ignores a ?team= query — we resolve our team key client-side. Other
+	// formats use the query param to scope the request to one team.
+	if teamID != "" && format != "forcad" {
 		sep := "?"
 		if strings.Contains(url, "?") {
 			sep = "&"
@@ -865,10 +868,26 @@ func parseFaustCTFRounded(body []byte, teamID string, roundDuration time.Duratio
 
 // parseForcADRounded parses ForcAD's flag ID format:
 // { "service_name": { "team_ip": ["value1", "value2", ...] } }
-// teamID is the team's IP address (e.g., "10.0.0.2").
-// No round numbers in the API, so the current round is computed from competition timing.
+//
+// teamID may be one of:
+//   - the team's full IP (e.g. "10.0.0.3")
+//   - a numeric team number (e.g. "3") — resolved against the last octet of the
+//     IP keys present in the API response. If no last-octet match exists, any
+//     octet match is accepted as long as it's unambiguous.
+//   - any substring that uniquely identifies a team key.
+//
+// This way each team only needs to set OUR_TEAM_ID=<their number> and the
+// poller figures out which IP key to read.
+//
+// Values are strings; some services (e.g. easyblog2) return JSON-encoded
+// objects as strings — we flatten those into their inner leaf values so the
+// Aho-Corasick matcher can hit the actual identifiers in network traffic.
+//
+// No round numbers in the API, so the current round is computed from
+// competition timing.
 func parseForcADRounded(body []byte, teamID string, roundDuration time.Duration, competitionStart time.Time) (map[int]map[string][]string, error) {
-	var raw map[string]map[string][]string
+	// Accept arrays of any JSON value (string, object, number) at the leaf.
+	var raw map[string]map[string][]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, err
 	}
@@ -890,16 +909,116 @@ func parseForcADRounded(body []byte, teamID string, roundDuration time.Duration,
 		return result, nil
 	}
 
+	// Collect every IP key seen across services to resolve the team key once.
+	keySet := make(map[string]struct{})
+	for _, perTeam := range raw {
+		for k := range perTeam {
+			keySet[k] = struct{}{}
+		}
+	}
+	resolvedKey := resolveForcADTeamKey(teamID, keySet)
+	if resolvedKey == "" {
+		// Nothing we can do without a key — return empty result for this round.
+		return result, nil
+	}
+
 	for serviceName, perTeam := range raw {
-		vals := perTeam[teamID]
-		if len(vals) == 0 {
+		vals, ok := perTeam[resolvedKey]
+		if !ok || len(vals) == 0 {
 			continue
 		}
-		for _, v := range vals {
-			if v != "" {
-				result[roundNum][serviceName] = append(result[roundNum][serviceName], v)
+		seen := make(map[string]bool)
+		appendVal := func(v string) {
+			if v == "" || seen[v] {
+				return
+			}
+			seen[v] = true
+			result[roundNum][serviceName] = append(result[roundNum][serviceName], v)
+		}
+		for _, msg := range vals {
+			for _, v := range flattenRawToStrings(msg) {
+				appendVal(v)
+				// Some ForcAD services return JSON-encoded strings (e.g. easyblog2:
+				// {"username": "...", "filename": "..."}). Try parsing the string
+				// content and extract its leaf values too, so the matcher hits the
+				// actual identifiers used by the service rather than the wrapper.
+				trimmed := strings.TrimSpace(v)
+				if len(trimmed) >= 2 && (trimmed[0] == '{' || trimmed[0] == '[') {
+					for _, leaf := range flattenRawToStrings(json.RawMessage(trimmed)) {
+						appendVal(leaf)
+					}
+				}
 			}
 		}
 	}
 	return result, nil
+}
+
+// resolveForcADTeamKey picks the best matching key from the ForcAD API
+// response given the user-configured teamID (which can be an IP, a team
+// number, or any substring).
+//
+// Priority:
+//  1. exact match (treats teamID as a full IP / key)
+//  2. if teamID is numeric, match keys whose last IP octet equals teamID
+//     (covers patterns like 10.0.0.<id>, 10.60.<id>.1, etc. — last octet is
+//     most common in ForcAD vulnboxes)
+//  3. if still no match and teamID is numeric, match keys where any octet
+//     equals teamID — but only if exactly one key qualifies
+//  4. fall back to a unique substring match
+//
+// Returns "" if nothing matched.
+func resolveForcADTeamKey(teamID string, keys map[string]struct{}) string {
+	if teamID == "" || len(keys) == 0 {
+		return ""
+	}
+	// 1) exact
+	if _, ok := keys[teamID]; ok {
+		return teamID
+	}
+
+	// 2) last-octet match (most common ForcAD layout)
+	if _, err := strconv.Atoi(teamID); err == nil {
+		var lastOctetHits []string
+		for k := range keys {
+			parts := strings.Split(k, ".")
+			if len(parts) >= 2 && parts[len(parts)-1] == teamID {
+				lastOctetHits = append(lastOctetHits, k)
+			}
+		}
+		if len(lastOctetHits) == 1 {
+			return lastOctetHits[0]
+		}
+		// 2b) any other single octet (covers 10.60.<id>.1 style)
+		var anyOctetHits []string
+		for k := range keys {
+			for _, p := range strings.Split(k, ".") {
+				if p == teamID {
+					anyOctetHits = append(anyOctetHits, k)
+					break
+				}
+			}
+		}
+		if len(anyOctetHits) == 1 {
+			return anyOctetHits[0]
+		}
+		// Ambiguous — pick the last-octet hit set deterministically if it's
+		// non-empty, otherwise give up rather than guess wrong.
+		if len(lastOctetHits) > 1 {
+			sort.Strings(lastOctetHits)
+			return lastOctetHits[0]
+		}
+	}
+
+	// 3) substring fallback (e.g. "0.3" → "10.0.0.3")
+	var contains []string
+	for k := range keys {
+		if strings.Contains(k, teamID) {
+			contains = append(contains, k)
+		}
+	}
+	if len(contains) == 1 {
+		return contains[0]
+	}
+	return ""
 }
