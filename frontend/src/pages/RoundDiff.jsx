@@ -338,7 +338,7 @@ function RoundStepper({ label, accent, value, onChange }) {
           onChange={(e) => onChange(e.target.value)}
           type="number"
           min="1"
-          className="w-16 text-center bg-gray-800 border-y border-gray-700 px-1 py-1.5 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
+          className="w-28 text-center bg-gray-800 border-y border-gray-700 px-2 py-1.5 text-gray-100 text-sm tabular-nums focus:outline-none focus:border-cyan-500 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
         />
         <button onClick={() => step(1)} className={`${btn} rounded-r`} title="Next round">▶</button>
       </div>
