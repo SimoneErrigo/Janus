@@ -35,7 +35,6 @@ docker compose up -d
 - **Frontend dashboard:** `http://localhost:2999` (localhost-only)
 - **Backend API:** `http://localhost:8080` (localhost-only)
 - **Redis:** `127.0.0.1:6379` (internal only)
-- **Dozzle (container logs):** `http://<host>:14000` (password-protected — port via `DOZZLE_PORT`)
 
 ### Competition VM (Linux)
 
@@ -157,24 +156,7 @@ The **Config** page lets you update:
 - PCAP export directory and auto-save toggle
 - "Run cleanup now", "Clear Packets", "Purge Dropped" buttons and current DB size
 
-### 16. Container logs (Dozzle)
-
-Sidebar **Logs** link opens Dozzle (lightweight read-only container log viewer) at `http://<VM_IP>:${DOZZLE_PORT}`. The frontend reads the port from `GET /api/config` at runtime, so changing `DOZZLE_PORT` in `.env` only requires a `docker compose up -d dozzle`.
-
-#### Change the Dozzle password
-
-```bash
-# 1. Edit .env — set a long random password (≥20 chars):
-#       DOZZLE_PASSWORD=<NEW_STRONG_PASSWORD>
-# 2. Regenerate the bcrypt hash file:
-./scripts/dozzle-hash.sh
-# 3. Reload only Dozzle:
-docker compose restart dozzle
-```
-
-Login username is `admin`. The hash file is mounted read-only.
-
-### 17. Redis caching
+### 16. Redis caching
 
 Redis is used as a performance cache for the rules-evaluation hot path (cache invalidated on every rule create/update/delete). Redis is never the source of truth: if it's unreachable, Janus falls back to the persistent store transparently with no loss of correctness.
 

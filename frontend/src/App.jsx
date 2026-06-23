@@ -11,7 +11,6 @@ import Config from './pages/Config'
 import System from './pages/System'
 import SavedFlows from './pages/SavedFlows'
 import RoundDiff from './pages/RoundDiff'
-import Logs from './pages/Logs'
 import Protocols from './pages/Protocols'
 import FilterSandbox from './pages/FilterSandbox'
 
@@ -35,7 +34,6 @@ export default function App() {
         <Route path="saved-flows" element={<SavedFlows />} />
         <Route path="round-diff" element={<RoundDiff />} />
         <Route path="system" element={<System />} />
-        <Route path="logs" element={<Logs />} />
         <Route path="config" element={<Config />} />
         <Route path="filter-sandbox" element={<FilterSandbox />} />
       </Route>

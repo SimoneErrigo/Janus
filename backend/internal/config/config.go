@@ -49,9 +49,6 @@ type Config struct {
 
 	// gRPC / protobuf decoding
 	ProtoDir string // directory scanned at runtime for .proto files (default /protos)
-
-	// Dozzle (container logs)
-	DozzlePort int // host port where Dozzle is published (default 14000)
 }
 
 var (
@@ -74,7 +71,6 @@ func Load(envPath string) (*Config, error) {
 			FlowCorrelationWindowSec: 120,
 			FlagIDFormat:             "cyberchallenge",
 			ProtoDir:                 "/protos",
-			DozzlePort:               14000,
 		}
 
 		env, err := parseEnvFile(envPath)
@@ -152,11 +148,6 @@ func Load(envPath string) (*Config, error) {
 		if v, ok := env["PROTO_DIR"]; ok && v != "" {
 			cfg.ProtoDir = v
 		}
-		if v, ok := env["DOZZLE_PORT"]; ok && v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 && n < 65536 {
-				cfg.DozzlePort = n
-			}
-		}
 
 		// Environment variables override .env file
 		if v := os.Getenv("TEAM_PASSWORD"); v != "" {
@@ -224,11 +215,6 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v := os.Getenv("PROTO_DIR"); v != "" {
 			cfg.ProtoDir = v
-		}
-		if v := os.Getenv("DOZZLE_PORT"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 && n < 65536 {
-				cfg.DozzlePort = n
-			}
 		}
 
 		// Derive PcapExportDir default from DataDir if not set
