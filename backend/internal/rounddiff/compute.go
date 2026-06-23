@@ -151,45 +151,69 @@ func Compute(roundA, roundB int, packetsA, packetsB []*sniffer.Packet, opts Opti
 	// canonical routeKey above (so /flag/12345 and /flag/67890 collapse).
 	res.NewRoutes, res.GoneRoutes, res.ChangedRoutes = computeRouteDeltas(routesA, routesB)
 
+	// Cache the A-side comparable text + token counts once, and a per-route set
+	// of exact comparable texts. Twin matching reuses the counts (instead of
+	// re-tokenizing every A packet for every B packet), and the exact set powers
+	// the unchanged-packet fast path below.
+	aCounts := make(map[*sniffer.Packet]map[string]int, len(packetsA))
+	aExactByRoute := make(map[string]map[string]struct{}, len(routesA))
+	for k, pkts := range routesA {
+		set := make(map[string]struct{}, len(pkts))
+		for _, p := range pkts {
+			txt := comparablePacketText(p, true)
+			aCounts[p] = exactTokenCounts(txt)
+			set[txt] = struct{}{}
+		}
+		aExactByRoute[k] = set
+	}
+	// Twin matching can also fall back to the kind pool (packets not sharing the
+	// exact route); make sure those A packets have cached counts too.
+	for _, p := range packetsA {
+		if _, ok := aCounts[p]; !ok {
+			aCounts[p] = exactTokenCounts(comparablePacketText(p, true))
+		}
+	}
+
 	// Walk every B packet and diff its captured contents against the closest
-	// A-side packet. Suspicion presets are computed later as a secondary view;
-	// this is the generic round-to-round packet-content comparison.
+	// A-side packet. This is done in two phases: a cheap pass scores and filters
+	// every B packet (no LCS), then the expensive field diffs are built only for
+	// the top_k survivors. Suspicion presets are computed later as a secondary
+	// view; this is the generic round-to-round packet-content comparison.
 	type scored struct {
-		p       *sniffer.Packet
-		twin    *sniffer.Packet
-		route   string
-		score   float64
-		toks    []string
-		scope   string
-		preview string
-		diffs   []FieldDiff
-		fields  []string
+		p     *sniffer.Packet
+		twin  *sniffer.Packet
+		route string
+		score float64
+		toks  []string
 	}
 	cands := make([]scored, 0, len(packetsB))
 	for _, p := range packetsB {
 		route := routeKey(p)
+		// Fast path: a verbatim copy of this packet already exists on the same
+		// route in the baseline — it is unchanged, so there is nothing to show.
+		// (Equivalent to the meaningful==false drop below, but without any work.)
+		bText := comparablePacketText(p, true)
+		if set := aExactByRoute[route]; set != nil {
+			if _, ok := set[bText]; ok {
+				continue
+			}
+		}
 		corpus := corpusA[route]
 		if corpus == nil {
-			// Route is brand new — every token is "novel"; use the route key
-			// itself to avoid scoring against an empty corpus.
+			// Route is brand new — every token is "novel"; use an empty corpus
+			// to avoid scoring against nothing.
 			corpus = TokenMultiset{}
 		}
-		twin := pickTwinPacket(twinPool(routesA, kindsA, p), p)
-		fieldDiffs, changeFields, meaningful := packetFieldDiffs(twin, p, opts)
-		if !meaningful {
+		twin := pickTwinPacket(twinPool(routesA, kindsA, p), bText, aCounts)
+		if _, meaningful := changedFields(twin, p); !meaningful {
 			continue
 		}
-
-		body, scope := previewField(fieldDiffs, p)
 		novelScore, novel, _ := NoveltyScore(corpus, packetNoveltyText(p), opts.MaxNovelTokens)
 		score := maxFloat(packetChangeScore(twin, p), novelScore)
 		if score < opts.MinScore {
 			continue
 		}
-		cands = append(cands, scored{
-			p: p, twin: twin, route: route, score: score, toks: novel,
-			scope: scope, preview: body, diffs: fieldDiffs, fields: changeFields,
-		})
+		cands = append(cands, scored{p: p, twin: twin, route: route, score: score, toks: novel})
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
 		if cands[i].score != cands[j].score {
@@ -203,33 +227,36 @@ func Compute(roundA, roundB int, packetsA, packetsB []*sniffer.Packet, opts Opti
 		limit = len(cands)
 	}
 	for _, c := range cands[:limit] {
+		// Phase 2: build the expensive field diffs and preview, only now.
+		fieldDiffs, changeFields, _ := packetFieldDiffs(c.twin, c.p, opts)
+		preview, scope := previewField(fieldDiffs, c.p)
 		np := NovelPacket{
 			PacketID:      c.p.ID,
 			RouteKey:      c.route,
 			Score:         c.score,
 			NovelTokens:   c.toks,
 			SuspicionTags: SuspicionTags(comparablePacketText(c.p, false)),
-			Scope:         c.scope,
+			Scope:         scope,
 			Direction:     string(c.p.Direction),
-			Preview:       stripNonPrintable(c.preview, 320),
+			Preview:       stripNonPrintable(preview, 320),
 			URL:           c.p.URL,
 			Method:        c.p.Method,
 			Status:        c.p.Status,
-			ChangeFields:  c.fields,
+			ChangeFields:  changeFields,
 		}
 		if c.twin != nil {
 			np.TwinPacketID = c.twin.ID
 		}
 		if opts.IncludeDiff {
-			np.FieldDiffs = c.diffs
-			for _, fd := range c.diffs {
+			np.FieldDiffs = fieldDiffs
+			for _, fd := range fieldDiffs {
 				if fd.Field == "body" {
 					np.Diff = fd.Diff
 					break
 				}
 			}
-			if len(np.Diff) == 0 && len(c.diffs) > 0 {
-				np.Diff = c.diffs[0].Diff
+			if len(np.Diff) == 0 && len(fieldDiffs) > 0 {
+				np.Diff = fieldDiffs[0].Diff
 			}
 		}
 		res.NovelPackets = append(res.NovelPackets, np)
@@ -668,15 +695,19 @@ func packetChangeScore(a, b *sniffer.Packet) float64 {
 	return score
 }
 
-func pickTwinPacket(aPkts []*sniffer.Packet, b *sniffer.Packet) *sniffer.Packet {
+// pickTwinPacket selects the A-side packet whose significant content is most
+// similar to b. bText is b's precomputed comparable text and aCounts holds the
+// precomputed token counts for every A packet, so the inner loop does no
+// tokenisation work.
+func pickTwinPacket(aPkts []*sniffer.Packet, bText string, aCounts map[*sniffer.Packet]map[string]int) *sniffer.Packet {
 	if len(aPkts) == 0 {
 		return nil
 	}
-	bText := comparablePacketText(b, true)
+	bCounts := exactTokenCounts(bText)
 	var best *sniffer.Packet
 	bestSim := -1.0
 	for _, p := range aPkts {
-		sim := exactSimilarity(comparablePacketText(p, true), bText)
+		sim := exactSimilarityCounts(aCounts[p], bCounts)
 		if sim > bestSim {
 			bestSim = sim
 			best = p
@@ -688,12 +719,12 @@ func pickTwinPacket(aPkts []*sniffer.Packet, b *sniffer.Packet) *sniffer.Packet 
 	return best
 }
 
-func exactSimilarity(a, b string) float64 {
-	if a == "" && b == "" {
+// exactSimilarityCounts is the token-multiset Jaccard similarity over two
+// precomputed token-count maps.
+func exactSimilarityCounts(ta, tb map[string]int) float64 {
+	if len(ta) == 0 && len(tb) == 0 {
 		return 1
 	}
-	ta := exactTokenCounts(a)
-	tb := exactTokenCounts(b)
 	if len(ta) == 0 || len(tb) == 0 {
 		return 0
 	}
@@ -718,6 +749,41 @@ func exactSimilarity(a, b string) float64 {
 		return 0
 	}
 	return float64(common) / float64(union)
+}
+
+// changedFields reports which packet fields differ between a (baseline twin)
+// and b, plus whether any *meaningful* change occurred. It is the cheap
+// counterpart of packetFieldDiffs: it does only string-equality checks and
+// never builds an LCS diff, so it can run over every B packet. The field set,
+// ordering, and "meaningful" semantics mirror packetFieldDiffs exactly.
+func changedFields(a, b *sniffer.Packet) ([]string, bool) {
+	fields := []struct {
+		name       string
+		before     string
+		after      string
+		meaningful bool
+	}{
+		{"url", requestLine(a), requestLine(b), true},
+		{"status", statusText(a), statusText(b), true},
+		{"headers", headersText(a, false), headersText(b, false), false},
+		{"body", bodyText(a), bodyText(b), true},
+	}
+	changed := make([]string, 0, len(fields))
+	meaningful := false
+	for _, f := range fields {
+		if f.before == f.after {
+			continue
+		}
+		changed = append(changed, f.name)
+		if f.name == "headers" {
+			if headersText(a, true) != headersText(b, true) {
+				meaningful = true
+			}
+		} else if f.meaningful {
+			meaningful = true
+		}
+	}
+	return changed, meaningful
 }
 
 func exactChangeScore(a, b string) float64 {
@@ -783,64 +849,6 @@ func queryString(url string) string {
 		return ""
 	}
 	return url[i+1:]
-}
-
-// pickTwin selects the A-side packet from the same route whose body is the
-// closest to the B-side body, using token-set Jaccard similarity. When the
-// route has no A-side packets we return nil and an empty body — the caller
-// renders the diff as a pure insertion.
-func pickTwin(aPkts []*sniffer.Packet, b *sniffer.Packet, bBody string) (*sniffer.Packet, string) {
-	if len(aPkts) == 0 {
-		return nil, ""
-	}
-	bToks := tokenSet(bBody)
-	var best *sniffer.Packet
-	var bestBody string
-	bestSim := -1.0
-	for _, p := range aPkts {
-		body, _ := pickBestPayload(p)
-		if body == "" {
-			continue
-		}
-		aToks := tokenSet(body)
-		sim := jaccard(aToks, bToks)
-		if sim > bestSim {
-			bestSim = sim
-			best = p
-			bestBody = body
-		}
-	}
-	if best == nil {
-		// Fall back to first packet's body even if empty so the caller can
-		// still produce a "this whole thing is new" diff.
-		return aPkts[0], ""
-	}
-	return best, bestBody
-}
-
-func tokenSet(s string) map[string]struct{} {
-	out := make(map[string]struct{}, 16)
-	for _, t := range Tokenize(s) {
-		out[t] = struct{}{}
-	}
-	return out
-}
-
-func jaccard(a, b map[string]struct{}) float64 {
-	if len(a) == 0 && len(b) == 0 {
-		return 0
-	}
-	inter := 0
-	for k := range a {
-		if _, ok := b[k]; ok {
-			inter++
-		}
-	}
-	union := len(a) + len(b) - inter
-	if union == 0 {
-		return 0
-	}
-	return float64(inter) / float64(union)
 }
 
 func buildSuspiciousBuckets(pkts []*sniffer.Packet) []SuspiciousBucket {
