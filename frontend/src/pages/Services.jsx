@@ -275,8 +275,10 @@ function ServiceForm({ service, onSave, onCancel }) {
     <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 mb-4">
       <h3 className="text-lg font-medium text-gray-100 mb-4">{form._isNew ? 'New Service' : 'Edit Service'}</h3>
       <div className="grid grid-cols-2 gap-4">
-        <Field label="Service ID" value={form.id} onChange={(v) => set('id', v)} disabled={!form._isNew} placeholder="e.g. web1" />
-        <Field label="Name" value={form.name} onChange={(v) => set('name', v)} placeholder="e.g. Web Challenge" />
+        {!form._isNew && (
+          <Field label="Service ID" value={form.id} onChange={() => {}} disabled placeholder="e.g. web1" />
+        )}
+        <Field label="Name" value={form.name} onChange={(v) => set('name', v)} placeholder={form._isNew ? 'e.g. Web Challenge (ID auto-generated)' : 'e.g. Web Challenge'} />
         <Field label="Listen Address" value={form.listen_addr} onChange={(v) => set('listen_addr', v)} placeholder="e.g. 10.10.0.1" />
         <Field label="Listen Port" value={form.listen_port} onChange={(v) => set('listen_port', v)} placeholder="e.g. 8080" type="number" />
         <Field label="Target Address" value={form.target_addr} onChange={(v) => set('target_addr', v)} placeholder="e.g. 127.0.0.1:9080" />

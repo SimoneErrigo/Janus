@@ -282,6 +282,15 @@ func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The ID is an internal key; users only provide a name. Auto-generate a
+	// unique slug from the name when the client didn't supply one.
+	if strings.TrimSpace(svc.ID) == "" {
+		svc.ID = uniqueServiceID(svc.Name, func(id string) bool {
+			_, exists := s.store.GetService(id)
+			return exists
+		})
+	}
+
 	if err := validateService(&svc); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

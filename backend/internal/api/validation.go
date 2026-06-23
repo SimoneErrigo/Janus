@@ -14,6 +14,37 @@ import (
 // (LIST returns the service but UPDATE/DELETE 404s on the URL-derived key).
 var serviceIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
+// slugifyServiceID derives a URL/JSON-safe service id from a human name, e.g.
+// "Buggy Web!" -> "buggy-web". Returns "" when the name has no usable chars.
+func slugifyServiceID(name string) string {
+	var b strings.Builder
+	lastDash := false
+	for _, r := range strings.ToLower(strings.TrimSpace(name)) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_' {
+			b.WriteRune(r)
+			lastDash = false
+		} else if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-._")
+}
+
+// uniqueServiceID builds a service id from name and bumps a numeric suffix
+// until taken() reports the id is free.
+func uniqueServiceID(name string, taken func(string) bool) string {
+	base := slugifyServiceID(name)
+	if base == "" {
+		base = "svc"
+	}
+	id := base
+	for i := 2; taken(id); i++ {
+		id = fmt.Sprintf("%s-%d", base, i)
+	}
+	return id
+}
+
 func validateService(svc *storage.Service) error {
 	svc.ID = strings.TrimSpace(svc.ID)
 	if svc.ID == "" {
