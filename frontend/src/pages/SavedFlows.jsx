@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import { getTrafficNavKeys } from '../trafficNavKeys'
 import QuickRulePanel from '../components/QuickRulePanel'
+import ExploitButton from '../components/ExploitButton'
 import { copyText } from '../utils/clipboard'
 import { tryFormatJSON } from '../utils/formatting'
 import {
@@ -37,7 +38,7 @@ function flowPcapUrl(anchorPacketId) {
 
 // ---- Packet detail panel (reused per flow column) ----
 
-const PacketDetail = memo(function PacketDetail({ packet, services, customProtocols, onClose, onCopyExploit, copyStatus }) {
+const PacketDetail = memo(function PacketDetail({ packet, services, customProtocols, onClose }) {
   const [showQuickRule, setShowQuickRule] = useState(false)
   // Server-side decoded gRPC frames (resolved via the service's .proto files).
   const [decodedNamed, setDecodedNamed] = useState(null)
@@ -120,16 +121,7 @@ const PacketDetail = memo(function PacketDetail({ packet, services, customProtoc
       <div className="flex items-center justify-between p-3 border-b border-gray-800 sticky top-0 bg-gray-900 z-10">
         <div className="flex items-center gap-2 flex-wrap">
           <h3 className="text-sm font-medium text-gray-100">Packet #{packet.id}</h3>
-          {onCopyExploit && (
-            <button
-              onClick={() => onCopyExploit(packet.id)}
-              disabled={copyStatus === 'copying'}
-              className="text-xs text-cyan-400 hover:text-cyan-300 cursor-pointer disabled:opacity-50"
-              title="Generate exploit skeleton from this flow"
-            >
-              {copyStatus === 'copying' ? '…' : 'Exploit'}
-            </button>
-          )}
+          <ExploitButton packetId={packet.id} variant="link" />
           <button
             onClick={() => setShowQuickRule((v) => !v)}
             className={`text-xs flex items-center gap-1 cursor-pointer transition-colors ${showQuickRule ? 'text-red-300' : 'text-red-400 hover:text-red-300'}`}
@@ -340,7 +332,7 @@ const PacketDetail = memo(function PacketDetail({ packet, services, customProtoc
 
 // ---- Single-flow inspector: list on left, selected packet detail on right ----
 
-function FlowInspector({ flowData, services, customProtocols, diffSet, onNavigate, onCopyExploit, copyStatus, isFocused, onFocus }) {
+function FlowInspector({ flowData, services, customProtocols, diffSet, onNavigate, isFocused, onFocus }) {
   const { flow, packets, missing_count: missing } = flowData
   const [selectedId, setSelectedId] = useState(null)
   const selected = useMemo(() => packets.find((p) => p.id === selectedId) || null, [packets, selectedId])
@@ -460,8 +452,6 @@ function FlowInspector({ flowData, services, customProtocols, diffSet, onNavigat
             services={services}
             customProtocols={customProtocols}
             onClose={() => setSelectedId(null)}
-            onCopyExploit={onCopyExploit}
-            copyStatus={copyStatus}
           />
         )}
       </div>
@@ -480,7 +470,6 @@ export default function SavedFlows() {
   const [loadingDetail, setLoadingDetail] = useState(false)
   const [error, setError] = useState('')
   const [sidebarOpen, setSidebarOpen] = useState(true)
-  const [copyStatus, setCopyStatus] = useState(null)
   const [services, setServices] = useState([])
   const [customProtocols, setCustomProtocols] = useState([])
   const [focusedFlowId, setFocusedFlowId] = useState(null)
@@ -546,21 +535,6 @@ export default function SavedFlows() {
 
   function openInTraffic(anchorPacketId) {
     navigate('/traffic', { state: { openFlowForPacketId: anchorPacketId } })
-  }
-
-  async function handleCopyExploit(packetId) {
-    setCopyStatus('copying')
-    try {
-      const data = await api.generateExploit(packetId)
-      const ok = await copyText(data.code)
-      if (!ok) throw new Error('clipboard copy failed')
-      setCopyStatus('copied')
-      setTimeout(() => setCopyStatus(null), 2000)
-    } catch (err) {
-      console.error('Failed to generate exploit:', err)
-      setCopyStatus('error')
-      setTimeout(() => setCopyStatus(null), 3000)
-    }
   }
 
   const loadedSelected = selectedIds.map((id) => flowData[id]).filter(Boolean)
@@ -706,8 +680,6 @@ export default function SavedFlows() {
             customProtocols={customProtocols}
             diffSet={null}
             onNavigate={openInTraffic}
-            onCopyExploit={handleCopyExploit}
-            copyStatus={copyStatus}
             isFocused={focusedFlowId === loadedSelected[0].flow.id}
             onFocus={() => setFocusedFlowId(loadedSelected[0].flow.id)}
           />
@@ -720,8 +692,6 @@ export default function SavedFlows() {
               customProtocols={customProtocols}
               diffSet={diffSets[0]}
               onNavigate={openInTraffic}
-              onCopyExploit={handleCopyExploit}
-              copyStatus={copyStatus}
               isFocused={focusedFlowId === loadedSelected[0].flow.id}
               onFocus={() => setFocusedFlowId(loadedSelected[0].flow.id)}
             />
@@ -732,8 +702,6 @@ export default function SavedFlows() {
               customProtocols={customProtocols}
               diffSet={diffSets[1]}
               onNavigate={openInTraffic}
-              onCopyExploit={handleCopyExploit}
-              copyStatus={copyStatus}
               isFocused={focusedFlowId === loadedSelected[1].flow.id}
               onFocus={() => setFocusedFlowId(loadedSelected[1].flow.id)}
             />
@@ -741,8 +709,6 @@ export default function SavedFlows() {
         )}
       </div>
 
-      {copyStatus === 'copied' && <div className="fixed bottom-4 right-4 bg-green-800 text-green-200 text-xs px-3 py-1.5 rounded-full z-50">Exploit copied!</div>}
-      {copyStatus === 'error' && <div className="fixed bottom-4 right-4 bg-red-800 text-red-200 text-xs px-3 py-1.5 rounded-full z-50">Failed to generate exploit</div>}
     </div>
   )
 }
