@@ -1,12 +1,21 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import ErrorBanner from '../components/ErrorBanner'
 
 // All the heavy lifting (packet-content diffing, tokenisation, twin selection,
-// suspicion tagging, route grouping) now lives in the Go backend at
+// suspicion tagging, route grouping) lives in the Go backend at
 // /api/round-diff. This page renders the result and exposes inspect / open-flow
 // actions on every packet referenced.
+//
+// Terminology: round A is the BASELINE (reference) and round B is the round
+// being ANALYZED. The backend pairs each analyzed-round packet with its closest
+// baseline twin and reports what changed. Diff colors: green = added in B,
+// red = removed since A.
+
+// Consistent accent colors for the two rounds, reused everywhere A/B appear.
+const BASE_ACCENT = 'text-blue-300'
+const ANALYZED_ACCENT = 'text-cyan-300'
 
 const ROUND_DIFF_MEMORY_KEY = 'janus.roundDiff.memory.v1'
 let roundDiffMemoryCache = null
@@ -36,6 +45,7 @@ function saveRoundDiffMemory(data) {
       include_diff: data.include_diff,
       top_k: data.top_k,
       expanded_ids: data.expanded_ids,
+      open_panels: data.open_panels,
       scroll_top: data.scroll_top,
     }
     window.sessionStorage.setItem(ROUND_DIFF_MEMORY_KEY, JSON.stringify(lightweight))
@@ -52,11 +62,13 @@ export default function RoundDiff() {
   const [selected, setSelected] = useState(() => Array.isArray(memory?.selected) ? memory.selected : [])
   const [roundA, setRoundA] = useState(() => memory?.round_a || '')
   const [roundB, setRoundB] = useState(() => memory?.round_b || '')
+  const [currentRound, setCurrentRound] = useState(0)
   const [includeDiff, setIncludeDiff] = useState(() => memory?.include_diff !== false)
   const [topK, setTopK] = useState(() => memory?.top_k || 24)
   const [rows, setRows] = useState(() => Array.isArray(memory?.rows) ? memory.rows : [])
   const [packet, setPacket] = useState(() => memory?.packet || null)
   const [expandedIds, setExpandedIds] = useState(() => new Set(Array.isArray(memory?.expanded_ids) ? memory.expanded_ids : []))
+  const [openPanels, setOpenPanels] = useState(() => new Set(Array.isArray(memory?.open_panels) ? memory.open_panels : []))
   const [packetError, setPacketError] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -75,6 +87,7 @@ export default function RoundDiff() {
     }).catch((err) => setError(err.message))
     api.getFlagIDStatus().then((st) => {
       const cur = st?.clock_round || st?.current_round
+      if (cur > 0) setCurrentRound(cur)
       if (cur > 1) {
         setRoundA((prev) => prev || String(cur - 1))
         setRoundB((prev) => prev || String(cur))
@@ -91,8 +104,9 @@ export default function RoundDiff() {
     rows,
     packet,
     expanded_ids: Array.from(expandedIds),
+    open_panels: Array.from(openPanels),
     scroll_top: scrollTopRef.current,
-  }), [selected, roundA, roundB, includeDiff, topK, rows, packet, expandedIds])
+  }), [selected, roundA, roundB, includeDiff, topK, rows, packet, expandedIds, openPanels])
 
   function memorySnapshot() {
     return { ...memoryData, scroll_top: scrollTopRef.current }
@@ -119,6 +133,21 @@ export default function RoundDiff() {
       if (prev.includes(id)) return prev.filter((x) => x !== id)
       if (prev.length >= 2) return prev
       return [...prev, id]
+    })
+  }
+
+  function setPrevToCurrent() {
+    if (currentRound < 2) return
+    setRoundA(String(currentRound - 1))
+    setRoundB(String(currentRound))
+  }
+
+  function togglePanel(key) {
+    setOpenPanels((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
     })
   }
 
@@ -194,16 +223,17 @@ export default function RoundDiff() {
 
       <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 mb-4">
         <div className="flex items-end gap-3 flex-wrap">
-          <label className="text-sm text-gray-400">
-            Round A
-            <input value={roundA} onChange={(e) => setRoundA(e.target.value)} type="number" min="1"
-              className="block mt-1 w-24 bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-gray-100 text-sm focus:outline-none focus:border-cyan-500" />
-          </label>
-          <label className="text-sm text-gray-400">
-            Round B
-            <input value={roundB} onChange={(e) => setRoundB(e.target.value)} type="number" min="1"
-              className="block mt-1 w-24 bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-gray-100 text-sm focus:outline-none focus:border-cyan-500" />
-          </label>
+          <RoundStepper label="Baseline (A)" accent={BASE_ACCENT} value={roundA} onChange={setRoundA} />
+          <div className="pb-1.5 text-gray-600 text-lg">→</div>
+          <RoundStepper label="Analyzed (B)" accent={ANALYZED_ACCENT} value={roundB} onChange={setRoundB} />
+          <button
+            onClick={setPrevToCurrent}
+            disabled={currentRound < 2}
+            title={currentRound < 2 ? 'Current round unknown' : `Set A=${currentRound - 1}, B=${currentRound}`}
+            className="text-xs px-2 py-1.5 rounded border border-gray-700 bg-gray-800 text-gray-300 hover:text-gray-100 hover:border-gray-600 disabled:opacity-40 disabled:cursor-default cursor-pointer"
+          >
+            Prev → current
+          </button>
           <label className="text-sm text-gray-400">
             Top K
             <input value={topK} onChange={(e) => setTopK(Math.max(1, Math.min(200, Number(e.target.value) || 1)))} type="number" min="1" max="200"
@@ -234,6 +264,12 @@ export default function RoundDiff() {
             Inline diff
           </label>
         </div>
+        <p className="mt-3 text-xs text-gray-500">
+          Showing what changed in the <span className={ANALYZED_ACCENT}>analyzed round (B)</span> relative to the{' '}
+          <span className={BASE_ACCENT}>baseline (A)</span>.{' '}
+          <span className="text-emerald-300">Green</span> = added in B ·{' '}
+          <span className="text-red-300">red</span> = removed since A.
+        </p>
       </div>
 
       <ErrorBanner error={error || packetError} className="mb-4" />
@@ -253,6 +289,8 @@ export default function RoundDiff() {
             onFlow={openFlow}
             expandedIds={expandedIds}
             onToggleExpanded={toggleExpanded}
+            openPanels={openPanels}
+            onTogglePanel={togglePanel}
           />
         ))}
         {!loading && rows.length === 0 && (
@@ -286,7 +324,29 @@ export default function RoundDiff() {
   )
 }
 
-function ServiceCard({ data, roundA, roundB, onInspect, onFlow, expandedIds, onToggleExpanded }) {
+function RoundStepper({ label, accent, value, onChange }) {
+  const n = Number(value) || 0
+  const step = (delta) => onChange(String(Math.max(1, n + delta)))
+  const btn = 'px-1.5 py-1.5 bg-gray-800 border border-gray-700 text-gray-400 hover:text-gray-100 cursor-pointer select-none'
+  return (
+    <div>
+      <div className={`text-xs mb-1 ${accent}`}>{label}</div>
+      <div className="flex items-stretch">
+        <button onClick={() => step(-1)} className={`${btn} rounded-l`} title="Previous round">◀</button>
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          type="number"
+          min="1"
+          className="w-16 text-center bg-gray-800 border-y border-gray-700 px-1 py-1.5 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
+        />
+        <button onClick={() => step(1)} className={`${btn} rounded-r`} title="Next round">▶</button>
+      </div>
+    </div>
+  )
+}
+
+function ServiceCard({ data, roundA, roundB, onInspect, onFlow, expandedIds, onToggleExpanded, openPanels, onTogglePanel }) {
   if (!data) return null
   // Keep the view tolerant of older backend responses that may serialize empty
   // Go slices as null.
@@ -297,19 +357,19 @@ function ServiceCard({ data, roundA, roundB, onInspect, onFlow, expandedIds, onT
   const newR = data.new_routes || []
   const goneR = data.gone_routes || []
   const changedR = data.changed_routes || []
+  const routesKey = `${data.service_id}:routes`
+  const suspKey = `${data.service_id}:suspicious`
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
       <div className="flex items-center justify-between mb-3">
         <h3 className="text-lg font-medium text-gray-100">{data.service_name || data.service_id}</h3>
         <span className="text-[10px] uppercase tracking-wide text-gray-600">
-          rounds {roundA} → {roundB} · scanned {data.packets_scanned}
+          <span className={BASE_ACCENT}>A {roundA}</span> → <span className={ANALYZED_ACCENT}>B {roundB}</span> · scanned {data.packets_scanned}
           {data.truncated && <span className="text-amber-400 ml-2">· truncated</span>}
         </span>
       </div>
-      <div className="grid grid-cols-2 gap-2 text-xs mb-4">
-        <StatsBox label={`Round ${roundA}`} stats={sa} />
-        <StatsBox label={`Round ${roundB}`} stats={sb} />
-      </div>
+
+      <StatsCompare a={sa} b={sb} roundA={roundA} roundB={roundB} />
 
       <ContentDiffSection
         items={novels}
@@ -319,65 +379,88 @@ function ServiceCard({ data, roundA, roundB, onInspect, onFlow, expandedIds, onT
         onToggleExpanded={onToggleExpanded}
       />
 
-      <SuspiciousSection items={suspicious} onInspect={onInspect} onFlow={onFlow} />
+      <CollapsiblePanel
+        title="Route volume changes"
+        count={newR.length + goneR.length + changedR.length}
+        open={openPanels.has(routesKey)}
+        onToggle={() => onTogglePanel(routesKey)}
+      >
+        <RouteChanges newR={newR} goneR={goneR} changedR={changedR} />
+      </CollapsiblePanel>
 
-      <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3">
-        <RouteList title="New route patterns" items={newR} primary="count_b" color="text-emerald-300" />
-        <RouteList title="Gone route patterns" items={goneR} primary="count_a" color="text-red-300" />
-        <RouteDeltaList title="Changed route volume" items={changedR} />
-      </div>
+      <CollapsiblePanel
+        title="Preset attack matches (secondary)"
+        count={suspicious.length}
+        open={openPanels.has(suspKey)}
+        onToggle={() => onTogglePanel(suspKey)}
+      >
+        <SuspiciousList items={suspicious} onInspect={onInspect} onFlow={onFlow} />
+      </CollapsiblePanel>
     </div>
   )
 }
 
-function StatsBox({ label, stats }) {
-  const s = stats || {}
-  return (
-    <div className="bg-gray-800/60 rounded p-2">
-      <div className="text-gray-500 mb-1">{label}</div>
-      <div className="grid grid-cols-3 gap-y-1">
-        <span>Total <b className="text-gray-200">{s.total || 0}</b></span>
-        <span>Req <b className="text-blue-300">{s.req || 0}</b></span>
-        <span>Res <b className="text-green-300">{s.res || 0}</b></span>
-        <span>Flags <b className="text-yellow-300">{s.flagged || 0}</b></span>
-        <span>FlagIDs <b className="text-teal-300">{s.flagids || 0}</b></span>
-        <span>Drops <b className="text-red-300">{s.dropped || 0}</b></span>
-      </div>
-    </div>
-  )
-}
+const STAT_METRICS = [
+  ['total', 'Total'],
+  ['req', 'Req'],
+  ['res', 'Res'],
+  ['flagged', 'Flags'],
+  ['flagids', 'FlagIDs'],
+  ['dropped', 'Drops'],
+]
 
-function SuspiciousSection({ items, onInspect, onFlow }) {
-  if (!items || items.length === 0) return null
+function StatsCompare({ a, b, roundA, roundB }) {
+  const A = a || {}
+  const B = b || {}
   return (
-    <div className="mt-4 mb-2 bg-red-950/10 border border-red-900/40 rounded p-3">
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-sm text-red-200">Preset matches ({items.length} buckets)</span>
-        <span className="text-[10px] uppercase tracking-wide text-red-400/70">secondary signal in round B</span>
-      </div>
-      <div className="space-y-1 max-h-72 overflow-auto">
-        {items.map((b) => (
-          <div key={b.key} className="bg-gray-900/60 rounded px-2 py-1 text-xs">
-            <div className="flex items-start justify-between gap-2">
-              <span className="text-red-200 font-mono">
-                {b.scope} · {(b.tags || []).join(' + ')}
+    <div className="bg-gray-800/40 rounded p-3 text-xs mb-4">
+      <div className="grid grid-cols-[1fr_auto_auto_auto] gap-x-4 gap-y-1 items-center">
+        <span />
+        <span className={`text-right ${BASE_ACCENT}`}>Baseline {roundA}</span>
+        <span className={`text-right ${ANALYZED_ACCENT}`}>Analyzed {roundB}</span>
+        <span className="text-right text-gray-500">Δ</span>
+        {STAT_METRICS.map(([key, label]) => {
+          const av = A[key] || 0
+          const bv = B[key] || 0
+          const d = bv - av
+          return (
+            <Fragment key={key}>
+              <span className="text-gray-400">{label}</span>
+              <span className="text-right text-gray-300">{av}</span>
+              <span className="text-right text-gray-100 font-medium">{bv}</span>
+              <span className={`text-right ${d > 0 ? 'text-emerald-300' : d < 0 ? 'text-red-300' : 'text-gray-600'}`}>
+                {d === 0 ? '·' : `${d > 0 ? '+' : ''}${d}`}
               </span>
-              <span className="text-gray-500 whitespace-nowrap">{b.count}</span>
-            </div>
-            {b.samples?.length > 0 && (
-              <div className="mt-1 flex items-center gap-1 flex-wrap">
-                {b.samples.map((s) => (
-                  <span key={s.packet_id} className="flex items-center gap-1">
-                    <button onClick={() => onInspect(s.packet_id)} className="text-cyan-300 hover:text-cyan-200 font-mono cursor-pointer">#{s.packet_id}</button>
-                    <button onClick={() => onFlow(s.packet_id)} className="text-purple-300 hover:text-purple-200 cursor-pointer">flow</button>
-                  </span>
-                ))}
-              </div>
-            )}
-          </div>
-        ))}
+            </Fragment>
+          )
+        })}
       </div>
     </div>
+  )
+}
+
+function CollapsiblePanel({ title, count, open, onToggle, children }) {
+  return (
+    <div className="mt-4 border border-gray-800 rounded">
+      <button
+        onClick={onToggle}
+        className="w-full flex items-center gap-2 px-3 py-2 text-sm text-gray-300 hover:bg-gray-800/40 cursor-pointer"
+      >
+        <span className="font-mono text-gray-500 w-3">{open ? '▼' : '▶'}</span>
+        <span>{title}</span>
+        <span className="text-xs text-gray-600">({count})</span>
+      </button>
+      {open && <div className="px-3 pb-3">{children}</div>}
+    </div>
+  )
+}
+
+function DiffLegend() {
+  return (
+    <span className="flex items-center gap-2 text-[10px] normal-case tracking-normal">
+      <span className="bg-emerald-900/40 text-emerald-200 rounded px-1">added (B)</span>
+      <span className="bg-red-900/40 text-red-200 rounded px-1 line-through">removed (A)</span>
+    </span>
   )
 }
 
@@ -385,13 +468,13 @@ function ContentDiffSection({ items, onInspect, onFlow, expandedIds, onToggleExp
   if (!items || items.length === 0) {
     return (
       <div className="text-xs text-gray-600">
-        No packet content changes found between these rounds.
+        No packet content changes found in the analyzed round.
       </div>
     )
   }
   return (
     <div className="mb-2">
-      <div className="text-sm text-gray-300 mb-2">Packet content diffs in round B ({items.length})</div>
+      <div className="text-sm text-gray-300 mb-2">Packet content changes in the analyzed round (B) ({items.length})</div>
       <div className="space-y-2 max-h-[36rem] overflow-auto">
         {items.map((it) => (
           <ContentDiffRow
@@ -420,14 +503,14 @@ function ContentDiffRow({ item, onInspect, onFlow, expanded, onToggleExpanded })
           <button onClick={onToggleExpanded} className="text-gray-500 hover:text-gray-300 cursor-pointer font-mono w-4">
             {expanded ? '▼' : '▶'}
           </button>
-          <span className="font-mono text-cyan-300 truncate">{item.route_key}</span>
+          <span className={`font-mono ${ANALYZED_ACCENT} truncate`}>{item.route_key}</span>
           {tags.length > 0 && (
             <span className="text-red-300 font-mono">!{tags.join('+')}</span>
           )}
         </div>
         <div className="flex items-center gap-2 whitespace-nowrap">
           <span className={`font-mono ${pct >= 50 ? 'text-red-300' : pct >= 20 ? 'text-amber-300' : 'text-gray-400'}`}>{pct}%</span>
-          <button onClick={() => onInspect(item.packet_id)} className="text-cyan-300 hover:text-cyan-200 font-mono cursor-pointer">#{item.packet_id}</button>
+          <button onClick={() => onInspect(item.packet_id)} className={`${ANALYZED_ACCENT} hover:text-cyan-200 font-mono cursor-pointer`}>#{item.packet_id}</button>
           <button onClick={() => onFlow(item.packet_id)} className="text-purple-300 hover:text-purple-200 cursor-pointer">flow</button>
         </div>
       </div>
@@ -470,15 +553,18 @@ function ContentDiffRow({ item, onInspect, onFlow, expanded, onToggleExpanded })
 
 function TwinHeader({ twinPacketId, onInspect, onFlow }) {
   return (
-    <div className="flex items-center justify-between text-[10px] uppercase tracking-wide text-gray-600">
-      <span>Diff vs closest round-A packet</span>
+    <div className="flex items-center justify-between gap-2 text-[10px] uppercase tracking-wide text-gray-600">
+      <span className="flex items-center gap-2">
+        <span>vs closest <span className={BASE_ACCENT}>baseline</span> packet</span>
+        <DiffLegend />
+      </span>
       {twinPacketId > 0 ? (
         <span className="flex items-center gap-2">
-          <button onClick={() => onInspect(twinPacketId)} className="text-cyan-400 hover:text-cyan-200 font-mono cursor-pointer">#{twinPacketId}</button>
+          <button onClick={() => onInspect(twinPacketId)} className={`${BASE_ACCENT} hover:text-blue-200 font-mono cursor-pointer`}>#{twinPacketId}</button>
           <button onClick={() => onFlow(twinPacketId)} className="text-purple-400 hover:text-purple-200 cursor-pointer">flow</button>
         </span>
       ) : (
-        <span className="text-gray-700">new in round B</span>
+        <span className="text-emerald-400/80">new in analyzed round</span>
       )}
     </div>
   )
@@ -504,14 +590,8 @@ function FieldDiffViewer({ fieldDiff }) {
 function DiffViewer({ ops, twinPacketId, onInspect, onFlow }) {
   return (
     <div className="mt-2 bg-gray-900/60 border border-gray-800 rounded p-2">
-      <div className="flex items-center justify-between mb-1 text-[10px] uppercase tracking-wide text-gray-600">
-        <span>Diff vs closest round-A twin</span>
-        {twinPacketId > 0 && (
-          <span className="flex items-center gap-2">
-            <button onClick={() => onInspect(twinPacketId)} className="text-cyan-400 hover:text-cyan-200 font-mono cursor-pointer">#{twinPacketId}</button>
-            <button onClick={() => onFlow(twinPacketId)} className="text-purple-400 hover:text-purple-200 cursor-pointer">flow</button>
-          </span>
-        )}
+      <div className="mb-1">
+        <TwinHeader twinPacketId={twinPacketId} onInspect={onInspect} onFlow={onFlow} />
       </div>
       <DiffOps ops={ops} />
     </div>
@@ -531,49 +611,77 @@ function DiffOps({ ops }) {
   )
 }
 
-function RouteList({ title, items, primary, color }) {
-  const list = items || []
+// RouteChanges merges new / gone / changed-volume routes into one badged list.
+function RouteChanges({ newR, goneR, changedR }) {
+  const rows = useMemo(() => {
+    const out = []
+    for (const r of newR) out.push({ key: r.key, kind: 'NEW', detail: `0 → ${r.count_b}` })
+    for (const r of goneR) out.push({ key: r.key, kind: 'GONE', detail: `${r.count_a} → 0` })
+    for (const r of changedR) {
+      const delta = (r.count_b || 0) - (r.count_a || 0)
+      out.push({ key: r.key, kind: 'DELTA', delta, detail: `${r.count_a} → ${r.count_b}` })
+    }
+    return out
+  }, [newR, goneR, changedR])
+
+  if (rows.length === 0) {
+    return <div className="text-xs text-gray-700">No route volume changes between these rounds.</div>
+  }
   return (
-    <div>
-      <div className="text-xs text-gray-500 mb-1">{title}</div>
-      {list.length === 0 ? (
-        <div className="text-xs text-gray-700">No change</div>
-      ) : (
-        <div className="space-y-1 max-h-60 overflow-auto">
-          {list.map((it) => (
-            <div key={it.key} className="flex items-center justify-between gap-3 text-xs bg-gray-800/40 rounded px-2 py-1">
-              <span className={`${color} font-mono truncate`}>{it.key}</span>
-              <span className="text-gray-500">{it[primary]}</span>
-            </div>
-          ))}
+    <div className="space-y-1 max-h-72 overflow-auto">
+      {rows.map((r, i) => (
+        <div key={`${r.kind}-${r.key}-${i}`} className="flex items-center justify-between gap-3 text-xs bg-gray-800/40 rounded px-2 py-1">
+          <span className="flex items-center gap-2 min-w-0">
+            <RouteBadge kind={r.kind} delta={r.delta} />
+            <span className="text-gray-300 font-mono truncate">{r.key}</span>
+          </span>
+          <span className="text-gray-500 whitespace-nowrap">{r.detail}</span>
         </div>
-      )}
+      ))}
     </div>
   )
 }
 
-function RouteDeltaList({ title, items }) {
-  const list = items || []
+function RouteBadge({ kind, delta }) {
+  if (kind === 'NEW') {
+    return <span className="text-[10px] font-mono px-1 rounded bg-emerald-950/50 border border-emerald-900/60 text-emerald-300">NEW</span>
+  }
+  if (kind === 'GONE') {
+    return <span className="text-[10px] font-mono px-1 rounded bg-red-950/50 border border-red-900/60 text-red-300">GONE</span>
+  }
   return (
-    <div>
-      <div className="text-xs text-gray-500 mb-1">{title}</div>
-      {list.length === 0 ? (
-        <div className="text-xs text-gray-700">No change</div>
-      ) : (
-        <div className="space-y-1 max-h-60 overflow-auto">
-          {list.map((it) => {
-            const delta = (it.count_b || 0) - (it.count_a || 0)
-            return (
-              <div key={it.key} className="flex items-center justify-between gap-3 text-xs bg-gray-800/40 rounded px-2 py-1">
-                <span className="text-gray-300 font-mono truncate">{it.key}</span>
-                <span className={delta > 0 ? 'text-emerald-300' : 'text-red-300'}>
-                  {it.count_a}{' -> '}{it.count_b} ({delta > 0 ? '+' : ''}{delta})
+    <span className="text-[10px] font-mono px-1 rounded bg-amber-950/40 border border-amber-900/60 text-amber-300">
+      Δ{delta > 0 ? '+' : ''}{delta}
+    </span>
+  )
+}
+
+function SuspiciousList({ items, onInspect, onFlow }) {
+  if (!items || items.length === 0) {
+    return <div className="text-xs text-gray-700">No preset attack-shape matches in the analyzed round.</div>
+  }
+  return (
+    <div className="space-y-1 max-h-72 overflow-auto">
+      {items.map((b) => (
+        <div key={b.key} className="bg-gray-900/60 rounded px-2 py-1 text-xs">
+          <div className="flex items-start justify-between gap-2">
+            <span className="text-red-200 font-mono">
+              {b.scope} · {(b.tags || []).join(' + ')}
+            </span>
+            <span className="text-gray-500 whitespace-nowrap">{b.count}</span>
+          </div>
+          {b.samples?.length > 0 && (
+            <div className="mt-1 flex items-center gap-1 flex-wrap">
+              {b.samples.map((s) => (
+                <span key={s.packet_id} className="flex items-center gap-1">
+                  <button onClick={() => onInspect(s.packet_id)} className={`${ANALYZED_ACCENT} hover:text-cyan-200 font-mono cursor-pointer`}>#{s.packet_id}</button>
+                  <button onClick={() => onFlow(s.packet_id)} className="text-purple-300 hover:text-purple-200 cursor-pointer">flow</button>
                 </span>
-              </div>
-            )
-          })}
+              ))}
+            </div>
+          )}
         </div>
-      )}
+      ))}
     </div>
   )
 }
