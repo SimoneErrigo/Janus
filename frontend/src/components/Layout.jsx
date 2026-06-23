@@ -4,17 +4,34 @@ import { api, clearToken, getDisplayName } from '../api'
 import ShortcutsLegend from './ShortcutsLegend'
 import { isTypingTarget } from '../shortcuts'
 
-const navItems = [
-  { to: '/services', label: 'Services', icon: ServerIcon },
-  { to: '/traffic', label: 'Traffic', icon: PacketIcon },
-  { to: '/rules', label: 'Rules', icon: ShieldIcon },
-  { to: '/protocols', label: 'Protocols', icon: ProtocolsIcon },
-  { to: '/alerts', label: 'Alerts', icon: AlertIcon },
-  { to: '/blocks', label: 'Blocks', icon: BlockIcon },
-  { to: '/saved-flows', label: 'Saved Flows', icon: BookmarkIcon },
-  { to: '/round-diff', label: 'Round Diff', icon: DiffIcon },
-  { to: '/system', label: 'System', icon: SystemIcon },
-  { to: '/config', label: 'Config', icon: GearIcon },
+// Grouped into sections so the sidebar reads as a small map of the app rather
+// than one long flat list. Section labels hide when the sidebar is collapsed.
+const navSections = [
+  {
+    title: 'Monitor',
+    items: [
+      { to: '/services', label: 'Services', icon: ServerIcon },
+      { to: '/traffic', label: 'Traffic', icon: PacketIcon },
+      { to: '/saved-flows', label: 'Saved Flows', icon: BookmarkIcon },
+      { to: '/round-diff', label: 'Round Diff', icon: DiffIcon },
+      { to: '/protocols', label: 'Protocols', icon: ProtocolsIcon },
+    ],
+  },
+  {
+    title: 'Defense',
+    items: [
+      { to: '/rules', label: 'Rules', icon: ShieldIcon },
+      { to: '/blocks', label: 'Blocks', icon: BlockIcon },
+      { to: '/alerts', label: 'Alerts', icon: AlertIcon },
+    ],
+  },
+  {
+    title: 'System',
+    items: [
+      { to: '/system', label: 'System', icon: SystemIcon },
+      { to: '/config', label: 'Config', icon: GearIcon },
+    ],
+  },
 ]
 
 export default function Layout() {
@@ -117,23 +134,32 @@ export default function Layout() {
             </svg>
           </button>
         </div>
-        <div className="flex-1 py-2">
-          {navItems.map(({ to, label, icon: Icon }) => (
-            <NavLink
-              key={to}
-              to={to}
-              title={collapsed ? label : undefined}
-              className={({ isActive }) =>
-                `flex items-center ${collapsed ? 'justify-center px-0 py-2.5' : 'gap-3 px-4 py-2.5'} text-sm transition-colors ${
-                  isActive
-                    ? 'bg-gray-800 text-cyan-400 border-r-2 border-cyan-400'
-                    : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'
-                }`
-              }
-            >
-              <Icon className="w-4 h-4 flex-shrink-0" />
-              {!collapsed && label}
-            </NavLink>
+        <div className="flex-1 py-2 overflow-y-auto">
+          {navSections.map((section, si) => (
+            <div key={section.title} className={si > 0 ? (collapsed ? 'mt-2 pt-2 border-t border-gray-800/60' : 'mt-4') : ''}>
+              {!collapsed && (
+                <p className="px-4 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-600">
+                  {section.title}
+                </p>
+              )}
+              {section.items.map(({ to, label, icon: Icon }) => (
+                <NavLink
+                  key={to}
+                  to={to}
+                  title={collapsed ? label : undefined}
+                  className={({ isActive }) =>
+                    `flex items-center ${collapsed ? 'justify-center px-0 py-2.5' : 'gap-3 px-4 py-2'} text-sm transition-colors ${
+                      isActive
+                        ? 'bg-gray-800 text-cyan-400 border-r-2 border-cyan-400'
+                        : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'
+                    }`
+                  }
+                >
+                  <Icon className="w-4 h-4 flex-shrink-0" />
+                  {!collapsed && label}
+                </NavLink>
+              ))}
+            </div>
           ))}
         </div>
         <div className="p-2 border-t border-gray-800 space-y-1">

@@ -43,9 +43,9 @@ export default function FilterSandbox() {
   }, [expression, packet])
 
   return (
-    <div className="p-4 space-y-4 max-w-5xl">
+    <div className="p-6 space-y-4 max-w-5xl">
       <header>
-        <h1 className="text-xl font-bold text-cyan-400">Filter Expression Sandbox</h1>
+        <h2 className="text-2xl font-semibold text-gray-100">Filter Expression Sandbox</h2>
         <p className="text-xs text-gray-500">
           Standalone playground for the unified filter / rule expression component. Edit the sample
           packet on the right and watch the evaluator update live. The expression is the single

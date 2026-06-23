@@ -89,7 +89,7 @@ export default function System() {
   if (error && !stats) {
     return (
       <div className="p-6">
-        <h1 className="text-2xl font-bold text-gray-100 mb-4">System</h1>
+        <h2 className="text-2xl font-semibold text-gray-100 mb-4">System</h2>
         <div className="bg-red-950/30 border border-red-800/50 rounded-lg p-4 text-red-400">
           Failed to load system stats: {error}
         </div>
@@ -100,7 +100,7 @@ export default function System() {
   if (!stats) {
     return (
       <div className="p-6">
-        <h1 className="text-2xl font-bold text-gray-100 mb-4">System</h1>
+        <h2 className="text-2xl font-semibold text-gray-100 mb-4">System</h2>
         <p className="text-gray-500">Loading...</p>
       </div>
     )
@@ -109,7 +109,7 @@ export default function System() {
   return (
     <div className="p-6">
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-2xl font-bold text-gray-100">System</h1>
+        <h2 className="text-2xl font-semibold text-gray-100">System</h2>
         <span className="text-xs text-gray-500">
           Refresh in {countdown}s
         </span>
