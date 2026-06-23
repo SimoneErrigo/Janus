@@ -515,6 +515,88 @@ func TestFlowCookieCorrelation_WithSNAT(t *testing.T) {
 	}
 }
 
+// ---------- ExploitFlow: single run out of a multi-run correlated flow ----------
+// Under SNAT an attacker re-runs the same exploit every tick; all runs share the
+// victim's session token, so QueryFlow correlates them into one flow. ExploitFlow
+// must return only the run containing the anchor packet, so the generated exploit
+// keeps the real step order (e.g. login before the authed GET).
+
+func TestExploitFlow_SingleRun(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewPacketStore(dir)
+	if err != nil {
+		t.Fatalf("NewPacketStore: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	gw := "10.254.0.1" // single SNAT gateway IP for everyone
+	vm := "10.60.1.1"
+	svc := "svc-soh"
+	sA := svc + "/" + gw + ":40001"
+	sB := svc + "/" + gw + ":40002"
+	tok := `"token":"sharedsession1234"` // links the two runs in QueryFlow
+
+	// Run A (older): user/4 then items — first response carries the shared token.
+	insertReqRes(t, store, svc, sA, now, gw, 40001, vm, 80,
+		"GET", "/api/user/4", "", 200, `{"user":"victim",`+tok+`}`)
+	insertReqRes(t, store, svc, sA, now.Add(100*time.Millisecond), gw, 40001, vm, 80,
+		"GET", "/api/user/items", "", 200, `{"items":[]}`)
+
+	// Run B (newer, +30s): user/4 -> login -> items. Login response is the anchor.
+	base := now.Add(30 * time.Second)
+	insertReqRes(t, store, svc, sB, base, gw, 40002, vm, 80,
+		"GET", "/api/user/4", "", 200, `{"user":"victim",`+tok+`}`)
+	if err := store.Insert(&Packet{
+		ServiceID: svc, SessionID: sB, Timestamp: base.Add(100 * time.Millisecond),
+		SrcIP: gw, SrcPort: 40002, DstIP: vm, DstPort: 80, Protocol: "http",
+		Direction: DirectionRequest, Method: "POST", URL: "/api/login", BodyString: `{"u":"x"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	anchor := &Packet{
+		ServiceID: svc, SessionID: sB, Timestamp: base.Add(150 * time.Millisecond),
+		SrcIP: vm, SrcPort: 80, DstIP: gw, DstPort: 40002, Protocol: "http",
+		Direction: DirectionResponse, Status: 200, BodyString: `{"ok":true,` + tok + `}`,
+	}
+	if err := store.Insert(anchor); err != nil {
+		t.Fatal(err)
+	}
+	insertReqRes(t, store, svc, sB, base.Add(200*time.Millisecond), gw, 40002, vm, 80,
+		"GET", "/api/user/items", "", 200, `{"items":[{"name":"Treasure"}]}`)
+
+	// Sanity: the correlated flow must merge both runs (shared token).
+	full, err := store.QueryFlow(anchor.ID)
+	if err != nil {
+		t.Fatalf("QueryFlow: %v", err)
+	}
+	if len(distinctSessions(full)) < 2 {
+		t.Fatalf("expected both runs correlated into the flow, got sessions %v", distinctSessions(full))
+	}
+
+	// ExploitFlow must return only the anchor's run (session :40002).
+	run, err := store.ExploitFlow(anchor.ID)
+	if err != nil {
+		t.Fatalf("ExploitFlow: %v", err)
+	}
+	if sids := distinctSessions(run); len(sids) != 1 || !sids[sB] {
+		t.Fatalf("ExploitFlow should return only the anchor run, got sessions %v (%d packets)", sids, len(run))
+	}
+	// ...and that run contains login followed by the authed items request.
+	var sawLogin, sawItemsAfterLogin bool
+	for _, p := range run {
+		if p.URL == "/api/login" {
+			sawLogin = true
+		}
+		if p.URL == "/api/user/items" && sawLogin {
+			sawItemsAfterLogin = true
+		}
+	}
+	if !sawLogin || !sawItemsAfterLogin {
+		t.Fatalf("anchor run should contain login then items; got %d packets", len(run))
+	}
+}
+
 // ---------- helpers ----------
 
 func findPacketByURL(t *testing.T, store *PacketStore, serviceID, urlPath string) *Packet {

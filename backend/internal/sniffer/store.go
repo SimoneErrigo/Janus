@@ -1705,6 +1705,56 @@ func (s *PacketStore) QueryFlow(packetID int64) ([]*Packet, error) {
 	return s.fetchSessions(startPkt.SessionID, sessionIDs, sessionPackets)
 }
 
+// exploitRunGap separates distinct exploit "runs" inside a single correlated
+// flow. Steps within one run are typically sub-second; repeated runs (e.g. one
+// per scoreboard tick, all sharing the victim's session token) are many seconds
+// apart, so a few seconds cleanly isolates a single run.
+const exploitRunGap = 5 * time.Second
+
+// ExploitFlow returns the packets of the single exploit run that contains the
+// given packet.
+//
+// QueryFlow (used by the flow view) deliberately correlates every connection
+// that shares a victim's auth token within ±FlowCorrelationWindowSec — under
+// real SNAT this is the only way to reconstruct a multi-connection attack. But
+// it also splices together several repetitions of the SAME exploit (the
+// attacker re-runs it every tick), and feeding all of them to the exploit
+// generator interleaves their steps and corrupts the order (e.g. an earlier
+// run's GET ends up before a later run's login).
+//
+// For generation we therefore keep only the time-contiguous cluster around the
+// anchor packet — one coherent run regardless of HTTP keep-alive (one session)
+// or connection-close (one session per request). The flow view is unaffected.
+func (s *PacketStore) ExploitFlow(packetID int64) ([]*Packet, error) {
+	flow, err := s.QueryFlow(packetID)
+	if err != nil {
+		return nil, err
+	}
+	if len(flow) < 2 {
+		return flow, nil
+	}
+	// flow is ordered by timestamp ASC. Find the anchor and grow outwards while
+	// consecutive packets stay within exploitRunGap of each other.
+	anchor := -1
+	for i, p := range flow {
+		if p.ID == packetID {
+			anchor = i
+			break
+		}
+	}
+	if anchor < 0 {
+		return flow, nil
+	}
+	lo, hi := anchor, anchor
+	for lo > 0 && flow[lo].Timestamp.Sub(flow[lo-1].Timestamp) <= exploitRunGap {
+		lo--
+	}
+	for hi < len(flow)-1 && flow[hi+1].Timestamp.Sub(flow[hi].Timestamp) <= exploitRunGap {
+		hi++
+	}
+	return flow[lo : hi+1], nil
+}
+
 // flowByPeerIP correlates sessions from the same source IP to the same service
 // within a time window (±30s around the session). Used when no auth tokens are
 // available to link connections.
