@@ -52,6 +52,13 @@ export function shortcutGroups() {
       ],
     },
     {
+      title: 'Selection (mouse)',
+      items: [
+        { keys: ['Shift + Click'], desc: 'Select / extend a range of rows (Traffic, Rules)' },
+        { keys: ['Ctrl/⌘ + Click'], desc: 'Toggle a single row in the selection (Traffic)' },
+      ],
+    },
+    {
       title: 'Saved Flows',
       items: [
         { keys: down, desc: 'Select next packet in the focused flow' },

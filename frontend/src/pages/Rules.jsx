@@ -24,6 +24,8 @@ export default function Rules() {
   const [selectedIds, setSelectedIds] = useState(new Set())
   const [actionFilter, setActionFilter] = useState('all') // 'all' | 'drop' | 'alert' | 'both'
   const ruleFormAnchorRef = useRef(null)
+  // Anchor for Shift+click range selection, set by any single checkbox toggle.
+  const selectionAnchorRef = useRef(null)
   const location = useLocation()
   const navigate = useNavigate()
 
@@ -132,9 +134,36 @@ export default function Rules() {
       else next.add(id)
       return next
     })
+    selectionAnchorRef.current = id
   }
 
   const filteredRules = actionFilter === 'all' ? rules : rules.filter(r => (r.action || 'drop') === actionFilter)
+
+  // Extend (or start) a selection from the anchor row to the clicked row, over
+  // the currently filtered list. Mirrors the Traffic table behaviour. Returns
+  // true when handled.
+  function selectRange(id) {
+    const anchorId = selectionAnchorRef.current
+    if (anchorId == null) return false
+    const anchorIdx = filteredRules.findIndex(r => r.id === anchorId)
+    const targetIdx = filteredRules.findIndex(r => r.id === id)
+    if (anchorIdx === -1 || targetIdx === -1) return false
+    const [from, to] = [Math.min(anchorIdx, targetIdx), Math.max(anchorIdx, targetIdx)]
+    const rangeIds = filteredRules.slice(from, to + 1).map(r => r.id)
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      // Extend when the anchor is already selected; otherwise start a fresh range.
+      if (prev.has(anchorId)) rangeIds.forEach(rid => next.add(rid))
+      else { next.clear(); rangeIds.forEach(rid => next.add(rid)) }
+      return next
+    })
+    return true
+  }
+
+  function handleSelectClick(id, e) {
+    if (e.shiftKey && selectRange(id)) return
+    toggleSelect(id)
+  }
 
   function toggleSelectAll() {
     const allSelected = filteredRules.length > 0 && filteredRules.every(r => selectedIds.has(r.id))
@@ -248,7 +277,9 @@ export default function Rules() {
             <div key={rule.id} className={`bg-gray-900 border rounded-lg p-4 flex items-center justify-between ${selectedIds.has(rule.id) ? 'border-cyan-700/50' : 'border-gray-800'}`}>
               <div className="flex items-center gap-4">
                 <input type="checkbox" checked={selectedIds.has(rule.id)}
-                  onChange={() => toggleSelect(rule.id)} className="accent-cyan-500 cursor-pointer flex-shrink-0" />
+                  onChange={(e) => handleSelectClick(rule.id, e)}
+                  title="Select (Shift+click for a range)"
+                  className="accent-cyan-500 cursor-pointer flex-shrink-0" />
                 <button
                   onClick={() => handleToggle(rule)}
                   className={`w-10 h-5 rounded-full relative transition-colors cursor-pointer ${rule.enabled ? 'bg-cyan-600' : 'bg-gray-700'}`}
