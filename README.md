@@ -127,9 +127,11 @@ From the Traffic detail panel you can **pin** a flow (or an arbitrary selection 
 
 ### 11. Round Diff
 
-The **Round Diff** page compares two scoreboard rounds for one or two services. It is content-based, not preset-based: Janus pairs each packet in round B with the closest packet from round A and shows visual field diffs for URL, headers, status, and body. Preset attack-shape matches are still shown as a secondary signal.
+The **Round Diff** page compares two scoreboard rounds for one or two services. The two rounds are asymmetric: round **A** is the *baseline* (reference) and round **B** is the round being *analyzed*. Janus pairs each packet in the analyzed round with its closest baseline twin and shows visual field diffs for URL, headers, status, and body — green is content added in B, red is content removed since A. It is content-based, not preset-based.
 
-Opening a packet flow from Round Diff preserves the view state, including selected services, rounds, loaded results, expanded diffs, inspector packet, and scroll position, so you can return without losing your place.
+Pick rounds with the ◀/▶ steppers or the **Prev → current** button. The stats panel shows a Baseline → Analyzed comparison with per-metric deltas. Packet content changes are the primary view; **Route volume changes** (new / gone / Δ routes) and **Preset attack matches** are secondary, collapsible panels. Computation is cached for closed rounds and skips packets that are unchanged from the baseline, so even chatty services diff quickly.
+
+Opening a packet flow from Round Diff preserves the view state, including selected services, rounds, loaded results, expanded diffs, collapsed panels, inspector packet, and scroll position, so you can return without losing your place.
 
 ### 12. PCAP import / export
 
