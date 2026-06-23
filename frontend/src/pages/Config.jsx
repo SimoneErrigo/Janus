@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api'
-import { getTrafficNavKeys, saveTrafficNavKeys, keysToInputString, parseKeyList, defaultTrafficNavKeys } from '../trafficNavKeys'
+import { SHORTCUT_ACTIONS, getBindings, saveBindings, defaultBindings, keysToInputString, parseKeyList } from '../trafficNavKeys'
 import ErrorBanner from '../components/ErrorBanner'
 
 export default function Config() {
@@ -27,8 +27,8 @@ export default function Config() {
   const [purgePacketsRunning, setPurgePacketsRunning] = useState(false)
   const [dbSizeMB, setDbSizeMB] = useState(0)
 
-  const [trafficNavUp, setTrafficNavUp] = useState('')
-  const [trafficNavDown, setTrafficNavDown] = useState('')
+  // Per-action shortcut inputs (action id -> comma-separated key string).
+  const [shortcutInputs, setShortcutInputs] = useState({})
   const [trafficNavSaved, setTrafficNavSaved] = useState(false)
   const [trafficNavError, setTrafficNavError] = useState('')
 
@@ -86,10 +86,39 @@ export default function Config() {
   }
 
   useEffect(() => {
-    const k = getTrafficNavKeys()
-    setTrafficNavUp(keysToInputString(k.up))
-    setTrafficNavDown(keysToInputString(k.down))
+    setShortcutInputs(bindingsToInputs(getBindings()))
   }, [])
+
+  function bindingsToInputs(b) {
+    const out = {}
+    for (const a of SHORTCUT_ACTIONS) out[a.id] = keysToInputString(b[a.id])
+    return out
+  }
+
+  function saveShortcuts() {
+    const map = {}
+    for (const a of SHORTCUT_ACTIONS) {
+      const keys = parseKeyList(shortcutInputs[a.id] || '')
+      if (keys.length === 0) {
+        setTrafficNavError(`"${a.label}" needs at least one key.`)
+        return
+      }
+      map[a.id] = keys
+    }
+    saveBindings(map)
+    setTrafficNavError('')
+    setTrafficNavSaved(true)
+    setTimeout(() => setTrafficNavSaved(false), 2500)
+  }
+
+  function resetShortcuts() {
+    const d = defaultBindings()
+    setShortcutInputs(bindingsToInputs(d))
+    saveBindings(d)
+    setTrafficNavError('')
+    setTrafficNavSaved(true)
+    setTimeout(() => setTrafficNavSaved(false), 2500)
+  }
 
   async function loadFlagIDData() {
     try {
@@ -334,58 +363,43 @@ export default function Config() {
       </form>
 
       <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 max-w-lg space-y-4 mt-6">
-        <h3 className="text-lg font-medium text-gray-100">Traffic keyboard</h3>
-        <p className="text-xs text-gray-500">Select previous/next packet on the Traffic page. Uses browser <code className="text-gray-400">KeyboardEvent.key</code> names (comma-separated), e.g. <code className="text-gray-400">k, K, ArrowUp</code>.</p>
         <div>
-          <label className="block text-sm text-gray-400 mb-1">Previous packet (up in list)</label>
-          <input
-            value={trafficNavUp}
-            onChange={(e) => { setTrafficNavUp(e.target.value); setTrafficNavError('') }}
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm font-mono focus:outline-none focus:border-cyan-500"
-            spellCheck={false}
-          />
+          <h3 className="text-lg font-medium text-gray-100">Keyboard shortcuts</h3>
+          <p className="text-xs text-gray-500 mt-1">
+            Customise the key bindings (this browser only). Comma-separated browser{' '}
+            <code className="text-gray-400">KeyboardEvent.key</code> names, e.g. <code className="text-gray-400">k, K, ArrowUp</code>.
+            Esc and mouse gestures (Shift/Ctrl+click) are fixed.
+          </p>
         </div>
-        <div>
-          <label className="block text-sm text-gray-400 mb-1">Next packet (down in list)</label>
-          <input
-            value={trafficNavDown}
-            onChange={(e) => { setTrafficNavDown(e.target.value); setTrafficNavError('') }}
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm font-mono focus:outline-none focus:border-cyan-500"
-            spellCheck={false}
-          />
+        <div className="space-y-3">
+          {SHORTCUT_ACTIONS.map((a) => (
+            <div key={a.id}>
+              <div className="flex items-baseline justify-between mb-1">
+                <label className="text-sm text-gray-300">{a.label}</label>
+                <span className="text-[10px] uppercase tracking-wide text-gray-600">{a.scope}</span>
+              </div>
+              <input
+                value={shortcutInputs[a.id] ?? ''}
+                onChange={(e) => { setShortcutInputs((s) => ({ ...s, [a.id]: e.target.value })); setTrafficNavError('') }}
+                className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm font-mono focus:outline-none focus:border-cyan-500"
+                spellCheck={false}
+              />
+            </div>
+          ))}
         </div>
         <ErrorBanner error={trafficNavError} />
         {trafficNavSaved && <div className="bg-green-900/30 border border-green-800 text-green-400 text-sm px-4 py-2 rounded">Shortcuts saved (this browser only)</div>}
         <div className="flex flex-wrap gap-2">
           <button
             type="button"
-            onClick={() => {
-              const up = parseKeyList(trafficNavUp)
-              const down = parseKeyList(trafficNavDown)
-              if (up.length === 0 || down.length === 0) {
-                setTrafficNavError('Each field needs at least one key.')
-                return
-              }
-              saveTrafficNavKeys(up, down)
-              setTrafficNavSaved(true)
-              setTrafficNavError('')
-              setTimeout(() => setTrafficNavSaved(false), 2500)
-            }}
+            onClick={saveShortcuts}
             className="bg-cyan-600 hover:bg-cyan-500 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
           >
             Save shortcuts
           </button>
           <button
             type="button"
-            onClick={() => {
-              const d = defaultTrafficNavKeys()
-              setTrafficNavUp(keysToInputString(d.up))
-              setTrafficNavDown(keysToInputString(d.down))
-              saveTrafficNavKeys(d.up, d.down)
-              setTrafficNavSaved(true)
-              setTrafficNavError('')
-              setTimeout(() => setTrafficNavSaved(false), 2500)
-            }}
+            onClick={resetShortcuts}
             className="bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm px-4 py-2 rounded transition-colors cursor-pointer"
           >
             Reset defaults

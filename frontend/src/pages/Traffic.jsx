@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { api, subscribePacketStream } from '../api'
-import { getTrafficNavKeys } from '../trafficNavKeys'
+import { getBindings } from '../trafficNavKeys'
 import { useInfiniteList } from '../hooks/useInfiniteList'
 import { getDisplayName } from '../api'
 import { hideParams, addHiddenIds, setClearCursor, getHiddenIds, getClearCursor, resetClearCursor, clearHiddenIds } from '../userHidden'
@@ -1225,19 +1225,20 @@ export default function Traffic() {
         if (selectedPkts.size > 0) { e.preventDefault(); setSelectedPkts(new Set()); return }
         return
       }
-      // x — toggle current packet in bulk selection
-      if (e.key === 'x' && selected) {
+      const b = getBindings()
+      // Toggle current packet in bulk selection
+      if (b.toggleSelect.includes(e.key) && selected) {
         e.preventDefault()
         toggleSingleSelect(selected.id)
         return
       }
-      // Delete / Backspace — bulk-delete selection
-      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedPkts.size > 0) {
+      // Bulk-delete selection
+      if (b.deleteSel.includes(e.key) && selectedPkts.size > 0) {
         e.preventDefault()
         bulkDelete()
         return
       }
-      const { up, down } = getTrafficNavKeys()
+      const { up, down } = b
       const list = flowMode ? flowMode.packets : packets
       if (!list.length) return
       let delta = 0

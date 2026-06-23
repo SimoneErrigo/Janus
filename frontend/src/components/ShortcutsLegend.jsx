@@ -1,5 +1,6 @@
 import { useEffect } from 'react'
 import { shortcutGroups, keyLabel } from '../shortcuts'
+import { getBindings } from '../trafficNavKeys'
 
 // Renders a single key cap.
 function Kbd({ children }) {
@@ -17,7 +18,8 @@ function Kbd({ children }) {
 export default function ShortcutsLegend({ onClose }) {
   useEffect(() => {
     function onKey(e) {
-      if (e.key === 'Escape' || e.key === '?') {
+      // Close on Esc or the configured "toggle help" key.
+      if (e.key === 'Escape' || getBindings().toggleHelp.includes(e.key)) {
         // Stop the event reaching page/global handlers (e.g. Traffic's Esc).
         e.preventDefault()
         e.stopPropagation()
@@ -77,7 +79,7 @@ export default function ShortcutsLegend({ onClose }) {
             </div>
           ))}
           <p className="text-[11px] text-gray-600 pt-1 border-t border-gray-800">
-            Navigation keys can be customised on the <span className="text-gray-400">Config</span> page.
+            Key shortcuts can be customised on the <span className="text-gray-400">Config</span> page (Esc and mouse gestures are fixed).
           </p>
         </div>
       </div>

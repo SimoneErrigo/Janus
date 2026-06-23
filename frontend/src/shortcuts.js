@@ -1,4 +1,4 @@
-import { getTrafficNavKeys } from './trafficNavKeys'
+import { getBindings } from './trafficNavKeys'
 
 // Pretty-print a KeyboardEvent.key value for display in the legend.
 const KEY_LABELS = {
@@ -31,23 +31,23 @@ export function isTypingTarget(el) {
  * read live from localStorage so the legend reflects the user's Config choices.
  */
 export function shortcutGroups() {
-  const { up, down } = getTrafficNavKeys()
+  const b = getBindings()
   return [
     {
       title: 'Global',
       items: [
-        { keys: ['?'], desc: 'Show / hide this shortcuts help' },
-        { keys: ['['], desc: 'Collapse / expand the sidebar' },
+        { keys: b.toggleHelp, desc: 'Show / hide this shortcuts help', editable: true },
+        { keys: b.toggleSidebar, desc: 'Collapse / expand the sidebar', editable: true },
         { keys: ['Escape'], desc: 'Close dialogs, panels, or flow view' },
       ],
     },
     {
       title: 'Traffic',
       items: [
-        { keys: down, desc: 'Select next packet' },
-        { keys: up, desc: 'Select previous packet' },
-        { keys: ['x'], desc: 'Toggle packet in bulk selection' },
-        { keys: ['Delete', 'Backspace'], desc: 'Delete selected packets' },
+        { keys: b.down, desc: 'Select next packet', editable: true },
+        { keys: b.up, desc: 'Select previous packet', editable: true },
+        { keys: b.toggleSelect, desc: 'Toggle packet in bulk selection', editable: true },
+        { keys: b.deleteSel, desc: 'Delete selected packets', editable: true },
         { keys: ['Escape'], desc: 'Exit flow view / clear selection' },
       ],
     },
@@ -61,8 +61,8 @@ export function shortcutGroups() {
     {
       title: 'Saved Flows',
       items: [
-        { keys: down, desc: 'Select next packet in the focused flow' },
-        { keys: up, desc: 'Select previous packet in the focused flow' },
+        { keys: b.down, desc: 'Select next packet in the focused flow', editable: true },
+        { keys: b.up, desc: 'Select previous packet in the focused flow', editable: true },
       ],
     },
   ]

@@ -3,6 +3,7 @@ import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { api, clearToken, getDisplayName } from '../api'
 import ShortcutsLegend from './ShortcutsLegend'
 import { isTypingTarget } from '../shortcuts'
+import { getBindings } from '../trafficNavKeys'
 
 // Grouped into sections so the sidebar reads as a small map of the app rather
 // than one long flat list. Section labels hide when the sidebar is collapsed.
@@ -46,8 +47,9 @@ export default function Layout() {
   useEffect(() => {
     function onKey(e) {
       if (isTypingTarget(e.target)) return
-      if (e.key === '?') { e.preventDefault(); setShowShortcuts(true) }
-      else if (e.key === '[') { e.preventDefault(); setCollapsed((c) => !c) }
+      const b = getBindings()
+      if (b.toggleHelp.includes(e.key)) { e.preventDefault(); setShowShortcuts(true) }
+      else if (b.toggleSidebar.includes(e.key)) { e.preventDefault(); setCollapsed((c) => !c) }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
