@@ -81,6 +81,14 @@ round in (10, 11, 12)
 
 `round` is the operator-facing round field. Janus computes it from `competition_start + round_duration`; for historical packets where timing metadata is unavailable, it falls back to the persisted flag-ID scan round.
 
+```text
+id == 1234                               # jump to one packet by its # number
+id in (1200, 1201, 1202)
+id >= 5000                               # everything captured after #5000
+```
+
+`id` is the packet's autoincrement number — the same `#` shown in the Traffic table and packet detail. Aliases: `packet_id`, `pkt`, `num`.
+
 ---
 
 ## Boolean shortcuts
@@ -192,6 +200,7 @@ true      false                                  # booleans
 
 | Group | Fields |
 |-------|--------|
+| Packet | `id` (the `#` packet number; aliases `packet_id`, `pkt`, `num`) |
 | Content | `body`, `raw` |
 | HTTP | `url`, `method`, `status`, `round`, `direction`, `header`, `header.<name>` |
 | Network | `service`, `proto`, `src`, `dst`, `peer`, `sport`, `dport` |

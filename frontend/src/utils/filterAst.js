@@ -23,6 +23,7 @@ export const FIELD_GROUPS = [
   {
     label: 'HTTP',
     fields: [
+      { name: 'id',        type: 'int',    desc: 'Packet number (the # column)' },
       { name: 'url',       type: 'string', desc: 'Request URL/path' },
       { name: 'method',    type: 'string', desc: 'HTTP method' },
       { name: 'status',    type: 'int',    desc: 'HTTP status code' },
@@ -360,6 +361,7 @@ function unwrapAndIfSolo(node) {
 
 function canonicalField(name) {
   switch (name) {
+    case 'packet_id': case 'pkt': case 'num': case 'no': return 'id'
     case 'headers': return 'header'
     case 'src_ip': return 'src'
     case 'dst_ip': return 'dst'
@@ -577,6 +579,7 @@ function splitList(v) {
 function readField(pr, p) {
   if (!p) return ''
   switch (pr.field) {
+    case 'id':              return p.id ?? 0
     case 'body':            return p.body_string ?? ''
     case 'raw':             return p.body_string ?? ''
     case 'url':             return p.url ?? ''

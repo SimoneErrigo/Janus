@@ -14,6 +14,7 @@ func AsView(p *Packet) filter.PacketView {
 
 type packetView struct{ p *Packet }
 
+func (v packetView) ID() int64          { return v.p.ID }
 func (v packetView) BodyString() string { return v.p.BodyString }
 func (v packetView) BodyBytes() []byte  { return v.p.Body }
 func (v packetView) URL() string        { return v.p.URL }

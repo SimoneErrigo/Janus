@@ -1,12 +1,14 @@
 package filter
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
 
 // fakePacket is a deterministic PacketView for tests.
 type fakePacket struct {
+	id                                           int64
 	body, url, method, proto, svc, dir, src, dst string
 	status, round, sport, dport                  int
 	headers                                      map[string]string
@@ -14,6 +16,7 @@ type fakePacket struct {
 	raw                                          []byte
 }
 
+func (f *fakePacket) ID() int64          { return f.id }
 func (f *fakePacket) BodyString() string { return f.body }
 func (f *fakePacket) BodyBytes() []byte  { return []byte(f.body) }
 func (f *fakePacket) URL() string        { return f.url }
@@ -62,6 +65,7 @@ func (f *fakePacket) Dropped() bool        { return f.dropped }
 
 func basePacket() *fakePacket {
 	return &fakePacket{
+		id:      42,
 		body:    `{"user":"pippo","note":"asdrubale"}`,
 		url:     "/api/admin/login",
 		method:  "POST",
@@ -86,6 +90,26 @@ func mustEval(t *testing.T, src string, p PacketView) bool {
 		t.Fatalf("compile %q: %v", src, err)
 	}
 	return fn(p)
+}
+
+func TestIDField_PushesToSQL(t *testing.T) {
+	ast, err := Parse(`id == 42`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	c, err := CompileSQL(ast)
+	if err != nil {
+		t.Fatalf("compile sql: %v", err)
+	}
+	if !strings.Contains(c.Where, "id") {
+		t.Fatalf("expected `id` pushed to SQL, got Where=%q", c.Where)
+	}
+	if len(c.Args) != 1 || fmt.Sprintf("%v", c.Args[0]) != "42" {
+		t.Fatalf("expected SQL arg [42], got %v", c.Args)
+	}
+	if c.Residual != nil {
+		t.Fatalf("expected no residual evaluator for a pure id predicate")
+	}
 }
 
 func TestParse_Empty(t *testing.T) {
@@ -119,6 +143,10 @@ func TestPredicate_BasicOps(t *testing.T) {
 		{`url matches "^/api/.*/login$"`, true},
 		{`method == "POST"`, true},
 		{`method != "GET"`, true},
+		{`id == 42`, true},
+		{`id == 7`, false},
+		{`id >= 40`, true},
+		{`packet_id == 42`, true},
 		{`status == 200`, true},
 		{`status >= 200`, true},
 		{`status < 300`, true},

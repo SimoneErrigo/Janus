@@ -7,6 +7,9 @@ package filter
 //
 // Adapters live in the calling packages so internal/filter has no Janus-specific deps.
 type PacketView interface {
+	// ID is the packet's autoincrement number (the "#" shown in the UI).
+	// Returns 0 on the ingest hot path, where no row id exists yet.
+	ID() int64
 	BodyString() string
 	BodyBytes() []byte
 	URL() string
@@ -57,6 +60,8 @@ type Field struct {
 // internally and in the registry.
 func canonicalField(name string) string {
 	switch name {
+	case "packet_id", "pkt", "num", "no":
+		return "id"
 	case "headers":
 		return "header"
 	case "src", "src_ip":
@@ -79,6 +84,7 @@ func canonicalField(name string) string {
 
 // fields is the master registry. Adding a field = one entry here.
 var fields = map[string]Field{
+	"id":              {Name: "id", Type: TypeInt, SQLColumn: "id"},
 	"body":            {Name: "body", Type: TypeString, SQLColumn: "body_string"},
 	"raw":             {Name: "raw", Type: TypeBytes, SQLColumn: ""},
 	"url":             {Name: "url", Type: TypeString, SQLColumn: "url"},
@@ -163,6 +169,8 @@ func readString(p PacketView, field string, headerName string) string {
 
 func readInt(p PacketView, field string) int64 {
 	switch field {
+	case "id":
+		return p.ID()
 	case "status":
 		return int64(p.Status())
 	case "round":

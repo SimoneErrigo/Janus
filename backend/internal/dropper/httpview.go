@@ -16,6 +16,7 @@ func newView(req *HTTPRequest) filter.PacketView {
 	return httpRequestView{req: req}
 }
 
+func (v httpRequestView) ID() int64          { return 0 }
 func (v httpRequestView) BodyString() string { return string(v.req.Body) }
 func (v httpRequestView) BodyBytes() []byte  { return v.req.Body }
 func (v httpRequestView) URL() string        { return v.req.URL }
