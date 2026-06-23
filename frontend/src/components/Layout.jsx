@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { api, clearToken, getDisplayName } from '../api'
+import ShortcutsLegend from './ShortcutsLegend'
+import { isTypingTarget } from '../shortcuts'
 
 const navItems = [
   { to: '/services', label: 'Services', icon: ServerIcon },
@@ -20,7 +22,19 @@ export default function Layout() {
   const [collapsed, setCollapsed] = useState(false)
   const [trafficMode, setTrafficMode] = useState('live')
   const [activeSessions, setActiveSessions] = useState([])
+  const [showShortcuts, setShowShortcuts] = useState(false)
   const myName = getDisplayName()
+
+  // App-wide shortcuts: `?` opens the legend, `[` toggles the sidebar.
+  useEffect(() => {
+    function onKey(e) {
+      if (isTypingTarget(e.target)) return
+      if (e.key === '?') { e.preventDefault(); setShowShortcuts(true) }
+      else if (e.key === '[') { e.preventDefault(); setCollapsed((c) => !c) }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   useEffect(() => {
     let mounted = true
@@ -122,17 +136,32 @@ export default function Layout() {
             </NavLink>
           ))}
         </div>
-        <div className="p-2 border-t border-gray-800">
+        <div className="p-2 border-t border-gray-800 space-y-1">
+          <button
+            onClick={() => setShowShortcuts(true)}
+            title={collapsed ? 'Keyboard shortcuts (?)' : 'Keyboard shortcuts'}
+            className={`w-full text-sm text-gray-500 hover:text-cyan-400 transition-colors cursor-pointer flex items-center ${collapsed ? 'justify-center py-1' : 'gap-2 px-2 py-1'}`}
+          >
+            <svg className="w-4 h-4 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="2" y="6" width="20" height="12" rx="2" />
+              <path d="M6 10h0M10 10h0M14 10h0M18 10h0M8 14h8" />
+            </svg>
+            {!collapsed && (
+              <span className="flex items-center gap-1.5">
+                Shortcuts
+                <kbd className="text-[10px] font-mono text-gray-600 border border-gray-700 rounded px-1">?</kbd>
+              </span>
+            )}
+          </button>
           <button
             onClick={handleLogout}
             title={collapsed ? 'Logout' : undefined}
-            className={`w-full text-sm text-gray-500 hover:text-red-400 transition-colors cursor-pointer ${collapsed ? 'text-center py-1' : 'text-left px-2'}`}
+            className={`w-full text-sm text-gray-500 hover:text-red-400 transition-colors cursor-pointer flex items-center ${collapsed ? 'justify-center py-1' : 'gap-2 px-2 py-1'}`}
           >
-            {collapsed ? (
-              <svg className="w-4 h-4 mx-auto" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><polyline points="16 17 21 12 16 7" /><line x1="21" y1="12" x2="9" y2="12" />
-              </svg>
-            ) : 'Logout'}
+            <svg className="w-4 h-4 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><polyline points="16 17 21 12 16 7" /><line x1="21" y1="12" x2="9" y2="12" />
+            </svg>
+            {!collapsed && 'Logout'}
           </button>
         </div>
       </nav>
@@ -141,6 +170,8 @@ export default function Layout() {
       <main className="flex-1 overflow-auto">
         <Outlet />
       </main>
+
+      {showShortcuts && <ShortcutsLegend onClose={() => setShowShortcuts(false)} />}
     </div>
   )
 }

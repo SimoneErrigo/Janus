@@ -1218,6 +1218,13 @@ export default function Traffic() {
     }
     function onKeyDown(e) {
       if (typingTarget(e.target)) return
+      // Esc — exit flow view, then clear the open packet / bulk selection
+      if (e.key === 'Escape') {
+        if (flowMode) { e.preventDefault(); clearFlow(); return }
+        if (selected) { e.preventDefault(); setSelected(null); return }
+        if (selectedPkts.size > 0) { e.preventDefault(); setSelectedPkts(new Set()); return }
+        return
+      }
       // x — toggle current packet in bulk selection
       if (e.key === 'x' && selected) {
         e.preventDefault()
@@ -1246,7 +1253,7 @@ export default function Traffic() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [flowMode, packets, selected, selectPacket, selectedPkts, toggleSingleSelect, bulkDelete, resetPackets])
+  }, [flowMode, packets, selected, selectPacket, selectedPkts, toggleSingleSelect, bulkDelete, resetPackets, clearFlow])
 
   useEffect(() => {
     const el = packetTableScrollRef.current
