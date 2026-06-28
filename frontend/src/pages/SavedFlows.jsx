@@ -49,10 +49,13 @@ const PacketDetail = memo(function PacketDetail({ packet, services, customProtoc
   // Manual override for the custom-protocol decoder. Resets when the user
   // switches packets so we don't carry an override across selections.
   const [customProtocolOverride, setCustomProtocolOverride] = useState('')
+  // Opt-in picker for services with no bound protocol — keeps the panel
+  // hidden until the user explicitly asks for a custom decode.
+  const [customPickerOpen, setCustomPickerOpen] = useState(false)
 
   // Close the rule panel when switching to a different packet.
   useEffect(() => { setShowQuickRule(false) }, [packet?.id])
-  useEffect(() => { setCustomProtocolOverride('') }, [packet?.id])
+  useEffect(() => { setCustomProtocolOverride(''); setCustomPickerOpen(false) }, [packet?.id])
 
   const formattedBody = useMemo(() => tryFormatJSON(packet?.body_string || ''), [packet?.body_string])
 
@@ -198,8 +201,18 @@ const PacketDetail = memo(function PacketDetail({ packet, services, customProtoc
           </div>
         )}
 
-        {/* Decoded — custom binary protocol */}
-        {(boundCustomProtocolID || (customProtocols && customProtocols.length > 0)) && (
+        {/* Decoded — custom binary protocol. Hidden unless a protocol is
+            bound to the service or the user explicitly opts in, so unrelated
+            services stay free of the picker and red "decode error". */}
+        {!boundCustomProtocolID && !customProtocolOverride && !customPickerOpen && customProtocols && customProtocols.length > 0 && (
+          <button
+            onClick={() => setCustomPickerOpen(true)}
+            className="text-[11px] text-gray-500 hover:text-cyan-300 cursor-pointer"
+          >
+            + Decode with custom protocol…
+          </button>
+        )}
+        {(boundCustomProtocolID || customProtocolOverride || customPickerOpen) && (
           <div>
             <div className="flex items-center gap-2 mb-1 flex-wrap">
               <span className="text-gray-500 text-xs">Decoded (custom protocol)</span>
@@ -219,7 +232,7 @@ const PacketDetail = memo(function PacketDetail({ packet, services, customProtoc
                   <option key={p.id} value={p.id}>Decode with: {p.name}</option>
                 ))}
               </select>
-              {decodedCustomError && (
+              {decodedCustomError && effectiveCustomProtocolID && (
                 <span className="text-[10px] text-red-400" title={decodedCustomError}>
                   decode error
                 </span>

@@ -621,6 +621,7 @@ export default function Traffic() {
   const [decodedCustom, setDecodedCustom] = useState(null) // { protocol, direction, fields, trailing_hex } or null
   const [decodedCustomError, setDecodedCustomError] = useState('')
   const [customProtocolOverride, setCustomProtocolOverride] = useState('') // empty = use service-bound
+  const [customPickerOpen, setCustomPickerOpen] = useState(false) // opt-in picker for services with no bound protocol
   const [activeSessions, setActiveSessions] = useState([])
   const [selected, setSelected] = useState(null)
   const [flowMode, setFlowMode] = useState(null) // { packetId, packets, total }
@@ -1395,7 +1396,7 @@ export default function Traffic() {
 
   // Reset the custom-protocol override whenever the user clicks a different
   // packet — overrides are scoped to a single inspection, not sticky.
-  useEffect(() => { setCustomProtocolOverride('') }, [selected?.id])
+  useEffect(() => { setCustomProtocolOverride(''); setCustomPickerOpen(false) }, [selected?.id])
 
   // Service-bound protocol for the currently selected packet, if any.
   const boundCustomProtocolID = useMemo(() => {
@@ -2321,7 +2322,19 @@ export default function Traffic() {
                   </div>
                 )}
 
-                {(boundCustomProtocolID || customProtocols.length > 0) && (
+                {/* Custom-protocol decode. Only shown when a protocol is bound
+                    to the service or the user explicitly opts in, so services
+                    that don't use custom protocols stay clean (no stray picker
+                    or red "decode error"). */}
+                {!boundCustomProtocolID && !customProtocolOverride && !customPickerOpen && customProtocols.length > 0 && (
+                  <button
+                    onClick={() => setCustomPickerOpen(true)}
+                    className="self-start text-[11px] text-gray-500 hover:text-cyan-300 cursor-pointer"
+                  >
+                    + Decode with custom protocol…
+                  </button>
+                )}
+                {(boundCustomProtocolID || customProtocolOverride || customPickerOpen) && (
                   <div className="flex-1">
                     <div className="flex items-center gap-2 mb-1 flex-wrap">
                       <span className="text-gray-500 text-xs">Decoded (custom protocol)</span>
@@ -2341,7 +2354,7 @@ export default function Traffic() {
                           <option key={p.id} value={p.id}>Decode with: {p.name}</option>
                         ))}
                       </select>
-                      {decodedCustomError && (
+                      {decodedCustomError && effectiveCustomProtocolID && (
                         <span className="text-[10px] text-red-400" title={decodedCustomError}>
                           decode error
                         </span>
