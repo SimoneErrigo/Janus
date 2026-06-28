@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/customdecode"
+	"github.com/SimoneErrigo/Janus/backend/internal/protoimport"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 	"github.com/google/uuid"
 )
@@ -23,6 +24,36 @@ func (s *Server) handleProtocols(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// handleProtocolImport parses pasted Python source (the standard struct +
+// enum.Enum idiom used by CTF challenge clients) into a draft CustomProtocol
+// that the editor can load. Nothing is persisted: the response carries the
+// draft plus any warnings about parts that couldn't be mapped cleanly. The
+// user reviews/wires it in the editor and saves through the normal create
+// endpoint.
+func (s *Server) handleProtocolImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	proto, warnings, err := protoimport.Parse(req.Code)
+	if err != nil {
+		// 422: the request was well-formed but we found nothing to import.
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"protocol": proto,
+		"warnings": warnings,
+	})
 }
 
 // handleProtocolByID dispatches get/update/delete on /api/protocols/:id.

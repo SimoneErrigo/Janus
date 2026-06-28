@@ -111,6 +111,7 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/packets/decoded-custom", s.handlePacketDecodedCustom)
 	protected.HandleFunc("/api/protos", s.handleListProtos)
 	protected.HandleFunc("/api/protos/encode-field", s.handleProtoEncodeField)
+	protected.HandleFunc("/api/protocols/import", s.handleProtocolImport)
 	protected.HandleFunc("/api/protocols", s.handleProtocols)
 	protected.HandleFunc("/api/protocols/", s.handleProtocolByID)
 	protected.HandleFunc("/api/packets/bulk-delete", s.handlePacketsBulkDelete)
