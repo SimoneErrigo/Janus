@@ -85,12 +85,21 @@ export default function Protocols() {
             Custom binary protocol decoders. Bind a protocol to a service to render packets as a structured tree instead of hex.
           </p>
         </div>
-        <button
-          onClick={() => setEditing({ ...deepClone(EMPTY_PROTOCOL), _isNew: true })}
-          className="bg-cyan-600 hover:bg-cyan-500 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
-        >
-          + Add Protocol
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setEditing({ ...deepClone(EMPTY_PROTOCOL), _isNew: true, _showImport: true })}
+            className="border border-gray-700 hover:border-cyan-500 text-gray-300 hover:text-cyan-300 text-sm px-4 py-2 rounded transition-colors cursor-pointer"
+            title="Paste challenge-client Python and let Janus build the enums and structs"
+          >
+            Import from Python
+          </button>
+          <button
+            onClick={() => setEditing({ ...deepClone(EMPTY_PROTOCOL), _isNew: true })}
+            className="bg-cyan-600 hover:bg-cyan-500 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
+          >
+            + Add Protocol
+          </button>
+        </div>
       </div>
 
       <ErrorBanner error={error} className="mb-4" />
@@ -136,14 +145,39 @@ export default function Protocols() {
 function ProtocolEditor({ protocol, onSave, onCancel }) {
   const [form, setForm] = useState(protocol)
   const [tab, setTab] = useState('request')
+  const [showImport, setShowImport] = useState(!!protocol._showImport)
 
   const enumNames = useMemo(() => Object.keys(form.enums || {}), [form.enums])
   const structNames = useMemo(() => Object.keys(form.structs || {}), [form.structs])
 
   function set(k, v) { setForm((f) => ({ ...f, [k]: v })) }
 
+  // Merge an imported draft (enums + structs) into the working copy. Imported
+  // names overwrite same-named entries; endianness and an empty name are
+  // adopted from the parsed code since it reflects the real wire format.
+  function mergeImported(draft) {
+    setForm((f) => {
+      const next = { ...f }
+      next.enums = { ...(f.enums || {}), ...(draft.enums || {}) }
+      next.structs = { ...(f.structs || {}), ...(draft.structs || {}) }
+      if (draft.endian) next.endian = draft.endian
+      if (!f.name && draft.name) next.name = draft.name
+      return next
+    })
+  }
+
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 mb-4">
+      <div className="flex justify-end mb-2">
+        <button
+          onClick={() => setShowImport((v) => !v)}
+          className="text-xs text-gray-400 hover:text-cyan-300 cursor-pointer"
+        >
+          {showImport ? '▾ Hide Python import' : '▸ Import from Python'}
+        </button>
+      </div>
+      {showImport && <ImportPanel onImport={mergeImported} />}
+
       <div className="grid grid-cols-2 gap-4 mb-4">
         <div>
           <Label>Name</Label>
@@ -532,6 +566,78 @@ function EnumsEditor({ enums, onChange }) {
   )
 }
 
+// ImportPanel lets the user paste challenge-client Python and turns the
+// struct.pack/Enum definitions into enums + structs, merged into the editor
+// via onImport. It never persists anything itself — the user reviews the
+// result in the tabs below and saves through the normal flow.
+function ImportPanel({ onImport }) {
+  const [code, setCode] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [warnings, setWarnings] = useState([])
+  const [summary, setSummary] = useState('')
+
+  async function parse() {
+    setError(''); setWarnings([]); setSummary('')
+    if (!code.trim()) { setError('Paste some Python first.'); return }
+    setBusy(true)
+    try {
+      const { protocol, warnings } = await api.importProtocol(code)
+      onImport(protocol)
+      const nEnums = Object.keys(protocol.enums || {}).length
+      const nStructs = Object.keys(protocol.structs || {}).length
+      const nFields = Object.values(protocol.structs || {}).reduce((a, fl) => a + fl.length, 0)
+      setSummary(`Imported ${nEnums} enum${nEnums === 1 ? '' : 's'}, ${nStructs} struct${nStructs === 1 ? '' : 's'} (${nFields} field${nFields === 1 ? '' : 's'}). Review the Structs / Enums tabs, then wire Request/Response.`)
+      setWarnings(warnings || [])
+    } catch (err) {
+      setError(err.message || String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="bg-gray-800/40 border border-gray-800 rounded-lg p-3 mb-4">
+      <p className="text-xs text-gray-500 mb-2">
+        Paste the challenge client's protocol code (its <code className="text-gray-400">Enum</code> classes and
+        {' '}<code className="text-gray-400">struct.pack</code> definitions). Janus extracts the enums and structs;
+        you then arrange Request/Response order and dispatch in the tabs below.
+      </p>
+      <textarea
+        value={code}
+        onChange={(e) => setCode(e.target.value)}
+        spellCheck={false}
+        placeholder={"class ReqType(Enum):\n    SIGNUP = 0\n    LOGIN = 1\n\nclass ReqHdr():\n    @property\n    def bytes(self):\n        return struct.pack('<IBH', self.ts, self.type, self.len)"}
+        className="w-full h-48 bg-gray-900 border border-gray-700 rounded px-2 py-2 text-xs font-mono text-gray-100 focus:outline-none focus:border-cyan-500 resize-y"
+      />
+      <div className="flex items-center gap-2 mt-2">
+        <button
+          onClick={parse}
+          disabled={busy}
+          className="bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-xs px-3 py-1.5 rounded cursor-pointer"
+        >
+          {busy ? 'Parsing…' : 'Parse & import'}
+        </button>
+        <button
+          onClick={() => { setCode(''); setError(''); setWarnings([]); setSummary('') }}
+          className="text-gray-500 hover:text-gray-300 text-xs px-2 py-1.5 cursor-pointer"
+        >
+          Clear
+        </button>
+      </div>
+      {error && <div className="mt-2 text-xs text-red-400">{error}</div>}
+      {summary && <div className="mt-2 text-xs text-green-400">{summary}</div>}
+      {warnings.length > 0 && (
+        <ul className="mt-2 space-y-0.5">
+          {warnings.map((w, i) => (
+            <li key={i} className="text-[11px] text-amber-400/90">⚠ {w}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
 function Label({ children }) {
   return <label className="block text-xs text-gray-500 mb-1">{children}</label>
 }
@@ -539,7 +645,11 @@ function Label({ children }) {
 function deepClone(o) { return JSON.parse(JSON.stringify(o)) }
 
 function stripInternal(o) {
-  const c = { ...o }
-  delete c._isNew
+  // Drop any editor-only keys (everything prefixed with "_") before sending
+  // to the backend.
+  const c = {}
+  for (const k of Object.keys(o)) {
+    if (!k.startsWith('_')) c[k] = o[k]
+  }
   return c
 }

@@ -155,6 +155,9 @@ export const api = {
   createProtocol: (data) => request('/protocols', { method: 'POST', body: data }),
   updateProtocol: (id, data) => request(`/protocols/${id}`, { method: 'PUT', body: data }),
   deleteProtocol: (id) => request(`/protocols/${id}`, { method: 'DELETE' }),
+  // Parse pasted Python (struct + Enum idiom) into a draft protocol.
+  // Returns { protocol, warnings }. Nothing is persisted server-side.
+  importProtocol: (code) => request('/protocols/import', { method: 'POST', body: { code } }),
   decodePacketCustom: (packetId, protocolId) => {
     const qs = new URLSearchParams({ packet_id: String(packetId) });
     if (protocolId) qs.set('protocol_id', protocolId);
