@@ -26,6 +26,12 @@ Copy the example and edit the few competition-specific values:
 cp .env.example .env
 ```
 
+Notable knobs (all documented in `.env.example`):
+
+- `TEAM_IP` — your team address; services with an empty listen host bind to it, so you don't retype `10.60.x.y` for every service.
+- `FLAG_REGEX_CASE_INSENSITIVE` / `FLAG_DECODE_URL` — catch flags that are case-mismatched or URL-encoded (e.g. `…%3D`).
+- `PYFILTER_ENABLED` — the mitmproxy-style Python filter engine (see [Python filters](#python-filters-scriptable)).
+
 ### 2. Deploy
 
 ```bash
@@ -111,6 +117,42 @@ Each rule has an action: **drop** (block), **alert** (log only), or **both**. Fl
 #### Attack Presets
 
 **Presets** opens a library of ready-made rules for common CTF attack patterns. Pick categories and individual rules, choose target services, and create them in bulk. Categories: SQLi, XSS, Path Traversal, Command Injection, XXE, SSTI, PHP/Python/Node.js code exec, SSRF, Deserialization, Auth Bypass, NoSQLi, IDOR, Web Shells, File Upload, Flag Exfiltration.
+
+#### Python filters (scriptable)
+
+When the filter DSL can't express what you need — anything **stateful** or
+cross-packet — use the **Python Filters** page (mitmproxy-style). Each script
+defines a top-level `match(flow)` function that runs against every captured
+packet; module-level state persists across calls, so you can count or correlate
+over time. Matches surface on the **Alerts** page.
+
+```python
+# Alert when the same user logs in more than once.
+import json
+logins = {}
+
+def match(flow):
+    if flow["method"] == "POST" and flow["url"] == "/login":
+        try:
+            user = json.loads(flow["body"]).get("user")
+        except Exception:
+            user = None
+        if user:
+            logins[user] = logins.get(user, 0) + 1
+            if logins[user] > 1:
+                return f"repeated login for {user} (#{logins[user]})"
+    return False
+```
+
+`match(flow)` returns `False`/`None` (no match), `True`, or a reason string.
+`flow` exposes `method`, `url`, `status`, `headers` (dict), `body`, `src`,
+`dst`, `service`, `direction`, `flagged`, `contains_flagid`, and more. Scripts
+run in a bundled `python3` interpreter, off the proxy hot path; a hung or broken
+script is isolated and never blocks traffic. Toggle the whole engine with
+`PYFILTER_ENABLED` and point at a specific interpreter with `PYFILTER_PYTHON`.
+
+You can **test** a script against an editable sample flow right on the page
+before enabling it.
 
 ### 8. Custom protocols
 
@@ -254,6 +296,15 @@ The response includes `stats_a`, `stats_b`, `new_routes`, `gone_routes`, `change
 | POST           | `/api/rules/bulk-delete`   | Delete a list of rule IDs                    |
 | GET            | `/api/rules/presets`       | List attack preset categories                |
 | POST           | `/api/rules/presets/apply` | Apply selected presets to services           |
+
+### Python filters
+
+| Method         | Endpoint                  | Description                                       |
+| -------------- | ------------------------- | ------------------------------------------------- |
+| GET / POST     | `/api/pyfilters`          | List (with engine status) / create a filter script |
+| GET/PUT/DELETE | `/api/pyfilters/{id}`     | Get / update / delete a script                    |
+| GET            | `/api/pyfilters/status`   | Engine health (python availability, worker, counts) |
+| POST           | `/api/pyfilters/test`     | Evaluate a script against a sample flow or packet |
 
 ### Custom protocols
 
