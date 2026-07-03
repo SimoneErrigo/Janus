@@ -144,15 +144,26 @@ def match(flow):
     return False
 ```
 
-`match(flow)` returns `False`/`None` (no match), `True`, or a reason string.
-`flow` exposes `method`, `url`, `status`, `headers` (dict), `body`, `src`,
-`dst`, `service`, `direction`, `flagged`, `contains_flagid`, and more. Scripts
-run in a bundled `python3` interpreter, off the proxy hot path; a hung or broken
-script is isolated and never blocks traffic. Toggle the whole engine with
+`match(flow)` returns `False`/`None` (no match), `True`, a reason string, or a
+dict `{"match": True, "reason": "...", "drop": "<filter expr>"}`. `flow` exposes
+`method`, `url`, `status`, `headers` (dict), `body`, `src`, `dst`, `service`,
+`direction`, `flagged`, `contains_flagid`, and more. Scripts run in a bundled
+`python3` interpreter, off the proxy hot path; a hung or broken script is
+isolated and never blocks traffic. Toggle the whole engine with
 `PYFILTER_ENABLED` and point at a specific interpreter with `PYFILTER_PYTHON`.
 
+**Dropping (fail2ban-style).** A match can also return a `drop` filter
+expression. Janus can't un-send the packet that tripped the script (it's already
+forwarded — Python runs async), but it installs that expression as a **drop
+rule** so all *future* matching traffic is blocked by the fast in-process
+engine. Drops are **content-only**: the expression may use `body` / `url` /
+`header` / `service` but not IP/port fields — dropping by source IP is
+meaningless under SNAT (every team shares one address) and is rejected. So the
+right pattern is "detect the offender, then block their traffic by content"
+(e.g. their username in the body). Installed rules appear on the **Blocks** page.
+
 You can **test** a script against an editable sample flow right on the page
-before enabling it.
+before enabling it (the test panel also shows the drop rule it would install).
 
 ### 8. Custom protocols
 

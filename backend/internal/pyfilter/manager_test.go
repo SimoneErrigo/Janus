@@ -181,3 +181,35 @@ func TestScriptsPersistAcrossReload(t *testing.T) {
 		t.Fatalf("expected 1 persisted script, got %d", len(m2.ListScripts()))
 	}
 }
+
+func TestDropDirectivePropagates(t *testing.T) {
+	m := newTestManager(t)
+	code := `
+def match(flow):
+    if "alice" in flow.get("body", ""):
+        return {"match": True, "reason": "abuse", "drop": 'body contains "alice"'}
+    return False
+`
+	matches, scriptErr, err := m.Test("ban", code, Flow{"body": `{"user":"alice"}`})
+	if err != nil || scriptErr != "" {
+		t.Fatalf("test: err=%v scriptErr=%s", err, scriptErr)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected 1 match, got %+v", matches)
+	}
+	if matches[0].Drop != `body contains "alice"` {
+		t.Errorf("drop not propagated: %q", matches[0].Drop)
+	}
+	if matches[0].Reason != "abuse" {
+		t.Errorf("reason: %q", matches[0].Reason)
+	}
+
+	// A bare drop directive (no explicit match key) still counts as a match.
+	matches, _, _ = m.Test("ban2", `
+def match(flow):
+    return {"drop": 'url contains "/admin"'}
+`, Flow{})
+	if len(matches) != 1 || matches[0].Drop != `url contains "/admin"` {
+		t.Fatalf("bare drop should match: %+v", matches)
+	}
+}

@@ -10,7 +10,12 @@ User scripts each define:
         #   False / None            -> no match
         #   True                    -> match (no reason)
         #   "some reason string"    -> match with a reason shown in Alerts
-        #   {"match": True, "reason": "..."}  -> match with reason
+        #   {"match": True, "reason": "...", "drop": "<filter expr>"}
+        #       -> match; if "drop" is a filter expression, Janus installs a
+        #          content-only drop rule so FUTURE matching traffic is blocked
+        #          by the fast in-process engine (fail2ban style). The drop
+        #          expression may only use content fields (body/url/header/
+        #          service); IP/port fields are rejected (SNAT-unsafe).
         return False
 
 Module-level state persists across calls, so a script can count things over
@@ -55,19 +60,22 @@ def _compile_scripts(scripts):
 
 
 def _normalize(res):
-    """Turn a match() return value into a reason string, or None for no match."""
+    """Turn a match() return value into {"reason","drop"}, or None for no match."""
     if res is None or res is False:
         return None
     if res is True:
-        return ""
+        return {"reason": "", "drop": ""}
     if isinstance(res, str):
-        return res if res else ""
+        return {"reason": res, "drop": ""}
     if isinstance(res, dict):
-        if res.get("match"):
-            return str(res.get("reason", ""))
+        drop = res.get("drop", "")
+        drop = str(drop) if drop else ""
+        # A drop directive implies a match even without an explicit "match" key.
+        if res.get("match") or drop:
+            return {"reason": str(res.get("reason", "")), "drop": drop}
         return None
     if res:
-        return ""
+        return {"reason": "", "drop": ""}
     return None
 
 
@@ -79,13 +87,14 @@ def _evaluate(scripts, flow):
         except Exception:
             matches.append({
                 "script": sid, "name": s["name"],
-                "reason": "error: " + _short_exc_line(), "error": True,
+                "reason": "error: " + _short_exc_line(), "drop": "", "error": True,
             })
             continue
-        reason = _normalize(res)
-        if reason is not None:
+        norm = _normalize(res)
+        if norm is not None:
             matches.append({
-                "script": sid, "name": s["name"], "reason": reason, "error": False,
+                "script": sid, "name": s["name"],
+                "reason": norm["reason"], "drop": norm["drop"], "error": False,
             })
     return matches
 

@@ -43,7 +43,7 @@ type Config struct {
 
 // Status is a snapshot of engine health for the API/UI.
 type Status struct {
-	Available     bool   `json:"available"`      // python3 interpreter found
+	Available     bool   `json:"available"` // python3 interpreter found
 	PythonPath    string `json:"python_path,omitempty"`
 	WorkerHealthy bool   `json:"worker_healthy"` // a live worker is running
 	ScriptCount   int    `json:"script_count"`

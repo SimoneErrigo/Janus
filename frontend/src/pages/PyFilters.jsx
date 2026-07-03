@@ -5,6 +5,12 @@ const STARTER_CODE = `# Runs against every captured packet. Return one of:
 #   False / None          -> no match
 #   True                  -> match (no reason)
 #   "reason string"       -> match, shown on the Alerts page
+#   {"match": True, "reason": "...", "drop": "<filter expr>"}
+#       -> match AND, fail2ban-style, install a content-only drop rule so
+#          FUTURE matching traffic is blocked by the fast in-process engine.
+#          The drop expression may only use content fields (body/url/header/
+#          service); IP/port fields are rejected (SNAT-unsafe).
+#
 # Module-level state persists across calls, so you can count things over time.
 #
 # flow fields: id, service, direction, method, url, status, src, dst,
@@ -24,7 +30,12 @@ def match(flow):
         if user:
             logins[user] = logins.get(user, 0) + 1
             if logins[user] > 1:
-                return "repeated login for %s (#%d)" % (user, logins[user])
+                # Alert, and block this user's future requests by content:
+                return {
+                    "match": True,
+                    "reason": "repeated login for %s (#%d)" % (user, logins[user]),
+                    "drop": 'body contains "\\"user\\":\\"%s\\""' % user,
+                }
     return False
 `
 
@@ -166,6 +177,8 @@ export default function PyFilters() {
             <code className="text-cyan-300">def match(flow)</code> and runs against every captured
             packet; module-level state persists, so you can express stateful checks (e.g. “same user
             logs in more than once”). Matches surface on the <span className="text-gray-300">Alerts</span> page.
+            A match can also return a <code className="text-cyan-300">drop</code> filter expression
+            to block <em>future</em> matching traffic (fail2ban-style, content-only — never by IP).
           </p>
         </div>
         {statusBadge}
@@ -299,8 +312,15 @@ export default function PyFilters() {
                     {testResult.script_error}
                   </div>
                 ) : testResult.matched ? (
-                  <div className="text-emerald-300">
-                    Matched{testResult.matches?.[0]?.reason ? `: ${testResult.matches[0].reason}` : ''}
+                  <div className="space-y-1">
+                    <div className="text-emerald-300">
+                      Matched{testResult.matches?.[0]?.reason ? `: ${testResult.matches[0].reason}` : ''}
+                    </div>
+                    {testResult.matches?.[0]?.drop && (
+                      <div className="text-amber-300">
+                        Would install drop rule: <code className="font-mono">{testResult.matches[0].drop}</code>
+                      </div>
+                    )}
                   </div>
                 ) : (
                   <div className="text-gray-400">No match.</div>

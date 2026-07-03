@@ -393,3 +393,24 @@ func TestLengthStaysResidualInSQL(t *testing.T) {
 		t.Error("expected a residual evaluator for a length predicate")
 	}
 }
+
+func TestFieldsUsed(t *testing.T) {
+	ast, err := Parse(`body contains "x" AND (header.Cookie contains "s" OR url startswith "/a") AND src == "1.2.3.4"`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	got := FieldsUsed(ast)
+	want := map[string]bool{"body": true, "header": true, "url": true, "src": true}
+	if len(got) != len(want) {
+		t.Fatalf("got %v", got)
+	}
+	for _, f := range got {
+		if !want[f] {
+			t.Errorf("unexpected field %q", f)
+		}
+	}
+	// nil expression -> empty
+	if len(FieldsUsed(nil)) != 0 {
+		t.Error("nil node should yield no fields")
+	}
+}

@@ -27,7 +27,10 @@ type Match struct {
 	Script string `json:"script"`
 	Name   string `json:"name"`
 	Reason string `json:"reason"`
-	Error  bool   `json:"error"`
+	// Drop, when non-empty, is a content-only filter expression the script asked
+	// Janus to install as a drop rule so future matching traffic is blocked.
+	Drop  string `json:"drop"`
+	Error bool   `json:"error"`
 }
 
 // worker wraps a single long-lived `python3 harness.py` process. The protocol
