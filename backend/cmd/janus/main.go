@@ -17,6 +17,7 @@ import (
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
 	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
+	"github.com/SimoneErrigo/Janus/backend/internal/pyfilter"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 	"github.com/SimoneErrigo/Janus/backend/internal/sysstat"
@@ -115,9 +116,53 @@ func main() {
 	// happen via the listener below — but no packets flow yet because the
 	// proxy services aren't started until further down.
 	packetHub := api.NewPacketStreamHub(flagIDPoller)
+
+	// Python filter engine (mitmproxy-style scriptable filtering). Matches are
+	// recorded as alerts (rule_id "pyfilter:<script>"), evaluated asynchronously
+	// off the proxy hot path. Inert until the operator enables a script.
+	var pyMgr *pyfilter.Manager
+	if cfg.PyFilterEnabled {
+		pyMgr = pyfilter.NewManager(pyfilter.Config{
+			DataDir:    cfg.DataDir,
+			PythonPath: cfg.PyFilterPython,
+			OnMatch: func(flow pyfilter.Flow, m pyfilter.Match) {
+				pid, _ := flow["id"].(int64)
+				svcID, _ := flow["service"].(string)
+				srcIP, _ := flow["src"].(string)
+				reason := m.Name
+				if m.Reason != "" {
+					reason = m.Name + ": " + m.Reason
+				}
+				alert := &sniffer.Alert{
+					PacketID:       pid,
+					RuleID:         "pyfilter:" + m.Script,
+					ServiceID:      svcID,
+					SrcIP:          srcIP,
+					Timestamp:      time.Now(),
+					PatternMatched: reason,
+				}
+				if err := packetStore.InsertAlert(alert); err != nil {
+					log.Printf("pyfilter: failed to record alert: %v", err)
+					return
+				}
+				packetHub.Notify()
+			},
+		})
+		defer pyMgr.Close()
+		st := pyMgr.Status()
+		if st.Available {
+			log.Printf("Python filters enabled (interpreter: %s)", st.PythonPath)
+		} else {
+			log.Printf("Python filters enabled but no python3 interpreter found — scripts will not run")
+		}
+	}
+
 	packetStore.SetPacketChangeListener(func(kind sniffer.PacketChangeKind, pkt *sniffer.Packet) {
 		if kind == sniffer.PacketChangeInsert && pkt != nil {
 			packetHub.PushPacket(pkt)
+			if pyMgr != nil {
+				pyMgr.Submit(api.FlowFromPacket(pkt))
+			}
 		} else {
 			packetHub.Notify()
 		}
@@ -159,7 +204,7 @@ func main() {
 	cleanupMgr.Start()
 
 	statsCollector := sysstat.NewCollector(packetStore, redisCache, cfg.DataDir)
-	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller, redisCache, statsCollector, packetHub, captureCtrl, cfg.ProtoDir)
+	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller, redisCache, statsCollector, packetHub, captureCtrl, cfg.ProtoDir, pyMgr)
 
 	// Graceful shutdown
 	go func() {

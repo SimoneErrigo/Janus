@@ -159,9 +159,27 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) enrichAlerts(alerts []*sniffer.Alert) {
 	for _, a := range alerts {
-		if rule, ok := s.ruleStore.GetRule(a.RuleID); ok {
-			a.RuleName = rule.Name
-			a.MatchedScope = string(rule.Scope)
+		s.enrichAlert(a)
+	}
+}
+
+// enrichAlert fills RuleName/MatchedScope for a single alert, resolving both
+// drop/alert rules and Python-filter ("pyfilter:<id>") alerts.
+func (s *Server) enrichAlert(a *sniffer.Alert) {
+	if rule, ok := s.ruleStore.GetRule(a.RuleID); ok {
+		a.RuleName = rule.Name
+		a.MatchedScope = string(rule.Scope)
+		return
+	}
+	if id, ok := strings.CutPrefix(a.RuleID, "pyfilter:"); ok {
+		a.MatchedScope = "python"
+		if s.pyfilter != nil {
+			if sc, found := s.pyfilter.GetScript(id); found {
+				a.RuleName = sc.Name
+			}
+		}
+		if a.RuleName == "" {
+			a.RuleName = id
 		}
 	}
 }
@@ -177,11 +195,8 @@ func (s *Server) getAlert(w http.ResponseWriter, r *http.Request, id int64) {
 		return
 	}
 
-	// Enrich with rule name and scope
-	if rule, ok := s.ruleStore.GetRule(alert.RuleID); ok {
-		alert.RuleName = rule.Name
-		alert.MatchedScope = string(rule.Scope)
-	}
+	// Enrich with rule name and scope (drop/alert rules or Python filters)
+	s.enrichAlert(alert)
 
 	// Get linked packet (flag IDs are now tagged at ingestion, no live enrichment needed)
 	linkedPacket, _ := s.packetStore.GetPacketByID(alert.PacketID)
