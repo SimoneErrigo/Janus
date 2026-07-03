@@ -13,6 +13,7 @@ import SavedFlows from './pages/SavedFlows'
 import RoundDiff from './pages/RoundDiff'
 import Protocols from './pages/Protocols'
 import FilterSandbox from './pages/FilterSandbox'
+import PyFilters from './pages/PyFilters'
 
 function ProtectedRoute({ children }) {
   if (!hasToken()) return <Navigate to="/login" replace />
@@ -28,6 +29,7 @@ export default function App() {
         <Route path="services" element={<Services />} />
         <Route path="traffic" element={<Traffic />} />
         <Route path="rules" element={<Rules />} />
+        <Route path="pyfilters" element={<PyFilters />} />
         <Route path="protocols" element={<Protocols />} />
         <Route path="alerts" element={<Alerts />} />
         <Route path="blocks" element={<Blocks />} />
