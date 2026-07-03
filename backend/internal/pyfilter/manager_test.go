@@ -242,3 +242,38 @@ def match(flow):
 		t.Fatalf("repeat=2 should match on the 2nd run, got %+v", got)
 	}
 }
+
+func TestSequenceCorrelatesReqAndRes(t *testing.T) {
+	m := newTestManager(t)
+	// Remembers the URL seen on the request, and flags the matching response.
+	code := `
+last = {}
+def match(flow):
+    if flow.get("direction") == "request":
+        last["url"] = flow.get("url")
+        return False
+    if flow.get("direction") == "response" and last.get("url") == "/login" and flow.get("status") == 500:
+        return "login errored (5xx) for %s" % last["url"]
+    return False
+`
+	flows := []Flow{
+		{"direction": "request", "url": "/login", "method": "POST"},
+		{"direction": "response", "url": "/login", "status": 500},
+	}
+	steps, scriptErr, err := m.TestSequence("corr", code, flows, 1)
+	if err != nil || scriptErr != "" {
+		t.Fatalf("err=%v scriptErr=%s", err, scriptErr)
+	}
+	if len(steps) != 2 {
+		t.Fatalf("expected 2 steps, got %d", len(steps))
+	}
+	if len(steps[0]) != 0 {
+		t.Errorf("request step should not match, got %+v", steps[0])
+	}
+	if len(steps[1]) != 1 {
+		t.Fatalf("response step should match, got %+v", steps[1])
+	}
+	if steps[1][0].Reason == "" {
+		t.Error("expected a reason on the response match")
+	}
+}

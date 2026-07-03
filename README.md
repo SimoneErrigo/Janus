@@ -162,8 +162,13 @@ meaningless under SNAT (every team shares one address) and is rejected. So the
 right pattern is "detect the offender, then block their traffic by content"
 (e.g. their username in the body). Installed rules appear on the **Blocks** page.
 
-You can **test** a script against an editable sample flow right on the page
-before enabling it (the test panel also shows the drop rule it would install).
+You can **test** a script right on the page before enabling it: build a
+Request/Response sample, or load a real captured packet (or a whole
+request+response **flow**) from traffic. Whole-flow tests run `match()` over the
+packets in order — so correlating/stateful scripts see the sequence — and show a
+per-packet verdict. A `Repeat` control re-runs the sample so counting logic
+(e.g. "2nd login") can fire, and the result labels each match as **Alert** or
+**Alert + Drop** (with the rule it would install).
 
 ### 8. Custom protocols
 

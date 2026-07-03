@@ -208,12 +208,26 @@ type pyFilterTestRequest struct {
 	Code     string        `json:"code"`
 	PacketID int64         `json:"packet_id,omitempty"`
 	Flow     pyfilter.Flow `json:"flow,omitempty"`
-	// Repeat re-runs the same flow N times so stateful scripts can be tested.
+	// Flows is an ordered sequence (a whole reconstructed flow) evaluated in
+	// turn; when set it takes precedence over Flow/PacketID.
+	Flows []pyfilter.Flow `json:"flows,omitempty"`
+	// FlowPacketID resolves a whole flow server-side from one of its packet #s.
+	FlowPacketID int64 `json:"flow_packet_id,omitempty"`
+	// Repeat re-runs the whole sequence N times so stateful scripts can be tested.
 	Repeat int `json:"repeat,omitempty"`
 }
 
+// pyFilterTestStep is one packet's verdict in a sequence test.
+type pyFilterTestStep struct {
+	Index     int              `json:"index"`
+	Direction string           `json:"direction,omitempty"`
+	Matched   bool             `json:"matched"`
+	Matches   []pyfilter.Match `json:"matches"`
+}
+
 // POST /api/pyfilters/test — evaluate a (possibly unsaved) script against a
-// sample flow or a stored packet, in isolation, and report the verdict.
+// single flow, a stored packet, or a whole reconstructed flow (an ordered
+// sequence of packets), in isolation, and report a per-step verdict.
 func (s *Server) handlePyFilterTest(w http.ResponseWriter, r *http.Request) {
 	if !s.pyFilterAvailable(w) {
 		return
@@ -228,17 +242,40 @@ func (s *Server) handlePyFilterTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	flow := req.Flow
-	if req.PacketID > 0 {
+	// Resolve the flow sequence (precedence: explicit flows > server-resolved
+	// flow > single packet > single flow object).
+	var flows []pyfilter.Flow
+	switch {
+	case len(req.Flows) > 0:
+		flows = req.Flows
+	case req.FlowPacketID > 0:
+		packets, err := s.packetStore.QueryFlow(req.FlowPacketID)
+		if err != nil {
+			http.Error(w, "flow query error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		for _, p := range packets {
+			flows = append(flows, FlowFromPacket(p))
+		}
+	case req.PacketID > 0:
 		p, err := s.packetStore.GetPacketByID(req.PacketID)
 		if err != nil || p == nil {
 			http.Error(w, "packet not found", http.StatusNotFound)
 			return
 		}
-		flow = FlowFromPacket(p)
+		flows = []pyfilter.Flow{FlowFromPacket(p)}
+	default:
+		f := req.Flow
+		if f == nil {
+			f = pyfilter.Flow{}
+		}
+		flows = []pyfilter.Flow{f}
 	}
-	if flow == nil {
-		flow = pyfilter.Flow{}
+	if len(flows) == 0 {
+		flows = []pyfilter.Flow{{}}
+	}
+	if len(flows) > 500 {
+		flows = flows[:500] // bound the isolated test run
 	}
 
 	repeat := req.Repeat
@@ -246,18 +283,30 @@ func (s *Server) handlePyFilterTest(w http.ResponseWriter, r *http.Request) {
 		repeat = 1
 	}
 	if repeat > 500 {
-		repeat = 500 // bound the isolated test run
+		repeat = 500
 	}
 
-	matches, scriptErr, err := s.pyfilter.Test(req.Name, req.Code, flow, repeat)
+	steps, scriptErr, err := s.pyfilter.TestSequence(req.Name, req.Code, flows, repeat)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	outSteps := make([]pyFilterTestStep, len(steps))
+	anyMatch := false
+	var lastMatches []pyfilter.Match
+	for i, ms := range steps {
+		dir, _ := flows[i]["direction"].(string)
+		outSteps[i] = pyFilterTestStep{Index: i, Direction: dir, Matched: len(ms) > 0, Matches: ms}
+		if len(ms) > 0 {
+			anyMatch = true
+		}
+		lastMatches = ms
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"matched":      len(matches) > 0,
-		"matches":      matches,
+		"matched":      anyMatch,
+		"steps":        outSteps,
+		"matches":      lastMatches, // backward-compat: last step's matches
 		"script_error": scriptErr,
-		"flow":         flow,
 	})
 }

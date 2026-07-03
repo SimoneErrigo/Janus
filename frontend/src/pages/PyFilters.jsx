@@ -217,9 +217,11 @@ export default function PyFilters() {
     setTestFlowJSON(JSON.stringify(flow, null, 2))
   }
 
-  const currentDirection = useMemo(() => {
-    try { return JSON.parse(testFlowJSON).direction || 'request' } catch { return 'request' }
+  const parsedFlow = useMemo(() => {
+    try { return JSON.parse(testFlowJSON) } catch { return null }
   }, [testFlowJSON])
+  const flowIsArray = Array.isArray(parsedFlow)
+  const currentDirection = (parsedFlow && !flowIsArray && parsedFlow.direction) || 'request'
 
   async function loadPacket(id) {
     setError('')
@@ -233,6 +235,23 @@ export default function PyFilters() {
       flash(`Loaded packet #${p.id} (${p.direction})`)
     } catch (e) {
       setError(e.message || 'failed to load packet')
+    } finally {
+      setLoadingFlow(false)
+    }
+  }
+
+  async function loadFlow(id) {
+    setError('')
+    setLoadingFlow(true)
+    setTestResult(null)
+    try {
+      const data = await api.getPacketFlow(id)
+      const pkts = data?.packets || []
+      if (!pkts.length) throw new Error('no packets in that flow')
+      setTestFlowJSON(JSON.stringify(pkts.map(mapPacketToFlow), null, 2))
+      flash(`Loaded flow of ${pkts.length} packet(s) from #${id}`)
+    } catch (e) {
+      setError(e.message || 'failed to load flow')
     } finally {
       setLoadingFlow(false)
     }
@@ -256,21 +275,24 @@ export default function PyFilters() {
     setTesting(true)
     setTestResult(null)
     setError('')
-    let flow
+    let parsed
     try {
-      flow = JSON.parse(testFlowJSON)
+      parsed = JSON.parse(testFlowJSON)
     } catch {
       setError('sample flow is not valid JSON')
       setTesting(false)
       return
     }
+    const body = {
+      name: draft.name || 'test',
+      code: draft.code,
+      repeat: Math.max(1, Number(repeat) || 1),
+    }
+    // A JSON array = a whole flow (sequence of packets); an object = one packet.
+    if (Array.isArray(parsed)) body.flows = parsed
+    else body.flow = parsed
     try {
-      const res = await api.testPyFilter({
-        name: draft.name || 'test',
-        code: draft.code,
-        flow,
-        repeat: Math.max(1, Number(repeat) || 1),
-      })
+      const res = await api.testPyFilter(body)
       setTestResult(res)
     } catch (e) {
       setError(e.message || 'test failed')
@@ -293,8 +315,6 @@ export default function PyFilters() {
       </div>
     )
   }, [status])
-
-  const match0 = testResult?.matches?.[0]
 
   return (
     <div className="p-6 space-y-4 max-w-6xl">
@@ -454,20 +474,26 @@ export default function PyFilters() {
 
             {/* Sample source controls */}
             <div className="flex items-center gap-2 flex-wrap text-[11px]">
-              <div className="inline-flex rounded border border-gray-700 overflow-hidden">
-                {['request', 'response'].map((d) => (
-                  <button
-                    key={d}
-                    onClick={() => applyDirection(d)}
-                    className={`px-2 py-1 cursor-pointer ${
-                      currentDirection === d ? 'bg-cyan-700 text-white' : 'bg-gray-800 text-gray-400 hover:text-gray-200'
-                    }`}
-                  >
-                    {d === 'request' ? 'Request' : 'Response'}
-                  </button>
-                ))}
-              </div>
-              <span className="text-gray-600">or from traffic:</span>
+              {flowIsArray ? (
+                <span className="px-2 py-1 rounded border border-cyan-700/50 bg-cyan-900/20 text-cyan-300">
+                  Flow sequence — {parsedFlow.length} packet(s)
+                </span>
+              ) : (
+                <div className="inline-flex rounded border border-gray-700 overflow-hidden">
+                  {['request', 'response'].map((d) => (
+                    <button
+                      key={d}
+                      onClick={() => applyDirection(d)}
+                      className={`px-2 py-1 cursor-pointer ${
+                        currentDirection === d ? 'bg-cyan-700 text-white' : 'bg-gray-800 text-gray-400 hover:text-gray-200'
+                      }`}
+                    >
+                      {d === 'request' ? 'Request' : 'Response'}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <span className="text-gray-600">from traffic:</span>
               <input
                 type="number"
                 value={packetId}
@@ -479,15 +505,24 @@ export default function PyFilters() {
                 onClick={() => packetId && loadPacket(packetId)}
                 disabled={loadingFlow || !packetId}
                 className="px-2 py-1 rounded bg-gray-800 border border-gray-700 text-gray-300 hover:border-cyan-600 hover:text-cyan-300 disabled:opacity-50 cursor-pointer"
+                title="Load just this packet"
               >
-                Load #
+                Load packet
+              </button>
+              <button
+                onClick={() => packetId && loadFlow(packetId)}
+                disabled={loadingFlow || !packetId}
+                className="px-2 py-1 rounded bg-gray-800 border border-gray-700 text-gray-300 hover:border-cyan-600 hover:text-cyan-300 disabled:opacity-50 cursor-pointer"
+                title="Load the whole request+response flow this packet belongs to"
+              >
+                Load flow
               </button>
               <button
                 onClick={loadLatestPacket}
                 disabled={loadingFlow}
                 className="px-2 py-1 rounded bg-gray-800 border border-gray-700 text-gray-300 hover:border-cyan-600 hover:text-cyan-300 disabled:opacity-50 cursor-pointer"
               >
-                {loadingFlow ? 'Loading…' : 'Load latest'}
+                {loadingFlow ? 'Loading…' : 'Latest'}
               </button>
             </div>
 
@@ -499,7 +534,7 @@ export default function PyFilters() {
               className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs font-mono text-gray-100 focus:outline-none focus:border-cyan-500"
             />
 
-            {testResult && <TestVerdict result={testResult} match0={match0} />}
+            {testResult && <TestVerdict result={testResult} />}
           </div>
         </div>
       </div>
@@ -507,7 +542,7 @@ export default function PyFilters() {
   )
 }
 
-function TestVerdict({ result, match0 }) {
+function TestVerdict({ result }) {
   if (result.script_error) {
     return (
       <div className="rounded border border-red-800/50 bg-red-950/40 p-2">
@@ -516,6 +551,27 @@ function TestVerdict({ result, match0 }) {
       </div>
     )
   }
+
+  const steps = result.steps || []
+
+  // Whole-flow (sequence) result: a verdict per packet, in order.
+  if (steps.length > 1) {
+    const matched = steps.filter((s) => s.matched).length
+    return (
+      <div className="rounded border border-gray-700 bg-gray-800/40 p-2 space-y-1.5">
+        <div className="text-xs text-gray-300">
+          Flow of {steps.length} packet(s) —{' '}
+          <span className={matched ? 'text-emerald-300' : 'text-gray-400'}>{matched} matched</span>
+        </div>
+        <div className="space-y-1">
+          {steps.map((s) => <StepRow key={s.index} step={s} />)}
+        </div>
+      </div>
+    )
+  }
+
+  // Single flow/packet.
+  const m0 = (steps[0]?.matches || result.matches || [])[0]
   if (!result.matched) {
     return (
       <div className="rounded border border-gray-700 bg-gray-800/50 p-2 text-xs text-gray-400">
@@ -523,16 +579,12 @@ function TestVerdict({ result, match0 }) {
       </div>
     )
   }
-  const drop = match0?.drop
+  const drop = m0?.drop
   return (
     <div className={`rounded border p-2 ${drop ? 'border-amber-700/50 bg-amber-950/30' : 'border-emerald-700/50 bg-emerald-950/30'}`}>
       <div className="flex items-center gap-2 mb-1">
-        <span className={`text-[10px] px-1.5 py-0.5 rounded border font-semibold ${
-          drop ? 'bg-amber-900/50 text-amber-200 border-amber-700/50' : 'bg-emerald-900/50 text-emerald-200 border-emerald-700/50'
-        }`}>
-          {drop ? 'MATCH → ALERT + DROP' : 'MATCH → ALERT'}
-        </span>
-        {match0?.reason && <span className="text-xs text-gray-300">{match0.reason}</span>}
+        <VerdictBadge drop={drop} />
+        {m0?.reason && <span className="text-xs text-gray-300">{m0.reason}</span>}
       </div>
       {drop ? (
         <div className="text-[11px] text-amber-200/90">
@@ -543,6 +595,44 @@ function TestVerdict({ result, match0 }) {
         <div className="text-[11px] text-emerald-200/80">Raises an alert on the Alerts page.</div>
       )}
     </div>
+  )
+}
+
+function StepRow({ step }) {
+  const m0 = step.matches?.[0]
+  const drop = m0?.drop
+  return (
+    <div className="flex items-center gap-2 text-[11px]">
+      <span className="text-gray-600 w-6 text-right">#{step.index}</span>
+      {step.direction && (
+        <span className={`px-1 rounded border text-[10px] ${
+          step.direction === 'response'
+            ? 'border-indigo-700/50 text-indigo-300 bg-indigo-900/20'
+            : 'border-sky-700/50 text-sky-300 bg-sky-900/20'
+        }`}>
+          {step.direction === 'response' ? 'RES' : 'REQ'}
+        </span>
+      )}
+      {step.matched ? (
+        <>
+          <VerdictBadge drop={drop} small />
+          {m0?.reason && <span className="text-gray-400 truncate">{m0.reason}</span>}
+        </>
+      ) : (
+        <span className="text-gray-600">no match</span>
+      )}
+    </div>
+  )
+}
+
+function VerdictBadge({ drop, small }) {
+  const cls = drop
+    ? 'bg-amber-900/50 text-amber-200 border-amber-700/50'
+    : 'bg-emerald-900/50 text-emerald-200 border-emerald-700/50'
+  return (
+    <span className={`${small ? 'text-[10px]' : 'text-[10px]'} px-1.5 py-0.5 rounded border font-semibold ${cls}`}>
+      {drop ? 'ALERT + DROP' : 'ALERT'}
+    </span>
   )
 }
 

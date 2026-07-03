@@ -131,9 +131,10 @@ def main():
             _send({"id": msg.get("id"), "matches": _evaluate(SCRIPTS, msg.get("packet", {}))})
         elif cmd == "test":
             # Evaluate one script in isolation without disturbing loaded state.
-            # `repeat` re-runs the same flow N times against the freshly-loaded
-            # script so stateful scripts (module globals) can be exercised — the
-            # verdict returned is from the last run.
+            # `packets` is an ordered sequence (a whole flow, or one packet);
+            # match() is called on each in turn so stateful/correlating scripts
+            # see the sequence. `repeat` re-runs the whole sequence N times.
+            # Returns per-step verdicts from the last pass.
             loaded, errors = _compile_scripts([msg.get("script", {})])
             if errors:
                 _send({"id": msg.get("id"), "error": list(errors.values())[0]})
@@ -144,11 +145,17 @@ def main():
                     repeat = 1
                 if repeat < 1:
                     repeat = 1
-                flow = msg.get("packet", {})
-                matches = []
+                packets = msg.get("packets")
+                if not isinstance(packets, list) or not packets:
+                    packets = [msg.get("packet", {})]
+                steps = []
                 for _ in range(repeat):
-                    matches = _evaluate(loaded, flow)
-                _send({"id": msg.get("id"), "matches": matches})
+                    steps = [{"matches": _evaluate(loaded, f)} for f in packets]
+                _send({
+                    "id": msg.get("id"),
+                    "steps": steps,
+                    "matches": steps[-1]["matches"] if steps else [],
+                })
         elif cmd == "ping":
             _send({"pong": True})
 

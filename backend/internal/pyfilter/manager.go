@@ -394,17 +394,34 @@ func (m *Manager) runPipeline() {
 	}
 }
 
-// Test evaluates a single (possibly unsaved) script against a sample flow in an
-// isolated worker, without touching the live worker or its state. Returns the
-// matches, a compile/definition error message (if the script is invalid), and a
-// transport error. repeat re-runs the same flow N times (>=1) so stateful
-// scripts can be exercised; the verdict is from the last run.
-func (m *Manager) Test(name, code string, flow Flow, repeat int) ([]Match, string, error) {
+// testResp is the harness reply to a test command.
+type testResp struct {
+	ID      int64        `json:"id"`
+	Steps   []stepResult `json:"steps"`
+	Matches []Match      `json:"matches"`
+	Error   string       `json:"error"`
+}
+
+type stepResult struct {
+	Matches []Match `json:"matches"`
+}
+
+// TestSequence evaluates a (possibly unsaved) script against an ordered sequence
+// of flows — a whole reconstructed flow, or a single packet — in an isolated
+// worker, without touching the live worker or its state. match() is called on
+// each flow in turn so stateful/correlating scripts see the sequence; repeat
+// re-runs the whole sequence N times (>=1). Returns one match list per flow (in
+// order, from the last pass), a compile/definition error message, and a
+// transport error.
+func (m *Manager) TestSequence(name, code string, flows []Flow, repeat int) ([][]Match, string, error) {
 	if !m.available {
 		return nil, "", errors.New("python interpreter not available")
 	}
 	if repeat < 1 {
 		repeat = 1
+	}
+	if len(flows) == 0 {
+		flows = []Flow{{}}
 	}
 	w, err := spawnWorker(m.pythonPath, harness)
 	if err != nil {
@@ -413,23 +430,37 @@ func (m *Manager) Test(name, code string, flow Flow, repeat int) ([]Match, strin
 	defer w.stop()
 
 	type testReq struct {
-		Cmd    string     `json:"cmd"`
-		ID     int64      `json:"id"`
-		Script scriptSpec `json:"script"`
-		Repeat int        `json:"repeat"`
-		Packet Flow       `json:"packet"`
+		Cmd     string     `json:"cmd"`
+		ID      int64      `json:"id"`
+		Script  scriptSpec `json:"script"`
+		Repeat  int        `json:"repeat"`
+		Packets []Flow     `json:"packets"`
 	}
-	var resp evalResp
-	req := testReq{Cmd: "test", Script: scriptSpec{ID: "test", Name: name, Code: code}, Repeat: repeat, Packet: flow}
-	// A large repeat count still runs inside one roundtrip; give it more time.
-	timeout := m.cfg.EvalTimeout
-	if repeat > 1 {
-		timeout = m.cfg.EvalTimeout + time.Duration(repeat)*10*time.Millisecond
-	}
+	var resp testResp
+	req := testReq{Cmd: "test", Script: scriptSpec{ID: "test", Name: name, Code: code}, Repeat: repeat, Packets: flows}
+	// The whole sequence runs inside one roundtrip; scale the timeout with work.
+	timeout := m.cfg.EvalTimeout + time.Duration(repeat*len(flows))*10*time.Millisecond
 	if err := w.roundtrip(req, timeout, &resp); err != nil {
 		return nil, "", err
 	}
-	return resp.Matches, resp.Error, nil
+	steps := make([][]Match, len(resp.Steps))
+	for i, s := range resp.Steps {
+		steps[i] = s.Matches
+	}
+	return steps, resp.Error, nil
+}
+
+// Test evaluates a script against a single flow, repeat times, returning the
+// verdict from the last run. Convenience wrapper over TestSequence.
+func (m *Manager) Test(name, code string, flow Flow, repeat int) ([]Match, string, error) {
+	steps, scriptErr, err := m.TestSequence(name, code, []Flow{flow}, repeat)
+	if err != nil || scriptErr != "" {
+		return nil, scriptErr, err
+	}
+	if len(steps) == 0 {
+		return nil, "", nil
+	}
+	return steps[len(steps)-1], "", nil
 }
 
 // Close stops the pipeline and terminates the worker.
