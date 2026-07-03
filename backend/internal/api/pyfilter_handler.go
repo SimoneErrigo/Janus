@@ -208,6 +208,8 @@ type pyFilterTestRequest struct {
 	Code     string        `json:"code"`
 	PacketID int64         `json:"packet_id,omitempty"`
 	Flow     pyfilter.Flow `json:"flow,omitempty"`
+	// Repeat re-runs the same flow N times so stateful scripts can be tested.
+	Repeat int `json:"repeat,omitempty"`
 }
 
 // POST /api/pyfilters/test — evaluate a (possibly unsaved) script against a
@@ -239,7 +241,15 @@ func (s *Server) handlePyFilterTest(w http.ResponseWriter, r *http.Request) {
 		flow = pyfilter.Flow{}
 	}
 
-	matches, scriptErr, err := s.pyfilter.Test(req.Name, req.Code, flow)
+	repeat := req.Repeat
+	if repeat < 1 {
+		repeat = 1
+	}
+	if repeat > 500 {
+		repeat = 500 // bound the isolated test run
+	}
+
+	matches, scriptErr, err := s.pyfilter.Test(req.Name, req.Code, flow, repeat)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

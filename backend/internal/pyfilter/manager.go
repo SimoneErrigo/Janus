@@ -397,10 +397,14 @@ func (m *Manager) runPipeline() {
 // Test evaluates a single (possibly unsaved) script against a sample flow in an
 // isolated worker, without touching the live worker or its state. Returns the
 // matches, a compile/definition error message (if the script is invalid), and a
-// transport error.
-func (m *Manager) Test(name, code string, flow Flow) ([]Match, string, error) {
+// transport error. repeat re-runs the same flow N times (>=1) so stateful
+// scripts can be exercised; the verdict is from the last run.
+func (m *Manager) Test(name, code string, flow Flow, repeat int) ([]Match, string, error) {
 	if !m.available {
 		return nil, "", errors.New("python interpreter not available")
+	}
+	if repeat < 1 {
+		repeat = 1
 	}
 	w, err := spawnWorker(m.pythonPath, harness)
 	if err != nil {
@@ -412,11 +416,17 @@ func (m *Manager) Test(name, code string, flow Flow) ([]Match, string, error) {
 		Cmd    string     `json:"cmd"`
 		ID     int64      `json:"id"`
 		Script scriptSpec `json:"script"`
+		Repeat int        `json:"repeat"`
 		Packet Flow       `json:"packet"`
 	}
 	var resp evalResp
-	req := testReq{Cmd: "test", Script: scriptSpec{ID: "test", Name: name, Code: code}, Packet: flow}
-	if err := w.roundtrip(req, m.cfg.EvalTimeout, &resp); err != nil {
+	req := testReq{Cmd: "test", Script: scriptSpec{ID: "test", Name: name, Code: code}, Repeat: repeat, Packet: flow}
+	// A large repeat count still runs inside one roundtrip; give it more time.
+	timeout := m.cfg.EvalTimeout
+	if repeat > 1 {
+		timeout = m.cfg.EvalTimeout + time.Duration(repeat)*10*time.Millisecond
+	}
+	if err := w.roundtrip(req, timeout, &resp); err != nil {
 		return nil, "", err
 	}
 	return resp.Matches, resp.Error, nil

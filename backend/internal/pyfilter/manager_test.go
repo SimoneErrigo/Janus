@@ -25,7 +25,7 @@ def match(flow):
     return False
 `
 	flow := Flow{"method": "POST", "url": "/login"}
-	matches, scriptErr, err := m.Test("login", code, flow)
+	matches, scriptErr, err := m.Test("login", code, flow, 1)
 	if err != nil {
 		t.Fatalf("Test: %v", err)
 	}
@@ -37,7 +37,7 @@ def match(flow):
 	}
 
 	// Non-matching flow.
-	matches, _, err = m.Test("login", code, Flow{"method": "GET", "url": "/"})
+	matches, _, err = m.Test("login", code, Flow{"method": "GET", "url": "/"}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ def match(flow):
 
 func TestTestScriptCompileError(t *testing.T) {
 	m := newTestManager(t)
-	_, scriptErr, err := m.Test("broken", "def match(flow)\n  return True", Flow{})
+	_, scriptErr, err := m.Test("broken", "def match(flow)\n  return True", Flow{}, 1)
 	if err != nil {
 		t.Fatalf("transport error: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestTestScriptCompileError(t *testing.T) {
 
 func TestTestScriptMissingMatch(t *testing.T) {
 	m := newTestManager(t)
-	_, scriptErr, err := m.Test("nofunc", "x = 1", Flow{})
+	_, scriptErr, err := m.Test("nofunc", "x = 1", Flow{}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ def match(flow):
         return {"match": True, "reason": "abuse", "drop": 'body contains "alice"'}
     return False
 `
-	matches, scriptErr, err := m.Test("ban", code, Flow{"body": `{"user":"alice"}`})
+	matches, scriptErr, err := m.Test("ban", code, Flow{"body": `{"user":"alice"}`}, 1)
 	if err != nil || scriptErr != "" {
 		t.Fatalf("test: err=%v scriptErr=%s", err, scriptErr)
 	}
@@ -208,8 +208,37 @@ def match(flow):
 	matches, _, _ = m.Test("ban2", `
 def match(flow):
     return {"drop": 'url contains "/admin"'}
-`, Flow{})
+`, Flow{}, 1)
 	if len(matches) != 1 || matches[0].Drop != `url contains "/admin"` {
 		t.Fatalf("bare drop should match: %+v", matches)
+	}
+}
+
+func TestTestRepeatExercisesState(t *testing.T) {
+	m := newTestManager(t)
+	code := `
+seen = {}
+def match(flow):
+    u = flow.get("user")
+    seen[u] = seen.get(u, 0) + 1
+    if seen[u] > 1:
+        return "seen %s x%d" % (u, seen[u])
+    return False
+`
+	// One run: first sighting, no match.
+	got, _, err := m.Test("count", code, Flow{"user": "x"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("single run should not match, got %+v", got)
+	}
+	// Two runs against a fresh worker: the 2nd sighting matches.
+	got, _, err = m.Test("count", code, Flow{"user": "x"}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("repeat=2 should match on the 2nd run, got %+v", got)
 	}
 }

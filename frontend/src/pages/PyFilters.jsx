@@ -1,36 +1,43 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
 
-const STARTER_CODE = `# Runs against every captured packet. Return one of:
-#   False / None          -> no match
-#   True                  -> match (no reason)
-#   "reason string"       -> match, shown on the Alerts page
-#   {"match": True, "reason": "...", "drop": "<filter expr>"}
-#       -> match AND, fail2ban-style, install a content-only drop rule so
-#          FUTURE matching traffic is blocked by the fast in-process engine.
-#          The drop expression may only use content fields (body/url/header/
-#          service); IP/port fields are rejected (SNAT-unsafe).
-#
-# Module-level state persists across calls, so you can count things over time.
-#
-# flow fields: id, service, direction, method, url, status, src, dst,
-#              sport, dport, headers (dict), body (str), flagged,
-#              contains_flagid, timestamp
+// --- example scripts, one per pattern, so alert vs drop is obvious ---
 
+const ALERT_EXAMPLE = `# ALERT ONLY — return a string (the reason) to raise an Alert.
+def match(flow):
+    if flow.get("method") == "POST" and "/admin" in flow.get("url", ""):
+        return "POST to an admin endpoint"   # string -> ALERT
+    return False
+`
+
+const DROP_EXAMPLE = `# ALERT + DROP — return a dict with a "drop" filter expression to also
+# block FUTURE matching traffic (fail2ban-style, content-only, never by IP).
+def match(flow):
+    ua = flow.get("headers", {}).get("User-Agent", "")
+    if "sqlmap" in ua.lower():
+        return {
+            "match": True,
+            "reason": "sqlmap user-agent",
+            "drop": 'header.User-Agent icontains "sqlmap"',
+        }
+    return False
+`
+
+const STATEFUL_EXAMPLE = `# STATEFUL — module-level state persists across packets. Here: alert (and
+# block) a user only from their SECOND login onward. Use Repeat >= 2 to test.
 import json
 
 logins = {}
 
 def match(flow):
-    if flow["method"] == "POST" and flow["url"] == "/login":
+    if flow.get("method") == "POST" and flow.get("url") == "/login":
         try:
-            user = json.loads(flow["body"]).get("user")
+            user = json.loads(flow.get("body", "")).get("user")
         except Exception:
             user = None
         if user:
             logins[user] = logins.get(user, 0) + 1
             if logins[user] > 1:
-                # Alert, and block this user's future requests by content:
                 return {
                     "match": True,
                     "reason": "repeated login for %s (#%d)" % (user, logins[user]),
@@ -39,21 +46,70 @@ def match(flow):
     return False
 `
 
-const SAMPLE_FLOW = {
-  method: 'POST',
-  url: '/login',
+const EXAMPLES = [
+  { key: 'alert', label: 'Alert example', code: ALERT_EXAMPLE },
+  { key: 'drop', label: 'Drop example', code: DROP_EXAMPLE },
+  { key: 'stateful', label: 'Stateful example', code: STATEFUL_EXAMPLE },
+]
+
+// --- sample flows for the tester ---
+
+const REQUEST_FLOW = {
+  id: 0,
   service: 'web',
   direction: 'request',
+  method: 'POST',
+  url: '/login',
   status: 0,
   src: '10.60.5.7',
   dst: '10.60.1.1',
+  sport: 54321,
+  dport: 8080,
   headers: { 'User-Agent': 'curl/8.0', 'Content-Type': 'application/json' },
   body: '{"user":"alice","password":"x"}',
   flagged: false,
   contains_flagid: false,
 }
 
-const EMPTY_DRAFT = { id: null, name: '', code: STARTER_CODE, enabled: true }
+const RESPONSE_FLOW = {
+  id: 0,
+  service: 'web',
+  direction: 'response',
+  method: '',
+  url: '/login',
+  status: 200,
+  src: '10.60.1.1',
+  dst: '10.60.5.7',
+  sport: 8080,
+  dport: 54321,
+  headers: { 'Content-Type': 'application/json' },
+  body: '{"ok":true,"token":"abc123"}',
+  flagged: false,
+  contains_flagid: false,
+}
+
+// mapPacketToFlow mirrors the backend FlowFromPacket shape so a real packet can
+// be tested without a server round-trip.
+function mapPacketToFlow(p) {
+  return {
+    id: p.id,
+    service: p.service_id || '',
+    direction: p.direction || '',
+    method: p.method || '',
+    url: p.url || '',
+    status: p.status || 0,
+    src: p.src_ip || '',
+    dst: p.dst_ip || '',
+    sport: p.src_port || 0,
+    dport: p.dst_port || 0,
+    headers: p.headers || {},
+    body: p.body_string || '',
+    flagged: !!p.flagged,
+    contains_flagid: !!p.contains_flagid,
+  }
+}
+
+const EMPTY_DRAFT = { id: null, name: '', code: ALERT_EXAMPLE, enabled: true }
 
 export default function PyFilters() {
   const [scripts, setScripts] = useState([])
@@ -62,9 +118,14 @@ export default function PyFilters() {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [saving, setSaving] = useState(false)
-  const [testFlowJSON, setTestFlowJSON] = useState(JSON.stringify(SAMPLE_FLOW, null, 2))
+
+  // tester state
+  const [testFlowJSON, setTestFlowJSON] = useState(JSON.stringify(REQUEST_FLOW, null, 2))
+  const [repeat, setRepeat] = useState(1)
+  const [packetId, setPacketId] = useState('')
   const [testResult, setTestResult] = useState(null)
   const [testing, setTesting] = useState(false)
+  const [loadingFlow, setLoadingFlow] = useState(false)
 
   const load = useCallback(async () => {
     try {
@@ -79,6 +140,7 @@ export default function PyFilters() {
   useEffect(() => { load() }, [load])
 
   const editing = draft.id !== null
+  const flash = (msg) => { setNotice(msg); setTimeout(() => setNotice(''), 2500) }
 
   const startNew = () => { setDraft(EMPTY_DRAFT); setTestResult(null); setError('') }
   const startEdit = (s) => {
@@ -86,8 +148,6 @@ export default function PyFilters() {
     setTestResult(null)
     setError('')
   }
-
-  const flash = (msg) => { setNotice(msg); setTimeout(() => setNotice(''), 2500) }
 
   async function save() {
     if (!draft.name.trim()) { setError('name is required'); return }
@@ -130,6 +190,68 @@ export default function PyFilters() {
     }
   }
 
+  function loadExample(code) {
+    setDraft((d) => ({ ...d, code }))
+    setTestResult(null)
+  }
+
+  // Direction toggle: rewrite the sample flow's direction and sensible defaults,
+  // preserving user edits when the JSON still parses.
+  function applyDirection(dir) {
+    let flow
+    try {
+      flow = JSON.parse(testFlowJSON)
+    } catch {
+      flow = dir === 'response' ? { ...RESPONSE_FLOW } : { ...REQUEST_FLOW }
+      setTestFlowJSON(JSON.stringify(flow, null, 2))
+      return
+    }
+    flow.direction = dir
+    if (dir === 'response') {
+      flow.method = ''
+      if (!flow.status) flow.status = 200
+    } else {
+      if (!flow.method) flow.method = 'POST'
+      flow.status = 0
+    }
+    setTestFlowJSON(JSON.stringify(flow, null, 2))
+  }
+
+  const currentDirection = useMemo(() => {
+    try { return JSON.parse(testFlowJSON).direction || 'request' } catch { return 'request' }
+  }, [testFlowJSON])
+
+  async function loadPacket(id) {
+    setError('')
+    setLoadingFlow(true)
+    setTestResult(null)
+    try {
+      const p = await api.getPacket(id)
+      if (!p || !p.id) throw new Error('packet not found')
+      setTestFlowJSON(JSON.stringify(mapPacketToFlow(p), null, 2))
+      setPacketId(String(p.id))
+      flash(`Loaded packet #${p.id} (${p.direction})`)
+    } catch (e) {
+      setError(e.message || 'failed to load packet')
+    } finally {
+      setLoadingFlow(false)
+    }
+  }
+
+  async function loadLatestPacket() {
+    setError('')
+    setLoadingFlow(true)
+    try {
+      const data = await api.getPackets({ limit: 1, sort: 'desc' })
+      const first = (data?.packets || [])[0]
+      if (!first) throw new Error('no packets captured yet')
+      await loadPacket(first.id)
+    } catch (e) {
+      setError(e.message || 'failed to load latest packet')
+      setLoadingFlow(false)
+    }
+  }
+
   async function runTest() {
     setTesting(true)
     setTestResult(null)
@@ -143,7 +265,12 @@ export default function PyFilters() {
       return
     }
     try {
-      const res = await api.testPyFilter({ name: draft.name || 'test', code: draft.code, flow })
+      const res = await api.testPyFilter({
+        name: draft.name || 'test',
+        code: draft.code,
+        flow,
+        repeat: Math.max(1, Number(repeat) || 1),
+      })
       setTestResult(res)
     } catch (e) {
       setError(e.message || 'test failed')
@@ -167,6 +294,8 @@ export default function PyFilters() {
     )
   }, [status])
 
+  const match0 = testResult?.matches?.[0]
+
   return (
     <div className="p-6 space-y-4 max-w-6xl">
       <header className="flex items-start justify-between gap-4 flex-wrap">
@@ -175,10 +304,8 @@ export default function PyFilters() {
           <p className="text-xs text-gray-500 max-w-2xl">
             mitmproxy-style scriptable filtering. Each script defines{' '}
             <code className="text-cyan-300">def match(flow)</code> and runs against every captured
-            packet; module-level state persists, so you can express stateful checks (e.g. “same user
-            logs in more than once”). Matches surface on the <span className="text-gray-300">Alerts</span> page.
-            A match can also return a <code className="text-cyan-300">drop</code> filter expression
-            to block <em>future</em> matching traffic (fail2ban-style, content-only — never by IP).
+            packet (request <em>and</em> response). Module-level state persists, so you can express
+            stateful checks. What a match does is decided by what you return — see the legend below.
           </p>
         </div>
         {statusBadge}
@@ -190,7 +317,7 @@ export default function PyFilters() {
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-[300px_1fr] gap-4">
+      <div className="grid grid-cols-1 lg:grid-cols-[280px_1fr] gap-4">
         {/* Script list */}
         <div className="space-y-2">
           <div className="flex items-center justify-between">
@@ -241,6 +368,8 @@ export default function PyFilters() {
               </div>
             </div>
           ))}
+
+          <ReturnLegend />
         </div>
 
         {/* Editor + test */}
@@ -269,6 +398,19 @@ export default function PyFilters() {
             </button>
           </div>
 
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-[11px] text-gray-500">Load example:</span>
+            {EXAMPLES.map((ex) => (
+              <button
+                key={ex.key}
+                onClick={() => loadExample(ex.code)}
+                className="text-[11px] px-2 py-0.5 rounded bg-gray-800 border border-gray-700 text-gray-300 hover:border-cyan-600 hover:text-cyan-300 cursor-pointer"
+              >
+                {ex.label}
+              </button>
+            ))}
+          </div>
+
           <textarea
             value={draft.code}
             onChange={(e) => setDraft({ ...draft, code: e.target.value })}
@@ -287,48 +429,146 @@ export default function PyFilters() {
           )}
 
           {/* Test panel */}
-          <div className="bg-gray-900 border border-gray-800 rounded p-3 space-y-2">
-            <div className="flex items-center justify-between">
-              <h3 className="text-xs uppercase tracking-wide text-gray-500">Test against a sample flow</h3>
+          <div className="bg-gray-900 border border-gray-800 rounded p-3 space-y-3">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <h3 className="text-xs uppercase tracking-wide text-gray-500">Test the script</h3>
+              <div className="flex items-center gap-2">
+                <label className="text-[11px] text-gray-500 flex items-center gap-1" title="Re-run the same flow N times so stateful scripts (module globals) can trigger — e.g. a 2nd login.">
+                  Repeat
+                  <input
+                    type="number" min={1} max={500}
+                    value={repeat}
+                    onChange={(e) => setRepeat(e.target.value)}
+                    className="w-14 bg-gray-800 border border-gray-700 rounded px-1.5 py-0.5 text-xs text-gray-100"
+                  />
+                </label>
+                <button
+                  onClick={runTest}
+                  disabled={testing || !status?.available}
+                  className="text-xs px-2.5 py-1 rounded bg-cyan-700 text-white hover:bg-cyan-600 disabled:opacity-50 cursor-pointer"
+                >
+                  {testing ? 'Running…' : 'Run test'}
+                </button>
+              </div>
+            </div>
+
+            {/* Sample source controls */}
+            <div className="flex items-center gap-2 flex-wrap text-[11px]">
+              <div className="inline-flex rounded border border-gray-700 overflow-hidden">
+                {['request', 'response'].map((d) => (
+                  <button
+                    key={d}
+                    onClick={() => applyDirection(d)}
+                    className={`px-2 py-1 cursor-pointer ${
+                      currentDirection === d ? 'bg-cyan-700 text-white' : 'bg-gray-800 text-gray-400 hover:text-gray-200'
+                    }`}
+                  >
+                    {d === 'request' ? 'Request' : 'Response'}
+                  </button>
+                ))}
+              </div>
+              <span className="text-gray-600">or from traffic:</span>
+              <input
+                type="number"
+                value={packetId}
+                onChange={(e) => setPacketId(e.target.value)}
+                placeholder="#"
+                className="w-20 bg-gray-800 border border-gray-700 rounded px-1.5 py-1 text-gray-100"
+              />
               <button
-                onClick={runTest}
-                disabled={testing || !status?.available}
-                className="text-xs px-2.5 py-1 rounded bg-gray-700 text-gray-100 hover:bg-gray-600 disabled:opacity-50 cursor-pointer"
+                onClick={() => packetId && loadPacket(packetId)}
+                disabled={loadingFlow || !packetId}
+                className="px-2 py-1 rounded bg-gray-800 border border-gray-700 text-gray-300 hover:border-cyan-600 hover:text-cyan-300 disabled:opacity-50 cursor-pointer"
               >
-                {testing ? 'Running…' : 'Run test'}
+                Load #
+              </button>
+              <button
+                onClick={loadLatestPacket}
+                disabled={loadingFlow}
+                className="px-2 py-1 rounded bg-gray-800 border border-gray-700 text-gray-300 hover:border-cyan-600 hover:text-cyan-300 disabled:opacity-50 cursor-pointer"
+              >
+                {loadingFlow ? 'Loading…' : 'Load latest'}
               </button>
             </div>
+
             <textarea
               value={testFlowJSON}
               onChange={(e) => setTestFlowJSON(e.target.value)}
-              rows={10}
+              rows={12}
               spellCheck={false}
               className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs font-mono text-gray-100 focus:outline-none focus:border-cyan-500"
             />
-            {testResult && (
-              <div className="text-xs space-y-1">
-                {testResult.script_error ? (
-                  <div className="text-red-300 font-mono whitespace-pre-wrap break-all">
-                    {testResult.script_error}
-                  </div>
-                ) : testResult.matched ? (
-                  <div className="space-y-1">
-                    <div className="text-emerald-300">
-                      Matched{testResult.matches?.[0]?.reason ? `: ${testResult.matches[0].reason}` : ''}
-                    </div>
-                    {testResult.matches?.[0]?.drop && (
-                      <div className="text-amber-300">
-                        Would install drop rule: <code className="font-mono">{testResult.matches[0].drop}</code>
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="text-gray-400">No match.</div>
-                )}
-              </div>
-            )}
+
+            {testResult && <TestVerdict result={testResult} match0={match0} />}
           </div>
         </div>
+      </div>
+    </div>
+  )
+}
+
+function TestVerdict({ result, match0 }) {
+  if (result.script_error) {
+    return (
+      <div className="rounded border border-red-800/50 bg-red-950/40 p-2">
+        <div className="text-xs font-semibold text-red-300 mb-1">Script error</div>
+        <pre className="text-[11px] text-red-300/90 font-mono whitespace-pre-wrap break-all">{result.script_error}</pre>
+      </div>
+    )
+  }
+  if (!result.matched) {
+    return (
+      <div className="rounded border border-gray-700 bg-gray-800/50 p-2 text-xs text-gray-400">
+        No match — this flow would be ignored.
+      </div>
+    )
+  }
+  const drop = match0?.drop
+  return (
+    <div className={`rounded border p-2 ${drop ? 'border-amber-700/50 bg-amber-950/30' : 'border-emerald-700/50 bg-emerald-950/30'}`}>
+      <div className="flex items-center gap-2 mb-1">
+        <span className={`text-[10px] px-1.5 py-0.5 rounded border font-semibold ${
+          drop ? 'bg-amber-900/50 text-amber-200 border-amber-700/50' : 'bg-emerald-900/50 text-emerald-200 border-emerald-700/50'
+        }`}>
+          {drop ? 'MATCH → ALERT + DROP' : 'MATCH → ALERT'}
+        </span>
+        {match0?.reason && <span className="text-xs text-gray-300">{match0.reason}</span>}
+      </div>
+      {drop ? (
+        <div className="text-[11px] text-amber-200/90">
+          Installs a drop rule <code className="font-mono bg-black/30 px-1 rounded">{drop}</code> — future
+          matching traffic is blocked (content-only).
+        </div>
+      ) : (
+        <div className="text-[11px] text-emerald-200/80">Raises an alert on the Alerts page.</div>
+      )}
+    </div>
+  )
+}
+
+function ReturnLegend() {
+  return (
+    <div className="mt-3 rounded border border-gray-800 bg-gray-900/60 p-3 space-y-1.5">
+      <h4 className="text-[10px] uppercase tracking-wide text-gray-500">What match(flow) returns</h4>
+      <LegendRow code="return False" desc="ignore (no match)" tone="gray" />
+      <LegendRow code='return "reason"' desc="ALERT only" tone="green" />
+      <LegendRow code='{"match": True, "drop": "<expr>"}' desc="ALERT + block future traffic" tone="amber" />
+      <p className="text-[10px] text-gray-600 pt-1 leading-snug">
+        Drop expressions are content-only (<code className="text-gray-500">body</code>/<code className="text-gray-500">url</code>/<code className="text-gray-500">header</code>/<code className="text-gray-500">service</code>);
+        IP/port fields are rejected (SNAT-unsafe).
+      </p>
+    </div>
+  )
+}
+
+function LegendRow({ code, desc, tone }) {
+  const dot = { gray: 'bg-gray-500', green: 'bg-emerald-400', amber: 'bg-amber-400' }[tone]
+  return (
+    <div className="flex items-start gap-2">
+      <span className={`mt-1 w-1.5 h-1.5 rounded-full flex-shrink-0 ${dot}`} />
+      <div className="min-w-0">
+        <code className="text-[11px] text-cyan-300 font-mono break-all">{code}</code>
+        <span className="text-[11px] text-gray-500"> — {desc}</span>
       </div>
     </div>
   )
