@@ -49,6 +49,16 @@ func (p *parser) match(k tokKind) bool {
 	return false
 }
 
+// isLengthWord reports whether an identifier is the `.length` accessor (or one
+// of its aliases). Case-insensitive.
+func isLengthWord(s string) bool {
+	switch strings.ToLower(s) {
+	case "length", "len", "size":
+		return true
+	}
+	return false
+}
+
 func (p *parser) parseOr() (Node, error) {
 	first, err := p.parseAnd()
 	if err != nil {
@@ -134,20 +144,37 @@ func (p *parser) parsePredicate() (Node, error) {
 	field := p.advance()
 	pred := Predicate{Field: strings.ToLower(field.val)}
 
-	// header.<name>
+	// Dotted suffixes: `header.<name>`, `<field>.length`, and the combination
+	// `header.<name>.length`. `.length` (aliases `.len`, `.size`) turns any
+	// string/bytes/header field into an integer byte-length comparison.
 	if p.peek().kind == tkDot {
-		if pred.Field != "header" && pred.Field != "headers" {
-			t := p.peek()
-			return nil, &SyntaxError{Pos: t.pos, Message: "only `header.` accepts a sub-name"}
-		}
 		p.advance() // consume dot
 		nm := p.peek()
 		if nm.kind != tkIdent {
-			return nil, &SyntaxError{Pos: nm.pos, Message: "expected header name after `.`"}
+			return nil, &SyntaxError{Pos: nm.pos, Message: "expected a name after `.`"}
 		}
-		p.advance()
-		pred.Field = "header"
-		pred.HeaderName = nm.val
+		if isLengthWord(nm.val) {
+			// <field>.length
+			p.advance()
+			pred.Length = true
+		} else {
+			// header.<name>[.length]
+			if pred.Field != "header" && pred.Field != "headers" {
+				return nil, &SyntaxError{Pos: nm.pos, Message: "only `header.` accepts a sub-name (use `.length` for byte length)"}
+			}
+			p.advance()
+			pred.Field = "header"
+			pred.HeaderName = nm.val
+			if p.peek().kind == tkDot {
+				p.advance()
+				lw := p.peek()
+				if lw.kind != tkIdent || !isLengthWord(lw.val) {
+					return nil, &SyntaxError{Pos: lw.pos, Message: "expected `.length` after header name"}
+				}
+				p.advance()
+				pred.Length = true
+			}
+		}
 	}
 
 	// canonicalize aliases

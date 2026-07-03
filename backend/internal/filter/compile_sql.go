@@ -159,6 +159,12 @@ func tryPushPredicate(pr *Predicate) (string, []any, bool) {
 		return "", nil, false
 	}
 
+	// `.length` comparisons are evaluated in-process (byte length semantics
+	// differ from any single SQL column), so leave them for the residual.
+	if pr.Length {
+		return "", nil, false
+	}
+
 	// Direction-aware pushdown for `peer`.
 	if pr.Field == "peer" {
 		return tryPushPeer(pr)

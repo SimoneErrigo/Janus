@@ -19,9 +19,12 @@ type BoolLit struct{ Value bool }
 
 // Predicate is a leaf comparison: <field> <op> <value>.
 // HeaderName is populated only for the special "header.<name>" form.
+// Length is set for the "<field>.length" form (aliases .len/.size), which
+// compares the byte length of a string/bytes/header field as an integer.
 type Predicate struct {
 	Field      string
 	HeaderName string
+	Length     bool
 	Op         Op
 	Value      Value
 }
