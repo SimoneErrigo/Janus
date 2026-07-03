@@ -5,8 +5,32 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/SimoneErrigo/Janus/backend/internal/config"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
+
+// applyServiceDefaults fills in implicit values before validation. Today it
+// defaults the listen host to the configured TEAM_IP so operators don't have to
+// retype their team address for every service: leaving listen_addr empty (or
+// giving just a ":port"/port form) binds the service to TEAM_IP.
+func applyServiceDefaults(svc *storage.Service) {
+	teamIP := strings.TrimSpace(config.Get().TeamIP)
+	if teamIP == "" {
+		return
+	}
+	addr := strings.TrimSpace(svc.ListenAddr)
+	switch {
+	case addr == "":
+		svc.ListenAddr = teamIP
+	case strings.HasPrefix(addr, ":"):
+		// ":8080" — a bare port; adopt TEAM_IP as the host and, when
+		// listen_port wasn't set separately, take the port from here too.
+		if svc.ListenPort == 0 {
+			fmt.Sscanf(addr[1:], "%d", &svc.ListenPort)
+		}
+		svc.ListenAddr = teamIP
+	}
+}
 
 // serviceIDPattern restricts service IDs to characters that survive URL paths
 // and JSON round-trips without surprises. Whitespace, BOMs and zero-width

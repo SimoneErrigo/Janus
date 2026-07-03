@@ -292,6 +292,8 @@ func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	applyServiceDefaults(&svc)
+
 	if err := validateService(&svc); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -320,6 +322,8 @@ func (s *Server) updateService(w http.ResponseWriter, r *http.Request, id string
 	}
 
 	svc.ID = id
+
+	applyServiceDefaults(&svc)
 
 	if err := validateService(&svc); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
