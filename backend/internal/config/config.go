@@ -13,9 +13,20 @@ import (
 type Config struct {
 	TeamPassword     string
 	FlagRegex        string
+	// FlagRegexCaseInsensitive matches flags regardless of ASCII case. A
+	// leading "(?i)" in FlagRegex implies the same thing.
+	FlagRegexCaseInsensitive bool
+	// FlagDecodeURL also scans a percent-decoded copy of the traffic so
+	// URL-encoded flags (e.g. "...%3D" instead of "...=") are still caught.
+	FlagDecodeURL bool
 	DataDir          string
 	APIPort          string
 	APIBind          string
+
+	// TeamIP is our team's address on the competition network. When a
+	// service's listen address omits the host (e.g. ":8080" or just a port),
+	// the proxy binds it to TeamIP instead of every interface.
+	TeamIP string
 
 	// Cleanup settings
 	CleanupMaxAgeMinutes int
@@ -64,6 +75,7 @@ func Load(envPath string) (*Config, error) {
 			// Defaults
 			TeamPassword:             "changeme",
 			FlagRegex:                "[A-Z0-9]{31}=",
+			FlagDecodeURL:            true,
 			DataDir:                  "/data",
 			APIPort:                  "8080",
 			APIBind:                  "0.0.0.0",
@@ -87,6 +99,15 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v, ok := env["FLAG_REGEX"]; ok {
 			cfg.FlagRegex = v
+		}
+		if v, ok := env["FLAG_REGEX_CASE_INSENSITIVE"]; ok {
+			cfg.FlagRegexCaseInsensitive = boolVal(v)
+		}
+		if v, ok := env["FLAG_DECODE_URL"]; ok {
+			cfg.FlagDecodeURL = boolVal(v)
+		}
+		if v, ok := env["TEAM_IP"]; ok {
+			cfg.TeamIP = strings.TrimSpace(v)
 		}
 		if v, ok := env["DATA_DIR"]; ok {
 			cfg.DataDir = v
@@ -155,6 +176,15 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v := os.Getenv("FLAG_REGEX"); v != "" {
 			cfg.FlagRegex = v
+		}
+		if v := os.Getenv("FLAG_REGEX_CASE_INSENSITIVE"); v != "" {
+			cfg.FlagRegexCaseInsensitive = boolVal(v)
+		}
+		if v := os.Getenv("FLAG_DECODE_URL"); v != "" {
+			cfg.FlagDecodeURL = boolVal(v)
+		}
+		if v := os.Getenv("TEAM_IP"); v != "" {
+			cfg.TeamIP = strings.TrimSpace(v)
 		}
 		if v := os.Getenv("DATA_DIR"); v != "" {
 			cfg.DataDir = v
@@ -237,6 +267,15 @@ func Get() *Config {
 		panic("config.Load() must be called before config.Get()")
 	}
 	return instance
+}
+
+// boolVal parses a truthy env value ("true"/"1"/"yes"/"on", case-insensitive).
+func boolVal(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func parseEnvFile(path string) (map[string]string, error) {

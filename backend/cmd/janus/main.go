@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -59,19 +60,27 @@ func main() {
 		redisCache.SetServiceRules(serviceID, rules)
 	})
 
-	// Compile flag regex for packet flagging
+	// Compile flag regex for packet flagging. When case-insensitivity is
+	// requested (env flag or an inline "(?i)"), ensure the compiled fallback
+	// regex honors it too.
+	effectiveFlagPattern := cfg.FlagRegex
+	if cfg.FlagRegexCaseInsensitive && effectiveFlagPattern != "" &&
+		!strings.HasPrefix(effectiveFlagPattern, "(?i)") {
+		effectiveFlagPattern = "(?i)" + effectiveFlagPattern
+	}
 	var flagRegex *regexp.Regexp
-	if cfg.FlagRegex != "" {
-		flagRegex, err = regexp.Compile(cfg.FlagRegex)
+	if effectiveFlagPattern != "" {
+		flagRegex, err = regexp.Compile(effectiveFlagPattern)
 		if err != nil {
 			log.Printf("Warning: invalid FLAG_REGEX %q: %v", cfg.FlagRegex, err)
 		}
 	}
 
 	// Build optimized flag scanner from the regex pattern
-	flagScanner := flagids.NewFlagScanner(cfg.FlagRegex)
+	flagScanner := flagids.NewFlagScanner(cfg.FlagRegex, cfg.FlagRegexCaseInsensitive, cfg.FlagDecodeURL)
 	if flagScanner != nil {
-		log.Printf("Flag scanner: optimized byte-level scanner active for pattern %q", cfg.FlagRegex)
+		log.Printf("Flag scanner active for pattern %q (case_insensitive=%v, decode_url=%v)",
+			cfg.FlagRegex, cfg.FlagRegexCaseInsensitive, cfg.FlagDecodeURL)
 	}
 
 	proxyMgr := proxy.NewManager(packetStore, ruleStore, flagRegex, flagScanner)
