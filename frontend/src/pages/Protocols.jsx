@@ -149,12 +149,17 @@ function ProtocolEditor({ protocol, onSave, onCancel }) {
 
   const enumNames = useMemo(() => Object.keys(form.enums || {}), [form.enums])
   const structNames = useMemo(() => Object.keys(form.structs || {}), [form.structs])
+  // Live "what still needs a human" analysis, recomputed as the user edits so
+  // items disappear the moment they're resolved.
+  const followUps = useMemo(() => computeFollowUps(form), [form])
 
   function set(k, v) { setForm((f) => ({ ...f, [k]: v })) }
 
-  // Merge an imported draft (enums + structs) into the working copy. Imported
-  // names overwrite same-named entries; endianness and an empty name are
-  // adopted from the parsed code since it reflects the real wire format.
+  // Merge an imported draft into the working copy. Imported enum/struct names
+  // overwrite same-named entries; endianness and an empty name are adopted from
+  // the parsed code since it reflects the real wire format. Auto-wired
+  // request/response field lists are adopted only when that direction is still
+  // empty, so a re-import never clobbers layout the user has already tweaked.
   function mergeImported(draft) {
     setForm((f) => {
       const next = { ...f }
@@ -162,6 +167,12 @@ function ProtocolEditor({ protocol, onSave, onCancel }) {
       next.structs = { ...(f.structs || {}), ...(draft.structs || {}) }
       if (draft.endian) next.endian = draft.endian
       if (!f.name && draft.name) next.name = draft.name
+      if (draft.request_fields?.length && !f.request_fields?.length) {
+        next.request_fields = deepClone(draft.request_fields)
+      }
+      if (draft.response_fields?.length && !f.response_fields?.length) {
+        next.response_fields = deepClone(draft.response_fields)
+      }
       return next
     })
   }
@@ -221,6 +232,8 @@ function ProtocolEditor({ protocol, onSave, onCancel }) {
         ))}
       </div>
 
+      <FollowUps steps={followUps} onGoto={setTab} />
+
       {tab === 'request' && (
         <FieldListEditor
           fields={form.request_fields || []}
@@ -230,18 +243,30 @@ function ProtocolEditor({ protocol, onSave, onCancel }) {
         />
       )}
       {tab === 'response' && (
-        <FieldListEditor
-          fields={form.response_fields || []}
-          onChange={(fl) => set('response_fields', fl)}
-          enumNames={enumNames}
-          allFieldsForDispatch={form.response_fields || []}
-        />
+        <>
+          {!(form.response_fields || []).length && (
+            <p className="text-xs text-gray-500 mb-2 bg-gray-800/40 border border-gray-800 rounded p-2">
+              Server replies aren't imported from Python automatically — they're read with
+              helper functions and <code className="text-gray-400">if</code> branches Janus can't
+              reconstruct. Add the reply fields here (often a status byte followed by a
+              {' '}<em>dispatch</em>), or open the <button type="button" onClick={() => setTab('structs')} className="text-cyan-400 hover:underline cursor-pointer">Structs</button> tab and click <span className="text-cyan-400">→ response</span> on a struct to reuse it.
+            </p>
+          )}
+          <FieldListEditor
+            fields={form.response_fields || []}
+            onChange={(fl) => set('response_fields', fl)}
+            enumNames={enumNames}
+            allFieldsForDispatch={form.response_fields || []}
+          />
+        </>
       )}
       {tab === 'structs' && (
         <StructsEditor
           structs={form.structs || {}}
           onChange={(s) => set('structs', s)}
           enumNames={enumNames}
+          onUseAsRequest={(fields) => { set('request_fields', deepClone(fields)); setTab('request') }}
+          onUseAsResponse={(fields) => { set('response_fields', deepClone(fields)); setTab('response') }}
         />
       )}
       {tab === 'enums' && (
@@ -408,7 +433,7 @@ function FieldListEditor({ fields, onChange, enumNames, allFieldsForDispatch }) 
 // StructsEditor manages a map of struct_name -> field list. Structs are
 // the dispatch targets: when a protocol's dispatch field resolves an enum
 // label, the decoder looks for a struct with the same name as the label.
-function StructsEditor({ structs, onChange, enumNames }) {
+function StructsEditor({ structs, onChange, enumNames, onUseAsRequest, onUseAsResponse }) {
   const names = Object.keys(structs)
   const [renameDraft, setRenameDraft] = useState({})
 
@@ -453,6 +478,24 @@ function StructsEditor({ structs, onChange, enumNames }) {
             />
             <span className="text-xs text-gray-600">{(structs[name] || []).length} fields</span>
             <div className="flex-1" />
+            {onUseAsRequest && (
+              <button
+                onClick={() => onUseAsRequest(structs[name] || [])}
+                title="Copy these fields into the Request layout"
+                className="text-gray-500 hover:text-cyan-400 text-xs cursor-pointer"
+              >
+                → request
+              </button>
+            )}
+            {onUseAsResponse && (
+              <button
+                onClick={() => onUseAsResponse(structs[name] || [])}
+                title="Copy these fields into the Response layout"
+                className="text-gray-500 hover:text-cyan-400 text-xs cursor-pointer"
+              >
+                → response
+              </button>
+            )}
             <button onClick={() => removeStruct(name)} className="text-gray-500 hover:text-red-400 text-xs cursor-pointer">Remove</button>
           </div>
           <FieldListEditor
@@ -587,7 +630,9 @@ function ImportPanel({ onImport }) {
       const nEnums = Object.keys(protocol.enums || {}).length
       const nStructs = Object.keys(protocol.structs || {}).length
       const nFields = Object.values(protocol.structs || {}).reduce((a, fl) => a + fl.length, 0)
-      setSummary(`Imported ${nEnums} enum${nEnums === 1 ? '' : 's'}, ${nStructs} struct${nStructs === 1 ? '' : 's'} (${nFields} field${nFields === 1 ? '' : 's'}). Review the Structs / Enums tabs, then wire Request/Response.`)
+      const nReq = (protocol.request_fields || []).length
+      const wired = nReq ? ` Request auto-wired (${nReq} field${nReq === 1 ? '' : 's'}).` : ''
+      setSummary(`Imported ${nEnums} enum${nEnums === 1 ? '' : 's'}, ${nStructs} struct${nStructs === 1 ? '' : 's'} (${nFields} field${nFields === 1 ? '' : 's'}).${wired} Check “Finish manually” below for anything left, then save.`)
       setWarnings(warnings || [])
     } catch (err) {
       setError(err.message || String(err))
@@ -599,9 +644,11 @@ function ImportPanel({ onImport }) {
   return (
     <div className="bg-gray-800/40 border border-gray-800 rounded-lg p-3 mb-4">
       <p className="text-xs text-gray-500 mb-2">
-        Paste the challenge client's protocol code (its <code className="text-gray-400">Enum</code> classes and
-        {' '}<code className="text-gray-400">struct.pack</code> definitions). Janus extracts the enums and structs;
-        you then arrange Request/Response order and dispatch in the tabs below.
+        Paste the challenge client's protocol code — a whole class, a single
+        {' '}<code className="text-gray-400">Enum</code>, or one packing method is fine (decorators optional).
+        Janus builds the enums and structs, maps custom packing logic (bit-packed grids →
+        {' '}<code className="text-gray-400">bytes_computed</code>), links <code className="text-gray-400">.value</code> fields to their enum,
+        and auto-wires the Request layout when the client prepends a header. Review the tabs and save.
       </p>
       <textarea
         value={code}
@@ -628,12 +675,109 @@ function ImportPanel({ onImport }) {
       {error && <div className="mt-2 text-xs text-red-400">{error}</div>}
       {summary && <div className="mt-2 text-xs text-green-400">{summary}</div>}
       {warnings.length > 0 && (
-        <ul className="mt-2 space-y-0.5">
-          {warnings.map((w, i) => (
-            <li key={i} className="text-[11px] text-amber-400/90">⚠ {w}</li>
-          ))}
-        </ul>
+        <div className="mt-2">
+          <div className="text-[11px] uppercase tracking-wide text-gray-500 mb-1">Parser notes</div>
+          <ul className="space-y-0.5">
+            {warnings.map((w, i) => (
+              <li key={i} className="text-[11px] text-amber-400/90">⚠ {w}</li>
+            ))}
+          </ul>
+          <p className="text-[11px] text-gray-500 mt-1">
+            The structural steps (dispatch structs, replies) are also listed under
+            {' '}<span className="text-gray-400">“Finish manually”</span> below, which updates as you fix them.
+          </p>
+        </div>
       )}
+    </div>
+  )
+}
+
+// computeFollowUps inspects the working copy and returns the concrete,
+// located steps a human still has to do — the parts the Python importer
+// deliberately can't infer. It's recomputed live, so a step vanishes as soon
+// as its cause is resolved (e.g. once a dispatch-target struct is created).
+function computeFollowUps(form) {
+  const steps = []
+  const structs = form.structs || {}
+  const enums = form.enums || {}
+  const structNames = new Set(Object.keys(structs))
+
+  const scopes = [
+    ['Request', form.request_fields || [], 'request'],
+    ['Response', form.response_fields || [], 'response'],
+    ...Object.entries(structs).map(([n, fl]) => [`Struct “${n}”`, fl, 'structs']),
+  ]
+
+  for (const [scopeName, fields, tab] of scopes) {
+    for (const f of fields) {
+      if (f.type !== 'dispatch' || !f.dispatch_on) continue
+      const src = fields.find((s) => s.name === f.dispatch_on)
+      if (!src) continue
+      if (!src.enum_ref) {
+        steps.push({
+          tab,
+          title: `${scopeName}: “${f.dispatch_on}” isn't linked to an enum`,
+          detail: `The “${f.name}” dispatch decides the body from “${f.dispatch_on}”, but that field has no enum, so it can only match structs named after raw numbers. Pick an enum for “${f.dispatch_on}” from its dropdown — with several enums imported, Janus can't guess which applies.`,
+        })
+        continue
+      }
+      const table = enums[src.enum_ref]
+      if (!table) continue
+      const missing = [...new Set(Object.values(table))].filter((l) => !structNames.has(l))
+      if (missing.length) {
+        steps.push({
+          tab: 'structs',
+          title: `Create body structs for the “${f.name}” dispatch (${src.enum_ref})`,
+          detail: `Add a struct named after each ${src.enum_ref} value so bodies decode: ${missing.join(', ')}. Each holds that message's body fields. Which body goes with which value lives in the client's send/recv helpers — not in the packing code — so it can't be filled in automatically. Until then those messages show as raw bytes tagged with the label.`,
+        })
+      }
+    }
+  }
+
+  const hasContent = (form.request_fields?.length || Object.keys(structs).length)
+  if (hasContent && !(form.response_fields?.length)) {
+    steps.push({
+      tab: 'response',
+      title: 'The Response layout is empty',
+      detail: `Server replies aren't imported from Python: they're decoded with helper reads and conditionals that can't be reconstructed mechanically. Build them in the Response tab (often a status byte + a dispatch), or reuse a struct with its “→ response” button.`,
+    })
+  }
+
+  return steps
+}
+
+// FollowUps renders computeFollowUps() as a compact, actionable callout with a
+// jump-to-tab link per step. Hidden entirely when nothing is left to do, so a
+// fully-wired protocol shows a clean editor.
+function FollowUps({ steps, onGoto }) {
+  if (!steps || steps.length === 0) return null
+  return (
+    <div className="mb-4 bg-amber-500/5 border border-amber-500/30 rounded-lg p-3">
+      <div className="flex items-center gap-2 mb-1.5">
+        <span className="text-amber-300 text-sm">⚙ Finish manually</span>
+        <span className="text-[11px] text-gray-500">
+          {steps.length} step{steps.length === 1 ? '' : 's'} the Python import can't infer
+        </span>
+      </div>
+      <ul className="space-y-2">
+        {steps.map((s, i) => (
+          <li key={i} className="text-xs">
+            <div className="flex items-baseline gap-2">
+              <span className="text-amber-200 font-medium">{s.title}</span>
+              {s.tab && (
+                <button
+                  type="button"
+                  onClick={() => onGoto(s.tab)}
+                  className="text-[11px] text-cyan-400 hover:underline cursor-pointer whitespace-nowrap"
+                >
+                  open {s.tab} →
+                </button>
+              )}
+            </div>
+            <p className="text-gray-400 mt-0.5">{s.detail}</p>
+          </li>
+        ))}
+      </ul>
     </div>
   )
 }
