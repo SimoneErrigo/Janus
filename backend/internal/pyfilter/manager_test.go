@@ -58,6 +58,28 @@ def match(flow):
 	}
 }
 
+func TestBlockingFilterDropsResponse(t *testing.T) {
+	m := newTestManager(t)
+	// Inline filters run on both directions; a {"drop": True} on a response
+	// drops it (the proxy closes the connection before the client sees it).
+	if _, err := m.CreateScript("hide-flag", `
+def match(flow):
+    if flow.is_response and "flag{" in flow.body:
+        return {"drop": True, "reason": "flag in response"}
+    return False
+`, true, true); err != nil {
+		t.Fatal(err)
+	}
+	// A request carrying the same text must NOT match (guards the direction check).
+	if got, _ := m.EvaluateBlocking(Flow{"direction": "request", "body": "give me flag{x}"}); len(got) != 0 {
+		t.Fatalf("request should not match a response-only filter, got %+v", got)
+	}
+	got, _ := m.EvaluateBlocking(Flow{"direction": "response", "body": "here is flag{x}"})
+	if len(got) != 1 || !got[0].Block {
+		t.Fatalf("response with a flag should block, got %+v", got)
+	}
+}
+
 func TestFlowErgonomicAccessors(t *testing.T) {
 	m := newTestManager(t)
 	code := `
@@ -487,12 +509,14 @@ func TestScriptsPersistAcrossReload(t *testing.T) {
 	}
 }
 
-func TestDropDirectivePropagates(t *testing.T) {
+func TestDropDirectiveBecomesBlock(t *testing.T) {
 	m := newTestManager(t)
+	// {"drop": ...} asks to drop the current message inline: any truthy value
+	// sets Block (there is no separate content-only "future traffic" rule).
 	code := `
 def match(flow):
     if "alice" in flow.get("body", ""):
-        return {"match": True, "reason": "abuse", "drop": 'body contains "alice"'}
+        return {"match": True, "reason": "abuse", "drop": True}
     return False
 `
 	matches, scriptErr, err := m.Test("ban", code, Flow{"body": `{"user":"alice"}`}, 1)
@@ -502,20 +526,21 @@ def match(flow):
 	if len(matches) != 1 {
 		t.Fatalf("expected 1 match, got %+v", matches)
 	}
-	if matches[0].Drop != `body contains "alice"` {
-		t.Errorf("drop not propagated: %q", matches[0].Drop)
+	if !matches[0].Block {
+		t.Errorf("drop:True should set Block, got %+v", matches[0])
 	}
 	if matches[0].Reason != "abuse" {
 		t.Errorf("reason: %q", matches[0].Reason)
 	}
 
-	// A bare drop directive (no explicit match key) still counts as a match.
+	// A bare drop directive (no explicit match key) still counts as a match,
+	// and a truthy string value blocks just like True.
 	matches, _, _ = m.Test("ban2", `
 def match(flow):
-    return {"drop": 'url contains "/admin"'}
+    return {"drop": "too many logins"}
 `, Flow{}, 1)
-	if len(matches) != 1 || matches[0].Drop != `url contains "/admin"` {
-		t.Fatalf("bare drop should match: %+v", matches)
+	if len(matches) != 1 || !matches[0].Block {
+		t.Fatalf("bare truthy drop should match and block: %+v", matches)
 	}
 }
 

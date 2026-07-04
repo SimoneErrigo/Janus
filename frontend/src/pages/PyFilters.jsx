@@ -11,20 +11,8 @@ def match(flow):
     return False
 `
 
-const DROP_EXAMPLE = `# ALERT + DROP (async) — return a dict with a "drop" filter expression to
-# block FUTURE matching traffic (fail2ban-style, content-only, never by IP).
-def match(flow):
-    if "sqlmap" in flow.header("user-agent").lower():   # missing header -> ""
-        return {
-            "match": True,
-            "reason": "sqlmap user-agent",
-            "drop": 'header.User-Agent icontains "sqlmap"',
-        }
-    return False
-`
-
-const STATEFUL_EXAMPLE = `# STATEFUL — module-level state persists across packets. Here: alert (and
-# block) a user only from their SECOND login onward. Use Repeat >= 2 to test.
+const STATEFUL_EXAMPLE = `# STATEFUL — module-level state persists across packets. Here: alert a user
+# only from their SECOND login onward. Use Repeat >= 2 to test.
 logins = {}
 
 def match(flow):
@@ -33,18 +21,14 @@ def match(flow):
         if user:
             logins[user] = logins.get(user, 0) + 1
             if logins[user] > 1:
-                return {
-                    "match": True,
-                    "reason": "repeated login for %s (#%d)" % (user, logins[user]),
-                    "drop": 'body contains "\\"user\\":\\"%s\\""' % user,
-                }
+                return "repeated login for %s (#%d)" % (user, logins[user])   # ALERT
     return False
 `
 
-const BLOCK_EXAMPLE = `# INLINE BLOCK — return {"drop": True} to drop the CURRENT request in real
-# time (not just future traffic). Requires the "Blocking" checkbox: the script
-# then runs synchronously on the request path. Here: block a registration whose
-# password was already used by an earlier one.
+const BLOCK_EXAMPLE = `# INLINE BLOCK — return {"drop": True} to drop the CURRENT message in real
+# time (request before it reaches the backend, or response before the client).
+# Requires the "Blocking" checkbox: the script then runs synchronously on the
+# proxy path. Here: block a registration whose password was already used.
 seen = {}
 
 def match(flow):
@@ -61,13 +45,14 @@ def match(flow):
     return False
 `
 
-const REWRITE_EXAMPLE = `# INLINE REWRITE — rewrite the CURRENT request before Janus forwards it
-# (needs the "Blocking" checkbox). Assign flow.body (HTTP text) or, for TCP,
-# flow.messages[-1].content (bytes). Applies even if you return False.
+const REWRITE_EXAMPLE = `# INLINE REWRITE — rewrite the CURRENT message before Janus forwards it (needs
+# the "Blocking" checkbox). Works on requests AND responses: assign flow.body
+# (text) or flow.content (bytes). Here: redact a flag from a response so the
+# client never sees it, without dropping the connection.
 def match(flow):
-    if "flag{" in flow.body:
+    if flow.is_response and "flag{" in flow.body:
         flow.body = flow.body.replace("flag{", "REDACTED{")
-        return "redacted a flag in the request"
+        return "redacted a flag in the response"
     return False
 `
 
@@ -93,7 +78,6 @@ def match(flow):
 
 const EXAMPLES = [
   { key: 'alert', label: 'Alert example', code: ALERT_EXAMPLE },
-  { key: 'drop', label: 'Drop (future) example', code: DROP_EXAMPLE },
   { key: 'block', label: 'Inline block example', code: BLOCK_EXAMPLE },
   { key: 'rewrite', label: 'Inline rewrite example', code: REWRITE_EXAMPLE },
   { key: 'stream', label: 'TCP stream example', code: STREAM_EXAMPLE },
@@ -361,7 +345,7 @@ export default function PyFilters() {
         <Badge tone="green">python ready</Badge>
         <Badge tone="gray">{status.enabled_count}/{status.script_count} enabled</Badge>
         {status.blocking_count > 0 && (
-          <Badge tone="amber" title="Filters running inline (synchronously) on the request path">
+          <Badge tone="amber" title="Filters running inline (synchronously) on the proxy path — can drop/rewrite requests and responses">
             {status.blocking_count} inline
           </Badge>
         )}
@@ -658,26 +642,21 @@ function TestVerdict({ result }) {
       </div>
     )
   }
-  const drop = m0?.drop
   const block = m0?.block
-  const border = block ? 'border-rose-700/50 bg-rose-950/30' : drop ? 'border-amber-700/50 bg-amber-950/30' : 'border-emerald-700/50 bg-emerald-950/30'
+  const border = block ? 'border-rose-700/50 bg-rose-950/30' : 'border-emerald-700/50 bg-emerald-950/30'
   return (
     <div className="space-y-1.5">
       {result.matched && (
         <div className={`rounded border p-2 ${border}`}>
           <div className="flex items-center gap-2 mb-1">
-            <VerdictBadge drop={drop} block={block} />
+            <VerdictBadge block={block} />
             {m0?.reason && <span className="text-xs text-gray-300">{m0.reason}</span>}
           </div>
           {block ? (
             <div className="text-[11px] text-rose-200/90">
-              Drops <strong>this</strong> request in real time (inline). Takes effect on live traffic only when the
-              filter has <strong>Blocking</strong> enabled.
-            </div>
-          ) : drop ? (
-            <div className="text-[11px] text-amber-200/90">
-              Installs a drop rule <code className="font-mono bg-black/30 px-1 rounded">{drop}</code> — future
-              matching traffic is blocked (content-only).
+              Drops <strong>this</strong> message in real time (inline) — a request before it reaches the backend,
+              a response before it reaches the client. Takes effect on live traffic only when the filter has{' '}
+              <strong>Blocking</strong> enabled.
             </div>
           ) : (
             <div className="text-[11px] text-emerald-200/80">Raises an alert on the Alerts page.</div>
@@ -704,7 +683,6 @@ function RewriteNote({ text }) {
 
 function StepRow({ step }) {
   const m0 = step.matches?.[0]
-  const drop = m0?.drop
   const block = m0?.block
   return (
     <div className="flex items-center gap-2 text-[11px]">
@@ -720,7 +698,7 @@ function StepRow({ step }) {
       )}
       {step.matched && (
         <>
-          <VerdictBadge drop={drop} block={block} small />
+          <VerdictBadge block={block} small />
           {m0?.reason && <span className="text-gray-400 truncate">{m0.reason}</span>}
         </>
       )}
@@ -737,15 +715,13 @@ function StepRow({ step }) {
   )
 }
 
-function VerdictBadge({ drop, block, small }) {
+function VerdictBadge({ block, small }) {
   const cls = block
     ? 'bg-rose-900/50 text-rose-200 border-rose-700/50'
-    : drop
-    ? 'bg-amber-900/50 text-amber-200 border-amber-700/50'
     : 'bg-emerald-900/50 text-emerald-200 border-emerald-700/50'
   return (
     <span className={`${small ? 'text-[10px]' : 'text-[10px]'} px-1.5 py-0.5 rounded border font-semibold ${cls}`}>
-      {block ? 'ALERT + BLOCK' : drop ? 'ALERT + DROP' : 'ALERT'}
+      {block ? 'ALERT + BLOCK' : 'ALERT'}
     </span>
   )
 }
@@ -756,14 +732,13 @@ function ReturnLegend() {
       <h4 className="text-[10px] uppercase tracking-wide text-gray-500">What match(flow) returns</h4>
       <LegendRow code="return False" desc="ignore (no match)" tone="gray" />
       <LegendRow code='return "reason"' desc="ALERT only" tone="green" />
-      <LegendRow code='{"match": True, "drop": "<expr>"}' desc="ALERT + block future traffic (async)" tone="amber" />
-      <LegendRow code='{"match": True, "drop": True}' desc="ALERT + block THIS request now (needs Blocking)" tone="red" />
-      <LegendRow code='flow.body = "..."  (or msg.content = b"...")' desc="rewrite THIS request inline (needs Blocking)" tone="fuchsia" />
+      <LegendRow code='{"match": True, "drop": True}' desc="ALERT + drop THIS message now (needs Blocking)" tone="red" />
+      <LegendRow code='flow.body = "..."  (or flow.content = b"...")' desc="rewrite THIS message inline (needs Blocking)" tone="fuchsia" />
       <p className="text-[10px] text-gray-600 pt-1 leading-snug">
-        <code className="text-gray-500">drop</code> as an expression blocks <em>future</em> matching traffic
-        (content-only: <code className="text-gray-500">body</code>/<code className="text-gray-500">url</code>/<code className="text-gray-500">header</code>/<code className="text-gray-500">service</code>;
-        IP/port rejected, SNAT-unsafe). <code className="text-gray-500">drop: True</code> and rewriting act on
-        the current request inline — only when the filter has <strong>Blocking</strong> on.
+        <code className="text-gray-500">drop: True</code> and rewriting act on the current message inline — a
+        request before it reaches the backend, or a response before it reaches the client — and only when the
+        filter has <strong>Blocking</strong> on. Use <code className="text-gray-500">flow.is_request</code> /{' '}
+        <code className="text-gray-500">flow.is_response</code> to target one direction.
       </p>
     </div>
   )
@@ -771,17 +746,18 @@ function ReturnLegend() {
 
 function FlowApiCheatsheet() {
   const rows = [
+    ['flow.is_request / is_response', 'which side you are on (match runs on both)'],
+    ['flow.direction', '"request" or "response"'],
     ['flow.method / url / path', 'POST, /login?x=1, /login'],
     ['flow.status / service', 'response status, service id'],
-    ['flow.is_request / is_response', 'direction helpers'],
+    ['flow.flagged / contains_flagid', 'body holds a flag / one of your flag-IDs'],
     ['flow.headers["Cookie"]', 'case-insensitive, missing → ""'],
     ['flow.query["id"] / .all("id")', 'parsed query string'],
     ['flow.cookies["session"]', 'parsed Cookie header'],
-    ['flow.json() / flow.body / .bytes', 'body as JSON / str / bytes'],
-    ['flow.request / flow.response', 'correlated side (never None)'],
-    ['flow.messages[-1]', 'most recent message (this service)'],
-    ['flow.recent(3) / last_request', 'recent history'],
-    ['flow.body = "…" / msg.content = b"…"', 'rewrite inline (Blocking only)'],
+    ['flow.json() / flow.body / .content', 'body as JSON / str / bytes'],
+    ['flow.request / flow.response', 'the correlated side (never None)'],
+    ['flow.messages[-1] / recent(3)', 'recent history for this service'],
+    ['flow.body = "…" / flow.content = b"…"', 'rewrite inline (Blocking only)'],
     ['for line in flow.lines:', 'TCP stream lines, reassembled across chunks'],
     ['flow.conn["…"]', 'per-TCP-connection state (auto)'],
     ['flow.commands({b"1": ("register", 2)})', 'parse a line-based CLI into commands'],
@@ -799,8 +775,10 @@ function FlowApiCheatsheet() {
       </div>
       <p className="text-[10px] text-gray-600 pt-1 leading-snug">
         Still a dict (<code className="text-gray-500">flow["body"]</code>, <code className="text-gray-500">flow.get(...)</code> work).
-        Missing fields read as <code className="text-gray-500">""</code>. For inline <strong>Blocking</strong> filters
-        <code className="text-gray-500"> flow.response</code> is empty (the response doesn't exist yet).
+        Missing fields read as <code className="text-gray-500">""</code>. <code className="text-gray-500">match(flow)</code> runs
+        once per message on <strong>both</strong> directions — branch on <code className="text-gray-500">flow.is_request</code> /
+        <code className="text-gray-500"> flow.is_response</code>, or read the other side via <code className="text-gray-500">flow.request</code> /
+        <code className="text-gray-500"> flow.response</code>.
       </p>
     </div>
   )

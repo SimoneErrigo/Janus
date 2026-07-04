@@ -14,10 +14,11 @@ type Script struct {
 	Name    string `json:"name"`
 	Code    string `json:"code"`
 	Enabled bool   `json:"enabled"`
-	// Blocking runs this script synchronously on the request hot path (inline),
-	// so a match returning {"drop": True} blocks the CURRENT request in real time
-	// (like a drop rule) instead of only alerting/installing a future-traffic
-	// rule. Non-blocking scripts stay on the async pipeline (zero hot-path cost).
+	// Blocking runs this script synchronously on the proxy hot path (inline),
+	// so a match returning {"drop": True} drops the CURRENT message in real time
+	// (request or response) and flow.body/flow.content rewrites take effect.
+	// Non-blocking scripts stay on the async pipeline (alert-only, zero hot-path
+	// cost).
 	Blocking  bool  `json:"blocking"`
 	CreatedAt int64 `json:"created_at"`
 	UpdatedAt int64 `json:"updated_at"`

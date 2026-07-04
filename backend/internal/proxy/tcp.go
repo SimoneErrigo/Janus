@@ -115,14 +115,16 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 		_ = backendConn.SetReadDeadline(time.Now().Add(tcpLingerTimeout))
 	}()
 
-	// Backend -> Client (response direction) — no rule evaluation, just sniff.
+	// Backend -> Client (response direction) — same path as the request so inline
+	// Python filters can see, rewrite, and drop responses too (a {"drop": True}
+	// on a response closes the connection before the bytes reach the client).
 	// defer closeBoth ensures full teardown when the response side completes,
 	// whether by reading all data, by a write error to the client, or by
 	// hitting the linger deadline set by the request goroutine above.
 	go func() {
 		defer wg.Done()
 		defer closeBoth()
-		m.sniffCopy(clientConn, backendConn, svc, sessionID, dstIP, dstPort, srcIP, srcPort, sniffer.DirectionResponse)
+		m.sniffCopyWithRules(clientConn, backendConn, svc, sessionID, dstIP, dstPort, srcIP, srcPort, sniffer.DirectionResponse, closeBoth)
 	}()
 
 	done := make(chan struct{})
@@ -139,9 +141,11 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 }
 
 // sniffCopyWithRules reads from src chunk by chunk, evaluates drop/alert rules
-// on each chunk, and forwards to dst. If a drop rule matches, closeBoth is
-// called to tear down both connections immediately. Each chunk is logged as a
-// separate packet.
+// and inline Python filters on each chunk, and forwards to dst. If a drop
+// matches, closeBoth is called to tear down both connections immediately; an
+// inline rewrite swaps the forwarded bytes. Each chunk is logged as a separate
+// packet. Used for both directions: the regex dropper engine runs on requests
+// only, while inline Python filters (pyBlock) run on requests and responses.
 func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.Service, sessionID string, srcIP string, srcPort int, dstIP string, dstPort int, dir sniffer.Direction, closeBoth func()) {
 	buf := make([]byte, 32*1024)
 	engine := m.engineFor(svc)
@@ -151,12 +155,15 @@ func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.
 		if n > 0 {
 			chunk := buf[:n]
 
-			// Evaluate rules on this chunk
+			// Evaluate rules on this chunk. The regex dropper engine is
+			// request-only (its rules and IP/port scopes are written for
+			// requests); the response direction relies on inline Python
+			// filters below.
 			var matchedRules []sniffer.MatchedRuleInfo
 			shouldDrop := false
 			var alertRules []dropper.Rule
 
-			if engine != nil {
+			if engine != nil && dir == sniffer.DirectionRequest {
 				result := engine.EvaluateActions(&dropper.HTTPRequest{
 					ServiceID: svc.ID,
 					RawBytes:  chunk,
@@ -278,55 +285,6 @@ func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.
 			// Forward chunk to backend
 			if _, writeErr := dst.Write(chunk); writeErr != nil {
 				return
-			}
-		}
-		if readErr != nil {
-			return
-		}
-	}
-}
-
-// sniffCopy copies data from src to dst, logging each chunk as a separate packet.
-// Used for the response direction (no rule evaluation).
-func (m *Manager) sniffCopy(dst io.Writer, src io.Reader, svc *storage.Service, sessionID string, srcIP string, srcPort int, dstIP string, dstPort int, dir sniffer.Direction) {
-	buf := make([]byte, 32*1024)
-	for {
-		n, readErr := src.Read(buf)
-		if n > 0 {
-			chunk := buf[:n]
-
-			if _, writeErr := dst.Write(chunk); writeErr != nil {
-				break
-			}
-
-			if m.packetStore != nil && m.shouldCapture() {
-				data := make([]byte, n)
-				copy(data, chunk)
-				flagged := sniffer.CheckFlagged(m.flagRegex, m.flagScanner, "", "", data)
-				containsFlagID, matchedFlagIDs, flagIDRound := false, []string(nil), 0
-				if m.shouldApplyFlagIDsOnIngest() {
-					containsFlagID, matchedFlagIDs, flagIDRound = sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", data)
-				}
-				pkt := &sniffer.Packet{
-					ServiceID:      svc.ID,
-					SessionID:      sessionID,
-					Timestamp:      time.Now(),
-					SrcIP:          srcIP,
-					SrcPort:        srcPort,
-					DstIP:          dstIP,
-					DstPort:        dstPort,
-					Protocol:       string(svc.Protocol),
-					Direction:      dir,
-					Body:           data,
-					MatchedRules:   []sniffer.MatchedRuleInfo{},
-					Flagged:        flagged,
-					ContainsFlagID: containsFlagID,
-					MatchedFlagIDs: matchedFlagIDs,
-					FlagIDRound:    flagIDRound,
-				}
-				if err := m.packetStore.Enqueue(pkt, nil); err != nil {
-					log.Printf("[%s] sniffer: failed to log TCP packet: %v", svc.Name, err)
-				}
 			}
 		}
 		if readErr != nil {

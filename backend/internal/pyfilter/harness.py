@@ -27,28 +27,28 @@ User scripts each define:
         #        b"2": ("login", 2)}):      #   cmd.name / cmd.args / cmd.flagid
         #       ...
         #
-        # NOTE: match(flow) runs per message. An inline (Blocking) filter only
-        # sees requests, so for it flow.response/.responses are empty.
+        # NOTE: match(flow) runs once per message, on BOTH directions. Use
+        # flow.is_request / flow.is_response (or flow.direction) to tell them
+        # apart. A Blocking filter can drop or rewrite either a request or a
+        # response in real time.
         #
         # return one of:
         #   False / None            -> no match
         #   True                    -> match (no reason)
         #   "some reason string"    -> match with a reason shown in Alerts
-        #   {"match": True, "reason": "...", "drop": "<filter expr>"}
-        #       -> match; if "drop" is a filter expression, Janus installs a
-        #          content-only drop rule so FUTURE matching traffic is blocked
-        #          by the fast in-process engine (fail2ban style). The drop
-        #          expression may only use content fields (body/url/header/
-        #          service); IP/port fields are rejected (SNAT-unsafe).
         #   {"match": True, "reason": "...", "drop": True}   (or "block": True)
-        #       -> match; blocks the CURRENT request in real time (inline). Only
+        #       -> match; drops the CURRENT message in real time (inline): a
+        #          request is blocked before it reaches the backend, a response
+        #          before it reaches the client (the connection is closed). Only
         #          takes effect for scripts marked "Blocking", which run
-        #          synchronously on the request hot path.
+        #          synchronously on the proxy hot path. Any truthy "drop" value
+        #          works, so {"drop": "some reason"} blocks too.
         #
         # Inline REWRITE (Blocking filters only): assign flow.body = "..." (HTTP)
-        # or flow.messages[-1].content = b"..." (TCP) to rewrite the current
-        # message before Janus forwards it. Applies whether or not you also
-        # return a match; ignored for non-Blocking (async) filters.
+        # or flow.content = b"..." (TCP) to rewrite the current message before
+        # Janus forwards it — works on requests and responses (e.g. redact a
+        # flag from a response). Applies whether or not you also return a match;
+        # ignored for non-Blocking (async) filters.
         return False
 
 Module-level state persists across calls, so a script can count things over
@@ -501,29 +501,24 @@ def _compile_scripts(scripts):
 
 
 def _normalize(res):
-    """Turn a match() return value into {"reason","drop","block"}, or None."""
+    """Turn a match() return value into {"reason","block"}, or None."""
     if res is None or res is False:
         return None
     if res is True:
-        return {"reason": "", "drop": "", "block": False}
+        return {"reason": "", "block": False}
     if isinstance(res, str):
-        return {"reason": res, "drop": "", "block": False}
+        return {"reason": res, "block": False}
     if isinstance(res, dict):
-        raw = res.get("drop")
-        block = bool(res.get("block"))
-        drop = ""
-        # drop=True (a bare boolean) means "block the current request" — the
-        # inline/synchronous drop. drop="<expr>" is the async future-traffic rule.
-        if raw is True:
-            block = True
-        elif isinstance(raw, str) and raw:
-            drop = raw
+        # "drop" and "block" are synonyms: both ask Janus to drop the CURRENT
+        # message inline (honored only for Blocking filters). Any truthy value
+        # counts, so {"drop": True} and {"drop": "reason text"} both block.
+        block = bool(res.get("drop")) or bool(res.get("block"))
         # A drop/block directive implies a match even without an explicit "match".
-        if res.get("match") or drop or block:
-            return {"reason": str(res.get("reason", "")), "drop": drop, "block": block}
+        if res.get("match") or block:
+            return {"reason": str(res.get("reason", "")), "block": block}
         return None
     if res:
-        return {"reason": "", "drop": "", "block": False}
+        return {"reason": "", "block": False}
     return None
 
 
@@ -539,15 +534,14 @@ def _evaluate(scripts, flow):
         except Exception:
             matches.append({
                 "script": sid, "name": s["name"],
-                "reason": "error: " + _short_exc_line(), "drop": "", "error": True,
+                "reason": "error: " + _short_exc_line(), "error": True,
             })
             continue
         norm = _normalize(res)
         if norm is not None:
             matches.append({
                 "script": sid, "name": s["name"],
-                "reason": norm["reason"], "drop": norm["drop"],
-                "block": norm["block"], "error": False,
+                "reason": norm["reason"], "block": norm["block"], "error": False,
             })
     return matches, _rewrite_of(flow)
 

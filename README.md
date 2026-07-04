@@ -140,41 +140,53 @@ def match(flow):
     return False
 ```
 
-`match(flow)` returns `False`/`None` (no match), `True`, a reason string, or a
-dict `{"match": True, "reason": "...", "drop": ...}`. `flow` is a **forgiving
-object** (still a dict, so `flow["body"]` / `flow.get(...)` keep working): a
-missing field reads as `""`, so filters are quick to write and never crash.
-Handy accessors — `flow.method` / `url` / `path` / `status` / `service` /
-`direction`, `flow.headers["Cookie"]` (case-insensitive), `flow.query["id"]`,
-`flow.cookies["session"]`, `flow.json()` / `flow.body` / `flow.bytes`,
-`flow.request` / `flow.response` (correlated sides, never `None`), and recent
-history `flow.messages[-1]` / `flow.recent(3)` / `flow.last_request`. Works for
-HTTP and TCP. Scripts run in a bundled `python3` interpreter; a hung or broken
-script is isolated and never blocks traffic. Toggle the whole engine with
+`match(flow)` returns one of:
+
+| return | meaning |
+| --- | --- |
+| `False` / `None` | no match |
+| `True` | match, no reason |
+| `"reason string"` | match, shown on the **Alerts** page |
+| `{"match": True, "reason": "...", "drop": True}` | match **and** drop this message now (inline — needs **Blocking**) |
+
+`drop` and `block` are synonyms and any truthy value counts, so `{"drop": True}`
+and `{"drop": "some reason"}` both drop.
+
+`flow` is a **forgiving object** (still a dict, so `flow["body"]` /
+`flow.get(...)` keep working): a missing field reads as `""`, so filters are
+quick to write and never crash. Handy accessors — `flow.method` / `url` / `path`
+/ `status` / `service`, `flow.direction` with `flow.is_request` /
+`flow.is_response`, `flow.flagged` / `flow.contains_flagid`,
+`flow.headers["Cookie"]` (case-insensitive), `flow.query["id"]`,
+`flow.cookies["session"]`, `flow.json()` / `flow.body` (str) / `flow.content`
+(bytes), `flow.request` / `flow.response` (the correlated side, never `None`),
+and recent history `flow.messages[-1]` / `flow.recent(3)` / `flow.last_request`.
+Works for HTTP and TCP. Scripts run in a bundled `python3` interpreter; a hung or
+broken script is isolated and never blocks traffic. Toggle the whole engine with
 `PYFILTER_ENABLED` and point at a specific interpreter with `PYFILTER_PYTHON`.
 
-**Dropping (fail2ban-style).** A match can also return a `drop` filter
-expression. Janus can't un-send the packet that tripped the script (it's already
-forwarded — Python runs async), but it installs that expression as a **drop
-rule** so all *future* matching traffic is blocked by the fast in-process
-engine. Drops are **content-only**: the expression may use `body` / `url` /
-`header` / `service` but not IP/port fields — dropping by source IP is
-meaningless under SNAT (every team shares one address) and is rejected. So the
-right pattern is "detect the offender, then block their traffic by content"
-(e.g. their username in the body). Installed rules appear on the **Blocks** page.
+**Requests and responses.** `match(flow)` runs once per message on **both**
+directions. Branch on `flow.is_request` / `flow.is_response` (or read the other
+side through `flow.request` / `flow.response`) to decide what to inspect, rewrite,
+or drop — an inline filter can act on a response just as it does on a request.
 
-**Inline (real-time) blocking.** Mark a filter **Blocking** in the UI and it runs
-*synchronously* on the request path: returning `{"drop": True}` then drops the
-**current** request in real time (a 403 for HTTP, a dropped connection for TCP),
-not just future traffic. It costs ~tens of µs per message on that service and is
-bounded + fail-open (a stuck script lets traffic through). Applies to HTTP
-requests and TCP (client→backend).
+Non-blocking filters run **async** and can only alert — they see the packet
+after it's already forwarded, so they can't change it. To act on traffic in real
+time, mark the filter **Blocking**.
+
+**Inline (real-time) blocking.** A **Blocking** filter runs *synchronously* on
+the proxy path, so returning `{"drop": True}` drops the **current** message in
+real time: a request is stopped before it reaches the backend, a response before
+it reaches the client (a 403 for HTTP, a closed connection for TCP). It costs
+~tens of µs per message on that service and is bounded + fail-open (a stuck
+script lets traffic through).
 
 **Inline (real-time) rewriting.** A Blocking filter can also *modify* the current
-message before Janus forwards it: assign `flow.body = "..."` (HTTP text) or
-`flow.messages[-1].content = b"..."` (TCP, exact bytes) inside `match()`. The
-rewrite is applied whether or not you also return a match. Like blocking it is
-inline-only — async filters can't mutate, since the packet is already forwarded.
+message before Janus forwards it: assign `flow.body = "..."` (text) or
+`flow.content = b"..."` (exact bytes) inside `match()`. It works on requests and
+responses alike — e.g. redact a flag from a response so the client never sees it,
+without dropping the connection. The rewrite applies whether or not you also
+return a match; like blocking it is inline-only (async filters can't mutate).
 
 **TCP streams.** For binary/CLI services (a continuous byte flow, not one message
 per chunk), `flow.lines` yields the complete lines reassembled across chunks and
@@ -204,7 +216,7 @@ request+response **flow**) from traffic. Whole-flow tests run `match()` over the
 packets in order — so correlating/stateful scripts see the sequence — and show a
 per-packet verdict. A `Repeat` control re-runs the sample so counting logic
 (e.g. "2nd login") can fire, and the result labels each match as **Alert** or
-**Alert + Drop** (with the rule it would install).
+**Alert + Block**.
 
 ### 8. Custom protocols
 

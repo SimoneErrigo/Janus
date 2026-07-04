@@ -145,16 +145,6 @@ func main() {
 					log.Printf("pyfilter: failed to record alert: %v", err)
 					return
 				}
-				// Fail2ban-style: if the script asked to drop, install a
-				// content-only drop rule so future matching traffic is blocked
-				// by the fast in-process engine (never by src IP — SNAT-unsafe).
-				if m.Drop != "" {
-					if ruleID, err := api.InstallPyFilterDrop(ruleStore, flow, m); err != nil {
-						log.Printf("pyfilter[%s]: drop rule rejected: %v", m.Script, err)
-					} else {
-						log.Printf("pyfilter[%s]: installed drop rule %s (%s)", m.Script, ruleID, m.Drop)
-					}
-				}
 				packetHub.Notify()
 			},
 		})

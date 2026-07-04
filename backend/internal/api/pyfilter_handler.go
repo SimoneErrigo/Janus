@@ -3,76 +3,12 @@ package api
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
-	"hash/fnv"
 	"net/http"
 	"strings"
 
-	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
-	"github.com/SimoneErrigo/Janus/backend/internal/filter"
 	"github.com/SimoneErrigo/Janus/backend/internal/pyfilter"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 )
-
-// pyDropForbiddenFields are network/identity fields a Python filter's drop
-// expression may not use. Dropping by src IP is meaningless under SNAT (every
-// team shares the same source address) and would take out all traffic, so we
-// keep pyfilter drops strictly content-based.
-var pyDropForbiddenFields = map[string]bool{
-	"src": true, "dst": true, "peer": true, "sport": true, "dport": true,
-}
-
-// InstallPyFilterDrop installs (idempotently) a content-only drop rule requested
-// by a Python filter match, so future matching traffic is blocked by the fast
-// in-process rules engine (fail2ban style). It is a no-op when m.Drop is empty,
-// and returns an error if the expression is invalid or references a forbidden
-// network/identity field.
-func InstallPyFilterDrop(ruleStore *dropper.RuleStore, flow pyfilter.Flow, m pyfilter.Match) (string, error) {
-	expr := strings.TrimSpace(m.Drop)
-	if expr == "" {
-		return "", nil
-	}
-	ast, err := filter.Parse(expr)
-	if err != nil {
-		return "", fmt.Errorf("invalid drop expression %q: %w", expr, err)
-	}
-	for _, f := range filter.FieldsUsed(ast) {
-		if pyDropForbiddenFields[f] {
-			return "", fmt.Errorf("drop expression may not use %q — pyfilter drops are content-only (IP/port dropping is unsafe under SNAT)", f)
-		}
-	}
-
-	svcID, _ := flow["service"].(string)
-	// Deterministic id per (script, service, expression) so repeated matches
-	// reuse one rule instead of flooding the store — one ban per offender.
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(svcID + "|" + expr))
-	ruleID := fmt.Sprintf("pyfilter-drop:%s:%08x", m.Script, h.Sum32())
-
-	if existing, ok := ruleStore.GetRule(ruleID); ok {
-		if existing.Enabled && existing.Action == dropper.ActionDrop {
-			return ruleID, nil
-		}
-		existing.Enabled = true
-		existing.Action = dropper.ActionDrop
-		return ruleID, ruleStore.UpdateRule(existing)
-	}
-
-	rule := &dropper.Rule{
-		ID:         ruleID,
-		ServiceID:  svcID,
-		Name:       "Python drop (" + m.Name + ")",
-		Expression: expr,
-		Action:     dropper.ActionDrop,
-		Priority:   0,
-		Enabled:    true,
-		CreatedBy:  "pyfilter",
-	}
-	if err := ruleStore.CreateRule(rule); err != nil {
-		return "", err
-	}
-	return ruleID, nil
-}
 
 // FlowFromPacket builds the generic flow dict handed to Python filter scripts.
 // Kept exported so the live-capture wiring in main can reuse the exact same

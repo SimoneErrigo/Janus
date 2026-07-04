@@ -27,12 +27,10 @@ type Match struct {
 	Script string `json:"script"`
 	Name   string `json:"name"`
 	Reason string `json:"reason"`
-	// Drop, when non-empty, is a content-only filter expression the script asked
-	// Janus to install as a drop rule so future matching traffic is blocked.
-	Drop string `json:"drop"`
-	// Block asks Janus to drop the CURRENT request synchronously (inline, on the
-	// proxy hot path). Only honored for scripts marked Blocking; produced by
-	// returning {"drop": True} or {"block": True} from match().
+	// Block asks Janus to drop the CURRENT message synchronously (inline, on the
+	// proxy hot path) — a request before it reaches the backend, or a response
+	// before it reaches the client. Only honored for scripts marked Blocking;
+	// produced by returning {"drop": True} or {"block": True} from match().
 	Block bool `json:"block"`
 	Error bool `json:"error"`
 }
