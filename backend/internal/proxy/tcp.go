@@ -180,16 +180,22 @@ func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.
 			// Exact bytes ride as base64 so binary payloads survive JSON.
 			var pyBlockAlerts []*sniffer.Alert
 			if pyBlock := m.currentPyBlockFn(); pyBlock != nil {
+				// Tag flag/flagID presence up front so inline filters can use
+				// flow.flagged / flow.contains_flagid without parsing.
+				pyFlagged := sniffer.CheckFlagged(m.flagRegex, m.flagScanner, "", "", chunk)
+				pyContainsFlagID, _, _ := sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", chunk)
 				flow := map[string]any{
-					"service":   svc.ID,
-					"direction": string(dir),
-					"src":       srcIP,
-					"dst":       dstIP,
-					"sport":     srcPort,
-					"dport":     dstPort,
-					"protocol":  string(svc.Protocol),
-					"body":      string(chunk),
-					"body_b64":  base64.StdEncoding.EncodeToString(chunk),
+					"service":         svc.ID,
+					"direction":       string(dir),
+					"src":             srcIP,
+					"dst":             dstIP,
+					"sport":           srcPort,
+					"dport":           dstPort,
+					"protocol":        string(svc.Protocol),
+					"body":            string(chunk),
+					"body_b64":        base64.StdEncoding.EncodeToString(chunk),
+					"flagged":         pyFlagged,
+					"contains_flagid": pyContainsFlagID,
 				}
 				res := pyBlock(flow)
 				for _, bm := range res.Blocks {
