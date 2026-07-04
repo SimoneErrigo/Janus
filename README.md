@@ -179,15 +179,22 @@ inline-only — async filters can't mutate, since the packet is already forwarde
 **TCP streams.** For binary/CLI services (a continuous byte flow, not one message
 per chunk), `flow.lines` yields the complete lines reassembled across chunks and
 `flow.conn` is a dict that persists for the whole connection (both directions) —
-so stream filters don't hand-roll a byte buffer or a per-connection state map:
+so stream filters don't hand-roll a byte buffer or a per-connection state map.
+For line-based CLI menus, `flow.commands(spec)` goes further and parses the
+stream into commands for you (`spec` maps a trigger line to `(name, n_args)`),
+handling cross-packet buffering and flag-ID tracking — so you write the grammar,
+not a state machine:
 
 ```python
+CMDS = {b"1": ("register", 2), b"2": ("login", 2)}   # trigger -> (name, n args)
+
 def match(flow):
-    for line in flow.lines:              # reassembled across chunks by Janus
-        if line.strip().lower() == b"admin":
-            flow.conn["hits"] = flow.conn.get("hits", 0) + 1   # per-connection
-            if flow.conn["hits"] >= 3:
-                return {"drop": True, "reason": "too many admin commands"}
+    for cmd in flow.commands(CMDS):      # cmd.name / cmd.args / cmd.flagid
+        user, password = cmd.args
+        if cmd.name == "register":
+            flow.conn.setdefault("regs", set()).add(password)
+        elif cmd.name == "login" and cmd.flagid and password in flow.conn.get("regs", set()):
+            return {"drop": True, "reason": "login as flag-ID reusing a registered password"}
     return False
 ```
 

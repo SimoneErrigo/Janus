@@ -72,17 +72,22 @@ def match(flow):
 `
 
 const STREAM_EXAMPLE = `# TCP STREAM (binary / CLI) — a continuous byte flow, not one-message-per-chunk.
-# Janus reassembles lines across chunks (flow.lines) and keeps per-connection
-# state (flow.conn), so you never manage a buffer. Mark this filter "Blocking".
-# Here: kill a connection that sends the "admin" command 3+ times.
+# flow.commands(spec) parses the line stream into CLI commands for you (buffering
+# across packets + flag-ID tracking), and flow.conn holds per-connection state.
+# spec maps a trigger line to (name, number_of_argument_lines).
+# Here: kill a login that uses a flag-ID as username with a password already
+# seen in a registration. Mark this filter "Blocking".
+CMDS = {b"1": ("register", 2), b"2": ("login", 2)}   # menu: 1=register, 2=login
+
 def match(flow):
     if flow.direction != "request":
         return False
-    for line in flow.lines:                 # complete lines, reassembled for you
-        if line.strip().lower() == b"admin":
-            flow.conn["hits"] = flow.conn.get("hits", 0) + 1   # per-connection state
-            if flow.conn["hits"] >= 3:
-                return {"drop": True, "reason": "too many admin commands"}
+    for cmd in flow.commands(CMDS):         # cmd.name / cmd.args / cmd.flagid
+        user, password = cmd.args
+        if cmd.name == "register":
+            flow.conn.setdefault("regs", set()).add(password)
+        elif cmd.name == "login" and cmd.flagid and password in flow.conn.get("regs", set()):
+            return {"drop": True, "reason": "login as flag-ID reusing a registered password"}
     return False
 `
 
@@ -779,6 +784,7 @@ function FlowApiCheatsheet() {
     ['flow.body = "…" / msg.content = b"…"', 'rewrite inline (Blocking only)'],
     ['for line in flow.lines:', 'TCP stream lines, reassembled across chunks'],
     ['flow.conn["…"]', 'per-TCP-connection state (auto)'],
+    ['flow.commands({b"1": ("register", 2)})', 'parse a line-based CLI into commands'],
   ]
   return (
     <div className="mt-3 rounded border border-gray-800 bg-gray-900/60 p-3 space-y-1">
