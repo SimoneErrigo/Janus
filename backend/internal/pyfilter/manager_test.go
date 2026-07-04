@@ -202,6 +202,36 @@ def match(flow):
 	}
 }
 
+func TestFlowStreamConnAndLines(t *testing.T) {
+	m := newTestManager(t)
+	// flow.lines reassembles across chunk boundaries; flow.conn persists per
+	// connection — no manual buffer / state dict.
+	code := `
+def match(flow):
+    for line in flow.lines:
+        flow.conn["n"] = flow.conn.get("n", 0) + 1
+        if line == b"boom":
+            return "line %d is boom" % flow.conn["n"]
+    return False
+`
+	chunk := func(s string) Flow {
+		return Flow{"service": "s", "direction": "request", "src": "1.2.3.4", "sport": 55,
+			"body_b64": base64.StdEncoding.EncodeToString([]byte(s))}
+	}
+	// "hello" and "world" complete on earlier chunks; "boom" on the last.
+	flows := []Flow{chunk("he"), chunk("llo\nwor"), chunk("ld\nbo"), chunk("om\n")}
+	steps, scriptErr, err := m.TestSequence("stream", code, flows, 1)
+	if err != nil || scriptErr != "" {
+		t.Fatalf("err=%v scriptErr=%s", err, scriptErr)
+	}
+	if len(steps[0].Matches) != 0 || len(steps[1].Matches) != 0 {
+		t.Fatalf("no line should complete/emit on the first two chunks: %+v", steps[:2])
+	}
+	if len(steps[3].Matches) != 1 || steps[3].Matches[0].Reason != "line 3 is boom" {
+		t.Fatalf("stream reassembly/conn state wrong: %+v", steps[3])
+	}
+}
+
 func TestTestScriptMatchAndReason(t *testing.T) {
 	m := newTestManager(t)
 	code := `

@@ -17,6 +17,12 @@ User scripts each define:
         #   flow.messages[-1]               # most recent message (this service)
         #   flow.recent(3)  flow.last_request  flow.requests  flow.responses
         #
+        # TCP streams (a continuous byte flow, not one-message-per-chunk):
+        #   flow.conn                       # dict persisting for the whole TCP
+        #                                   #   connection — your per-conn state
+        #   for line in flow.lines:         # complete lines, reassembled across
+        #       ...                         #   chunks by Janus (bytes, exact)
+        #
         # NOTE: match(flow) runs per message. An inline (Blocking) filter only
         # sees requests, so for it flow.response/.responses are empty.
         #
@@ -57,7 +63,7 @@ import sys
 import json
 import base64
 import traceback
-from collections import deque
+from collections import deque, OrderedDict
 from urllib.parse import urlsplit, parse_qs
 
 # id -> {"name": str, "fn": callable}
@@ -70,6 +76,35 @@ SCRIPTS = {}
 
 _HISTORY = {}        # service -> deque[Flow] of recently evaluated messages
 _HISTORY_MAX = 32
+
+# Per-TCP-connection scratch: state that persists across every chunk of a
+# connection (both directions), plus an internal line-reassembly buffer so
+# stream filters don't have to manage a byte buffer themselves.
+_CONNS = OrderedDict()   # conn_key -> {"state": {}, "linebuf": {direction: bytes}}
+_CONNS_MAX = 4096
+_LINEBUF_MAX = 1 << 16   # cap a single unterminated line
+
+
+def _conn_key(flow):
+    # Direction-independent: request and response of the same connection share it.
+    svc = flow.get("service") or ""
+    a = (flow.get("src") or "", flow.get("sport") or 0)
+    b = (flow.get("dst") or "", flow.get("dport") or 0)
+    lo, hi = (a, b) if a <= b else (b, a)
+    return (svc, lo, hi)
+
+
+def _conn_record(flow):
+    k = _conn_key(flow)
+    rec = _CONNS.get(k)
+    if rec is None:
+        rec = {"state": {}, "linebuf": {}}
+        _CONNS[k] = rec
+        if len(_CONNS) > _CONNS_MAX:
+            _CONNS.popitem(last=False)   # evict the oldest connection
+    else:
+        _CONNS.move_to_end(k)
+    return rec
 
 
 class _Headers:
@@ -327,6 +362,35 @@ class Flow(dict):
     @property
     def response(self):
         return self if self.is_response else self.last_response
+
+    # -- TCP streams: per-connection state + line reassembly (no manual buffer) --
+    @property
+    def conn(self):
+        """A dict that persists across every message of THIS TCP connection
+        (both directions, keyed by service + endpoints). Use it for per-
+        connection state instead of a global keyed by src/port."""
+        return _conn_record(self)["state"]
+
+    @property
+    def lines(self):
+        """The complete lines newly available on this direction's stream, with
+        the line terminator removed. Janus buffers the partial remainder across
+        chunks, so you never manage a byte buffer yourself. Returns bytes (exact,
+        binary-safe). Empty when the chunk holds no complete line yet."""
+        cached = self.get("__lines")
+        if cached is not None:
+            return cached
+        rec = _conn_record(self)
+        d = self.direction or ""
+        buf = rec["linebuf"].get(d, b"") + self.content
+        parts = buf.split(b"\n")
+        tail = parts[-1]
+        if len(tail) > _LINEBUF_MAX:
+            tail = tail[-_LINEBUF_MAX:]
+        rec["linebuf"][d] = tail            # keep the unterminated remainder
+        out = [(p[:-1] if p.endswith(b"\r") else p) for p in parts[:-1]]
+        self["__lines"] = out
+        return out
 
     # -- attribute fallback: flow.<key> -> flow["<key>"], missing -> "" --
     def __getattr__(self, name):
