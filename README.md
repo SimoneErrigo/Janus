@@ -176,6 +176,21 @@ message before Janus forwards it: assign `flow.body = "..."` (HTTP text) or
 rewrite is applied whether or not you also return a match. Like blocking it is
 inline-only — async filters can't mutate, since the packet is already forwarded.
 
+**TCP streams.** For binary/CLI services (a continuous byte flow, not one message
+per chunk), `flow.lines` yields the complete lines reassembled across chunks and
+`flow.conn` is a dict that persists for the whole connection (both directions) —
+so stream filters don't hand-roll a byte buffer or a per-connection state map:
+
+```python
+def match(flow):
+    for line in flow.lines:              # reassembled across chunks by Janus
+        if line.strip().lower() == b"admin":
+            flow.conn["hits"] = flow.conn.get("hits", 0) + 1   # per-connection
+            if flow.conn["hits"] >= 3:
+                return {"drop": True, "reason": "too many admin commands"}
+    return False
+```
+
 You can **test** a script right on the page before enabling it: build a
 Request/Response sample, or load a real captured packet (or a whole
 request+response **flow**) from traffic. Whole-flow tests run `match()` over the
