@@ -2,6 +2,7 @@ package sniffer
 
 import (
 	"bytes"
+	"encoding/base64"
 	"io"
 	"log"
 	"net"
@@ -150,6 +151,7 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 				"dport":           dstPort,
 				"headers":         reqHeaders,
 				"body":            string(reqBody),
+				"body_b64":        base64.StdEncoding.EncodeToString(reqBody),
 				"flagged":         flagged,
 				"contains_flagid": containsFlagID,
 				"timestamp":       start.Unix(),

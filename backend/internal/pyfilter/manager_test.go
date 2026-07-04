@@ -80,6 +80,42 @@ def match(flow):
 	}
 }
 
+func TestUtilHelpersAvailable(t *testing.T) {
+	m := newTestManager(t)
+	// The `util` analysis namespace is injected into every filter. Exercise a
+	// few helpers end-to-end so a filter can validate a payload and drop.
+	code := `
+def match(flow):
+    data = flow.json() or {}
+    if util.extra_keys(data, ("name", "pw", "url", "file")):   # mass assignment
+        return {"drop": True, "reason": "unexpected field"}
+    if util.uri_scheme(data.get("url", "")) not in ("", "http", "https"):
+        return {"drop": True, "reason": "bad scheme"}
+    if data.get("file") and not util.is_base64(data.get("file")):
+        return {"drop": True, "reason": "not base64"}
+    return False
+`
+	drops := func(body string) bool {
+		mm, se, err := m.Test("u", code, Flow{"body": body}, 1)
+		if err != nil || se != "" {
+			t.Fatalf("err=%v scriptErr=%s", err, se)
+		}
+		return len(mm) == 1 && mm[0].Block
+	}
+	if !drops(`{"name":"a","pw":"b","friends":["victim"]}`) {
+		t.Error("mass-assignment should drop")
+	}
+	if !drops(`{"name":"a","pw":"b","url":"telnet://db:27017"}`) {
+		t.Error("dangerous scheme should drop")
+	}
+	if !drops(`{"name":"a","pw":"b","file":"not base64!!"}`) {
+		t.Error("non-base64 file should drop")
+	}
+	if drops(`{"name":"a","pw":"b","url":"https://ok","file":"YWJj"}`) {
+		t.Error("clean request must NOT drop (checker false positive)")
+	}
+}
+
 func TestFlowErgonomicAccessors(t *testing.T) {
 	m := newTestManager(t)
 	code := `

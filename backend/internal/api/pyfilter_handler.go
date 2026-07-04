@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -19,18 +20,21 @@ func FlowFromPacket(p *sniffer.Packet) pyfilter.Flow {
 		body = string(p.Body)
 	}
 	return pyfilter.Flow{
-		"id":              p.ID,
-		"service":         p.ServiceID,
-		"direction":       string(p.Direction),
-		"method":          p.Method,
-		"url":             p.URL,
-		"status":          p.Status,
-		"src":             p.SrcIP,
-		"dst":             p.DstIP,
-		"sport":           p.SrcPort,
-		"dport":           p.DstPort,
-		"headers":         p.Headers,
-		"body":            body,
+		"id":        p.ID,
+		"service":   p.ServiceID,
+		"direction": string(p.Direction),
+		"method":    p.Method,
+		"url":       p.URL,
+		"status":    p.Status,
+		"src":       p.SrcIP,
+		"dst":       p.DstIP,
+		"sport":     p.SrcPort,
+		"dport":     p.DstPort,
+		"headers":   p.Headers,
+		"body":      body,
+		// Exact bytes for binary payload analysis (util.magic/entropy/…); the
+		// content property prefers this over the lossy utf-8 body string.
+		"body_b64":        base64.StdEncoding.EncodeToString(p.Body),
 		"flagged":         p.Flagged,
 		"contains_flagid": p.ContainsFlagID,
 		"timestamp":       p.Timestamp.Unix(),

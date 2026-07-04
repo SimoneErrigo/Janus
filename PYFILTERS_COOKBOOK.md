@@ -1,426 +1,545 @@
 # Python filters — cookbook
 
-A big pile of ready-to-adapt `match(flow)` filters, from one-liners to full
-attack detectors, for both HTTP and TCP services. For the full API and semantics
-see [PYFILTERS.md](PYFILTERS.md); this file is all worked examples.
+Worked `match(flow)` filters, from one-liners to stateful attack detectors, for
+HTTP and TCP services. Most are modelled on **real A/D vulnerabilities**, and each
+is written **ad-hoc so it drops the exploit without ever matching the checker's
+normal traffic** — the note under each one says exactly why the checker slips
+through. For the full API see [PYFILTERS.md](PYFILTERS.md).
 
-Every example is copy-pasteable. Each is tagged:
+Tags: **Alert** returns a reason string (works on any filter). **Blocking** drops
+or rewrites the current message and needs the *Blocking* checkbox (inline on TCP
+requests + responses, and HTTP requests).
 
-- **Alert** — returns a reason string; shows up on the Alerts page. Works on any
-  filter (async or Blocking).
-- **Blocking** — drops or rewrites the current message in real time. Requires the
-  **Blocking** checkbox on the filter. Inline blocking/rewriting works on TCP
-  requests **and** responses, and on HTTP **requests**; HTTP *responses* are
-  already forwarded before filters run, so a response-side HTTP filter can only
-  Alert.
+Return values: `False`/`None` ignore · `"reason"` alert · `{"drop": True, "reason": …}`
+drop now · assign `flow.body` / `flow.content` rewrite. `DIRECTION = "request"`/`"response"`
+at module level restricts the side. Module globals persist; `flow.conn` is
+per-TCP-connection state (private to each filter).
 
-Quick reminder of return values:
+## `util.*` — payload analysis helpers
 
-| return | effect |
+Injected into every filter as `util`. Stdlib-only, so you can inspect a payload
+and drop immediately without pulling the whole thing apart by hand.
+
+| helper | returns |
 |---|---|
-| `False` / `None` | ignore |
-| `"reason"` | Alert |
-| `{"drop": True, "reason": "..."}` | drop this message now (needs Blocking) |
-| assign `flow.body` / `flow.content` | rewrite this message (needs Blocking) |
-
-`match(flow)` runs once per message on **both directions**. Branch on
-`flow.is_request` / `flow.is_response`, or set a module-level
-`DIRECTION = "request"` / `"response"` and Janus skips the other side. Module-level
-variables persist across calls (use them to count/correlate); `flow.conn` is
-per-TCP-connection state, private to each filter.
+| `util.is_base64(s, canonical=True)` | bytes are valid (and, by default, *canonical*) base64 |
+| `util.b64(s)` | decoded bytes, or `None` if not base64 |
+| `util.valid_json(s)` | `s` is one complete, well-formed JSON document (no truncation / trailing bytes) |
+| `util.extra_keys(obj, allowed)` | set of dict keys not in `allowed` (mass assignment) |
+| `util.entropy(data)` | Shannon entropy in bits/byte (0 = uniform) |
+| `util.longest_run(data)` | length of the longest run of one repeated byte |
+| `util.repeated_block(data, size=16)` | an aligned block repeats (ECB-like / crafted oracle) |
+| `util.printable_ratio(data)` | fraction of printable-ASCII bytes |
+| `util.has_control_chars(s)` | text holds a C0 control (incl. `\r \n \t`) or DEL |
+| `util.magic(data)` | sniffed file type (`png`,`jpg`,`pdf`,`zip`,`svg`,…) or `""` |
+| `util.content_type_ok(ct, data)` | declared Content-Type is consistent with the bytes |
+| `util.trailing_data(data)` | bytes appended after an image's logical end (polyglot) |
+| `util.normpath(p)` | URL-decoded, `.`/`..`/`//`-folded path |
+| `util.uri_scheme(s)` | scheme if `s` carries one (`telnet`, `file`, …) else `""` |
+| `util.path_escapes(p)` | a (relative) path is absolute / traverses out / has a scheme or NUL |
 
 ---
 
 ## Table of contents
 
-- [HTTP](#http)
-  1. [Alert on an admin endpoint](#1-alert-on-an-admin-endpoint) · **Alert**
-  2. [Suspicious User-Agent](#2-suspicious-user-agent) · **Alert**
-  3. [SQLi / traversal probing in the URL](#3-sqli--traversal-probing-in-the-url) · **Alert**
-  4. [Inspect a JSON body (None-safe)](#4-inspect-a-json-body-none-safe) · **Alert**
-  5. [A flag-ID appears in a request](#5-a-flag-id-appears-in-a-request) · **Alert**
-  6. [A flag leaks in a response](#6-a-flag-leaks-in-a-response) · **Alert**
-  7. [Block a request outright](#7-block-a-request-outright) · **Blocking**
-  8. [Block path traversal on the way in](#8-block-path-traversal-on-the-way-in) · **Blocking**
-  9. [Rewrite a request body](#9-rewrite-a-request-body) · **Blocking**
-  10. [Second login onward (stateful, SNAT-safe)](#10-second-login-onward-stateful-snat-safe) · **Alert**
-  11. [Login reusing a registered password](#11-login-reusing-a-registered-password) · **Blocking**
-  12. [Correlate request → response](#12-correlate-request--response) · **Alert**
-- [TCP / byte streams](#tcp--byte-streams)
-  13. [Alert when a chunk carries a flag](#13-alert-when-a-chunk-carries-a-flag) · **Alert**
-  14. [Block a raw command by content](#14-block-a-raw-command-by-content) · **Blocking**
-  15. [Parse a line protocol by hand](#15-parse-a-line-protocol-by-hand) · **Alert**
-  16. [Parse a CLI menu with flow.commands](#16-parse-a-cli-menu-with-flowcommands) · **Blocking**
-  17. [Block "get vip" on a flag-ID flight](#17-block-get-vip-on-a-flag-id-flight) · **Blocking**
-  18. [Only the owner may read the vip (auth tracking)](#18-only-the-owner-may-read-the-vip-auth-tracking) · **Blocking**
-  19. [Second flag-ID login on a connection](#19-second-flag-id-login-on-a-connection) · **Blocking**
-  20. [Redact a flag from a TCP response](#20-redact-a-flag-from-a-tcp-response) · **Blocking**
-  21. [Password reuse across connections](#21-password-reuse-across-connections) · **Alert**
-  22. [Length-prefixed binary framing](#22-length-prefixed-binary-framing) · **Alert**
+**Level 1 — stateless pattern**
+1. [Mass assignment on registration](#1-mass-assignment-on-registration) · Blocking
+2. [Curl option injection / SSRF](#2-curl-option-injection--ssrf) · Blocking
+3. [Control chars in a username](#3-control-chars-in-a-username) · Blocking
+4. [Strict date format (buffer overflow)](#4-strict-date-format-buffer-overflow) · Blocking
+5. [Bounded numeric timestamp](#5-bounded-numeric-timestamp) · Blocking
+
+**Level 2 — body / file parsing**
+6. [Reject malformed JSON (error-leak)](#6-reject-malformed-json-error-leak) · Blocking
+7. [A file field must be canonical base64](#7-a-file-field-must-be-canonical-base64) · Blocking
+8. [Content-Type must match the bytes](#8-content-type-must-match-the-bytes) · Blocking
+9. [Polyglot: data appended after an image](#9-polyglot-data-appended-after-an-image) · Blocking
+10. [Static path traversal / SSRF](#10-static-path-traversal--ssrf) · Blocking
+11. [Algorithm allowlist](#11-algorithm-allowlist) · Blocking
+
+**Level 3 — semantic payload**
+12. [JOIN result-length overflow](#12-join-result-length-overflow) · Blocking
+13. [Marker that appears only after sanitization](#13-marker-that-appears-only-after-sanitization) · Blocking
+14. [Crypto-oracle input (uniform blocks)](#14-crypto-oracle-input-uniform-blocks) · Blocking
+15. [Parameter pollution + shell metacharacters](#15-parameter-pollution--shell-metacharacters) · Blocking
+
+**Level 4 — stateful flow**
+16. [Empty-password login flood](#16-empty-password-login-flood) · Blocking
+17. [Repeated protocol INIT (challenge reuse)](#17-repeated-protocol-init-challenge-reuse) · Blocking
+18. [Byte-at-a-time compare oracle](#18-byte-at-a-time-compare-oracle) · Blocking
+19. [Author overwrite between open and answer](#19-author-overwrite-between-open-and-answer) · Blocking
+20. [IDOR: object never created in this session](#20-idor-object-never-created-in-this-session) · Alert
+
+**Level 5 — [when a traffic filter can't be trusted](#level-5--when-a-traffic-filter-cant-be-trusted)**
 
 ---
 
-## HTTP
+## Level 1 — stateless pattern
 
-### 1. Alert on an admin endpoint
-
-The simplest possible filter: return a string and it becomes an Alert. `flow` is
-forgiving — missing fields read as `""`, so no `KeyError`.
-
-```python
-def match(flow):
-    if flow.method == "POST" and "/admin" in flow.path:
-        return "POST to an admin endpoint"
-    return False
-```
-
-### 2. Suspicious User-Agent
-
-Header access is case-insensitive and never raises on a missing header.
+### 1. Mass assignment on registration
+*Duogesto — the registration object is copied into the session, so `friends`
+lets you spoof a friendship.* Registration should carry only `name` + `password`;
+reject sensitive extra keys.
 
 ```python
-def match(flow):
-    ua = flow.header("user-agent").lower()          # missing -> ""
-    if "sqlmap" in ua or "nikto" in ua or "curl" in ua:
-        return "scanner user-agent: %s" % ua
-    return False
-```
-
-### 3. SQLi / traversal probing in the URL
-
-`flow.query` parses the query string; `.all(name)` returns every value.
-
-```python
-NEEDLES = ("' or ", " union ", "../", "..\\", "<script")
+DIRECTION = "request"
+ALLOWED = {"name", "password"}
+SENSITIVE = {"friends", "role", "admin", "is_admin", "permissions"}
 
 def match(flow):
-    hay = (flow.url + " " + flow.body).lower()
-    hit = next((n for n in NEEDLES if n in hay), None)
-    if hit:
-        return "injection-ish payload: %r" % hit
+    if flow.method == "POST" and flow.path.endswith("/register"):
+        extra = util.extra_keys(flow.json() or {}, ALLOWED)
+        if extra & SENSITIVE:
+            return {"drop": True, "reason": "mass assignment: %s" % sorted(extra & SENSITIVE)}
     return False
 ```
+*Checker sends only `name`+`password`, so `extra` is empty. Intersecting with
+`SENSITIVE` means even a future benign extra field wouldn't be dropped.*
 
-### 4. Inspect a JSON body (None-safe)
-
-`flow.json()` returns the parsed body or `None`; guard with `or {}`.
-
-```python
-def match(flow):
-    data = flow.json() or {}
-    role = data.get("role")
-    if role in ("admin", "root"):
-        return "privilege escalation attempt (role=%s)" % role
-    return False
-```
-
-### 5. A flag-ID appears in a request
-
-Janus tags each message with whether it contains one of *your* current flag-IDs.
-A flag-ID in a **request** usually means someone is targeting a specific victim.
+### 2. Curl option injection / SSRF
+*Duogesto — a URL/filename reach `curl`; `-K`/`--config` turn an uploaded file
+into curl config (`telnet://mongo:27017`).* Allowlist the scheme, forbid values
+that look like options.
 
 ```python
 DIRECTION = "request"
 
 def match(flow):
-    if flow.contains_flagid:
-        return "request references one of our flag-IDs: %s %s" % (flow.method, flow.path)
+    if flow.method == "POST" and flow.path.endswith("/download"):
+        data = flow.json() or {}
+        for field in ("url", "filename"):
+            v = str(data.get(field, ""))
+            if v.startswith("-"):
+                return {"drop": True, "reason": "%s looks like a curl option: %r" % (field, v[:24])}
+        if util.uri_scheme(str(data.get("url", ""))) not in ("", "http", "https"):
+            return {"drop": True, "reason": "non-HTTP URL scheme"}
     return False
 ```
+*Checker downloads `https://…` images with ordinary filenames — no leading `-`,
+only `http`/`https` schemes.*
 
-### 6. A flag leaks in a response
-
-`flow.flagged` means the message body contains an actual flag. Seeing that on a
-**response** is an exfiltration signal. (HTTP responses are alert-only — to stop
-the leak on a TCP service, see example 20.)
-
-```python
-DIRECTION = "response"
-
-def match(flow):
-    if flow.flagged:
-        return "flag left the service in a %s response" % flow.status
-    return False
-```
-
-### 7. Block a request outright
-
-Return `{"drop": True}` and mark the filter **Blocking** to stop the request
-before it reaches the backend (a 403 for HTTP).
-
-```python
-def match(flow):
-    if flow.path.startswith("/internal/") and flow.header("x-internal") == "":
-        return {"drop": True, "reason": "external hit on an internal-only route"}
-    return False
-```
-
-### 8. Block path traversal on the way in
-
-```python
-def match(flow):
-    if "../" in flow.path or "%2e%2e" in flow.url.lower():
-        return {"drop": True, "reason": "path traversal in URL"}
-    return False
-```
-
-### 9. Rewrite a request body
-
-A Blocking filter can mutate the message before Janus forwards it. Assign
-`flow.body` (text) or `flow.content` (bytes).
-
-```python
-def match(flow):
-    if "debug=1" in flow.body:
-        flow.body = flow.body.replace("debug=1", "debug=0")   # neuter a debug flag
-        return "stripped debug flag from request"
-    return False
-```
-
-### 10. Second login onward (stateful, SNAT-safe)
-
-Under SNAT every team shares one source IP, so **never key on IP**. Key on a
-request field — here the credential. Module-level state persists across calls.
-
-```python
-attempts = {}
-
-def match(flow):
-    if flow.method == "POST" and flow.path.endswith("/login"):
-        user = (flow.json() or {}).get("user")
-        if user:
-            attempts[user] = attempts.get(user, 0) + 1
-            if attempts[user] > 1:
-                return "repeated login for %s (#%d)" % (user, attempts[user])
-    return False
-```
-
-### 11. Login reusing a registered password
-
-Collect passwords seen at `/register`, then flag a `/login` that reuses one while
-carrying a flag-ID (a classic account-takeover shape). Mark **Blocking** to drop.
-
-```python
-registered = set()
-
-def match(flow):
-    if flow.method != "POST":
-        return False
-    pw = (flow.json() or {}).get("password", "")
-    if not pw:
-        return False
-    if flow.path.endswith("/register"):
-        registered.add(pw)
-    elif flow.path.endswith("/login") and flow.contains_flagid and pw in registered:
-        return {"drop": True, "reason": "login flag-ID with a registered password"}
-    return False
-```
-
-### 12. Correlate request → response
-
-From a response you can look back at its request (never `None`). Alert on a flag
-in a response to a route that wasn't authenticated.
-
-```python
-DIRECTION = "response"
-
-def match(flow):
-    if flow.flagged and flow.request.header("authorization") == "":
-        return "flag returned to an unauthenticated %s" % flow.request.path
-    return False
-```
-
----
-
-## TCP / byte streams
-
-TCP services are a continuous byte flow. `flow.lines` reassembles complete lines
-across chunks; `flow.conn` is per-connection scratch; `flow.commands(spec)` parses
-a line-based CLI for you.
-
-### 13. Alert when a chunk carries a flag
-
-```python
-def match(flow):
-    if flow.flagged:
-        return "flag seen on the %s side" % flow.direction
-    return False
-```
-
-### 14. Block a raw command by content
-
-No parsing — just look at the bytes of this chunk.
-
-```python
-def match(flow):
-    if b"DROP TABLE" in flow.content or b"/bin/sh" in flow.content:
-        return {"drop": True, "reason": "dangerous payload in stream"}
-    return False
-```
-
-### 15. Parse a line protocol by hand
-
-`flow.lines` hands you complete lines (bytes), buffering partial ones across
-chunks — you never manage a byte buffer.
+### 3. Control chars in a username
+*CCalendar — a newline in the username bypasses a regex and yields `/../victim`.*
+Usernames are letters/numbers only; block control chars and path metacharacters.
 
 ```python
 DIRECTION = "request"
+BAD = set("/\\#")
 
 def match(flow):
-    for line in flow.lines:
-        if line.upper().startswith(b"AUTH ") and flow.contains_flagid:
-            return "AUTH with a flag-ID: %r" % line
+    if flow.method == "POST" and flow.path.endswith("/register"):
+        user = str((flow.json() or {}).get("name", ""))
+        if util.has_control_chars(user) or (set(user) & BAD):
+            return {"drop": True, "reason": "illegal characters in username"}
     return False
 ```
+*Checker usernames are short alphanumerics, so neither test fires.*
 
-### 16. Parse a CLI menu with flow.commands
-
-`spec` maps a trigger line to `(name, field-names)`. Read arguments **by name** —
-don't unpack `cmd.args`, since different commands can have different arities.
-
-```python
-DIRECTION = "request"
-CMDS = {
-    b"1": ("register", ("user", "pw")),   # "1\n" then two lines
-    b"2": ("login",    ("user", "pw")),
-}
-
-def match(flow):
-    for cmd in flow.commands(CMDS):
-        if cmd.name == "register":
-            flow.conn.setdefault("regs", set()).add(cmd.pw)
-        elif cmd.name == "login" and cmd.flagid and cmd.pw in flow.conn.get("regs", set()):
-            return {"drop": True, "reason": "login as flag-ID reusing a registered password"}
-    return False
-```
-
-### 17. Block "get vip" on a flag-ID flight
-
-The menu item that leaks the flag is `6` (`Get vip of private flight`). Drop the
-request that asks for a vip whose flight number is one of our flag-IDs.
-
-```python
-DIRECTION = "request"
-CMDS = {b"6": ("getvip", ("flight",))}    # "6\n" then the flight number
-
-def match(flow):
-    for cmd in flow.commands(CMDS):
-        if cmd.name == "getvip" and cmd.flagid:
-            return {"drop": True, "reason": "get-vip on a flag-ID flight (flag theft)"}
-    return False
-```
-
-### 18. Only the owner may read the vip (auth tracking)
-
-Blocking example 17 outright can hit the checker, which legitimately reads its own
-flag-ID vip. Distinguish attacker from checker: the attacker uses a *throwaway*
-(non-flag-ID) account, the checker authenticates as the flag-ID owner. Track it on
-`flow.conn`.
-
-```python
-DIRECTION = "request"
-CMDS = {
-    b"1": ("register", ("user", "pw")),
-    b"2": ("login",    ("user", "pw")),
-    b"6": ("getvip",   ("flight",)),
-}
-
-def match(flow):
-    for cmd in flow.commands(CMDS):
-        if cmd.name in ("register", "login") and not cmd.flagid:
-            flow.conn["own_account"] = True        # used a throwaway identity
-        elif cmd.name == "getvip" and cmd.flagid and flow.conn.get("own_account"):
-            return {"drop": True, "reason": "get-vip on a flag-ID from a throwaway session"}
-    return False
-```
-
-### 19. Second flag-ID login on a connection
-
-Another attacker tell: they log into their own account first, then try to log in
-*as the victim* (a flag-ID username). The checker logs in once, as the owner. So
-"the 2nd+ login on this connection uses a flag-ID" is attacker-shaped.
-
-```python
-DIRECTION = "request"
-CMDS = {b"2": ("login", ("user", "pw"))}
-
-def match(flow):
-    for cmd in flow.commands(CMDS):
-        n = flow.conn.get("logins", 0) + 1
-        flow.conn["logins"] = n
-        if n >= 2 and cmd.flagid:
-            return {"drop": True, "reason": "2nd login on this connection targets a flag-ID"}
-    return False
-```
-
-### 20. Redact a flag from a TCP response
-
-Instead of dropping the connection, rewrite the response so the client gets a
-plausible-looking blank instead of the flag. Response rewriting is inline for TCP
-and needs **Blocking**.
+### 4. Strict date format (buffer overflow)
+*CCalendar — `date` is copied into a 16-byte buffer; a valid date **followed by
+extra bytes** overflows it.* Enforce the exact `YYYY-MM-DD` shape — but only the
+*format*, so the checker's semantically-invalid dates still reach the app's own
+error path.
 
 ```python
 import re
-DIRECTION = "response"
-FLAG = re.compile(rb"[A-Z0-9]{31}=")     # match your flag format
-
-def match(flow):
-    if FLAG.search(flow.content):
-        flow.content = FLAG.sub(b"X" * 31 + b"=", flow.content)
-        return "redacted a flag from the response"
-    return False
-```
-
-### 21. Password reuse across connections
-
-`flow.conn` is per-connection; for state that spans connections use a module-level
-container. Here: notice the same password registered from many separate sessions.
-
-```python
 DIRECTION = "request"
-CMDS = {b"1": ("register", ("user", "pw"))}
-seen = {}
+DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 def match(flow):
-    for cmd in flow.commands(CMDS):
-        seen[cmd.pw] = seen.get(cmd.pw, 0) + 1
-        if seen[cmd.pw] == 5:
-            return "password %r registered from many sessions" % cmd.pw
+    if flow.path.rstrip("/").endswith("/events"):
+        d = str(flow.query["date"] or (flow.json() or {}).get("date", ""))
+        if d and not DATE.fullmatch(d):
+            return {"drop": True, "reason": "malformed date %r" % d[:32]}
     return False
 ```
+*Checker sends `2026-07-04`; its SLA "bad date" tests (`2026-13-40`) still match
+the `\d{4}-\d{2}-\d{2}` shape, so they pass through and get the app's 4xx.*
 
-### 22. Length-prefixed binary framing
-
-For binary protocols, buffer raw bytes on `flow.conn` yourself and parse frames.
-Here: a 4-byte big-endian length, then that many bytes; alert if a frame body
-holds a flag-ID.
+### 5. Bounded numeric timestamp
+*ExCCel — a length-prefixed timestamp overruns a 32-byte buffer and rewrites the
+target worksheet id.* A Unix timestamp is short and numeric.
 
 ```python
 DIRECTION = "request"
 
 def match(flow):
-    buf = flow.conn.get("buf", b"") + flow.content
-    hits = []
-    while len(buf) >= 4:
-        n = int.from_bytes(buf[:4], "big")
-        if len(buf) < 4 + n:
-            break                                    # frame not complete yet
-        frame, buf = buf[4:4 + n], buf[4 + n:]
-        if flow.contains_flagid and frame:
-            hits.append(len(frame))
-    flow.conn["buf"] = buf[-65536:]                  # keep the remainder, capped
-    if hits:
-        return "flag-ID inside framed payload(s): %r" % hits
+    if flow.path.endswith("/worksheet"):
+        ts = str((flow.json() or {}).get("timestamp", ""))
+        if ts and (not ts.isdigit() or len(ts) > 15):
+            return {"drop": True, "reason": "oversized/non-numeric timestamp"}
     return False
 ```
+*Checker sends a ~10-digit epoch near now; well under the 15-char cap.*
 
 ---
 
-## Testing your filter
+## Level 2 — body / file parsing
 
-Use the **Test** panel on the Python Filters page before enabling anything: build
-a Request/Response sample, or load a real captured packet (or a whole
-request+response **flow**) from traffic. Whole-flow tests replay `match()` over
-the packets in order, so stateful and `flow.commands`-based scripts see the real
-sequence, and each step shows an **Alert** / **Alert + Block** verdict. The
-`Repeat` control re-runs the sample so counting logic (e.g. "2nd login") fires.
+### 6. Reject malformed JSON (error-leak)
+*CCForms — a truncated JSON body triggers a stack trace that leaks `JWT_SECRET`.*
+Parse before forwarding; drop bodies that aren't well-formed JSON.
+
+```python
+DIRECTION = "request"
+
+def match(flow):
+    if flow.method == "POST" and "json" in flow.header("content-type").lower():
+        if not util.valid_json(flow.body):
+            return {"drop": True, "reason": "malformed JSON body"}
+    return False
+```
+*Checker always sends well-formed JSON, so `valid_json` is True and nothing drops.*
+
+### 7. A file field must be canonical base64
+*CCForms — an uploaded file's `content` is concatenated into SQL; only true
+base64 is safe, an SQLi rides in a non-base64 tail.* Don't hunt for `SELECT` —
+require the field to *be* canonical base64.
+
+```python
+DIRECTION = "request"
+
+def match(flow):
+    if flow.method == "POST" and flow.path.endswith("/upload"):
+        content = (flow.json() or {}).get("content")
+        if content is not None and not util.is_base64(content):
+            return {"drop": True, "reason": "file content is not canonical base64"}
+    return False
+```
+*Checker base64-encodes the whole file, so `is_base64` is True. The exploit's
+`QQ==' || (SELECT …)` has non-alphabet bytes and fails canonicity.*
+
+### 8. Content-Type must match the bytes
+*Generic upload hardening — a file claimed as an image that is really a script or
+archive.* Sniff the magic and compare to the declared type.
+
+```python
+DIRECTION = "request"
+
+def match(flow):
+    if flow.method in ("POST", "PUT") and flow.path.endswith("/avatar"):
+        if not util.content_type_ok(flow.header("content-type"), flow.content):
+            return {"drop": True, "reason": "body does not match its Content-Type"}
+    return False
+```
+*Checker uploads a real PNG with `image/png`; the sniff matches. Unknown/
+unenforced types return True, so non-image endpoints are never touched.*
+
+### 9. Polyglot: data appended after an image
+*A file that is a valid image plus a smuggled payload after the image's end
+(curl-config / archive / script).* `util.trailing_data` bounds PNG/JPEG precisely.
+
+```python
+DIRECTION = "request"
+
+def match(flow):
+    if flow.method == "POST" and flow.path.endswith("/images"):
+        data = flow.content
+        if util.magic(data) in ("png", "jpg") and util.trailing_data(data):
+            return {"drop": True, "reason": "%d bytes appended after the image" % len(util.trailing_data(data))}
+    return False
+```
+*A checker's clean image ends exactly at `IEND`/EOI, so `trailing_data` is empty.*
+
+### 10. Static path traversal / SSRF
+*CCalendar — `/static//etc/passwd` and `/static/http://api/...` escape the
+resource dir.* Normalize the tail and reject anything that leaves the folder.
+
+```python
+DIRECTION = "request"
+PREFIX = "/static/"
+
+def match(flow):
+    p = flow.path
+    if p.startswith(PREFIX) and util.path_escapes(p[len(PREFIX):]):
+        return {"drop": True, "reason": "static path escapes the resource directory"}
+    return False
+```
+*Checker fetches `/static/app.js` → tail `app.js` is a plain relative file, so
+`path_escapes` is False.*
+
+### 11. Algorithm allowlist
+*ENOWARS SCEAM — the export "algorithm" is eval-like; a crafted HMAC config
+exports someone else's image.* It must be a name from a fixed set, not an
+expression.
+
+```python
+DIRECTION = "request"
+ALGOS = {"AES256", "AES128", "NONE"}
+
+def match(flow):
+    if flow.path.endswith("/export"):
+        alg = str((flow.json() or {}).get("algorithm", ""))
+        if alg and alg not in ALGOS:
+            return {"drop": True, "reason": "algorithm not in allowlist: %r" % alg[:40]}
+    return False
+```
+*Checker picks one of the enumerated names; `.hmac_hash(hashes.SHA1())` isn't in
+the set.*
+
+---
+
+## Level 3 — semantic payload
+
+### 12. JOIN result-length overflow
+*ExCCel — the size check forgets the `,` separators a `JOIN` inserts, so a JOIN
+over many (even empty) cells overflows.* Bound the range span, since each element
+adds a separator regardless of content.
+
+```python
+import re
+DIRECTION = "request"
+JOIN = re.compile(r"JOIN\(\s*[A-Z]+(\d+)\s*:\s*[A-Z]+(\d+)", re.I)
+
+def match(flow):
+    formula = str((flow.json() or {}).get("formula", ""))
+    m = JOIN.search(formula)
+    if m:
+        span = abs(int(m.group(2)) - int(m.group(1))) + 1
+        if span > 32:
+            return {"drop": True, "reason": "JOIN over %d cells overflows via separators" % span}
+    return False
+```
+*Checker uses small ranges; `=JOIN(C1:C64, A1)` spans 64 cells. (Heuristic on the
+range span — tune `32` to the real buffer.)*
+
+### 13. Marker that appears only after sanitization
+*Inlook — a message is classified as an invite **before** sanitization; a leading
+backtick is stripped afterwards and the invite marker becomes valid.* Classify
+the *normalized* text too, and drop when normalization *creates* the marker.
+
+```python
+DIRECTION = "request"
+MARKER = "=====MAILING LIST INVITE====="
+STRIP = str.maketrans("", "", "`'{}\\")
+
+def is_invite(s):
+    return any(line.startswith(MARKER) for line in s.split("\n"))
+
+def match(flow):
+    if flow.method == "POST" and flow.path.endswith("/message"):
+        body = str((flow.json() or {}).get("content", ""))
+        if is_invite(body.translate(STRIP)) and not is_invite(body):
+            return {"drop": True, "reason": "invite marker appears only after sanitization"}
+    return False
+```
+*The service classifies a message as an invite when a line **starts** with the
+marker. A leading backtick moves the marker off the line start (so `is_invite` is
+False), but sanitizing strips it and the line then starts with the marker. The
+checker's unsafe-char probes don't become invites once stripped; a genuine invite
+starts with the marker before and after, so `not is_invite(body)` is False.*
+
+### 14. Crypto-oracle input (uniform blocks)
+*Inlook / ArcaneLink — a structured plaintext (`0xff`×32 then repeated blocks)
+turns encrypt-then-reflect into an oracle.* Real mail is high-entropy; flag long
+uniform runs, repeated blocks, or very low entropy.
+
+```python
+DIRECTION = "request"
+
+def match(flow):
+    if flow.method == "POST" and flow.path.endswith("/mail"):
+        data = flow.content
+        if util.longest_run(data) >= 32 or util.repeated_block(data, 16) or \
+                (len(data) >= 64 and util.entropy(data) < 2.0):
+            return {"drop": True, "reason": "structured low-entropy payload (crypto oracle)"}
+    return False
+```
+*Checker mail is 100–200 random-ish chars: entropy well above 2, no 32-byte run,
+no repeated 16-byte block.*
+
+### 15. Parameter pollution + shell metacharacters
+*SaarCTF Pasteable — `nonce[]` collapses the HMAC key and `modifiers` reaches a
+shell.* The checker never touches this endpoint, so it can be strict.
+
+```python
+import re
+DIRECTION = "request"
+SHELL = re.compile(r"[;|&`$><\n]|\$\(")
+
+def match(flow):
+    if flow.path.endswith("/ntp"):
+        q = flow.query
+        if "nonce[]" in q or len(q.all("nonce")) > 1:
+            return {"drop": True, "reason": "nonce parameter pollution"}
+        if SHELL.search(str(q["modifiers"])):
+            return {"drop": True, "reason": "shell metacharacters in modifiers"}
+    return False
+```
+*The checker's flag flow (register → challenge → login → paste) never calls
+`/ntp`, so this filter can't affect it at all.*
+
+---
+
+## Level 4 — stateful flow
+
+These key on `flow.conn` (per TCP connection). For HTTP, prefer a module-level
+dict keyed by a **session cookie** (SNAT-safe — never by IP).
+
+### 16. Login flood against one victim
+*CookingNonna — the exploit opens ~253 failed logins against the victim's
+username to groom file descriptors before a null-byte overflow.* Count login
+attempts **per username** on the connection.
+
+```python
+DIRECTION = "request"
+CMDS = {b"1": ("login", ("user", "pw"))}
+
+def match(flow):
+    for cmd in flow.commands(CMDS):
+        if cmd.name == "login":
+            k = "u:" + cmd.user.decode("latin1", "ignore")
+            n = flow.conn.get(k, 0) + 1
+            flow.conn[k] = n
+            if n >= 30:
+                return {"drop": True, "reason": "login flood: %d attempts on one user" % n}
+    return False
+```
+*The checker does a single correct login, so the per-user counter never
+approaches 30. (Note: an empty password sent as a blank line isn't visible here —
+`flow.commands` skips blank lines — so key on the attempt count, not the password.
+The long vault names the checker uses are deliberately not what we match.)*
+
+### 17. Repeated protocol INIT (challenge reuse)
+*Fonograph — the Schnorr challenge isn't regenerated; two `INIT`s before `FINISH`
+break it.* Track the protocol state per connection.
+
+```python
+DIRECTION = "request"
+CMDS = {b"INIT": ("init", 0), b"FINISH": ("finish", 0)}
+
+def match(flow):
+    for cmd in flow.commands(CMDS):
+        if cmd.name == "init":
+            if flow.conn.get("state") == "challenged":
+                return {"drop": True, "reason": "second INIT without FINISH (challenge reuse)"}
+            flow.conn["state"] = "challenged"
+        elif cmd.name == "finish":
+            flow.conn["state"] = "idle"
+    return False
+```
+*The checker runs `INIT` → `FINISH`, so a second `INIT` never arrives while a
+challenge is outstanding.*
+
+### 18. Byte-at-a-time compare oracle
+*ArcaneLink — `CHK_KEY` leaks the `memcmp` result, so the key is recovered a byte
+at a time.* The checker verifies once with the right key; the attacker hammers the
+same UID.
+
+```python
+DIRECTION = "request"
+CMDS = {b"CHK_KEY": ("chk", ("uid", "key"))}
+
+def match(flow):
+    for cmd in flow.commands(CMDS):
+        if cmd.name == "chk":
+            k = "n:" + cmd.uid.decode("latin1", "ignore")
+            n = flow.conn.get(k, 0) + 1
+            flow.conn[k] = n
+            if n >= 16:
+                return {"drop": True, "reason": "%d CHK_KEY on the same UID (compare oracle)" % n}
+    return False
+```
+*One legitimate `CHK_KEY` per UID never reaches 16. (Refinement: also require the
+successive keys to share a growing common prefix.)*
+
+### 19. Author overwrite between open and answer
+*Duogesto — listing another user's challenges overwrites the session's "author",
+so answering your own question pays out the victim's reward.* A listing between
+opening a question and answering it is the tell.
+
+```python
+DIRECTION = "request"
+
+def match(flow):
+    c = flow.conn
+    p = flow.path
+    if p.endswith("/challenge/open"):
+        c["open"], c["listed"] = True, False
+    elif p.endswith("/challenges"):
+        if c.get("open"):
+            c["listed"] = True
+    elif p.endswith("/challenge/answer"):
+        if c.get("open") and c.get("listed"):
+            return {"drop": True, "reason": "author overwritten by a listing before answering"}
+    return False
+```
+*The checker's order is list → open → answer: the listing happens **before** the
+open, so `listed` is reset to False by the open and the answer is clean.*
+
+### 20. IDOR: object never created in this session
+*CCForms — `/form/:id/answers` (and embedded forms) don't check ownership.* Learn
+the ids this session created from the **responses**, then flag reads of an id it
+never made. This needs response visibility, so it **alerts** (run it non-Blocking).
+
+```python
+import re
+ANSWERS = re.compile(r"/form/([^/]+)/answers")
+
+def match(flow):
+    c = flow.conn
+    if flow.is_response:
+        data = flow.json() or {}
+        fid = data.get("id") or data.get("form_id")
+        if fid and "/form" in flow.request.path:
+            c.setdefault("owned", set()).add(str(fid))
+        return False
+    m = ANSWERS.search(flow.path)
+    if m and m.group(1) not in c.get("owned", set()):
+        return "reading answers of form %s never created in this session" % m.group(1)
+    return False
+```
+*The checker creates a form (its response teaches us the id), then reads that same
+id — which is in `owned`. The exploit reads the victim's id without ever creating
+it. Because it correlates a request with an earlier response, keep it **async**
+(alert): inline blocking on HTTP doesn't see responses.*
+
+---
+
+## Level 5 — when a traffic filter can't be trusted
+
+Some bugs can't be told apart from legitimate traffic by looking at bytes,
+because the attacker's decisive step happens **offline**:
+
+- **CCForms weak JWT secret** — `$RANDOM` has 32768 values; the attacker brute
+  forces the key offline and then presents a *cryptographically valid* JWT,
+  byte-identical to a real one.
+- **ExCCel share-token forging** / **Inlook factor-from-signature** — the forged
+  token or the factoring is computed off-box; the request that uses the result
+  looks exactly like the checker's.
+- **ENOWARS SCEAM reversible blur** — the attacker just downloads the public
+  blurred image (a normal request) and de-blurs it locally.
+
+For these the only real defense is **fixing the service**. A filter can at best
+add **token binding** — remember what the server actually issued and reject tokens
+it never handed out:
+
+```python
+issued = set()   # tokens the server has really minted
+
+def match(flow):
+    if flow.is_response:
+        tok = (flow.json() or {}).get("token")
+        if tok:
+            issued.add(str(tok))
+        return False
+    auth = flow.header("authorization")
+    if auth.startswith("Bearer "):
+        tok = auth[7:]
+        if tok and tok not in issued:
+            return "bearer token that was never issued by the server (possible forgery)"
+    return False
+```
+*Alert-only, and it needs to see the issuing responses — so run it async and be
+aware it will false-positive on tokens minted before the filter started.*
+
+---
+
+## Testing your filters
+
+Use the **Test** panel on the Python Filters page: build a Request/Response
+sample, or load a real captured packet (or a whole request+response **flow**) from
+traffic. Whole-flow tests replay `match()` over the packets in order, so stateful
+and `flow.commands` filters see the real sequence. Always test the **checker's**
+happy path too and confirm it shows *no match* — that's what keeps a filter from
+costing you SLA.

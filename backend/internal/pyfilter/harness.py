@@ -17,6 +17,12 @@ User scripts each define:
         #   flow.messages[-1]               # most recent message (this service)
         #   flow.recent(3)  flow.last_request  flow.requests  flow.responses
         #
+        # Payload analysis — `util` (injected into every filter), stdlib-only:
+        #   util.is_base64(s)  util.valid_json(s)  util.extra_keys(obj, allowed)
+        #   util.entropy(b)  util.longest_run(b)  util.repeated_block(b)
+        #   util.magic(b)  util.content_type_ok(ct, b)  util.trailing_data(b)
+        #   util.normpath(p)  util.uri_scheme(s)  util.path_escapes(p)
+        #
         # TCP streams (a continuous byte flow, not one-message-per-chunk):
         #   flow.conn                       # dict persisting for the whole TCP
         #                                   #   connection — your per-conn state,
@@ -69,9 +75,12 @@ Protocol (one JSON object per line):
 import sys
 import json
 import base64
+import math
+import posixpath
+import re
 import traceback
-from collections import deque, OrderedDict
-from urllib.parse import urlsplit, parse_qs
+from collections import deque, OrderedDict, Counter
+from urllib.parse import urlsplit, parse_qs, unquote
 
 # A parsed CLI command yielded by flow.commands(spec): its name, its argument
 # lines (bytes), and whether a flag ID appeared anywhere within it.
@@ -562,6 +571,252 @@ def _norm_direction(v):
     return None
 
 
+# --- util: analysis helpers injected into every script namespace as `util` ----
+# Stdlib-only, side-effect-free. Meant for validating/inspecting a payload right
+# in a filter so it can drop immediately: base64 canonicity, entropy & repeated
+# blocks (crypto oracles), file magic vs Content-Type, trailing/polyglot data,
+# path normalization & traversal, URI schemes, JSON well-formedness.
+
+_MAGIC = [
+    (b"\x89PNG\r\n\x1a\n", "png"), (b"\xff\xd8\xff", "jpg"),
+    (b"GIF87a", "gif"), (b"GIF89a", "gif"), (b"%PDF", "pdf"),
+    (b"PK\x03\x04", "zip"), (b"PK\x05\x06", "zip"), (b"\x1f\x8b", "gzip"),
+    (b"\x7fELF", "elf"), (b"BM", "bmp"), (b"\x00\x00\x01\x00", "ico"),
+    (b"II*\x00", "tiff"), (b"MM\x00*", "tiff"),
+]
+_CT_MAGIC = {
+    "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
+    "image/webp": "webp", "image/bmp": "bmp", "image/svg+xml": "svg",
+    "image/x-icon": "ico", "image/vnd.microsoft.icon": "ico",
+    "image/tiff": "tiff", "application/pdf": "pdf",
+    "application/zip": "zip", "application/gzip": "gzip",
+}
+_DANGEROUS_SCHEMES = ("file", "gopher", "dict", "telnet", "ldap", "jar",
+                      "mailto", "data", "javascript", "php", "expect", "netdoc")
+_SCHEME_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.\-]*):(//)?")
+_B64_RE = re.compile(r"^[A-Za-z0-9+/]*={0,2}$")
+
+
+def _as_bytes(x):
+    if isinstance(x, (bytes, bytearray)):
+        return bytes(x)
+    return str(x).encode("utf-8", "replace")
+
+
+def _as_text(x):
+    if isinstance(x, (bytes, bytearray)):
+        return bytes(x).decode("utf-8", "replace")
+    return str(x)
+
+
+class _Util:
+    """Analysis helpers. Available in every filter as `util`."""
+
+    # -- base64 --
+    @staticmethod
+    def b64(s):
+        """Decode base64 → bytes, or None if it isn't valid base64."""
+        try:
+            return base64.b64decode(_as_text(s).strip(), validate=True)
+        except Exception:
+            return None
+
+    @staticmethod
+    def is_base64(s, canonical=True):
+        """True if s is base64. canonical=True also rejects non-minimal padding
+        or trailing junk (i.e. re-encoding must reproduce the input exactly)."""
+        t = _as_text(s).strip()
+        if not t or len(t) % 4 != 0 or not _B64_RE.match(t):
+            return False
+        try:
+            raw = base64.b64decode(t, validate=True)
+        except Exception:
+            return False
+        if canonical:
+            return base64.b64encode(raw).decode("ascii") == t
+        return True
+
+    # -- entropy / block structure (crypto-oracle payloads) --
+    @staticmethod
+    def entropy(data):
+        """Shannon entropy in bits/byte (0..8). Low = uniform/repetitive."""
+        d = _as_bytes(data)
+        if not d:
+            return 0.0
+        n = len(d)
+        return -sum((c / n) * math.log2(c / n) for c in Counter(d).values())
+
+    @staticmethod
+    def longest_run(data):
+        """Length of the longest run of one repeated byte (e.g. 32×0xff)."""
+        d = _as_bytes(data)
+        best = cur = 0
+        prev = None
+        for b in d:
+            cur = cur + 1 if b == prev else 1
+            prev = b
+            if cur > best:
+                best = cur
+        return best
+
+    @staticmethod
+    def repeated_block(data, size=16):
+        """True if any aligned block of `size` bytes repeats (ECB-like / a
+        crafted crypto-oracle input)."""
+        d = _as_bytes(data)
+        if size <= 0 or len(d) < size * 2:
+            return False
+        seen = set()
+        for i in range(0, len(d) - size + 1, size):
+            blk = d[i:i + size]
+            if blk in seen:
+                return True
+            seen.add(blk)
+        return False
+
+    @staticmethod
+    def printable_ratio(data):
+        """Fraction of bytes that are printable ASCII (incl. \\t\\n\\r)."""
+        d = _as_bytes(data)
+        if not d:
+            return 1.0
+        p = sum(1 for b in d if 0x20 <= b < 0x7f or b in (9, 10, 13))
+        return p / len(d)
+
+    @staticmethod
+    def has_control_chars(s):
+        """True if the text holds any C0 control byte (incl. \\r \\n \\t) or DEL."""
+        return any(ord(c) < 0x20 or ord(c) == 0x7f for c in _as_text(s))
+
+    # -- files: magic / content-type / polyglot trailing data --
+    @staticmethod
+    def magic(data):
+        """Sniff a file type from its leading bytes: 'png','jpg','gif','pdf',
+        'zip','gzip','elf','bmp','webp','tiff','ico','svg', or '' if unknown."""
+        d = _as_bytes(data)
+        for sig, name in _MAGIC:
+            if d.startswith(sig):
+                if name == "riff":
+                    return "webp" if d[8:12] == b"WEBP" else "riff"
+                return name
+        if d[:4] == b"RIFF" and d[8:12] == b"WEBP":
+            return "webp"
+        head = d[:512].lstrip().lower()
+        if head[:5] == b"<?xml" or head[:4] == b"<svg" or b"<svg" in head:
+            return "svg"
+        return ""
+
+    @staticmethod
+    def content_type_ok(declared, data):
+        """False when the declared Content-Type contradicts the sniffed magic
+        (e.g. Content-Type image/png but the bytes are a ZIP). Unknown/unenforced
+        types return True so you never false-positive on them."""
+        ct = _as_text(declared).split(";")[0].strip().lower()
+        expected = _CT_MAGIC.get(ct)
+        if expected is None:
+            return True
+        got = _Util.magic(data)
+        return got == "" or got == expected
+
+    @staticmethod
+    def trailing_data(data):
+        """Bytes appended after the logical end of a recognized image container
+        (polyglot / smuggled payload). b'' when there is none, or the format is
+        not one we can bound precisely (PNG and JPEG only)."""
+        d = _as_bytes(data)
+        if d.startswith(b"\x89PNG\r\n\x1a\n"):
+            end = d.find(b"IEND")
+            if end != -1:
+                return d[end + 8:]  # IEND + 4-byte CRC
+            return b""
+        if d[:3] == b"\xff\xd8\xff":
+            i, n = 2, len(d)
+            while i + 1 < n:
+                if d[i] != 0xff:
+                    return b""
+                m = d[i + 1]
+                if m == 0xd9:                       # EOI
+                    return d[i + 2:]
+                if m == 0x01 or 0xd0 <= m <= 0xd7:  # standalone markers
+                    i += 2
+                    continue
+                if m == 0xda:                       # SOS: scan entropy-coded data
+                    i += 2
+                    while i + 1 < n:
+                        if d[i] == 0xff and d[i + 1] == 0xd9:
+                            return d[i + 2:]
+                        if d[i] == 0xff and d[i + 1] != 0x00 and not (0xd0 <= d[i + 1] <= 0xd7):
+                            break
+                        i += 1
+                    return b""
+                if i + 3 >= n:
+                    return b""
+                i += 2 + ((d[i + 2] << 8) | d[i + 3])
+            return b""
+        return b""
+
+    # -- paths / URIs --
+    @staticmethod
+    def normpath(p, decode=2):
+        """URL-decode (up to `decode` passes), fold backslashes and duplicate
+        slashes, and resolve . / .. — so you can inspect the real target path."""
+        s = _as_text(p)
+        for _ in range(max(1, decode)):
+            nxt = unquote(s)
+            if nxt == s:
+                break
+            s = nxt
+        s = re.sub(r"[\\/]+", "/", s)
+        return posixpath.normpath(s)
+
+    @staticmethod
+    def uri_scheme(s):
+        """The URI scheme (lowercased) if s carries one — "http", "file",
+        "telnet://" → "telnet", bare "file:" → "file" — else ""."""
+        m = _SCHEME_RE.match(_as_text(s).strip())
+        if not m:
+            return ""
+        scheme = m.group(1).lower()
+        if m.group(2) or scheme in _DANGEROUS_SCHEMES:
+            return scheme
+        return ""
+
+    @staticmethod
+    def path_escapes(p):
+        """True if a (supposedly relative) path is unsafe: a NUL byte, a URI
+        scheme, an absolute path, or traversal that climbs out of the root."""
+        raw = _as_text(p)
+        if "\x00" in raw or _Util.uri_scheme(raw):
+            return True
+        n = _Util.normpath(raw)
+        return n.startswith("/") or n == ".." or n.startswith("../")
+
+    # -- json / objects --
+    @staticmethod
+    def valid_json(s):
+        """True only if s is one complete, well-formed JSON document (no
+        truncation, no trailing bytes)."""
+        t = _as_text(s)
+        if not t.strip():
+            return False
+        try:
+            json.loads(t)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def extra_keys(obj, allowed):
+        """The set of keys in dict `obj` that aren't in `allowed` — for spotting
+        mass-assignment (unexpected fields the checker never sends)."""
+        if not isinstance(obj, dict):
+            return set()
+        return set(obj) - set(allowed)
+
+
+util = _Util()
+
+
 def _compile_scripts(scripts):
     """Compile+exec each script into its own namespace. Returns (loaded, errors)."""
     loaded = {}
@@ -569,7 +824,7 @@ def _compile_scripts(scripts):
     for spec in scripts:
         sid = spec.get("id") or spec.get("name") or "script"
         name = spec.get("name", sid)
-        ns = {}
+        ns = {"util": util}
         try:
             code = compile(spec.get("code", ""), "<pyfilter:%s>" % name, "exec")
             exec(code, ns)  # noqa: S102 - intentional user code execution

@@ -99,6 +99,25 @@ flow.body = flow.body.replace("foo", "bar")            # HTTP request body (str)
 flow.content = flow.content.replace(b"\x00", b"\xff")  # exact bytes (TCP, binary-safe)
 ```
 
+## Analysis helpers (`util`)
+
+`util` is injected into every filter — stdlib-only helpers to validate/inspect a
+payload and drop immediately. Pass `flow.content` (exact bytes) for binary.
+
+| helper | meaning |
+|---|---|
+| `util.is_base64(s, canonical=True)` | valid (and by default canonical) base64 |
+| `util.b64(s)` | decoded bytes, or `None` |
+| `util.valid_json(s)` | one complete, well-formed JSON document |
+| `util.extra_keys(obj, allowed)` | dict keys not in `allowed` (mass assignment) |
+| `util.entropy(data)` | Shannon entropy (bits/byte) |
+| `util.longest_run(data)` / `util.repeated_block(data, size=16)` | uniform run / repeated block (crypto oracles) |
+| `util.printable_ratio(data)` / `util.has_control_chars(s)` | printable fraction / any `\r \n \t`/control/DEL |
+| `util.magic(data)` | sniffed file type (`png`,`jpg`,`pdf`,`zip`,`svg`,…) or `""` |
+| `util.content_type_ok(ct, data)` | declared Content-Type matches the bytes |
+| `util.trailing_data(data)` | bytes appended after an image's end (polyglot) |
+| `util.normpath(p)` / `util.uri_scheme(s)` / `util.path_escapes(p)` | path folding / scheme / traversal-or-absolute-or-scheme |
+
 ## Examples
 
 **HTTP** — block a login that reuses a registered password with a flag-ID. Correlate by the
