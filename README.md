@@ -355,8 +355,8 @@ The response includes `stats_a`, `stats_b`, `new_routes`, `gone_routes`, `change
 | -------------- | ------------------------- | ------------------------------------------------- |
 | GET / POST     | `/api/pyfilters`          | List (with engine status) / create a filter script |
 | GET/PUT/DELETE | `/api/pyfilters/{id}`     | Get / update / delete a script                    |
-| GET            | `/api/pyfilters/status`   | Engine health (python availability, worker, counts) |
-| POST           | `/api/pyfilters/test`     | Evaluate a script against a sample flow or packet |
+| GET            | `/api/pyfilter-engine/status` | Engine health (python availability, worker, counts) |
+| POST           | `/api/pyfilter-engine/test`   | Evaluate a script against a sample flow or packet |
 
 ### Custom protocols
 

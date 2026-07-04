@@ -197,7 +197,7 @@ func (s *Server) writePyFilterErr(w http.ResponseWriter, err error) {
 	http.Error(w, err.Error(), http.StatusBadRequest)
 }
 
-// GET /api/pyfilters/status
+// GET /api/pyfilter-engine/status
 func (s *Server) handlePyFilterStatus(w http.ResponseWriter, r *http.Request) {
 	if s.pyfilter == nil {
 		writeJSON(w, http.StatusOK, pyfilter.Status{Available: false})
@@ -231,7 +231,7 @@ type pyFilterTestStep struct {
 	Rewrite string `json:"rewrite,omitempty"`
 }
 
-// POST /api/pyfilters/test — evaluate a (possibly unsaved) script against a
+// POST /api/pyfilter-engine/test — evaluate a (possibly unsaved) script against a
 // single flow, a stored packet, or a whole reconstructed flow (an ordered
 // sequence of packets), in isolation, and report a per-step verdict.
 func (s *Server) handlePyFilterTest(w http.ResponseWriter, r *http.Request) {

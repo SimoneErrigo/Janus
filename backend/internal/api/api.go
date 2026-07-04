@@ -152,9 +152,12 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/pcap/import", s.handlePcapImport)
 	protected.HandleFunc("/api/pcap/import/", s.handlePcapImportStatus)
 	protected.HandleFunc("/api/round-diff", s.handleRoundDiff)
-	// Python filters (mitmproxy-style scriptable filtering)
-	protected.HandleFunc("/api/pyfilters/status", s.handlePyFilterStatus)
-	protected.HandleFunc("/api/pyfilters/test", s.handlePyFilterTest)
+	// Python filters (mitmproxy-style scriptable filtering). Engine endpoints
+	// live under /api/pyfilter-engine/ rather than /api/pyfilters/ so they
+	// can't ever be shadowed by a script whose slug is "status" or "test"
+	// (slugID allows both).
+	protected.HandleFunc("/api/pyfilter-engine/status", s.handlePyFilterStatus)
+	protected.HandleFunc("/api/pyfilter-engine/test", s.handlePyFilterTest)
 	protected.HandleFunc("/api/pyfilters", s.handlePyFilters)
 	protected.HandleFunc("/api/pyfilters/", s.handlePyFilterByID)
 
