@@ -4,7 +4,7 @@ import { api } from '../api'
 import { getTrafficNavKeys } from '../trafficNavKeys'
 import QuickRulePanel from '../components/QuickRulePanel'
 import ExploitButton from '../components/ExploitButton'
-import { copyText } from '../utils/clipboard'
+import { copyText, copyRawBytesFromBase64 } from '../utils/clipboard'
 import { tryFormatJSON } from '../utils/formatting'
 import {
   ProtobufFields,
@@ -193,7 +193,15 @@ const PacketDetail = memo(function PacketDetail({ packet, services, customProtoc
                 onClick={() => copyText(packet.body_string || '')}
                 disabled={!packet.body_string}
                 className="text-[10px] text-gray-600 hover:text-gray-400 ml-auto cursor-pointer disabled:opacity-50"
+                title="Copy body as text"
               >Copy</button>
+              {packet.body && (
+                <button
+                  onClick={async () => { await copyRawBytesFromBase64(packet.body) }}
+                  className="text-[10px] text-gray-600 hover:text-gray-400 cursor-pointer"
+                  title="Copy body as raw bytes (binary clipboard when supported; otherwise hex)"
+                >Copy bytes</button>
+              )}
             </div>
             <pre className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 overflow-auto whitespace-pre-wrap break-all" style={{ maxHeight: '55vh' }}>
               {packet.body_string || <span className="text-gray-500">(non-UTF8 body)</span>}

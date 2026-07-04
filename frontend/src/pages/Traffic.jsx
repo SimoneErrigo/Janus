@@ -9,7 +9,7 @@ import QuickRulePanel from '../components/QuickRulePanel'
 import FilterExpression from '../components/FilterExpression'
 import ExploitButton from '../components/ExploitButton'
 import { tryFormatJSON } from '../utils/formatting'
-import { copyText } from '../utils/clipboard'
+import { copyText, copyRawBytesFromBase64 } from '../utils/clipboard'
 import { decodeProtobuf, looksLikeProtobuf, hasGRPCFraming } from '../utils/protobufDecode'
 import { useServiceMap } from '../hooks/useServiceMap'
 import { parse as parseFilter, evaluate as evaluateFilter } from '../utils/filterAst'
@@ -35,23 +35,6 @@ function bytesToHex(bytes, maxBytes = 1024 * 64) {
   for (let i = 0; i < n; i++) out += bytes[i].toString(16).padStart(2, '0')
   if (bytes.length > n) out += `...(+${bytes.length - n} bytes)`
   return out
-}
-
-async function copyRawBytesFromBase64(b64) {
-  const bytes = base64ToBytes(b64)
-  if (!bytes || bytes.length === 0) return false
-
-  // Prefer true binary clipboard when supported; fall back to hex text.
-  try {
-    if (navigator.clipboard?.write && typeof ClipboardItem !== 'undefined' && window.isSecureContext) {
-      const blob = new Blob([bytes], { type: 'application/octet-stream' })
-      await navigator.clipboard.write([new ClipboardItem({ 'application/octet-stream': blob })])
-      return true
-    }
-  } catch {
-    // ignore; fallback below
-  }
-  return copyText(bytesToHex(bytes))
 }
 
 // Highlight matching text with support for multiple patterns (flags=yellow, flagIDs=cyan)
