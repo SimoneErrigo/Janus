@@ -169,9 +169,10 @@ func main() {
 		// Inline blocking: filters marked "Blocking" run synchronously on the
 		// request hot path so a match returning {"drop": True} drops the current
 		// request in real time. Bounded + fail-open inside EvaluateBlocking.
-		proxyMgr.SetPyBlockFn(func(flow map[string]any) []sniffer.PyBlockMatch {
-			var out []sniffer.PyBlockMatch
-			for _, mt := range pyMgr.EvaluateBlocking(flow) {
+		proxyMgr.SetPyBlockFn(func(flow map[string]any) sniffer.PyResult {
+			matches, newBody := pyMgr.EvaluateBlocking(flow)
+			var res sniffer.PyResult
+			for _, mt := range matches {
 				if !mt.Block {
 					continue
 				}
@@ -179,9 +180,13 @@ func main() {
 				if mt.Reason != "" {
 					reason = mt.Name + ": " + mt.Reason
 				}
-				out = append(out, sniffer.PyBlockMatch{Script: mt.Script, Reason: reason})
+				res.Blocks = append(res.Blocks, sniffer.PyBlockMatch{Script: mt.Script, Reason: reason})
 			}
-			return out
+			if newBody != nil {
+				res.NewBody = newBody
+				res.Rewritten = true
+			}
+			return res
 		})
 	}
 

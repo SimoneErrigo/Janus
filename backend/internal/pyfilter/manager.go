@@ -12,6 +12,7 @@ package pyfilter
 
 import (
 	_ "embed"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -336,9 +337,29 @@ type evalReq struct {
 }
 
 type evalResp struct {
-	ID      int64   `json:"id"`
-	Matches []Match `json:"matches"`
-	Error   string  `json:"error"`
+	ID      int64        `json:"id"`
+	Matches []Match      `json:"matches"`
+	Rewrite *rewriteWire `json:"rewrite"`
+	Error   string       `json:"error"`
+}
+
+// rewriteWire carries a script's inline content rewrite (base64 of the new
+// exact bytes) so binary/TCP payloads survive JSON transport.
+type rewriteWire struct {
+	ContentB64 string `json:"content_b64"`
+}
+
+// decodeRewrite turns a harness rewrite reply into new content bytes (nil when
+// there was no rewrite or the payload is malformed).
+func decodeRewrite(rw *rewriteWire) []byte {
+	if rw == nil || rw.ContentB64 == "" {
+		return nil
+	}
+	b, err := base64.StdEncoding.DecodeString(rw.ContentB64)
+	if err != nil {
+		return nil
+	}
+	return b
 }
 
 type loadReq struct {
@@ -358,37 +379,40 @@ func (m *Manager) Evaluate(flow Flow) []Match {
 	if !m.available || !m.hasEnabled(false) {
 		return nil
 	}
-	return m.evalLane(&m.async, flow)
+	matches, _ := m.evalLane(&m.async, flow) // async can't mutate — drop any rewrite
+	return matches
 }
 
 // EvaluateBlocking runs the enabled blocking scripts against flow synchronously
-// on the request hot path. It is bounded by a short timeout and fails open (nil,
-// = no block) if the worker stalls or dies, so a bad script never stalls
-// traffic. Returns the matches (each Block flag says whether to drop now).
-func (m *Manager) EvaluateBlocking(flow Flow) []Match {
+// on the request hot path. It is bounded by a short timeout and fails open
+// (nil, nil = no block, no rewrite) if the worker stalls or dies, so a bad
+// script never stalls traffic. Returns the matches (each Block flag says whether
+// to drop now) and, when a script rewrote the content inline, the new bytes to
+// forward.
+func (m *Manager) EvaluateBlocking(flow Flow) ([]Match, []byte) {
 	if !m.available || !m.hasEnabled(true) {
-		return nil
+		return nil, nil
 	}
 	return m.evalLane(&m.block, flow)
 }
 
 // evalLane ensures the lane's worker is up with the right scripts loaded, then
 // runs one evaluation. On any transport error the worker is discarded (respawned
-// next call) and nil is returned.
-func (m *Manager) evalLane(l *lane, flow Flow) []Match {
+// next call) and (nil, nil) is returned.
+func (m *Manager) evalLane(l *lane, flow Flow) ([]Match, []byte) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if err := m.ensureLaneLocked(l); err != nil {
 		m.setLastErr(err.Error())
-		return nil
+		return nil, nil
 	}
 	var resp evalResp
 	if err := l.worker.roundtrip(evalReq{Cmd: "eval", Packet: flow}, l.timeout, &resp); err != nil {
 		m.setLastErr(err.Error())
 		l.worker = nil // force respawn next time
-		return nil
+		return nil, nil
 	}
-	return resp.Matches
+	return resp.Matches, decodeRewrite(resp.Rewrite)
 }
 
 // ensureLaneLocked spawns the lane's worker if needed and (re)loads its script
@@ -465,7 +489,16 @@ type testResp struct {
 }
 
 type stepResult struct {
-	Matches []Match `json:"matches"`
+	Matches []Match      `json:"matches"`
+	Rewrite *rewriteWire `json:"rewrite"`
+}
+
+// TestStep is one packet's result in a sequence test: its matches plus, when a
+// script rewrote the content inline, the new bytes (so the tester can preview
+// the rewrite).
+type TestStep struct {
+	Matches []Match
+	Rewrite []byte
 }
 
 // TestSequence evaluates a (possibly unsaved) script against an ordered sequence
@@ -475,7 +508,7 @@ type stepResult struct {
 // re-runs the whole sequence N times (>=1). Returns one match list per flow (in
 // order, from the last pass), a compile/definition error message, and a
 // transport error.
-func (m *Manager) TestSequence(name, code string, flows []Flow, repeat int) ([][]Match, string, error) {
+func (m *Manager) TestSequence(name, code string, flows []Flow, repeat int) ([]TestStep, string, error) {
 	if !m.available {
 		return nil, "", errors.New("python interpreter not available")
 	}
@@ -505,9 +538,9 @@ func (m *Manager) TestSequence(name, code string, flows []Flow, repeat int) ([][
 	if err := w.roundtrip(req, timeout, &resp); err != nil {
 		return nil, "", err
 	}
-	steps := make([][]Match, len(resp.Steps))
+	steps := make([]TestStep, len(resp.Steps))
 	for i, s := range resp.Steps {
-		steps[i] = s.Matches
+		steps[i] = TestStep{Matches: s.Matches, Rewrite: decodeRewrite(s.Rewrite)}
 	}
 	return steps, resp.Error, nil
 }
@@ -522,7 +555,7 @@ func (m *Manager) Test(name, code string, flow Flow, repeat int) ([]Match, strin
 	if len(steps) == 0 {
 		return nil, "", nil
 	}
-	return steps[len(steps)-1], "", nil
+	return steps[len(steps)-1].Matches, "", nil
 }
 
 // Close stops the pipeline and terminates both lane workers.

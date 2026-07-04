@@ -34,6 +34,11 @@ User scripts each define:
         #       -> match; blocks the CURRENT request in real time (inline). Only
         #          takes effect for scripts marked "Blocking", which run
         #          synchronously on the request hot path.
+        #
+        # Inline REWRITE (Blocking filters only): assign flow.body = "..." (HTTP)
+        # or flow.messages[-1].content = b"..." (TCP) to rewrite the current
+        # message before Janus forwards it. Applies whether or not you also
+        # return a match; ignored for non-Blocking (async) filters.
         return False
 
 Module-level state persists across calls, so a script can count things over
@@ -50,6 +55,7 @@ Protocol (one JSON object per line):
 """
 import sys
 import json
+import base64
 import traceback
 from collections import deque
 from urllib.parse import urlsplit, parse_qs
@@ -212,16 +218,47 @@ class Flow(dict):
     def is_response(self):
         return self.direction == "response"
 
-    # -- body --
+    # -- body (str) / content (bytes) — settable for inline rewriting --
     @property
     def body(self):
         b = self.get("body", "")
         return b if isinstance(b, str) else (b or "")
 
+    @body.setter
+    def body(self, value):
+        # Rewrite the current message's body (inline/Blocking filters only).
+        if isinstance(value, (bytes, bytearray)):
+            self.content = bytes(value)
+        else:
+            text = str(value)
+            self["body"] = text
+            self["__new_bytes"] = text.encode("utf-8")
+
     @property
-    def bytes(self):
-        b = self.body
-        return b.encode("utf-8", "replace") if isinstance(b, str) else b
+    def content(self):
+        # Exact bytes (mutated value if rewritten, else base64 payload for TCP,
+        # else utf-8 of the text body).
+        nb = self.get("__new_bytes")
+        if nb is not None:
+            return nb
+        b64 = self.get("body_b64")
+        if b64:
+            try:
+                return base64.b64decode(b64)
+            except Exception:
+                pass
+        b = self.get("body", "")
+        return b.encode("utf-8", "replace") if isinstance(b, str) else (b or b"")
+
+    @content.setter
+    def content(self, value):
+        if isinstance(value, str):
+            value = value.encode("utf-8")
+        value = bytes(value)
+        self["__new_bytes"] = value
+        self["body"] = value.decode("utf-8", "replace")  # keep .body/.json usable
+
+    bytes = content  # alias: exact bytes (mutated if rewritten)
 
     def json(self, default=None):
         try:
@@ -314,6 +351,15 @@ def _record(flow):
     dq.append(flow)
 
 
+def _rewrite_of(flow):
+    """If a script rewrote the flow's content, return the new bytes (base64) for
+    Janus to forward; else None. Honored only on the inline path."""
+    nb = flow.get("__new_bytes")
+    if nb is None:
+        return None
+    return {"content_b64": base64.b64encode(nb).decode("ascii")}
+
+
 def _compile_scripts(scripts):
     """Compile+exec each script into its own namespace. Returns (loaded, errors)."""
     loaded = {}
@@ -363,6 +409,7 @@ def _normalize(res):
 
 
 def _evaluate(scripts, flow):
+    """Run every script against flow; returns (matches, rewrite-or-None)."""
     if not isinstance(flow, Flow):
         flow = Flow(flow)
     _record(flow)  # record once per message, before any script runs
@@ -383,7 +430,7 @@ def _evaluate(scripts, flow):
                 "reason": norm["reason"], "drop": norm["drop"],
                 "block": norm["block"], "error": False,
             })
-    return matches
+    return matches, _rewrite_of(flow)
 
 
 def _short_traceback():
@@ -415,7 +462,11 @@ def main():
             SCRIPTS, errors = _compile_scripts(msg.get("scripts", []))
             _send({"cmd": "load", "ok": len(errors) == 0, "errors": errors})
         elif cmd == "eval":
-            _send({"id": msg.get("id"), "matches": _evaluate(SCRIPTS, msg.get("packet", {}))})
+            matches, rewrite = _evaluate(SCRIPTS, msg.get("packet", {}))
+            reply = {"id": msg.get("id"), "matches": matches}
+            if rewrite is not None:
+                reply["rewrite"] = rewrite
+            _send(reply)
         elif cmd == "test":
             # Evaluate one script in isolation without disturbing loaded state.
             # `packets` is an ordered sequence (a whole flow, or one packet);
@@ -437,7 +488,13 @@ def main():
                     packets = [msg.get("packet", {})]
                 steps = []
                 for _ in range(repeat):
-                    steps = [{"matches": _evaluate(loaded, f)} for f in packets]
+                    steps = []
+                    for f in packets:
+                        m, rewrite = _evaluate(loaded, f)
+                        step = {"matches": m}
+                        if rewrite is not None:
+                            step["rewrite"] = rewrite
+                        steps.append(step)
                 _send({
                     "id": msg.get("id"),
                     "steps": steps,

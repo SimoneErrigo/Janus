@@ -1,6 +1,8 @@
 package pyfilter
 
 import (
+	"bytes"
+	"encoding/base64"
 	"sync"
 	"testing"
 	"time"
@@ -37,15 +39,15 @@ def match(flow):
 	}
 
 	// The block lane sees only the blocking filter.
-	got := m.EvaluateBlocking(Flow{"body": "some evil payload"})
+	got, _ := m.EvaluateBlocking(Flow{"body": "some evil payload"})
 	if len(got) != 1 {
 		t.Fatalf("block lane should return exactly the blocking filter, got %+v", got)
 	}
 	if got[0].Script != "inline-ban" || !got[0].Block {
 		t.Fatalf("expected inline-ban with Block=true, got %+v", got[0])
 	}
-	if got := m.EvaluateBlocking(Flow{"body": "harmless"}); len(got) != 0 {
-		t.Fatalf("blocking filter must not match harmless body, got %+v", got)
+	if g, _ := m.EvaluateBlocking(Flow{"body": "harmless"}); len(g) != 0 {
+		t.Fatalf("blocking filter must not match harmless body, got %+v", g)
 	}
 
 	// The async lane (Evaluate) sees only the non-blocking filter — the blocking
@@ -125,10 +127,10 @@ def match(flow):
 	if len(steps) != 2 {
 		t.Fatalf("expected 2 steps, got %d", len(steps))
 	}
-	if len(steps[0]) != 0 {
+	if len(steps[0].Matches) != 0 {
 		t.Fatalf("request step should not match, got %+v", steps[0])
 	}
-	if len(steps[1]) != 1 || steps[1][0].Reason != "resp for /pay (seen 2 msgs)" {
+	if len(steps[1].Matches) != 1 || steps[1].Matches[0].Reason != "resp for /pay (seen 2 msgs)" {
 		t.Fatalf("response step should correlate the request, got %+v", steps[1])
 	}
 }
@@ -153,8 +155,50 @@ def match(flow):
 		t.Fatal(err)
 	}
 	// Only the last step sees /r1,/r2,/r3 as the 3 most recent.
-	if len(steps[3]) != 1 || steps[3][0].Reason != "recent ok" {
+	if len(steps[3].Matches) != 1 || steps[3].Matches[0].Reason != "recent ok" {
 		t.Fatalf("recent(3) at last step wrong: %+v", steps[3])
+	}
+}
+
+func TestFlowRewriteBody(t *testing.T) {
+	m := newTestManager(t)
+	code := `
+def match(flow):
+    if "foo" in flow.body:
+        flow.body = flow.body.replace("foo", "BAR")   # inline rewrite
+        return "rewrote"
+    return False
+`
+	steps, scriptErr, err := m.TestSequence("rw", code,
+		[]Flow{{"service": "w", "direction": "request", "body": "a foo b"}}, 1)
+	if err != nil || scriptErr != "" {
+		t.Fatalf("err=%v scriptErr=%s", err, scriptErr)
+	}
+	if len(steps) != 1 || string(steps[0].Rewrite) != "a BAR b" {
+		t.Fatalf("expected rewrite 'a BAR b', got %q (matches %+v)", string(steps[0].Rewrite), steps[0].Matches)
+	}
+}
+
+func TestFlowRewriteTCPBytes(t *testing.T) {
+	m := newTestManager(t)
+	// Exact bytes (incl. non-UTF8) survive via base64.
+	code := `
+def match(flow):
+    msg = flow.messages[-1]
+    if b"foo" in msg.content:
+        msg.content = msg.content.replace(b"foo", b"BARBAR")
+        return "tcp rewrite"
+    return False
+`
+	raw := append([]byte{0x00, 0x01}, append([]byte("foo"), 0xff)...)
+	steps, _, err := m.TestSequence("tcprw", code,
+		[]Flow{{"service": "t", "direction": "request", "body_b64": base64.StdEncoding.EncodeToString(raw)}}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append([]byte{0x00, 0x01}, append([]byte("BARBAR"), 0xff)...)
+	if !bytes.Equal(steps[0].Rewrite, want) {
+		t.Fatalf("tcp rewrite bytes wrong: got %v want %v", steps[0].Rewrite, want)
 	}
 }
 
@@ -409,13 +453,13 @@ def match(flow):
 	if len(steps) != 2 {
 		t.Fatalf("expected 2 steps, got %d", len(steps))
 	}
-	if len(steps[0]) != 0 {
+	if len(steps[0].Matches) != 0 {
 		t.Errorf("request step should not match, got %+v", steps[0])
 	}
-	if len(steps[1]) != 1 {
+	if len(steps[1].Matches) != 1 {
 		t.Fatalf("response step should match, got %+v", steps[1])
 	}
-	if steps[1][0].Reason == "" {
+	if steps[1].Matches[0].Reason == "" {
 		t.Error("expected a reason on the response match")
 	}
 }

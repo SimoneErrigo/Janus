@@ -25,11 +25,19 @@ type PyBlockMatch struct {
 	Reason string
 }
 
+// PyResult is the outcome of the inline (synchronous) Python filters on a
+// request: the matches that asked to block, plus an optional rewritten body.
+type PyResult struct {
+	Blocks    []PyBlockMatch
+	NewBody   []byte // rewritten body to forward (only when Rewritten)
+	Rewritten bool
+}
+
 // PyBlockFunc synchronously evaluates the inline (blocking) Python filters
-// against a request flow and returns the matches that asked to block. It runs on
-// the request hot path, so implementations must be bounded and fail open. A nil
-// func disables inline blocking.
-type PyBlockFunc func(flow map[string]any) []PyBlockMatch
+// against a request/message flow and returns their verdict (block and/or
+// rewrite). It runs on the hot path, so implementations must be bounded and fail
+// open. A nil func disables inline blocking/rewriting.
+type PyBlockFunc func(flow map[string]any) PyResult
 
 func roundFromFlagIDMatches(matches []flagids.FlagMatch, fallback int) int {
 	round := 0
@@ -146,7 +154,8 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 				"contains_flagid": containsFlagID,
 				"timestamp":       start.Unix(),
 			}
-			for _, bm := range pyBlock(flow) {
+			res := pyBlock(flow)
+			for _, bm := range res.Blocks {
 				matchedRules = append(matchedRules, MatchedRuleInfo{
 					ID:      "pyfilter:" + bm.Script,
 					Name:    "Python block (" + bm.Script + ")",
@@ -162,6 +171,14 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 					PatternMatched: bm.Reason,
 				})
 				shouldDrop = true
+			}
+			// Inline rewrite: swap the request body before forwarding + logging
+			// (only when we're not about to drop it).
+			if res.Rewritten && !shouldDrop {
+				reqBody = res.NewBody
+				r.Body = io.NopCloser(bytes.NewReader(reqBody))
+				r.ContentLength = int64(len(reqBody))
+				r.Header.Set("Content-Length", strconv.Itoa(len(reqBody)))
 			}
 		}
 

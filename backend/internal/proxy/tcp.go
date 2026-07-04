@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -174,8 +175,47 @@ func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.
 				alertRules = result.AlertRules
 			}
 
+			// Inline (synchronous) Python filters on this chunk: they can block
+			// (close the connection) or rewrite the bytes before we forward them.
+			// Exact bytes ride as base64 so binary payloads survive JSON.
+			var pyBlockAlerts []*sniffer.Alert
+			if pyBlock := m.currentPyBlockFn(); pyBlock != nil {
+				flow := map[string]any{
+					"service":   svc.ID,
+					"direction": string(dir),
+					"src":       srcIP,
+					"dst":       dstIP,
+					"sport":     srcPort,
+					"dport":     dstPort,
+					"protocol":  string(svc.Protocol),
+					"body":      string(chunk),
+					"body_b64":  base64.StdEncoding.EncodeToString(chunk),
+				}
+				res := pyBlock(flow)
+				for _, bm := range res.Blocks {
+					matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{
+						ID:      "pyfilter:" + bm.Script,
+						Name:    "Python block (" + bm.Script + ")",
+						Action:  "drop",
+						Pattern: bm.Reason,
+						Scope:   "python",
+					})
+					pyBlockAlerts = append(pyBlockAlerts, &sniffer.Alert{
+						RuleID:         "pyfilter:" + bm.Script,
+						ServiceID:      svc.ID,
+						SrcIP:          srcIP,
+						Timestamp:      time.Now(),
+						PatternMatched: bm.Reason,
+					})
+					shouldDrop = true
+				}
+				if res.Rewritten && !shouldDrop {
+					chunk = res.NewBody // forward + log the rewritten bytes
+				}
+			}
+
 			captureEnabled := m.shouldCapture()
-			mustPersist := captureEnabled || shouldDrop || len(alertRules) > 0
+			mustPersist := captureEnabled || shouldDrop || len(alertRules) > 0 || len(pyBlockAlerts) > 0
 
 			// Log this chunk as a packet
 			if m.packetStore != nil && mustPersist {
@@ -207,7 +247,7 @@ func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.
 					MatchedFlagIDs: matchedFlagIDs,
 					FlagIDRound:    flagIDRound,
 				}
-				alertTemplates := make([]*sniffer.Alert, 0, len(alertRules))
+				alertTemplates := make([]*sniffer.Alert, 0, len(alertRules)+len(pyBlockAlerts))
 				for _, rule := range alertRules {
 					alertTemplates = append(alertTemplates, &sniffer.Alert{
 						RuleID:         rule.ID,
@@ -217,6 +257,7 @@ func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.
 						PatternMatched: rule.Pattern,
 					})
 				}
+				alertTemplates = append(alertTemplates, pyBlockAlerts...)
 				if err := m.packetStore.Enqueue(pkt, alertTemplates); err != nil {
 					log.Printf("[%s] sniffer: failed to log TCP packet: %v", svc.Name, err)
 				}
@@ -287,4 +328,3 @@ func (m *Manager) sniffCopy(dst io.Writer, src io.Reader, svc *storage.Service, 
 		}
 	}
 }
-

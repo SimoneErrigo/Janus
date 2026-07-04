@@ -226,6 +226,9 @@ type pyFilterTestStep struct {
 	Direction string           `json:"direction,omitempty"`
 	Matched   bool             `json:"matched"`
 	Matches   []pyfilter.Match `json:"matches"`
+	// Rewrite is the new content (best-effort text) when an inline filter
+	// rewrote this message; empty otherwise.
+	Rewrite string `json:"rewrite,omitempty"`
 }
 
 // POST /api/pyfilters/test — evaluate a (possibly unsaved) script against a
@@ -298,13 +301,17 @@ func (s *Server) handlePyFilterTest(w http.ResponseWriter, r *http.Request) {
 	outSteps := make([]pyFilterTestStep, len(steps))
 	anyMatch := false
 	var lastMatches []pyfilter.Match
-	for i, ms := range steps {
+	for i, st := range steps {
 		dir, _ := flows[i]["direction"].(string)
-		outSteps[i] = pyFilterTestStep{Index: i, Direction: dir, Matched: len(ms) > 0, Matches: ms}
-		if len(ms) > 0 {
+		step := pyFilterTestStep{Index: i, Direction: dir, Matched: len(st.Matches) > 0, Matches: st.Matches}
+		if st.Rewrite != nil {
+			step.Rewrite = string(st.Rewrite)
+		}
+		outSteps[i] = step
+		if len(st.Matches) > 0 {
 			anyMatch = true
 		}
-		lastMatches = ms
+		lastMatches = st.Matches
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"matched":      anyMatch,
