@@ -290,6 +290,90 @@ def match(flow):
 	}
 }
 
+func TestFlowCommandsNamedFields(t *testing.T) {
+	m := newTestManager(t)
+	// A spec can name a command's arguments; the parsed command then exposes
+	// them by name (cmd.user / cmd.pw) so you never unpack a variable-length
+	// list. Mixed arities in one table must not crash.
+	code := `
+CMDS = {b"1": ("register", ("user", "pw")), b"6": ("getvip", ("flight",))}
+def match(flow):
+    for cmd in flow.commands(CMDS):
+        if cmd.name == "register":
+            return "reg %s/%s missing=%r" % (cmd.user.decode(), cmd.pw.decode(), cmd.arg(9))
+        if cmd.name == "getvip":
+            return "vip %s" % cmd.flight.decode()
+    return False
+`
+	pkt := func(s string) Flow {
+		return Flow{"service": "s", "direction": "request", "src": "1.2.3.4", "sport": 9,
+			"body_b64": base64.StdEncoding.EncodeToString([]byte(s))}
+	}
+	flows := []Flow{pkt("1\n"), pkt("alice\n"), pkt("secret\n")}
+	steps, scriptErr, err := m.TestSequence("named", code, flows, 1)
+	if err != nil || scriptErr != "" {
+		t.Fatalf("err=%v scriptErr=%s", err, scriptErr)
+	}
+	if len(steps[2].Matches) != 1 || steps[2].Matches[0].Reason != `reg alice/secret missing=b''` {
+		t.Fatalf("named-field access wrong: %+v", steps[2])
+	}
+}
+
+func TestConnStateIsolatedPerFilter(t *testing.T) {
+	m := newTestManager(t)
+	// Two filters use the SAME flow.conn key for different things. Per-script
+	// namespacing must keep them from clobbering each other.
+	if _, err := m.CreateScript("counter", `
+def match(flow):
+    flow.conn["n"] = flow.conn.get("n", 0) + 1
+    return "n=%d" % flow.conn["n"]
+`, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.CreateScript("stomper", `
+def match(flow):
+    flow.conn["n"] = "not-a-number"   # same key, different filter
+    return False
+`, true, true); err != nil {
+		t.Fatal(err)
+	}
+	f := Flow{"service": "s", "direction": "request", "src": "1.2.3.4", "sport": 9, "body": "x"}
+	var last []Match
+	for i := 0; i < 3; i++ {
+		last, _ = m.EvaluateBlocking(f)
+	}
+	var reason string
+	for _, mm := range last {
+		if mm.Script == "counter" {
+			reason = mm.Reason
+		}
+	}
+	if reason != "n=3" {
+		t.Fatalf("counter should be isolated from stomper, got reason %q", reason)
+	}
+}
+
+func TestDirectionConstantSkipsOtherSide(t *testing.T) {
+	m := newTestManager(t)
+	// A module-level DIRECTION lets a script declare its side; the other
+	// direction is skipped entirely (no need to guard it in match()).
+	code := `
+DIRECTION = "response"
+def match(flow):
+    return "ran"
+`
+	if got, _, err := m.Test("resp-only", code, Flow{"direction": "request", "body": "x"}, 1); err != nil {
+		t.Fatal(err)
+	} else if len(got) != 0 {
+		t.Fatalf("request should be skipped for a response-only filter, got %+v", got)
+	}
+	if got, _, err := m.Test("resp-only", code, Flow{"direction": "response", "body": "x"}, 1); err != nil {
+		t.Fatal(err)
+	} else if len(got) != 1 {
+		t.Fatalf("response should run, got %+v", got)
+	}
+}
+
 func TestFlowCommandsMultiFilterIsolation(t *testing.T) {
 	m := newTestManager(t)
 	// Two blocking filters parse the same stream with DIFFERENT command tables.

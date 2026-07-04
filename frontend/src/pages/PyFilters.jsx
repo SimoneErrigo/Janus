@@ -58,20 +58,20 @@ def match(flow):
 
 const STREAM_EXAMPLE = `# TCP STREAM (binary / CLI) — a continuous byte flow, not one-message-per-chunk.
 # flow.commands(spec) parses the line stream into CLI commands for you (buffering
-# across packets + flag-ID tracking), and flow.conn holds per-connection state.
-# spec maps a trigger line to (name, number_of_argument_lines).
+# across packets + flag-ID tracking); flow.conn holds per-connection state (it's
+# private to this filter). spec maps a trigger line to (name, field names) — read
+# args by name (cmd.pw), never unpack cmd.args (arities differ).
+# DIRECTION = "request" tells Janus to skip responses, so you don't guard it.
 # Here: kill a login that uses a flag-ID as username with a password already
 # seen in a registration. Mark this filter "Blocking".
-CMDS = {b"1": ("register", 2), b"2": ("login", 2)}   # menu: 1=register, 2=login
+DIRECTION = "request"
+CMDS = {b"1": ("register", ("user", "pw")), b"2": ("login", ("user", "pw"))}
 
 def match(flow):
-    if flow.direction != "request":
-        return False
-    for cmd in flow.commands(CMDS):         # cmd.name / cmd.args / cmd.flagid
-        user, password = cmd.args
+    for cmd in flow.commands(CMDS):         # cmd.name / cmd.flagid / named args
         if cmd.name == "register":
-            flow.conn.setdefault("regs", set()).add(password)
-        elif cmd.name == "login" and cmd.flagid and password in flow.conn.get("regs", set()):
+            flow.conn.setdefault("regs", set()).add(cmd.pw)
+        elif cmd.name == "login" and cmd.flagid and cmd.pw in flow.conn.get("regs", set()):
             return {"drop": True, "reason": "login as flag-ID reusing a registered password"}
     return False
 `
@@ -759,8 +759,10 @@ function FlowApiCheatsheet() {
     ['flow.messages[-1] / recent(3)', 'recent history for this service'],
     ['flow.body = "…" / flow.content = b"…"', 'rewrite inline (Blocking only)'],
     ['for line in flow.lines:', 'TCP stream lines, reassembled across chunks'],
-    ['flow.conn["…"]', 'per-TCP-connection state (auto)'],
-    ['flow.commands({b"1": ("register", 2)})', 'parse a line-based CLI into commands'],
+    ['flow.conn["…"]', 'per-connection state (private to this filter)'],
+    ['flow.commands({b"1": ("register", ("user","pw"))})', 'parse a CLI into commands'],
+    ['cmd.name / cmd.flagid / cmd.user / cmd.arg(0)', 'command + args by name or index'],
+    ['DIRECTION = "request" (module-level)', 'run only on that side (optional)'],
   ]
   return (
     <div className="mt-3 rounded border border-gray-800 bg-gray-900/60 p-3 space-y-1">

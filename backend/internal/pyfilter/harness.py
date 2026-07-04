@@ -19,18 +19,21 @@ User scripts each define:
         #
         # TCP streams (a continuous byte flow, not one-message-per-chunk):
         #   flow.conn                       # dict persisting for the whole TCP
-        #                                   #   connection — your per-conn state
+        #                                   #   connection — your per-conn state,
+        #                                   #   private to this filter
         #   for line in flow.lines:         # complete lines, reassembled across
         #       ...                         #   chunks by Janus (bytes, exact)
         #   for cmd in flow.commands(       # parse a line-based CLI into commands
-        #       {b"1": ("register", 2),     #   trigger line -> (name, n arg lines)
-        #        b"2": ("login", 2)}):      #   cmd.name / cmd.args / cmd.flagid
-        #       ...
+        #       {b"1": ("register",         #   trigger line -> (name, arg spec);
+        #                ("user","pw"))}):  #   arg spec = a count, or field names
+        #       cmd.user, cmd.pw            #   named args (or cmd.arg(0)); never
+        #                                   #   unpack cmd.args — arities vary
         #
         # NOTE: match(flow) runs once per message, on BOTH directions. Use
         # flow.is_request / flow.is_response (or flow.direction) to tell them
-        # apart. A Blocking filter can drop or rewrite either a request or a
-        # response in real time.
+        # apart, or set a module-level DIRECTION = "request" | "response" to have
+        # Janus skip the other side for you. A Blocking filter can drop or
+        # rewrite either a request or a response in real time.
         #
         # return one of:
         #   False / None            -> no match
@@ -67,12 +70,51 @@ import sys
 import json
 import base64
 import traceback
-from collections import deque, OrderedDict, namedtuple
+from collections import deque, OrderedDict
 from urllib.parse import urlsplit, parse_qs
 
-# A parsed CLI command: its name, its argument lines (bytes), and whether a flag
-# ID appeared anywhere within it. Yielded by flow.commands(spec).
-Command = namedtuple("Command", "name args flagid")
+# A parsed CLI command yielded by flow.commands(spec): its name, its argument
+# lines (bytes), and whether a flag ID appeared anywhere within it.
+#
+# Access args safely — never unpack a raw list whose length can vary between
+# commands:
+#   cmd.args              # the list of argument lines (bytes)
+#   cmd.arg(0)            # positional, "" if missing (no IndexError)
+#   cmd.user, cmd.pw      # by name, when the spec declared field names, e.g.
+#                         #   {b"1": ("register", ("user", "pw"))}
+class Command:
+    __slots__ = ("name", "args", "flagid", "_names")
+
+    def __init__(self, name, args, flagid, names=()):
+        self.name = name
+        self.args = list(args)
+        self.flagid = flagid
+        self._names = tuple(names)
+
+    def arg(self, i, default=b""):
+        """The i-th argument line, or default if the command has fewer args."""
+        return self.args[i] if -len(self.args) <= i < len(self.args) else default
+
+    def field(self, name, default=b""):
+        """The argument declared under `name` in the spec, or default."""
+        try:
+            return self.args[self._names.index(name)]
+        except (ValueError, IndexError):
+            return default
+
+    def __getattr__(self, name):
+        # cmd.<declared-name> -> that argument (b"" if the arg is absent).
+        names = object.__getattribute__(self, "_names")
+        if name in names:
+            return self.field(name)
+        raise AttributeError(name)
+
+    def __iter__(self):
+        # Back-compat: `name, args, flagid = cmd` still works.
+        return iter((self.name, self.args, self.flagid))
+
+    def __repr__(self):
+        return "Command(name=%r, args=%r, flagid=%r)" % (self.name, self.args, self.flagid)
 
 # id -> {"name": str, "fn": callable}
 SCRIPTS = {}
@@ -85,10 +127,14 @@ SCRIPTS = {}
 _HISTORY = {}        # service -> deque[Flow] of recently evaluated messages
 _HISTORY_MAX = 32
 
-# Per-TCP-connection scratch: state that persists across every chunk of a
-# connection (both directions), plus an internal line-reassembly buffer so
-# stream filters don't have to manage a byte buffer themselves.
-_CONNS = OrderedDict()   # conn_key -> {"state": {}, "linebuf": {direction: bytes}}
+# Per-TCP-connection scratch, persisting across every chunk of a connection
+# (both directions):
+#   "linebuf"  — internal line-reassembly buffer, shared (it's the raw byte
+#                stream, identical for every script)
+#   "state"    — flow.conn, namespaced per script id so two filters can use the
+#                same key name without clobbering each other
+#   "cmdstate" — internal flow.commands() pending state, per script id
+_CONNS = OrderedDict()   # conn_key -> {"linebuf": {}, "state": {sid: {}}, "cmdstate": {sid: {}}}
 _CONNS_MAX = 4096
 _LINEBUF_MAX = 1 << 16   # cap a single unterminated line
 
@@ -106,7 +152,7 @@ def _conn_record(flow):
     k = _conn_key(flow)
     rec = _CONNS.get(k)
     if rec is None:
-        rec = {"state": {}, "linebuf": {}}
+        rec = {"linebuf": {}, "state": {}, "cmdstate": {}}
         _CONNS[k] = rec
         if len(_CONNS) > _CONNS_MAX:
             _CONNS.popitem(last=False)   # evict the oldest connection
@@ -372,12 +418,21 @@ class Flow(dict):
         return self if self.is_response else self.last_response
 
     # -- TCP streams: per-connection state + line reassembly (no manual buffer) --
+    def _conn_ns(self, bucket):
+        # Per-(connection, script) namespace inside `bucket` of the conn record.
+        # Namespacing by script id means two filters can use the same conn key
+        # name without stepping on each other.
+        sid = self.get("__sid") or ""
+        return _conn_record(self)[bucket].setdefault(sid, {})
+
     @property
     def conn(self):
         """A dict that persists across every message of THIS TCP connection
         (both directions, keyed by service + endpoints). Use it for per-
-        connection state instead of a global keyed by src/port."""
-        return _conn_record(self)["state"]
+        connection state instead of a global keyed by src/port. Each filter
+        gets its own namespace, so your keys never collide with another
+        filter's."""
+        return self._conn_ns("state")
 
     @property
     def lines(self):
@@ -402,24 +457,40 @@ class Flow(dict):
 
     def commands(self, spec):
         """Parse this connection's line stream into CLI commands, so you don't
-        write the state machine yourself. `spec` maps a trigger line to
-        (name, n_args): a command is that trigger line followed by n_args lines.
-        Returns the Command(name, args, flagid) values completed by THIS chunk;
-        cross-chunk buffering and flag-ID tracking are handled for you.
+        write the state machine yourself. `spec` maps a trigger line to either
+        (name, n_args) — the trigger line followed by n_args argument lines — or
+        (name, ("field", ...)) to also name those arguments. Returns the Command
+        values completed by THIS chunk; cross-chunk buffering and flag-ID
+        tracking are handled for you. Access args safely with cmd.arg(i) or, when
+        named, cmd.<field> — never unpack cmd.args blindly (arities can differ):
 
-            for cmd in flow.commands({b"1": ("register", 2), b"2": ("login", 2)}):
-                user, password = cmd.args
+            SPEC = {b"1": ("register", ("user", "pw")),
+                    b"2": ("login", ("user", "pw"))}
+            for cmd in flow.commands(SPEC):
+                if cmd.name == "login" and cmd.flagid:
+                    check(cmd.user, cmd.pw)      # by name, "" if missing
         """
-        table = {(k if isinstance(k, bytes) else str(k).encode()): v for k, v in spec.items()}
-        # Both the per-message result cache and the cross-chunk pending state are
-        # keyed by the spec, so several filters parsing the same stream with
-        # different command tables don't clobber each other's parse.
-        spec_key = tuple(sorted((k, v[0], v[1]) for k, v in table.items()))
+        # Normalize each spec value to (name, need, field_names). The arg spec is
+        # either an int (count) or a sequence of field names.
+        table = {}
+        for k, v in spec.items():
+            key = k if isinstance(k, bytes) else str(k).encode()
+            cmd_name, argspec = v[0], v[1]
+            if isinstance(argspec, int):
+                need, names = argspec, ()
+            else:
+                names = tuple(argspec)
+                need = len(names)
+            table[key] = (cmd_name, need, names)
+        # The per-message result cache and the cross-chunk pending state are keyed
+        # by (script, spec): filters never clobber each other's parse, and one
+        # filter can even parse the same stream with two different tables.
+        spec_key = tuple(sorted((k, nm, need) for k, (nm, need, _) in table.items()))
         cache = self.setdefault("__commands", {})
-        if spec_key in cache:
-            return cache[spec_key]
-        st = _conn_record(self)["state"]
-        pending = st.setdefault("__cmd", {})
+        cache_key = (self.get("__sid") or "", spec_key)
+        if cache_key in cache:
+            return cache[cache_key]
+        pending = self._conn_ns("cmdstate")
         cur = pending.get(spec_key)
         flagid = bool(self.contains_flagid)
         out = []
@@ -431,20 +502,20 @@ class Flow(dict):
                 cur["args"].append(line)
                 cur["flag"] = cur["flag"] or flagid
                 if len(cur["args"]) >= cur["need"]:
-                    out.append(Command(cur["name"], cur["args"], cur["flag"]))
+                    out.append(Command(cur["name"], cur["args"], cur["flag"], cur["names"]))
                     cur = None
             else:
                 hit = table.get(line)
                 if hit is not None:             # a trigger line -> start a command
-                    name, need = hit
+                    name, need, names = hit
                     if need <= 0:
-                        out.append(Command(name, [], flagid))
+                        out.append(Command(name, [], flagid, names))
                     else:
-                        cur = {"name": name, "need": need, "args": [], "flag": flagid}
+                        cur = {"name": name, "need": need, "args": [], "flag": flagid, "names": names}
         if cur is not None and flagid:          # keep the flag "sticky" across chunks
             cur["flag"] = True
         pending[spec_key] = cur
-        cache[spec_key] = out
+        cache[cache_key] = out
         return out
 
     # -- attribute fallback: flow.<key> -> flow["<key>"], missing -> "" --
@@ -479,6 +550,18 @@ def _rewrite_of(flow):
     return {"content_b64": base64.b64encode(nb).decode("ascii")}
 
 
+def _norm_direction(v):
+    """Normalize an optional DIRECTION constant to "request"/"response"/None."""
+    if not isinstance(v, str):
+        return None
+    s = v.strip().lower()
+    if s.startswith("req"):
+        return "request"
+    if s.startswith("res"):
+        return "response"
+    return None
+
+
 def _compile_scripts(scripts):
     """Compile+exec each script into its own namespace. Returns (loaded, errors)."""
     loaded = {}
@@ -494,7 +577,10 @@ def _compile_scripts(scripts):
             if not callable(fn):
                 errors[sid] = "script must define a top-level match(flow) function"
                 continue
-            loaded[sid] = {"name": name, "fn": fn}
+            # Optional module-level DIRECTION = "request" | "response" lets a
+            # script declare which side it cares about; Janus then skips the
+            # other direction instead of the script guarding it every call.
+            loaded[sid] = {"name": name, "fn": fn, "direction": _norm_direction(ns.get("DIRECTION"))}
         except Exception:
             errors[sid] = _short_traceback()
     return loaded, errors
@@ -527,8 +613,13 @@ def _evaluate(scripts, flow):
     if not isinstance(flow, Flow):
         flow = Flow(flow)
     _record(flow)  # record once per message, before any script runs
+    direction = flow.get("direction")
     matches = []
     for sid, s in scripts.items():
+        # Skip scripts that declared DIRECTION for the other side.
+        if s.get("direction") and direction and s["direction"] != direction:
+            continue
+        flow["__sid"] = sid   # namespaces flow.conn / flow.commands per script
         try:
             res = s["fn"](flow)
         except Exception:

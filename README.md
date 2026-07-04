@@ -192,23 +192,36 @@ return a match; like blocking it is inline-only (async filters can't mutate).
 per chunk), `flow.lines` yields the complete lines reassembled across chunks and
 `flow.conn` is a dict that persists for the whole connection (both directions) —
 so stream filters don't hand-roll a byte buffer or a per-connection state map.
-For line-based CLI menus, `flow.commands(spec)` goes further and parses the
-stream into commands for you (`spec` maps a trigger line to `(name, n_args)`),
-handling cross-packet buffering and flag-ID tracking — so you write the grammar,
-not a state machine:
+`flow.conn` is **private to each filter**: two filters can use the same key name
+without colliding. For line-based CLI menus, `flow.commands(spec)` goes further
+and parses the stream into commands for you, handling cross-packet buffering and
+flag-ID tracking — so you write the grammar, not a state machine. Each `spec`
+entry maps a trigger line to `(name, arg_spec)`, where `arg_spec` is either the
+number of argument lines **or a tuple of field names**. With names, read the
+arguments by name (`cmd.user`) — don't unpack `cmd.args`, since different
+commands can have different arities:
 
 ```python
-CMDS = {b"1": ("register", 2), b"2": ("login", 2)}   # trigger -> (name, n args)
+# Declare it once; DIRECTION lets Janus skip the response side for you.
+DIRECTION = "request"
+CMDS = {
+    b"1": ("register", ("user", "pw")),   # trigger -> (name, field names)
+    b"2": ("login",    ("user", "pw")),
+    b"6": ("getvip",   ("flight",)),
+}
 
 def match(flow):
-    for cmd in flow.commands(CMDS):      # cmd.name / cmd.args / cmd.flagid
-        user, password = cmd.args
+    for cmd in flow.commands(CMDS):        # cmd.name / cmd.flagid / named args
         if cmd.name == "register":
-            flow.conn.setdefault("regs", set()).add(password)
-        elif cmd.name == "login" and cmd.flagid and password in flow.conn.get("regs", set()):
+            flow.conn.setdefault("regs", set()).add(cmd.pw)
+        elif cmd.name == "login" and cmd.flagid and cmd.pw in flow.conn.get("regs", set()):
             return {"drop": True, "reason": "login as flag-ID reusing a registered password"}
     return False
 ```
+
+`cmd.arg(i)` reads the i-th argument positionally (returns `b""` if absent), so a
+missing field never raises. The older `(name, n_args)` count form still works and
+exposes the plain `cmd.args` list.
 
 You can **test** a script right on the page before enabling it: build a
 Request/Response sample, or load a real captured packet (or a whole
