@@ -231,6 +231,9 @@ per-packet verdict. A `Repeat` control re-runs the sample so counting logic
 (e.g. "2nd login") can fire, and the result labels each match as **Alert** or
 **Alert + Block**.
 
+Full API reference: [PYFILTERS.md](PYFILTERS.md). A big set of worked examples
+(easy → advanced, HTTP and TCP): [PYFILTERS_COOKBOOK.md](PYFILTERS_COOKBOOK.md).
+
 ### 8. Custom protocols
 
 The **Protocols** page lets you define **custom binary protocols** (length-prefixed strings, fixed-width ints, enums with dispatched payloads, computed-length blobs, etc.). Bind a protocol to a TCP service and Janus auto-decodes every packet body into a structured tree, viewable in the Traffic detail panel. For gRPC services, drop `.proto` files into the mounted `protos/` folder (or set `proto_paths` on the service) and Janus does the same with protobuf.

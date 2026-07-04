@@ -18,12 +18,20 @@ def match(flow):
 | `True` | match, no reason |
 | `"reason"` | match + reason (shown in Alerts) |
 | `{"match": True, "reason": "..."}` | same, explicit |
-| `{"match": True, "drop": "<filter expr>"}` | install a content drop rule → **future** matching traffic blocked (fail2ban style; content fields only, no IP/port) |
-| `{"drop": True}` / `{"block": True}` | block **this** message in real time (requires the **Blocking** flag) |
+| `{"drop": True}` / `{"block": True}` | drop **this** message in real time (requires the **Blocking** flag). Any truthy `drop` works, so `{"drop": "reason"}` blocks too. |
 
-**Blocking** filters run synchronously and see **requests only** (`flow.response` is empty),
-but can block/rewrite now. **Async** filters (default) see requests + responses but can't
-touch the current message.
+`match(flow)` runs **once per message on both directions** — branch on
+`flow.is_request` / `flow.is_response`, or declare a module-level
+`DIRECTION = "request"` (or `"response"`) to have Janus skip the other side.
+
+| filter kind | sees | can drop / rewrite the current message? |
+|---|---|---|
+| **Blocking** (inline) | TCP: requests + responses · HTTP: requests | TCP: both directions · HTTP: requests only |
+| **Async** (default) | everything (HTTP + TCP, both directions) | no — alert only (message already forwarded) |
+
+> Dropping/rewriting a **response** inline is available for **TCP** services today
+> (HTTP response bodies are still forwarded before filters run — a response-side
+> HTTP filter can only alert).
 
 ## Read — HTTP & TCP
 
@@ -67,12 +75,22 @@ field** — a cookie, or the reused **credential** — not by IP.
 
 | accessor | meaning |
 |---|---|
-| `flow.conn` | dict persisting for the whole TCP connection — your per-connection state |
+| `flow.conn` | dict persisting for the whole TCP connection — per-connection state, **private to each filter** (same key in two filters won't collide) |
 | `for line in flow.lines:` | complete lines, reassembled across chunks (`bytes`) |
 | `for cmd in flow.commands(spec):` | parse a line-based CLI into commands |
-| `cmd.name` / `cmd.args` / `cmd.flagid` | command name, arg lines (`bytes`), flag-ID seen in it |
+| `cmd.name` / `cmd.flagid` | command name; flag-ID seen anywhere in it |
+| `cmd.user` / `cmd.arg(0)` | an argument by declared name, or positional (`b""` if absent) |
 
-`spec` maps a trigger line to `(name, n_arg_lines)`: `{b"1": ("register", 2), b"2": ("login", 2)}`.
+`spec` maps a trigger line to `(name, arg_spec)`, where `arg_spec` is either the
+number of argument lines **or a tuple of field names**:
+
+```python
+{b"1": ("register", ("user", "pw")),   # named  -> cmd.user, cmd.pw
+ b"2": ("login", 2)}                    # count  -> cmd.args[0], cmd.arg(1)
+```
+
+Don't unpack `cmd.args` (`user, pw = cmd.args`) when a table mixes commands of
+different arities — read by name or with `cmd.arg(i)` instead.
 
 ## Rewrite (Blocking filters only)
 
@@ -102,19 +120,20 @@ def match(flow):
     return False
 ```
 
-**TCP CLI** — same intent, via `flow.commands` + per-connection state:
+**TCP CLI** — same intent, via `flow.commands` + per-connection state and named args:
 
 ```python
-CMDS = {b"1": ("register", 2), b"2": ("login", 2)}
+DIRECTION = "request"
+CMDS = {b"1": ("register", ("user", "pw")), b"2": ("login", ("user", "pw"))}
 
 def match(flow):
-    if flow.direction != "request":
-        return False
     for cmd in flow.commands(CMDS):
-        user, pw = cmd.args
         if cmd.name == "register":
-            flow.conn.setdefault("regs", set()).add(pw)
-        elif cmd.name == "login" and cmd.flagid and pw in flow.conn.get("regs", set()):
+            flow.conn.setdefault("regs", set()).add(cmd.pw)
+        elif cmd.name == "login" and cmd.flagid and cmd.pw in flow.conn.get("regs", set()):
             return {"drop": True, "reason": "login flag-ID with a registered password"}
     return False
 ```
+
+More recipes — easy to advanced, HTTP and TCP — in
+[PYFILTERS_COOKBOOK.md](PYFILTERS_COOKBOOK.md).
