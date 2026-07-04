@@ -61,10 +61,21 @@ def match(flow):
     return False
 `
 
+const REWRITE_EXAMPLE = `# INLINE REWRITE — rewrite the CURRENT request before Janus forwards it
+# (needs the "Blocking" checkbox). Assign flow.body (HTTP text) or, for TCP,
+# flow.messages[-1].content (bytes). Applies even if you return False.
+def match(flow):
+    if "flag{" in flow.body:
+        flow.body = flow.body.replace("flag{", "REDACTED{")
+        return "redacted a flag in the request"
+    return False
+`
+
 const EXAMPLES = [
   { key: 'alert', label: 'Alert example', code: ALERT_EXAMPLE },
   { key: 'drop', label: 'Drop (future) example', code: DROP_EXAMPLE },
   { key: 'block', label: 'Inline block example', code: BLOCK_EXAMPLE },
+  { key: 'rewrite', label: 'Inline rewrite example', code: REWRITE_EXAMPLE },
   { key: 'stateful', label: 'Stateful example', code: STATEFUL_EXAMPLE },
 ]
 
@@ -445,7 +456,7 @@ export default function PyFilters() {
             </label>
             <label
               className="flex items-center gap-1.5 text-xs text-gray-400 select-none cursor-pointer"
-              title="Run this filter synchronously on the request path so a match returning {'drop': True} blocks the CURRENT request in real time. Adds ~tens of µs per request on this service; a stuck script fails open."
+              title="Run this filter synchronously on the request path so it can act on the CURRENT request in real time: return {'drop': True} to block it, or assign flow.body / flow.messages[-1].content to rewrite it. Adds ~tens of µs per request on this service; a stuck script fails open."
             >
               <input
                 type="checkbox"
@@ -616,8 +627,10 @@ function TestVerdict({ result }) {
   }
 
   // Single flow/packet.
-  const m0 = (steps[0]?.matches || result.matches || [])[0]
-  if (!result.matched) {
+  const step0 = steps[0]
+  const m0 = (step0?.matches || result.matches || [])[0]
+  const rewrite = step0?.rewrite
+  if (!result.matched && rewrite == null) {
     return (
       <div className="rounded border border-gray-700 bg-gray-800/50 p-2 text-xs text-gray-400">
         No match — this flow would be ignored.
@@ -628,24 +641,42 @@ function TestVerdict({ result }) {
   const block = m0?.block
   const border = block ? 'border-rose-700/50 bg-rose-950/30' : drop ? 'border-amber-700/50 bg-amber-950/30' : 'border-emerald-700/50 bg-emerald-950/30'
   return (
-    <div className={`rounded border p-2 ${border}`}>
-      <div className="flex items-center gap-2 mb-1">
-        <VerdictBadge drop={drop} block={block} />
-        {m0?.reason && <span className="text-xs text-gray-300">{m0.reason}</span>}
-      </div>
-      {block ? (
-        <div className="text-[11px] text-rose-200/90">
-          Drops <strong>this</strong> request in real time (inline). Takes effect on live traffic only when the
-          filter has <strong>Blocking</strong> enabled.
+    <div className="space-y-1.5">
+      {result.matched && (
+        <div className={`rounded border p-2 ${border}`}>
+          <div className="flex items-center gap-2 mb-1">
+            <VerdictBadge drop={drop} block={block} />
+            {m0?.reason && <span className="text-xs text-gray-300">{m0.reason}</span>}
+          </div>
+          {block ? (
+            <div className="text-[11px] text-rose-200/90">
+              Drops <strong>this</strong> request in real time (inline). Takes effect on live traffic only when the
+              filter has <strong>Blocking</strong> enabled.
+            </div>
+          ) : drop ? (
+            <div className="text-[11px] text-amber-200/90">
+              Installs a drop rule <code className="font-mono bg-black/30 px-1 rounded">{drop}</code> — future
+              matching traffic is blocked (content-only).
+            </div>
+          ) : (
+            <div className="text-[11px] text-emerald-200/80">Raises an alert on the Alerts page.</div>
+          )}
         </div>
-      ) : drop ? (
-        <div className="text-[11px] text-amber-200/90">
-          Installs a drop rule <code className="font-mono bg-black/30 px-1 rounded">{drop}</code> — future
-          matching traffic is blocked (content-only).
-        </div>
-      ) : (
-        <div className="text-[11px] text-emerald-200/80">Raises an alert on the Alerts page.</div>
       )}
+      {rewrite != null && <RewriteNote text={rewrite} />}
+    </div>
+  )
+}
+
+function RewriteNote({ text }) {
+  const preview = text.length > 300 ? text.slice(0, 300) + '…' : text
+  return (
+    <div className="rounded border border-fuchsia-700/50 bg-fuchsia-950/30 p-2">
+      <div className="flex items-center gap-2 mb-1">
+        <span className="text-[10px] px-1.5 py-0.5 rounded border font-semibold bg-fuchsia-900/50 text-fuchsia-200 border-fuchsia-700/50">REWRITE</span>
+        <span className="text-[11px] text-fuchsia-200/80">forwards this rewritten content (inline / <strong>Blocking</strong> only):</span>
+      </div>
+      <pre className="text-[11px] text-fuchsia-100/90 font-mono whitespace-pre-wrap break-all">{preview}</pre>
     </div>
   )
 }
@@ -666,14 +697,21 @@ function StepRow({ step }) {
           {step.direction === 'response' ? 'RES' : 'REQ'}
         </span>
       )}
-      {step.matched ? (
+      {step.matched && (
         <>
           <VerdictBadge drop={drop} block={block} small />
           {m0?.reason && <span className="text-gray-400 truncate">{m0.reason}</span>}
         </>
-      ) : (
-        <span className="text-gray-600">no match</span>
       )}
+      {step.rewrite != null && (
+        <span
+          className="text-[10px] px-1 rounded border font-semibold bg-fuchsia-900/50 text-fuchsia-200 border-fuchsia-700/50"
+          title={step.rewrite}
+        >
+          REWRITE
+        </span>
+      )}
+      {!step.matched && step.rewrite == null && <span className="text-gray-600">no match</span>}
     </div>
   )
 }
@@ -699,11 +737,12 @@ function ReturnLegend() {
       <LegendRow code='return "reason"' desc="ALERT only" tone="green" />
       <LegendRow code='{"match": True, "drop": "<expr>"}' desc="ALERT + block future traffic (async)" tone="amber" />
       <LegendRow code='{"match": True, "drop": True}' desc="ALERT + block THIS request now (needs Blocking)" tone="red" />
+      <LegendRow code='flow.body = "..."  (or msg.content = b"...")' desc="rewrite THIS request inline (needs Blocking)" tone="fuchsia" />
       <p className="text-[10px] text-gray-600 pt-1 leading-snug">
         <code className="text-gray-500">drop</code> as an expression blocks <em>future</em> matching traffic
         (content-only: <code className="text-gray-500">body</code>/<code className="text-gray-500">url</code>/<code className="text-gray-500">header</code>/<code className="text-gray-500">service</code>;
-        IP/port rejected, SNAT-unsafe). <code className="text-gray-500">drop: True</code> drops the current
-        request inline — only when the filter has <strong>Blocking</strong> on.
+        IP/port rejected, SNAT-unsafe). <code className="text-gray-500">drop: True</code> and rewriting act on
+        the current request inline — only when the filter has <strong>Blocking</strong> on.
       </p>
     </div>
   )
@@ -721,6 +760,7 @@ function FlowApiCheatsheet() {
     ['flow.request / flow.response', 'correlated side (never None)'],
     ['flow.messages[-1]', 'most recent message (this service)'],
     ['flow.recent(3) / last_request', 'recent history'],
+    ['flow.body = "…" / msg.content = b"…"', 'rewrite inline (Blocking only)'],
   ]
   return (
     <div className="mt-3 rounded border border-gray-800 bg-gray-900/60 p-3 space-y-1">
@@ -743,7 +783,7 @@ function FlowApiCheatsheet() {
 }
 
 function LegendRow({ code, desc, tone }) {
-  const dot = { gray: 'bg-gray-500', green: 'bg-emerald-400', amber: 'bg-amber-400', red: 'bg-rose-400' }[tone]
+  const dot = { gray: 'bg-gray-500', green: 'bg-emerald-400', amber: 'bg-amber-400', red: 'bg-rose-400', fuchsia: 'bg-fuchsia-400' }[tone]
   return (
     <div className="flex items-start gap-2">
       <span className={`mt-1 w-1.5 h-1.5 rounded-full flex-shrink-0 ${dot}`} />

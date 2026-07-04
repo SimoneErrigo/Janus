@@ -165,9 +165,16 @@ right pattern is "detect the offender, then block their traffic by content"
 
 **Inline (real-time) blocking.** Mark a filter **Blocking** in the UI and it runs
 *synchronously* on the request path: returning `{"drop": True}` then drops the
-**current** request in real time (403), not just future traffic. It costs ~tens
-of µs per request on that service and is bounded + fail-open (a stuck script lets
-the request through). Inline blocking applies to HTTP requests only.
+**current** request in real time (a 403 for HTTP, a dropped connection for TCP),
+not just future traffic. It costs ~tens of µs per message on that service and is
+bounded + fail-open (a stuck script lets traffic through). Applies to HTTP
+requests and TCP (client→backend).
+
+**Inline (real-time) rewriting.** A Blocking filter can also *modify* the current
+message before Janus forwards it: assign `flow.body = "..."` (HTTP text) or
+`flow.messages[-1].content = b"..."` (TCP, exact bytes) inside `match()`. The
+rewrite is applied whether or not you also return a match. Like blocking it is
+inline-only — async filters can't mutate, since the packet is already forwarded.
 
 You can **test** a script right on the page before enabling it: build a
 Request/Response sample, or load a real captured packet (or a whole
