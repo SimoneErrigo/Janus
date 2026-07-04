@@ -22,6 +22,10 @@ User scripts each define:
         #                                   #   connection — your per-conn state
         #   for line in flow.lines:         # complete lines, reassembled across
         #       ...                         #   chunks by Janus (bytes, exact)
+        #   for cmd in flow.commands(       # parse a line-based CLI into commands
+        #       {b"1": ("register", 2),     #   trigger line -> (name, n arg lines)
+        #        b"2": ("login", 2)}):      #   cmd.name / cmd.args / cmd.flagid
+        #       ...
         #
         # NOTE: match(flow) runs per message. An inline (Blocking) filter only
         # sees requests, so for it flow.response/.responses are empty.
@@ -63,8 +67,12 @@ import sys
 import json
 import base64
 import traceback
-from collections import deque, OrderedDict
+from collections import deque, OrderedDict, namedtuple
 from urllib.parse import urlsplit, parse_qs
+
+# A parsed CLI command: its name, its argument lines (bytes), and whether a flag
+# ID appeared anywhere within it. Yielded by flow.commands(spec).
+Command = namedtuple("Command", "name args flagid")
 
 # id -> {"name": str, "fn": callable}
 SCRIPTS = {}
@@ -390,6 +398,48 @@ class Flow(dict):
         rec["linebuf"][d] = tail            # keep the unterminated remainder
         out = [(p[:-1] if p.endswith(b"\r") else p) for p in parts[:-1]]
         self["__lines"] = out
+        return out
+
+    def commands(self, spec):
+        """Parse this connection's line stream into CLI commands, so you don't
+        write the state machine yourself. `spec` maps a trigger line to
+        (name, n_args): a command is that trigger line followed by n_args lines.
+        Returns the Command(name, args, flagid) values completed by THIS chunk;
+        cross-chunk buffering and flag-ID tracking are handled for you.
+
+            for cmd in flow.commands({b"1": ("register", 2), b"2": ("login", 2)}):
+                user, password = cmd.args
+        """
+        cached = self.get("__commands")
+        if cached is not None:
+            return cached
+        table = {(k if isinstance(k, bytes) else str(k).encode()): v for k, v in spec.items()}
+        st = _conn_record(self)["state"]
+        cur = st.get("__cmd")
+        flagid = bool(self.contains_flagid)
+        out = []
+        for line in self.lines:
+            line = line.strip()
+            if not line:
+                continue
+            if cur is not None:                 # collecting a pending command's args
+                cur["args"].append(line)
+                cur["flag"] = cur["flag"] or flagid
+                if len(cur["args"]) >= cur["need"]:
+                    out.append(Command(cur["name"], cur["args"], cur["flag"]))
+                    cur = None
+            else:
+                hit = table.get(line)
+                if hit is not None:             # a trigger line -> start a command
+                    name, need = hit
+                    if need <= 0:
+                        out.append(Command(name, [], flagid))
+                    else:
+                        cur = {"name": name, "need": need, "args": [], "flag": flagid}
+        if cur is not None and flagid:          # keep the flag "sticky" across chunks
+            cur["flag"] = True
+        st["__cmd"] = cur
+        self["__commands"] = out
         return out
 
     # -- attribute fallback: flow.<key> -> flow["<key>"], missing -> "" --

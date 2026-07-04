@@ -232,6 +232,42 @@ def match(flow):
 	}
 }
 
+func TestFlowCommandsParsing(t *testing.T) {
+	m := newTestManager(t)
+	// flow.commands() turns a line stream into CLI commands (args + flag-id),
+	// reassembled across packets — no hand-written state machine.
+	code := `
+CMDS = {b"1": ("register", 2), b"2": ("login", 2)}
+def match(flow):
+    for cmd in flow.commands(CMDS):
+        if cmd.name == "register":
+            flow.conn.setdefault("regs", set()).add(cmd.args[1])
+        elif cmd.name == "login" and cmd.flagid and cmd.args[1] in flow.conn.get("regs", set()):
+            return "kill %s/%s" % (cmd.args[0].decode(), cmd.args[1].decode())
+    return False
+`
+	pkt := func(s string, flag bool) Flow {
+		f := Flow{"service": "s", "direction": "request", "src": "1.2.3.4", "sport": 9,
+			"body_b64": base64.StdEncoding.EncodeToString([]byte(s))}
+		if flag {
+			f["contains_flagid"] = true
+		}
+		return f
+	}
+	// register alice/secret, then login FLAG/secret (username carries a flag id)
+	flows := []Flow{
+		pkt("1\n", false), pkt("alice\n", false), pkt("secret\n", false),
+		pkt("2\n", false), pkt("FLAG\n", true), pkt("secret\n", false),
+	}
+	steps, scriptErr, err := m.TestSequence("cmds", code, flows, 1)
+	if err != nil || scriptErr != "" {
+		t.Fatalf("err=%v scriptErr=%s", err, scriptErr)
+	}
+	if len(steps[5].Matches) != 1 || steps[5].Matches[0].Reason != "kill FLAG/secret" {
+		t.Fatalf("commands() correlation wrong: %+v", steps[5])
+	}
+}
+
 func TestTestScriptMatchAndReason(t *testing.T) {
 	m := newTestManager(t)
 	code := `
