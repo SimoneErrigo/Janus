@@ -410,12 +410,17 @@ class Flow(dict):
             for cmd in flow.commands({b"1": ("register", 2), b"2": ("login", 2)}):
                 user, password = cmd.args
         """
-        cached = self.get("__commands")
-        if cached is not None:
-            return cached
         table = {(k if isinstance(k, bytes) else str(k).encode()): v for k, v in spec.items()}
+        # Both the per-message result cache and the cross-chunk pending state are
+        # keyed by the spec, so several filters parsing the same stream with
+        # different command tables don't clobber each other's parse.
+        spec_key = tuple(sorted((k, v[0], v[1]) for k, v in table.items()))
+        cache = self.setdefault("__commands", {})
+        if spec_key in cache:
+            return cache[spec_key]
         st = _conn_record(self)["state"]
-        cur = st.get("__cmd")
+        pending = st.setdefault("__cmd", {})
+        cur = pending.get(spec_key)
         flagid = bool(self.contains_flagid)
         out = []
         for line in self.lines:
@@ -438,8 +443,8 @@ class Flow(dict):
                         cur = {"name": name, "need": need, "args": [], "flag": flagid}
         if cur is not None and flagid:          # keep the flag "sticky" across chunks
             cur["flag"] = True
-        st["__cmd"] = cur
-        self["__commands"] = out
+        pending[spec_key] = cur
+        cache[spec_key] = out
         return out
 
     # -- attribute fallback: flow.<key> -> flow["<key>"], missing -> "" --

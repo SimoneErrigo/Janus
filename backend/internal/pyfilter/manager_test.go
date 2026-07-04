@@ -268,6 +268,59 @@ def match(flow):
 	}
 }
 
+func TestFlowCommandsMultiFilterIsolation(t *testing.T) {
+	m := newTestManager(t)
+	// Two blocking filters parse the same stream with DIFFERENT command tables.
+	// The per-message command cache must be keyed by the spec, otherwise the
+	// filter that runs first clobbers the parse seen by the second one.
+	if _, err := m.CreateScript("only-login", `
+CMDS = {b"1": ("register", 2), b"2": ("login", 2)}
+def match(flow):
+    for cmd in flow.commands(CMDS):
+        pass
+    return False
+`, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.CreateScript("with-getvip", `
+CMDS = {b"1": ("register", 2), b"2": ("login", 2), b"6": ("getvip", 1)}
+def match(flow):
+    for cmd in flow.commands(CMDS):
+        if cmd.name == "getvip" and cmd.flagid:
+            return {"drop": True, "reason": "getvip flagid"}
+    return False
+`, true, true); err != nil {
+		t.Fatal(err)
+	}
+
+	pkt := func(s string, flag bool) Flow {
+		f := Flow{"service": "s", "direction": "request", "src": "1.2.3.4", "sport": 9,
+			"body_b64": base64.StdEncoding.EncodeToString([]byte(s))}
+		if flag {
+			f["contains_flagid"] = true
+		}
+		return f
+	}
+	// register + login (harmless), then getvip with a flag-ID flight number.
+	flows := []Flow{
+		pkt("1\n", false), pkt("u\n", false), pkt("p\n", false),
+		pkt("6\n", false), pkt("FLAGFLIGHT\n", true),
+	}
+	var last []Match
+	for _, f := range flows {
+		last, _ = m.EvaluateBlocking(f)
+	}
+	var found bool
+	for _, mm := range last {
+		if mm.Script == "with-getvip" && mm.Block {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("with-getvip filter must still block despite only-login running first, got %+v", last)
+	}
+}
+
 func TestTestScriptMatchAndReason(t *testing.T) {
 	m := newTestManager(t)
 	code := `
