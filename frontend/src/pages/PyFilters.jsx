@@ -376,9 +376,9 @@ export default function PyFilters() {
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-[280px_1fr] gap-4">
+      <div className="grid grid-cols-1 lg:grid-cols-[300px_1fr] gap-4 items-start">
         {/* Script list */}
-        <div className="space-y-2">
+        <div className="space-y-2 min-w-0">
           <div className="flex items-center justify-between">
             <h3 className="text-xs uppercase tracking-wide text-gray-500">Filters</h3>
             <button
@@ -394,9 +394,9 @@ export default function PyFilters() {
           {scripts.map((s) => (
             <div
               key={s.id}
-              className={`rounded border px-3 py-2 cursor-pointer transition-colors ${
+              className={`rounded-lg border px-3 py-2 cursor-pointer transition-colors ${
                 draft.id === s.id
-                  ? 'bg-gray-800 border-cyan-700/60'
+                  ? 'bg-gray-800 border-cyan-700/60 ring-1 ring-cyan-700/30'
                   : 'bg-gray-900 border-gray-800 hover:border-gray-700'
               }`}
               onClick={() => startEdit(s)}
@@ -438,12 +438,14 @@ export default function PyFilters() {
             </div>
           ))}
 
-          <ReturnLegend />
-          <FlowApiCheatsheet />
+          <div className="pt-1 space-y-3">
+            <ReturnLegend />
+            <FlowApiCheatsheet />
+          </div>
         </div>
 
         {/* Editor + test */}
-        <div className="space-y-3">
+        <div className="space-y-3 min-w-0">
           <div className="flex items-center gap-2">
             <input
               value={draft.name}
@@ -461,7 +463,7 @@ export default function PyFilters() {
             </label>
             <label
               className="flex items-center gap-1.5 text-xs text-gray-400 select-none cursor-pointer"
-              title="Run this filter synchronously on the request path so it can act on the CURRENT request in real time: return {'drop': True} to block it, or assign flow.body / flow.messages[-1].content to rewrite it. Adds ~tens of µs per request on this service; a stuck script fails open."
+              title="Run this filter synchronously on the proxy path so it can act on the CURRENT message in real time — return {'drop': True} to drop it, or assign flow.body / flow.content to rewrite it. Works on requests and (for TCP) responses. Adds ~tens of µs per message on this service; a stuck script fails open."
             >
               <input
                 type="checkbox"
@@ -492,13 +494,19 @@ export default function PyFilters() {
             ))}
           </div>
 
-          <textarea
-            value={draft.code}
-            onChange={(e) => setDraft({ ...draft, code: e.target.value })}
-            rows={18}
-            spellCheck={false}
-            className="w-full bg-gray-950 border border-gray-800 rounded px-3 py-2 text-xs font-mono text-gray-100 focus:outline-none focus:border-cyan-500 leading-relaxed"
-          />
+          <div className="rounded-lg border border-gray-800 bg-gray-950 overflow-hidden focus-within:border-cyan-600/70 transition-colors">
+            <div className="flex items-center justify-between px-3 py-1.5 border-b border-gray-800 bg-gray-900/60">
+              <span className="text-[11px] font-mono text-gray-500">def match(flow):</span>
+              <span className="text-[10px] text-gray-600 tabular-nums">{draft.code.split('\n').length} lines</span>
+            </div>
+            <textarea
+              value={draft.code}
+              onChange={(e) => setDraft({ ...draft, code: e.target.value })}
+              rows={18}
+              spellCheck={false}
+              className="w-full bg-transparent px-3 py-2.5 text-xs font-mono text-gray-100 focus:outline-none leading-relaxed resize-y block"
+            />
+          </div>
 
           {error && (
             <div className="text-xs text-red-300 bg-red-950/40 border border-red-800/50 rounded px-3 py-2 font-mono break-all">
@@ -728,59 +736,63 @@ function VerdictBadge({ block, small }) {
 
 function ReturnLegend() {
   return (
-    <div className="mt-3 rounded border border-gray-800 bg-gray-900/60 p-3 space-y-1.5">
-      <h4 className="text-[10px] uppercase tracking-wide text-gray-500">What match(flow) returns</h4>
+    <div className="rounded-lg border border-gray-800 bg-gray-900/50 p-3 space-y-2">
+      <h4 className="text-[10px] font-semibold uppercase tracking-wide text-gray-400">What match(flow) returns</h4>
       <LegendRow code="return False" desc="ignore (no match)" tone="gray" />
-      <LegendRow code='return "reason"' desc="ALERT only" tone="green" />
-      <LegendRow code='{"match": True, "drop": True}' desc="ALERT + drop THIS message now (needs Blocking)" tone="red" />
-      <LegendRow code='flow.body = "..."  (or flow.content = b"...")' desc="rewrite THIS message inline (needs Blocking)" tone="fuchsia" />
-      <p className="text-[10px] text-gray-600 pt-1 leading-snug">
-        <code className="text-gray-500">drop: True</code> and rewriting act on the current message inline — a
-        request before it reaches the backend, or a response before it reaches the client — and only when the
-        filter has <strong>Blocking</strong> on. Use <code className="text-gray-500">flow.is_request</code> /{' '}
-        <code className="text-gray-500">flow.is_response</code> to target one direction.
+      <LegendRow code='return "reason"' desc="alert only" tone="green" />
+      <LegendRow code='{"drop": True, "reason": "…"}' desc="drop this message now — needs Blocking" tone="red" />
+      <LegendRow code='flow.body = "…"' desc="rewrite this message inline — needs Blocking" tone="fuchsia" />
+      <p className="text-[10px] text-gray-600 pt-1.5 leading-snug border-t border-gray-800/70">
+        Drop &amp; rewrite act on the current message inline (needs <strong>Blocking</strong>) — a request before it
+        reaches the backend, or a response before it reaches the client. Branch with{' '}
+        <code className="text-gray-500">flow.is_request</code> / <code className="text-gray-500">flow.is_response</code>.
       </p>
     </div>
   )
 }
 
 function FlowApiCheatsheet() {
-  const rows = [
-    ['flow.is_request / is_response', 'which side you are on (match runs on both)'],
-    ['flow.direction', '"request" or "response"'],
-    ['flow.method / url / path', 'POST, /login?x=1, /login'],
-    ['flow.status / service', 'response status, service id'],
-    ['flow.flagged / contains_flagid', 'body holds a flag / one of your flag-IDs'],
-    ['flow.headers["Cookie"]', 'case-insensitive, missing → ""'],
-    ['flow.query["id"] / .all("id")', 'parsed query string'],
-    ['flow.cookies["session"]', 'parsed Cookie header'],
-    ['flow.json() / flow.body / .content', 'body as JSON / str / bytes'],
-    ['flow.request / flow.response', 'the correlated side (never None)'],
-    ['flow.messages[-1] / recent(3)', 'recent history for this service'],
-    ['flow.body = "…" / flow.content = b"…"', 'rewrite inline (Blocking only)'],
-    ['for line in flow.lines:', 'TCP stream lines, reassembled across chunks'],
-    ['flow.conn["…"]', 'per-connection state (private to this filter)'],
-    ['flow.commands({b"1": ("register", ("user","pw"))})', 'parse a CLI into commands'],
-    ['cmd.name / cmd.flagid / cmd.user / cmd.arg(0)', 'command + args by name or index'],
-    ['DIRECTION = "request" (module-level)', 'run only on that side (optional)'],
+  const groups = [
+    ['Any message', [
+      ['flow.is_request / is_response', 'which side you are on'],
+      ['flow.flagged / contains_flagid', 'body holds a flag / a flag-ID'],
+      ['flow.json() / flow.body / flow.content', 'body as JSON / str / bytes'],
+      ['flow.service / flow.direction', 'service id · "request"/"response"'],
+    ]],
+    ['HTTP', [
+      ['flow.method / url / path / status', 'request line parts + status'],
+      ['flow.headers["Cookie"]', 'case-insensitive, missing → ""'],
+      ['flow.query["id"] / .all("id")', 'parsed query string'],
+      ['flow.cookies["session"]', 'parsed Cookie header'],
+    ]],
+    ['History / correlation', [
+      ['flow.request / flow.response', 'the correlated side (never None)'],
+      ['flow.messages[-1] / recent(3)', 'recent history for this service'],
+    ]],
+    ['TCP streams', [
+      ['for line in flow.lines:', 'lines reassembled across chunks'],
+      ['flow.conn["…"]', 'per-connection state (private to filter)'],
+      ['flow.commands({b"1": ("cmd", ("a","b"))})', 'parse a CLI into commands'],
+      ['cmd.name / cmd.flagid / cmd.a / cmd.arg(0)', 'command + args by name or index'],
+    ]],
   ]
   return (
-    <div className="mt-3 rounded border border-gray-800 bg-gray-900/60 p-3 space-y-1">
-      <h4 className="text-[10px] uppercase tracking-wide text-gray-500">Flow API — quick to write, forgiving</h4>
-      <div className="space-y-0.5">
-        {rows.map(([code, desc]) => (
-          <div key={code} className="flex items-baseline gap-2">
-            <code className="text-[11px] text-cyan-300 font-mono break-all flex-shrink-0">{code}</code>
-            <span className="text-[10px] text-gray-500 truncate">{desc}</span>
-          </div>
-        ))}
-      </div>
-      <p className="text-[10px] text-gray-600 pt-1 leading-snug">
-        Still a dict (<code className="text-gray-500">flow["body"]</code>, <code className="text-gray-500">flow.get(...)</code> work).
-        Missing fields read as <code className="text-gray-500">""</code>. <code className="text-gray-500">match(flow)</code> runs
-        once per message on <strong>both</strong> directions — branch on <code className="text-gray-500">flow.is_request</code> /
-        <code className="text-gray-500"> flow.is_response</code>, or read the other side via <code className="text-gray-500">flow.request</code> /
-        <code className="text-gray-500"> flow.response</code>.
+    <div className="rounded-lg border border-gray-800 bg-gray-900/50 p-3 space-y-2.5">
+      <h4 className="text-[10px] font-semibold uppercase tracking-wide text-gray-400">Flow API</h4>
+      {groups.map(([title, rows]) => (
+        <div key={title} className="space-y-1">
+          <div className="text-[9px] uppercase tracking-wider text-gray-600">{title}</div>
+          {rows.map(([code, desc]) => (
+            <div key={code} className="min-w-0 leading-tight">
+              <code className="block text-[11px] text-cyan-300 font-mono break-words">{code}</code>
+              <span className="block text-[10px] text-gray-500">{desc}</span>
+            </div>
+          ))}
+        </div>
+      ))}
+      <p className="text-[10px] text-gray-600 pt-1 leading-snug border-t border-gray-800/70">
+        Still a dict — <code className="text-gray-500">flow["body"]</code> / <code className="text-gray-500">flow.get(...)</code> work,
+        and a missing field reads as <code className="text-gray-500">""</code> so filters never crash on it.
       </p>
     </div>
   )
@@ -790,9 +802,9 @@ function LegendRow({ code, desc, tone }) {
   const dot = { gray: 'bg-gray-500', green: 'bg-emerald-400', amber: 'bg-amber-400', red: 'bg-rose-400', fuchsia: 'bg-fuchsia-400' }[tone]
   return (
     <div className="flex items-start gap-2">
-      <span className={`mt-1 w-1.5 h-1.5 rounded-full flex-shrink-0 ${dot}`} />
+      <span className={`mt-[5px] w-1.5 h-1.5 rounded-full flex-shrink-0 ${dot}`} />
       <div className="min-w-0">
-        <code className="text-[11px] text-cyan-300 font-mono break-all">{code}</code>
+        <code className="text-[11px] text-cyan-300 font-mono break-words">{code}</code>
         <span className="text-[11px] text-gray-500"> — {desc}</span>
       </div>
     </div>
