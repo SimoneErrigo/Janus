@@ -4,8 +4,22 @@ Runs as a long-lived worker driven by newline-delimited JSON over stdin/stdout.
 User scripts each define:
 
     def match(flow):
-        # flow is a dict: method, url, status, headers, body, src, dst,
-        # service, direction, sport, dport, flagged, contains_flagid, id, ...
+        # `flow` is still a dict (flow["body"], flow.get(...) work), plus a
+        # forgiving, quick-to-write API — a missing field reads as "" (never
+        # crashes). Works for HTTP and TCP, in every mode.
+        #
+        #   flow.method / url / path / status / service / direction
+        #   flow.is_request / flow.is_response
+        #   flow.headers["Cookie"]          # case-insensitive, missing -> ""
+        #   flow.query["id"]  flow.cookies["session"]   # forgiving dicts
+        #   flow.body (str)   flow.bytes    flow.json()  # parsed body or None
+        #   flow.request / flow.response    # correlated sides (never None)
+        #   flow.messages[-1]               # most recent message (this service)
+        #   flow.recent(3)  flow.last_request  flow.requests  flow.responses
+        #
+        # NOTE: match(flow) runs per message. An inline (Blocking) filter only
+        # sees requests, so for it flow.response/.responses are empty.
+        #
         # return one of:
         #   False / None            -> no match
         #   True                    -> match (no reason)
@@ -37,9 +51,267 @@ Protocol (one JSON object per line):
 import sys
 import json
 import traceback
+from collections import deque
+from urllib.parse import urlsplit, parse_qs
 
 # id -> {"name": str, "fn": callable}
 SCRIPTS = {}
+
+# --- ergonomic flow object -------------------------------------------------
+# match(flow) receives a Flow: still a plain dict (flow["body"], flow.get(...)
+# keep working), plus forgiving attribute access + HTTP/TCP helpers so filters
+# are quick to write and never crash on a missing field.
+
+_HISTORY = {}        # service -> deque[Flow] of recently evaluated messages
+_HISTORY_MAX = 32
+
+
+class _Headers:
+    """Case-insensitive header view; a missing header reads as ""."""
+
+    def __init__(self, d):
+        self._d = d or {}
+        self._l = {str(k).lower(): v for k, v in self._d.items()}
+
+    def __getitem__(self, k):
+        return self._l.get(str(k).lower(), "")
+
+    def get(self, k, default=""):
+        return self._l.get(str(k).lower(), default)
+
+    def __contains__(self, k):
+        return str(k).lower() in self._l
+
+    def __iter__(self):
+        return iter(self._d)
+
+    def keys(self):
+        return self._d.keys()
+
+    def items(self):
+        return self._d.items()
+
+    def values(self):
+        return self._d.values()
+
+    def __bool__(self):
+        return bool(self._d)
+
+    def __repr__(self):
+        return repr(self._d)
+
+
+class _Bag(dict):
+    """A dict whose missing keys read as "" (used for cookies)."""
+
+    def __missing__(self, k):
+        return ""
+
+    def get(self, k, default=""):
+        return dict.get(self, k, default)
+
+
+class _Query:
+    """Forgiving query-string view: q["id"] -> first value ("" if absent),
+    q.all("id") -> every value."""
+
+    def __init__(self, url):
+        self._q = parse_qs(urlsplit(url or "").query, keep_blank_values=True)
+
+    def __getitem__(self, k):
+        v = self._q.get(k)
+        return v[0] if v else ""
+
+    def get(self, k, default=""):
+        v = self._q.get(k)
+        return v[0] if v else default
+
+    def all(self, k):
+        return list(self._q.get(k, []))
+
+    def __contains__(self, k):
+        return k in self._q
+
+    def keys(self):
+        return self._q.keys()
+
+    def items(self):
+        return [(k, v[0] if v else "") for k, v in self._q.items()]
+
+    def __bool__(self):
+        return bool(self._q)
+
+    def __repr__(self):
+        return repr({k: (v[0] if v else "") for k, v in self._q.items()})
+
+
+def _parse_cookies(raw):
+    out = _Bag()
+    for part in (raw or "").split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            out[k.strip()] = v.strip()
+    return out
+
+
+class Flow(dict):
+    """Ergonomic wrapper around the raw flow dict (still a dict, backward
+    compatible). Adds forgiving attribute access + HTTP/TCP helpers."""
+
+    # -- core fields (forgiving: missing -> "" / 0) --
+    @property
+    def method(self):
+        return self.get("method", "") or ""
+
+    @property
+    def url(self):
+        return self.get("url", "") or ""
+
+    @property
+    def status(self):
+        return self.get("status", 0) or 0
+
+    @property
+    def service(self):
+        return self.get("service", "") or ""
+
+    @property
+    def direction(self):
+        return self.get("direction", "") or ""
+
+    @property
+    def src(self):
+        return self.get("src", "") or ""
+
+    @property
+    def dst(self):
+        return self.get("dst", "") or ""
+
+    @property
+    def sport(self):
+        return self.get("sport", 0) or 0
+
+    @property
+    def dport(self):
+        return self.get("dport", 0) or 0
+
+    @property
+    def flagged(self):
+        return bool(self.get("flagged"))
+
+    @property
+    def contains_flagid(self):
+        return bool(self.get("contains_flagid"))
+
+    @property
+    def is_request(self):
+        return self.direction == "request"
+
+    @property
+    def is_response(self):
+        return self.direction == "response"
+
+    # -- body --
+    @property
+    def body(self):
+        b = self.get("body", "")
+        return b if isinstance(b, str) else (b or "")
+
+    @property
+    def bytes(self):
+        b = self.body
+        return b.encode("utf-8", "replace") if isinstance(b, str) else b
+
+    def json(self, default=None):
+        try:
+            return json.loads(self.body)
+        except Exception:
+            return default
+
+    # -- headers / url parts (all forgiving) --
+    @property
+    def headers(self):
+        return _Headers(self.get("headers") or {})
+
+    def header(self, name, default=""):
+        return self.headers.get(name, default)
+
+    @property
+    def path(self):
+        return urlsplit(self.url).path
+
+    @property
+    def query(self):
+        return _Query(self.url)
+
+    params = query
+
+    @property
+    def cookies(self):
+        return _parse_cookies(self.headers.get("cookie", ""))
+
+    # -- history / recency (per service, most-recent last) --
+    @property
+    def messages(self):
+        dq = _HISTORY.get(self.service)
+        return list(dq) if dq else [self]
+
+    def recent(self, n=3):
+        msgs = self.messages
+        return msgs[-n:] if n and n > 0 else msgs
+
+    @property
+    def requests(self):
+        return [m for m in self.messages if m.is_request]
+
+    @property
+    def responses(self):
+        return [m for m in self.messages if m.is_response]
+
+    @property
+    def last_request(self):
+        for m in reversed(self.messages[:-1]):
+            if m.is_request:
+                return m
+        return _EMPTY
+
+    @property
+    def last_response(self):
+        for m in reversed(self.messages[:-1]):
+            if m.is_response:
+                return m
+        return _EMPTY
+
+    @property
+    def request(self):
+        return self if self.is_request else self.last_request
+
+    @property
+    def response(self):
+        return self if self.is_response else self.last_response
+
+    # -- attribute fallback: flow.<key> -> flow["<key>"], missing -> "" --
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            return self[name]
+        except KeyError:
+            return ""
+
+
+_EMPTY = Flow()
+
+
+def _record(flow):
+    """Append the flow to its service's bounded recent-history deque."""
+    svc = flow.get("service") or ""
+    dq = _HISTORY.get(svc)
+    if dq is None:
+        dq = deque(maxlen=_HISTORY_MAX)
+        _HISTORY[svc] = dq
+    dq.append(flow)
 
 
 def _compile_scripts(scripts):
@@ -91,6 +363,9 @@ def _normalize(res):
 
 
 def _evaluate(scripts, flow):
+    if not isinstance(flow, Flow):
+        flow = Flow(flow)
+    _record(flow)  # record once per message, before any script runs
     matches = []
     for sid, s in scripts.items():
         try:

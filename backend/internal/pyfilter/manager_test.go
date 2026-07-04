@@ -56,6 +56,108 @@ def match(flow):
 	}
 }
 
+func TestFlowErgonomicAccessors(t *testing.T) {
+	m := newTestManager(t)
+	code := `
+def match(flow):
+    if (flow.headers["cookie"] == "session=abc"          # case-insensitive
+            and flow.headers["missing"] == ""            # forgiving
+            and flow.header("user-agent") == "curl/8"
+            and flow.json().get("n") == 3                # parsed body
+            and flow.query["id"] == "9"                  # parsed query
+            and flow.query.all("x") == ["1", "2"]
+            and flow.cookies["session"] == "abc"
+            and flow.path == "/api/x"
+            and flow.is_request):
+        return "ergonomic ok"
+    return False
+`
+	flow := Flow{
+		"service": "t", "direction": "request", "method": "POST",
+		"url":     "/api/x?id=9&x=1&x=2",
+		"headers": map[string]any{"Cookie": "session=abc", "User-Agent": "curl/8"},
+		"body":    `{"n":3}`,
+	}
+	got, scriptErr, err := m.Test("erg", code, flow, 1)
+	if err != nil || scriptErr != "" {
+		t.Fatalf("Test: err=%v scriptErr=%s", err, scriptErr)
+	}
+	if len(got) != 1 || got[0].Reason != "ergonomic ok" {
+		t.Fatalf("expected ergonomic match, got %+v", got)
+	}
+}
+
+func TestFlowBackwardCompatDictStyle(t *testing.T) {
+	m := newTestManager(t)
+	// The classic dict-style API must keep working unchanged.
+	code := `
+def match(flow):
+    if flow.get("method") == "POST" and flow.get("headers", {}).get("User-Agent", "") == "x":
+        return "dict-style ok"
+    return False
+`
+	got, _, err := m.Test("compat", code, Flow{"method": "POST", "headers": map[string]any{"User-Agent": "x"}}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Reason != "dict-style ok" {
+		t.Fatalf("dict-style compat broken, got %+v", got)
+	}
+}
+
+func TestFlowHistoryAndCorrelation(t *testing.T) {
+	m := newTestManager(t)
+	// The response step reads the correlated request via history.
+	code := `
+def match(flow):
+    if flow.is_response and flow.request.url == "/pay":
+        return "resp for %s (seen %d msgs)" % (flow.request.url, len(flow.messages))
+    return False
+`
+	flows := []Flow{
+		{"service": "api", "direction": "request", "method": "POST", "url": "/pay"},
+		{"service": "api", "direction": "response", "status": 200},
+	}
+	steps, scriptErr, err := m.TestSequence("corr", code, flows, 1)
+	if err != nil || scriptErr != "" {
+		t.Fatalf("TestSequence: err=%v scriptErr=%s", err, scriptErr)
+	}
+	if len(steps) != 2 {
+		t.Fatalf("expected 2 steps, got %d", len(steps))
+	}
+	if len(steps[0]) != 0 {
+		t.Fatalf("request step should not match, got %+v", steps[0])
+	}
+	if len(steps[1]) != 1 || steps[1][0].Reason != "resp for /pay (seen 2 msgs)" {
+		t.Fatalf("response step should correlate the request, got %+v", steps[1])
+	}
+}
+
+func TestFlowRecentMessages(t *testing.T) {
+	m := newTestManager(t)
+	code := `
+def match(flow):
+    urls = [x.url for x in flow.recent(3)]
+    if urls == ["/r1", "/r2", "/r3"]:
+        return "recent ok"
+    return False
+`
+	flows := []Flow{
+		{"service": "s", "direction": "request", "url": "/r0"},
+		{"service": "s", "direction": "request", "url": "/r1"},
+		{"service": "s", "direction": "request", "url": "/r2"},
+		{"service": "s", "direction": "request", "url": "/r3"},
+	}
+	steps, _, err := m.TestSequence("recent", code, flows, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only the last step sees /r1,/r2,/r3 as the 3 most recent.
+	if len(steps[3]) != 1 || steps[3][0].Reason != "recent ok" {
+		t.Fatalf("recent(3) at last step wrong: %+v", steps[3])
+	}
+}
+
 func TestTestScriptMatchAndReason(t *testing.T) {
 	m := newTestManager(t)
 	code := `
