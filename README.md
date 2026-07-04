@@ -128,15 +128,11 @@ over time. Matches surface on the **Alerts** page.
 
 ```python
 # Alert when the same user logs in more than once.
-import json
 logins = {}
 
 def match(flow):
-    if flow["method"] == "POST" and flow["url"] == "/login":
-        try:
-            user = json.loads(flow["body"]).get("user")
-        except Exception:
-            user = None
+    if flow.method == "POST" and flow.path == "/login":
+        user = (flow.json() or {}).get("user")   # parsed body, None-safe
         if user:
             logins[user] = logins.get(user, 0) + 1
             if logins[user] > 1:
@@ -145,11 +141,16 @@ def match(flow):
 ```
 
 `match(flow)` returns `False`/`None` (no match), `True`, a reason string, or a
-dict `{"match": True, "reason": "...", "drop": "<filter expr>"}`. `flow` exposes
-`method`, `url`, `status`, `headers` (dict), `body`, `src`, `dst`, `service`,
-`direction`, `flagged`, `contains_flagid`, and more. Scripts run in a bundled
-`python3` interpreter, off the proxy hot path; a hung or broken script is
-isolated and never blocks traffic. Toggle the whole engine with
+dict `{"match": True, "reason": "...", "drop": ...}`. `flow` is a **forgiving
+object** (still a dict, so `flow["body"]` / `flow.get(...)` keep working): a
+missing field reads as `""`, so filters are quick to write and never crash.
+Handy accessors — `flow.method` / `url` / `path` / `status` / `service` /
+`direction`, `flow.headers["Cookie"]` (case-insensitive), `flow.query["id"]`,
+`flow.cookies["session"]`, `flow.json()` / `flow.body` / `flow.bytes`,
+`flow.request` / `flow.response` (correlated sides, never `None`), and recent
+history `flow.messages[-1]` / `flow.recent(3)` / `flow.last_request`. Works for
+HTTP and TCP. Scripts run in a bundled `python3` interpreter; a hung or broken
+script is isolated and never blocks traffic. Toggle the whole engine with
 `PYFILTER_ENABLED` and point at a specific interpreter with `PYFILTER_PYTHON`.
 
 **Dropping (fail2ban-style).** A match can also return a `drop` filter
@@ -161,6 +162,12 @@ engine. Drops are **content-only**: the expression may use `body` / `url` /
 meaningless under SNAT (every team shares one address) and is rejected. So the
 right pattern is "detect the offender, then block their traffic by content"
 (e.g. their username in the body). Installed rules appear on the **Blocks** page.
+
+**Inline (real-time) blocking.** Mark a filter **Blocking** in the UI and it runs
+*synchronously* on the request path: returning `{"drop": True}` then drops the
+**current** request in real time (403), not just future traffic. It costs ~tens
+of µs per request on that service and is bounded + fail-open (a stuck script lets
+the request through). Inline blocking applies to HTTP requests only.
 
 You can **test** a script right on the page before enabling it: build a
 Request/Response sample, or load a real captured packet (or a whole

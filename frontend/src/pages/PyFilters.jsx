@@ -4,17 +4,17 @@ import { api } from '../api'
 // --- example scripts, one per pattern, so alert vs drop is obvious ---
 
 const ALERT_EXAMPLE = `# ALERT ONLY — return a string (the reason) to raise an Alert.
+# flow is forgiving: flow.method, flow.path, flow.headers["x"], flow.json()...
 def match(flow):
-    if flow.get("method") == "POST" and "/admin" in flow.get("url", ""):
+    if flow.method == "POST" and "/admin" in flow.path:
         return "POST to an admin endpoint"   # string -> ALERT
     return False
 `
 
-const DROP_EXAMPLE = `# ALERT + DROP — return a dict with a "drop" filter expression to also
+const DROP_EXAMPLE = `# ALERT + DROP (async) — return a dict with a "drop" filter expression to
 # block FUTURE matching traffic (fail2ban-style, content-only, never by IP).
 def match(flow):
-    ua = flow.get("headers", {}).get("User-Agent", "")
-    if "sqlmap" in ua.lower():
+    if "sqlmap" in flow.header("user-agent").lower():   # missing header -> ""
         return {
             "match": True,
             "reason": "sqlmap user-agent",
@@ -25,16 +25,11 @@ def match(flow):
 
 const STATEFUL_EXAMPLE = `# STATEFUL — module-level state persists across packets. Here: alert (and
 # block) a user only from their SECOND login onward. Use Repeat >= 2 to test.
-import json
-
 logins = {}
 
 def match(flow):
-    if flow.get("method") == "POST" and flow.get("url") == "/login":
-        try:
-            user = json.loads(flow.get("body", "")).get("user")
-        except Exception:
-            user = None
+    if flow.method == "POST" and flow.path == "/login":
+        user = (flow.json() or {}).get("user")   # parsed body, None-safe
         if user:
             logins[user] = logins.get(user, 0) + 1
             if logins[user] > 1:
@@ -50,16 +45,11 @@ const BLOCK_EXAMPLE = `# INLINE BLOCK — return {"drop": True} to drop the CURR
 # time (not just future traffic). Requires the "Blocking" checkbox: the script
 # then runs synchronously on the request path. Here: block a registration whose
 # password was already used by an earlier one.
-import json
-
 seen = {}
 
 def match(flow):
-    if flow.get("method") == "POST" and "register" in (flow.get("url") or ""):
-        try:
-            pw = json.loads(flow.get("body", "")).get("password")
-        except Exception:
-            pw = None
+    if flow.method == "POST" and "register" in flow.path:
+        pw = (flow.json() or {}).get("password")
         if pw:
             seen[pw] = seen.get(pw, 0) + 1
             if seen[pw] >= 2:
@@ -433,6 +423,7 @@ export default function PyFilters() {
           ))}
 
           <ReturnLegend />
+          <FlowApiCheatsheet />
         </div>
 
         {/* Editor + test */}
@@ -713,6 +704,39 @@ function ReturnLegend() {
         (content-only: <code className="text-gray-500">body</code>/<code className="text-gray-500">url</code>/<code className="text-gray-500">header</code>/<code className="text-gray-500">service</code>;
         IP/port rejected, SNAT-unsafe). <code className="text-gray-500">drop: True</code> drops the current
         request inline — only when the filter has <strong>Blocking</strong> on.
+      </p>
+    </div>
+  )
+}
+
+function FlowApiCheatsheet() {
+  const rows = [
+    ['flow.method / url / path', 'POST, /login?x=1, /login'],
+    ['flow.status / service', 'response status, service id'],
+    ['flow.is_request / is_response', 'direction helpers'],
+    ['flow.headers["Cookie"]', 'case-insensitive, missing → ""'],
+    ['flow.query["id"] / .all("id")', 'parsed query string'],
+    ['flow.cookies["session"]', 'parsed Cookie header'],
+    ['flow.json() / flow.body / .bytes', 'body as JSON / str / bytes'],
+    ['flow.request / flow.response', 'correlated side (never None)'],
+    ['flow.messages[-1]', 'most recent message (this service)'],
+    ['flow.recent(3) / last_request', 'recent history'],
+  ]
+  return (
+    <div className="mt-3 rounded border border-gray-800 bg-gray-900/60 p-3 space-y-1">
+      <h4 className="text-[10px] uppercase tracking-wide text-gray-500">Flow API — quick to write, forgiving</h4>
+      <div className="space-y-0.5">
+        {rows.map(([code, desc]) => (
+          <div key={code} className="flex items-baseline gap-2">
+            <code className="text-[11px] text-cyan-300 font-mono break-all flex-shrink-0">{code}</code>
+            <span className="text-[10px] text-gray-500 truncate">{desc}</span>
+          </div>
+        ))}
+      </div>
+      <p className="text-[10px] text-gray-600 pt-1 leading-snug">
+        Still a dict (<code className="text-gray-500">flow["body"]</code>, <code className="text-gray-500">flow.get(...)</code> work).
+        Missing fields read as <code className="text-gray-500">""</code>. For inline <strong>Blocking</strong> filters
+        <code className="text-gray-500"> flow.response</code> is empty (the response doesn't exist yet).
       </p>
     </div>
   )
