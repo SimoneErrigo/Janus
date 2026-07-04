@@ -29,8 +29,12 @@ type Match struct {
 	Reason string `json:"reason"`
 	// Drop, when non-empty, is a content-only filter expression the script asked
 	// Janus to install as a drop rule so future matching traffic is blocked.
-	Drop  string `json:"drop"`
-	Error bool   `json:"error"`
+	Drop string `json:"drop"`
+	// Block asks Janus to drop the CURRENT request synchronously (inline, on the
+	// proxy hot path). Only honored for scripts marked Blocking; produced by
+	// returning {"drop": True} or {"block": True} from match().
+	Block bool `json:"block"`
+	Error bool `json:"error"`
 }
 
 // worker wraps a single long-lived `python3 harness.py` process. The protocol

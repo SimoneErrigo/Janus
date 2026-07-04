@@ -165,6 +165,24 @@ func main() {
 		} else {
 			log.Printf("Python filters enabled but no python3 interpreter found — scripts will not run")
 		}
+
+		// Inline blocking: filters marked "Blocking" run synchronously on the
+		// request hot path so a match returning {"drop": True} drops the current
+		// request in real time. Bounded + fail-open inside EvaluateBlocking.
+		proxyMgr.SetPyBlockFn(func(flow map[string]any) []sniffer.PyBlockMatch {
+			var out []sniffer.PyBlockMatch
+			for _, mt := range pyMgr.EvaluateBlocking(flow) {
+				if !mt.Block {
+					continue
+				}
+				reason := mt.Name
+				if mt.Reason != "" {
+					reason = mt.Name + ": " + mt.Reason
+				}
+				out = append(out, sniffer.PyBlockMatch{Script: mt.Script, Reason: reason})
+			}
+			return out
+		})
 	}
 
 	packetStore.SetPacketChangeListener(func(kind sniffer.PacketChangeKind, pkt *sniffer.Packet) {

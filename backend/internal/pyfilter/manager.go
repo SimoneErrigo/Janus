@@ -31,9 +31,14 @@ type Config struct {
 	DataDir string
 	// PythonPath optionally overrides interpreter auto-detection.
 	PythonPath string
-	// EvalTimeout bounds a single evaluation before the worker is killed.
+	// EvalTimeout bounds a single async evaluation before the worker is killed.
 	// Defaults to 2s.
 	EvalTimeout time.Duration
+	// BlockTimeout bounds a single synchronous (inline blocking) evaluation on
+	// the request hot path. Kept short so a stuck script can never stall traffic
+	// for long — on timeout the request fails open (is forwarded). Defaults to
+	// 100ms.
+	BlockTimeout time.Duration
 	// QueueSize bounds the async Submit backlog. Defaults to 1024.
 	QueueSize int
 	// OnMatch is invoked (from a background goroutine) for every match produced
@@ -48,10 +53,23 @@ type Status struct {
 	WorkerHealthy bool   `json:"worker_healthy"` // a live worker is running
 	ScriptCount   int    `json:"script_count"`
 	EnabledCount  int    `json:"enabled_count"`
+	BlockingCount int    `json:"blocking_count"` // enabled scripts that run inline
 	LastError     string `json:"last_error,omitempty"`
 }
 
-// Manager owns the script set and the Python worker.
+// lane is one evaluation context: a long-lived worker that loads exactly one
+// subset of the enabled scripts (blocking vs non-blocking). Keeping the two
+// subsets in separate workers guarantees each script's match() runs in exactly
+// one place, so stateful counters are never double-incremented.
+type lane struct {
+	blocking  bool          // loads enabled scripts whose Blocking == this
+	timeout   time.Duration // per-eval timeout
+	mu        sync.Mutex
+	worker    *worker
+	loadedGen int
+}
+
+// Manager owns the script set and the Python workers.
 type Manager struct {
 	cfg        Config
 	pythonPath string
@@ -63,15 +81,28 @@ type Manager struct {
 	gen     int // bumped on every script-set change
 	path    string
 
-	// live worker state
-	wmu       sync.Mutex
-	worker    *worker
-	loadedGen int
-	lastErr   string
+	// evaluation lanes
+	async lane // non-blocking scripts (async Submit pipeline)
+	block lane // blocking scripts (synchronous, request hot path)
+
+	errMu   sync.Mutex
+	lastErr string
 
 	queue    chan Flow
 	stopOnce sync.Once
 	stopped  chan struct{}
+}
+
+func (m *Manager) setLastErr(s string) {
+	m.errMu.Lock()
+	m.lastErr = s
+	m.errMu.Unlock()
+}
+
+func (m *Manager) lastErrStr() string {
+	m.errMu.Lock()
+	defer m.errMu.Unlock()
+	return m.lastErr
 }
 
 // NewManager detects python3, loads persisted scripts, and starts the async
@@ -81,15 +112,19 @@ func NewManager(cfg Config) *Manager {
 	if cfg.EvalTimeout <= 0 {
 		cfg.EvalTimeout = 2 * time.Second
 	}
+	if cfg.BlockTimeout <= 0 {
+		cfg.BlockTimeout = 100 * time.Millisecond
+	}
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = 1024
 	}
 	m := &Manager{
-		cfg:       cfg,
-		path:      cfg.DataDir + "/pyfilters.json",
-		loadedGen: -1,
-		queue:     make(chan Flow, cfg.QueueSize),
-		stopped:   make(chan struct{}),
+		cfg:     cfg,
+		path:    cfg.DataDir + "/pyfilters.json",
+		async:   lane{blocking: false, timeout: cfg.EvalTimeout, loadedGen: -1},
+		block:   lane{blocking: true, timeout: cfg.BlockTimeout, loadedGen: -1},
+		queue:   make(chan Flow, cfg.QueueSize),
+		stopped: make(chan struct{}),
 	}
 
 	m.pythonPath = cfg.PythonPath
@@ -143,7 +178,7 @@ func (m *Manager) GetScript(id string) (Script, bool) {
 }
 
 // CreateScript adds a new script. The id is derived from the name (uniquified).
-func (m *Manager) CreateScript(name, code string, enabled bool) (Script, error) {
+func (m *Manager) CreateScript(name, code string, enabled, blocking bool) (Script, error) {
 	if name == "" {
 		return Script{}, errors.New("name is required")
 	}
@@ -156,14 +191,14 @@ func (m *Manager) CreateScript(name, code string, enabled bool) (Script, error) 
 		id = fmt.Sprintf("%s-%d", base, i)
 	}
 	now := time.Now().Unix()
-	s := Script{ID: id, Name: name, Code: code, Enabled: enabled, CreatedAt: now, UpdatedAt: now}
+	s := Script{ID: id, Name: name, Code: code, Enabled: enabled, Blocking: blocking, CreatedAt: now, UpdatedAt: now}
 	m.scripts = append(m.scripts, s)
 	m.persistAndBumpLocked()
 	return s, nil
 }
 
-// UpdateScript mutates an existing script's name/code/enabled.
-func (m *Manager) UpdateScript(id, name, code string, enabled bool) (Script, error) {
+// UpdateScript mutates an existing script's name/code/enabled/blocking.
+func (m *Manager) UpdateScript(id, name, code string, enabled, blocking bool) (Script, error) {
 	m.smu.Lock()
 	defer m.smu.Unlock()
 	i := m.indexOf(id)
@@ -175,6 +210,7 @@ func (m *Manager) UpdateScript(id, name, code string, enabled bool) (Script, err
 	}
 	m.scripts[i].Code = code
 	m.scripts[i].Enabled = enabled
+	m.scripts[i].Blocking = blocking
 	m.scripts[i].UpdatedAt = time.Now().Unix()
 	s := m.scripts[i]
 	m.persistAndBumpLocked()
@@ -228,28 +264,29 @@ func (m *Manager) indexOf(id string) int {
 func (m *Manager) persistAndBumpLocked() {
 	m.gen++
 	if err := saveScripts(m.path, m.scripts); err != nil {
-		m.lastErr = "saving scripts: " + err.Error()
+		m.setLastErr("saving scripts: " + err.Error())
 	}
 }
 
-// enabledSpecsAndGen snapshots the enabled scripts and current generation.
-func (m *Manager) enabledSpecsAndGen() ([]scriptSpec, int) {
+// enabledSpecsAndGen snapshots the enabled scripts in one lane's subset
+// (Blocking == blocking) plus the current generation.
+func (m *Manager) enabledSpecsAndGen(blocking bool) ([]scriptSpec, int) {
 	m.smu.Lock()
 	defer m.smu.Unlock()
 	specs := make([]scriptSpec, 0, len(m.scripts))
 	for _, s := range m.scripts {
-		if s.Enabled {
+		if s.Enabled && s.Blocking == blocking {
 			specs = append(specs, scriptSpec{ID: s.ID, Name: s.Name, Code: s.Code})
 		}
 	}
 	return specs, m.gen
 }
 
-func (m *Manager) hasEnabled() bool {
+func (m *Manager) hasEnabled(blocking bool) bool {
 	m.smu.Lock()
 	defer m.smu.Unlock()
 	for _, s := range m.scripts {
-		if s.Enabled {
+		if s.Enabled && s.Blocking == blocking {
 			return true
 		}
 	}
@@ -262,27 +299,32 @@ func (m *Manager) hasEnabled() bool {
 func (m *Manager) Status() Status {
 	m.smu.Lock()
 	total := len(m.scripts)
-	enabled := 0
+	enabled, blocking := 0, 0
 	for _, s := range m.scripts {
 		if s.Enabled {
 			enabled++
+			if s.Blocking {
+				blocking++
+			}
 		}
 	}
 	m.smu.Unlock()
 
-	m.wmu.Lock()
-	healthy := m.worker != nil && !m.worker.isDead()
-	lastErr := m.lastErr
-	m.wmu.Unlock()
-
 	return Status{
 		Available:     m.available,
 		PythonPath:    m.pythonPath,
-		WorkerHealthy: healthy,
+		WorkerHealthy: m.async.healthy() || m.block.healthy(),
 		ScriptCount:   total,
 		EnabledCount:  enabled,
-		LastError:     lastErr,
+		BlockingCount: blocking,
+		LastError:     m.lastErrStr(),
 	}
+}
+
+func (l *lane) healthy() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.worker != nil && !l.worker.isDead()
 }
 
 // --- evaluation ---
@@ -309,51 +351,71 @@ type loadResp struct {
 	Errors map[string]string `json:"errors"`
 }
 
-// Evaluate runs all enabled scripts against flow synchronously and returns the
-// matches. Returns nil when the engine is unavailable or has no enabled
-// scripts. Safe for concurrent use (evaluations are serialized).
+// Evaluate runs the enabled non-blocking scripts against flow synchronously and
+// returns the matches. Returns nil when the engine is unavailable or has no
+// enabled non-blocking scripts. Used by the async Submit pipeline.
 func (m *Manager) Evaluate(flow Flow) []Match {
-	if !m.available || !m.hasEnabled() {
+	if !m.available || !m.hasEnabled(false) {
 		return nil
 	}
-	m.wmu.Lock()
-	defer m.wmu.Unlock()
-	if err := m.ensureWorkerLocked(); err != nil {
-		m.lastErr = err.Error()
+	return m.evalLane(&m.async, flow)
+}
+
+// EvaluateBlocking runs the enabled blocking scripts against flow synchronously
+// on the request hot path. It is bounded by a short timeout and fails open (nil,
+// = no block) if the worker stalls or dies, so a bad script never stalls
+// traffic. Returns the matches (each Block flag says whether to drop now).
+func (m *Manager) EvaluateBlocking(flow Flow) []Match {
+	if !m.available || !m.hasEnabled(true) {
+		return nil
+	}
+	return m.evalLane(&m.block, flow)
+}
+
+// evalLane ensures the lane's worker is up with the right scripts loaded, then
+// runs one evaluation. On any transport error the worker is discarded (respawned
+// next call) and nil is returned.
+func (m *Manager) evalLane(l *lane, flow Flow) []Match {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := m.ensureLaneLocked(l); err != nil {
+		m.setLastErr(err.Error())
 		return nil
 	}
 	var resp evalResp
-	if err := m.worker.roundtrip(evalReq{Cmd: "eval", Packet: flow}, m.cfg.EvalTimeout, &resp); err != nil {
-		m.lastErr = err.Error()
-		m.worker = nil // force respawn next time
+	if err := l.worker.roundtrip(evalReq{Cmd: "eval", Packet: flow}, l.timeout, &resp); err != nil {
+		m.setLastErr(err.Error())
+		l.worker = nil // force respawn next time
 		return nil
 	}
 	return resp.Matches
 }
 
-// ensureWorkerLocked spawns the worker if needed and (re)loads the enabled
-// scripts when the generation changed. Caller holds wmu.
-func (m *Manager) ensureWorkerLocked() error {
-	if m.worker == nil || m.worker.isDead() {
+// ensureLaneLocked spawns the lane's worker if needed and (re)loads its script
+// subset when the generation changed. Caller holds l.mu.
+func (m *Manager) ensureLaneLocked(l *lane) error {
+	if l.worker == nil || l.worker.isDead() {
 		w, err := spawnWorker(m.pythonPath, harness)
 		if err != nil {
 			return err
 		}
-		m.worker = w
-		m.loadedGen = -1
+		l.worker = w
+		l.loadedGen = -1
 	}
-	specs, gen := m.enabledSpecsAndGen()
-	if gen != m.loadedGen {
+	specs, gen := m.enabledSpecsAndGen(l.blocking)
+	if gen != l.loadedGen {
 		var resp loadResp
-		if err := m.worker.roundtrip(loadReq{Cmd: "load", Scripts: specs}, m.cfg.EvalTimeout, &resp); err != nil {
-			m.worker = nil
+		// Loading compiles+execs the scripts (top-level code runs); use the
+		// generous eval timeout, not the tight per-request block timeout.
+		if err := l.worker.roundtrip(loadReq{Cmd: "load", Scripts: specs}, m.cfg.EvalTimeout, &resp); err != nil {
+			l.worker = nil
 			return err
 		}
-		m.loadedGen = gen
+		l.loadedGen = gen
 		if len(resp.Errors) > 0 {
-			m.lastErr = "script errors: " + firstError(resp.Errors)
+			m.setLastErr("script errors: " + firstError(resp.Errors))
 		} else {
-			m.lastErr = ""
+			m.setLastErr("")
 		}
 	}
 	return nil
@@ -369,7 +431,7 @@ func firstError(errs map[string]string) string {
 // Submit queues a flow for asynchronous evaluation. Non-blocking: when the
 // backlog is full the flow is dropped (live tagging is best-effort).
 func (m *Manager) Submit(flow Flow) {
-	if !m.available || !m.hasEnabled() {
+	if !m.available || !m.hasEnabled(false) {
 		return
 	}
 	select {
@@ -463,15 +525,17 @@ func (m *Manager) Test(name, code string, flow Flow, repeat int) ([]Match, strin
 	return steps[len(steps)-1], "", nil
 }
 
-// Close stops the pipeline and terminates the worker.
+// Close stops the pipeline and terminates both lane workers.
 func (m *Manager) Close() {
 	m.stopOnce.Do(func() {
 		close(m.stopped)
 	})
-	m.wmu.Lock()
-	if m.worker != nil {
-		m.worker.stop()
-		m.worker = nil
+	for _, l := range []*lane{&m.async, &m.block} {
+		l.mu.Lock()
+		if l.worker != nil {
+			l.worker.stop()
+			l.worker = nil
+		}
+		l.mu.Unlock()
 	}
-	m.wmu.Unlock()
 }

@@ -10,12 +10,17 @@ import (
 
 // Script is a persisted Python filter addon.
 type Script struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Code      string `json:"code"`
-	Enabled   bool   `json:"enabled"`
-	CreatedAt int64  `json:"created_at"`
-	UpdatedAt int64  `json:"updated_at"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Code    string `json:"code"`
+	Enabled bool   `json:"enabled"`
+	// Blocking runs this script synchronously on the request hot path (inline),
+	// so a match returning {"drop": True} blocks the CURRENT request in real time
+	// (like a drop rule) instead of only alerting/installing a future-traffic
+	// rule. Non-blocking scripts stay on the async pipeline (zero hot-path cost).
+	Blocking  bool  `json:"blocking"`
+	CreatedAt int64 `json:"created_at"`
+	UpdatedAt int64 `json:"updated_at"`
 }
 
 var idSanitize = regexp.MustCompile(`[^a-z0-9._-]+`)

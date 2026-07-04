@@ -16,6 +16,46 @@ func newTestManager(t *testing.T) *Manager {
 	return m
 }
 
+func TestEvaluateBlockingLaneIsolation(t *testing.T) {
+	m := newTestManager(t)
+
+	// A blocking filter: {"drop": True} -> Block. Runs only in the block lane.
+	if _, err := m.CreateScript("inline-ban", `
+def match(flow):
+    if "evil" in flow.get("body", ""):
+        return {"match": True, "reason": "inline block", "drop": True}
+    return False
+`, true, true); err != nil {
+		t.Fatal(err)
+	}
+	// A normal (non-blocking) alert filter. Runs only in the async lane.
+	if _, err := m.CreateScript("noisy", `
+def match(flow):
+    return "always"
+`, true, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// The block lane sees only the blocking filter.
+	got := m.EvaluateBlocking(Flow{"body": "some evil payload"})
+	if len(got) != 1 {
+		t.Fatalf("block lane should return exactly the blocking filter, got %+v", got)
+	}
+	if got[0].Script != "inline-ban" || !got[0].Block {
+		t.Fatalf("expected inline-ban with Block=true, got %+v", got[0])
+	}
+	if got := m.EvaluateBlocking(Flow{"body": "harmless"}); len(got) != 0 {
+		t.Fatalf("blocking filter must not match harmless body, got %+v", got)
+	}
+
+	// The async lane (Evaluate) sees only the non-blocking filter — the blocking
+	// one is NOT evaluated here, so its state is never double-counted.
+	got = m.Evaluate(Flow{"body": "some evil payload"})
+	if len(got) != 1 || got[0].Script != "noisy" {
+		t.Fatalf("async lane should return only the non-blocking filter, got %+v", got)
+	}
+}
+
 func TestTestScriptMatchAndReason(t *testing.T) {
 	m := newTestManager(t)
 	code := `
@@ -81,7 +121,7 @@ def match(flow):
             return "repeat login for %s (#%d)" % (u, seen[u])
     return False
 `
-	if _, err := m.CreateScript("repeat-login", code, true); err != nil {
+	if _, err := m.CreateScript("repeat-login", code, true, false); err != nil {
 		t.Fatalf("CreateScript: %v", err)
 	}
 
@@ -128,7 +168,7 @@ def match(flow):
     if len(flow.get("body", "")) > 10:
         return "body too big"
     return False
-`, true); err != nil {
+`, true, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -151,7 +191,7 @@ func TestDisabledScriptNotEvaluated(t *testing.T) {
 	if _, err := m.CreateScript("always", `
 def match(flow):
     return "always"
-`, false); err != nil {
+`, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if got := m.Evaluate(Flow{}); len(got) != 0 {
@@ -170,7 +210,7 @@ def match(flow):
 func TestScriptsPersistAcrossReload(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(Config{DataDir: dir, EvalTimeout: 5 * time.Second})
-	if _, err := m.CreateScript("keep", "def match(flow):\n  return False", true); err != nil {
+	if _, err := m.CreateScript("keep", "def match(flow):\n  return False", true, false); err != nil {
 		t.Fatal(err)
 	}
 	m.Close()

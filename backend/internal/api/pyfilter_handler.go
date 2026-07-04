@@ -114,6 +114,9 @@ type pyFilterRequest struct {
 	Name    string `json:"name"`
 	Code    string `json:"code"`
 	Enabled bool   `json:"enabled"`
+	// Blocking runs the script inline (synchronously) on the request hot path so
+	// a match returning {"drop": True} blocks the current request in real time.
+	Blocking bool `json:"blocking"`
 }
 
 // GET /api/pyfilters — list scripts + engine status.
@@ -134,7 +137,7 @@ func (s *Server) handlePyFilters(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		sc, err := s.pyfilter.CreateScript(req.Name, req.Code, req.Enabled)
+		sc, err := s.pyfilter.CreateScript(req.Name, req.Code, req.Enabled, req.Blocking)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -169,7 +172,7 @@ func (s *Server) handlePyFilterByID(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		sc, err := s.pyfilter.UpdateScript(id, req.Name, req.Code, req.Enabled)
+		sc, err := s.pyfilter.UpdateScript(id, req.Name, req.Code, req.Enabled, req.Blocking)
 		if err != nil {
 			s.writePyFilterErr(w, err)
 			return

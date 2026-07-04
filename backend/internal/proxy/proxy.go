@@ -66,6 +66,7 @@ type Manager struct {
 	rulesCache    dropper.RulesCache
 	flagIDChecker sniffer.FlagIDChecker
 	captureCtrl   *sniffer.CaptureController
+	pyBlockFn     sniffer.PyBlockFunc // inline (synchronous) Python filter eval
 }
 
 // runningProxy tracks the lifecycle of a single proxy. The outer ctx/cancel
@@ -203,6 +204,20 @@ func (m *Manager) currentFlagIDChecker() sniffer.FlagIDChecker {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.flagIDChecker
+}
+
+// SetPyBlockFn sets the inline (synchronous) Python-filter evaluator run on the
+// request hot path. Call before starting services.
+func (m *Manager) SetPyBlockFn(fn sniffer.PyBlockFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pyBlockFn = fn
+}
+
+func (m *Manager) currentPyBlockFn() sniffer.PyBlockFunc {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.pyBlockFn
 }
 
 func (m *Manager) SetCaptureController(c *sniffer.CaptureController) {
@@ -512,7 +527,7 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 	var handler http.Handler = reverseProxy
 	if m.packetStore != nil {
 		dropEngine := m.engineFor(svc)
-		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine, m.flagRegex, m.flagScanner, m.currentFlagIDChecker, m.shouldCapture, m.shouldApplyFlagIDsOnIngest)
+		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine, m.flagRegex, m.flagScanner, m.currentFlagIDChecker, m.shouldCapture, m.shouldApplyFlagIDsOnIngest, m.currentPyBlockFn())
 	}
 
 	server := &http.Server{
@@ -595,7 +610,7 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 	var handler http.Handler = reverseProxy
 	if m.packetStore != nil {
 		dropEngine := m.engineFor(svc)
-		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine, m.flagRegex, m.flagScanner, m.currentFlagIDChecker, m.shouldCapture, m.shouldApplyFlagIDsOnIngest)
+		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine, m.flagRegex, m.flagScanner, m.currentFlagIDChecker, m.shouldCapture, m.shouldApplyFlagIDsOnIngest, m.currentPyBlockFn())
 	}
 
 	// For gRPC, support h2c (HTTP/2 cleartext) from backend if needed

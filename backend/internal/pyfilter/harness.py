@@ -16,6 +16,10 @@ User scripts each define:
         #          by the fast in-process engine (fail2ban style). The drop
         #          expression may only use content fields (body/url/header/
         #          service); IP/port fields are rejected (SNAT-unsafe).
+        #   {"match": True, "reason": "...", "drop": True}   (or "block": True)
+        #       -> match; blocks the CURRENT request in real time (inline). Only
+        #          takes effect for scripts marked "Blocking", which run
+        #          synchronously on the request hot path.
         return False
 
 Module-level state persists across calls, so a script can count things over
@@ -60,22 +64,29 @@ def _compile_scripts(scripts):
 
 
 def _normalize(res):
-    """Turn a match() return value into {"reason","drop"}, or None for no match."""
+    """Turn a match() return value into {"reason","drop","block"}, or None."""
     if res is None or res is False:
         return None
     if res is True:
-        return {"reason": "", "drop": ""}
+        return {"reason": "", "drop": "", "block": False}
     if isinstance(res, str):
-        return {"reason": res, "drop": ""}
+        return {"reason": res, "drop": "", "block": False}
     if isinstance(res, dict):
-        drop = res.get("drop", "")
-        drop = str(drop) if drop else ""
-        # A drop directive implies a match even without an explicit "match" key.
-        if res.get("match") or drop:
-            return {"reason": str(res.get("reason", "")), "drop": drop}
+        raw = res.get("drop")
+        block = bool(res.get("block"))
+        drop = ""
+        # drop=True (a bare boolean) means "block the current request" — the
+        # inline/synchronous drop. drop="<expr>" is the async future-traffic rule.
+        if raw is True:
+            block = True
+        elif isinstance(raw, str) and raw:
+            drop = raw
+        # A drop/block directive implies a match even without an explicit "match".
+        if res.get("match") or drop or block:
+            return {"reason": str(res.get("reason", "")), "drop": drop, "block": block}
         return None
     if res:
-        return {"reason": "", "drop": ""}
+        return {"reason": "", "drop": "", "block": False}
     return None
 
 
@@ -94,7 +105,8 @@ def _evaluate(scripts, flow):
         if norm is not None:
             matches.append({
                 "script": sid, "name": s["name"],
-                "reason": norm["reason"], "drop": norm["drop"], "error": False,
+                "reason": norm["reason"], "drop": norm["drop"],
+                "block": norm["block"], "error": False,
             })
     return matches
 
