@@ -46,9 +46,35 @@ def match(flow):
     return False
 `
 
+const BLOCK_EXAMPLE = `# INLINE BLOCK — return {"drop": True} to drop the CURRENT request in real
+# time (not just future traffic). Requires the "Blocking" checkbox: the script
+# then runs synchronously on the request path. Here: block a registration whose
+# password was already used by an earlier one.
+import json
+
+seen = {}
+
+def match(flow):
+    if flow.get("method") == "POST" and "register" in (flow.get("url") or ""):
+        try:
+            pw = json.loads(flow.get("body", "")).get("password")
+        except Exception:
+            pw = None
+        if pw:
+            seen[pw] = seen.get(pw, 0) + 1
+            if seen[pw] >= 2:
+                return {
+                    "match": True,
+                    "reason": "duplicate registration password (#%d)" % seen[pw],
+                    "drop": True,   # block THIS request now
+                }
+    return False
+`
+
 const EXAMPLES = [
   { key: 'alert', label: 'Alert example', code: ALERT_EXAMPLE },
-  { key: 'drop', label: 'Drop example', code: DROP_EXAMPLE },
+  { key: 'drop', label: 'Drop (future) example', code: DROP_EXAMPLE },
+  { key: 'block', label: 'Inline block example', code: BLOCK_EXAMPLE },
   { key: 'stateful', label: 'Stateful example', code: STATEFUL_EXAMPLE },
 ]
 
@@ -109,7 +135,7 @@ function mapPacketToFlow(p) {
   }
 }
 
-const EMPTY_DRAFT = { id: null, name: '', code: ALERT_EXAMPLE, enabled: true }
+const EMPTY_DRAFT = { id: null, name: '', code: ALERT_EXAMPLE, enabled: true, blocking: false }
 
 export default function PyFilters() {
   const [scripts, setScripts] = useState([])
@@ -144,7 +170,7 @@ export default function PyFilters() {
 
   const startNew = () => { setDraft(EMPTY_DRAFT); setTestResult(null); setError('') }
   const startEdit = (s) => {
-    setDraft({ id: s.id, name: s.name, code: s.code, enabled: s.enabled })
+    setDraft({ id: s.id, name: s.name, code: s.code, enabled: s.enabled, blocking: !!s.blocking })
     setTestResult(null)
     setError('')
   }
@@ -153,13 +179,14 @@ export default function PyFilters() {
     if (!draft.name.trim()) { setError('name is required'); return }
     setSaving(true)
     setError('')
+    const payload = { name: draft.name, code: draft.code, enabled: draft.enabled, blocking: draft.blocking }
     try {
       if (editing) {
-        await api.updatePyFilter(draft.id, { name: draft.name, code: draft.code, enabled: draft.enabled })
+        await api.updatePyFilter(draft.id, payload)
         flash('Filter saved')
       } else {
-        const created = await api.createPyFilter({ name: draft.name, code: draft.code, enabled: draft.enabled })
-        setDraft({ id: created.id, name: created.name, code: created.code, enabled: created.enabled })
+        const created = await api.createPyFilter(payload)
+        setDraft({ id: created.id, name: created.name, code: created.code, enabled: created.enabled, blocking: !!created.blocking })
         flash('Filter created')
       }
       await load()
@@ -172,7 +199,8 @@ export default function PyFilters() {
 
   async function toggle(s) {
     try {
-      await api.updatePyFilter(s.id, { name: s.name, code: s.code, enabled: !s.enabled })
+      // Preserve blocking — PUT replaces the whole script.
+      await api.updatePyFilter(s.id, { name: s.name, code: s.code, enabled: !s.enabled, blocking: !!s.blocking })
       await load()
     } catch (e) {
       setError(e.message || 'toggle failed')
@@ -310,6 +338,11 @@ export default function PyFilters() {
       <div className="flex items-center gap-2 flex-wrap">
         <Badge tone="green">python ready</Badge>
         <Badge tone="gray">{status.enabled_count}/{status.script_count} enabled</Badge>
+        {status.blocking_count > 0 && (
+          <Badge tone="amber" title="Filters running inline (synchronously) on the request path">
+            {status.blocking_count} inline
+          </Badge>
+        )}
         {status.worker_healthy && <Badge tone="cyan">worker running</Badge>}
         {status.last_error && <Badge tone="amber" title={status.last_error}>last error</Badge>}
       </div>
@@ -364,13 +397,23 @@ export default function PyFilters() {
             >
               <div className="flex items-center justify-between gap-2">
                 <span className="text-sm text-gray-200 truncate" title={s.name}>{s.name}</span>
-                <span className={`text-[10px] px-1.5 py-0.5 rounded border flex-shrink-0 ${
-                  s.enabled
-                    ? 'bg-emerald-900/40 text-emerald-300 border-emerald-700/50'
-                    : 'bg-gray-800 text-gray-500 border-gray-700'
-                }`}>
-                  {s.enabled ? 'ON' : 'OFF'}
-                </span>
+                <div className="flex items-center gap-1 flex-shrink-0">
+                  {s.blocking && (
+                    <span
+                      className="text-[10px] px-1.5 py-0.5 rounded border bg-rose-900/40 text-rose-300 border-rose-700/50"
+                      title="Inline blocking — runs synchronously and can drop the current request"
+                    >
+                      INLINE
+                    </span>
+                  )}
+                  <span className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                    s.enabled
+                      ? 'bg-emerald-900/40 text-emerald-300 border-emerald-700/50'
+                      : 'bg-gray-800 text-gray-500 border-gray-700'
+                  }`}>
+                    {s.enabled ? 'ON' : 'OFF'}
+                  </span>
+                </div>
               </div>
               <div className="flex items-center gap-3 mt-1.5">
                 <button
@@ -408,6 +451,17 @@ export default function PyFilters() {
                 onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })}
               />
               Enabled
+            </label>
+            <label
+              className="flex items-center gap-1.5 text-xs text-gray-400 select-none cursor-pointer"
+              title="Run this filter synchronously on the request path so a match returning {'drop': True} blocks the CURRENT request in real time. Adds ~tens of µs per request on this service; a stuck script fails open."
+            >
+              <input
+                type="checkbox"
+                checked={draft.blocking}
+                onChange={(e) => setDraft({ ...draft, blocking: e.target.checked })}
+              />
+              Blocking
             </label>
             <button
               onClick={save}
@@ -580,13 +634,20 @@ function TestVerdict({ result }) {
     )
   }
   const drop = m0?.drop
+  const block = m0?.block
+  const border = block ? 'border-rose-700/50 bg-rose-950/30' : drop ? 'border-amber-700/50 bg-amber-950/30' : 'border-emerald-700/50 bg-emerald-950/30'
   return (
-    <div className={`rounded border p-2 ${drop ? 'border-amber-700/50 bg-amber-950/30' : 'border-emerald-700/50 bg-emerald-950/30'}`}>
+    <div className={`rounded border p-2 ${border}`}>
       <div className="flex items-center gap-2 mb-1">
-        <VerdictBadge drop={drop} />
+        <VerdictBadge drop={drop} block={block} />
         {m0?.reason && <span className="text-xs text-gray-300">{m0.reason}</span>}
       </div>
-      {drop ? (
+      {block ? (
+        <div className="text-[11px] text-rose-200/90">
+          Drops <strong>this</strong> request in real time (inline). Takes effect on live traffic only when the
+          filter has <strong>Blocking</strong> enabled.
+        </div>
+      ) : drop ? (
         <div className="text-[11px] text-amber-200/90">
           Installs a drop rule <code className="font-mono bg-black/30 px-1 rounded">{drop}</code> — future
           matching traffic is blocked (content-only).
@@ -601,6 +662,7 @@ function TestVerdict({ result }) {
 function StepRow({ step }) {
   const m0 = step.matches?.[0]
   const drop = m0?.drop
+  const block = m0?.block
   return (
     <div className="flex items-center gap-2 text-[11px]">
       <span className="text-gray-600 w-6 text-right">#{step.index}</span>
@@ -615,7 +677,7 @@ function StepRow({ step }) {
       )}
       {step.matched ? (
         <>
-          <VerdictBadge drop={drop} small />
+          <VerdictBadge drop={drop} block={block} small />
           {m0?.reason && <span className="text-gray-400 truncate">{m0.reason}</span>}
         </>
       ) : (
@@ -625,13 +687,15 @@ function StepRow({ step }) {
   )
 }
 
-function VerdictBadge({ drop, small }) {
-  const cls = drop
+function VerdictBadge({ drop, block, small }) {
+  const cls = block
+    ? 'bg-rose-900/50 text-rose-200 border-rose-700/50'
+    : drop
     ? 'bg-amber-900/50 text-amber-200 border-amber-700/50'
     : 'bg-emerald-900/50 text-emerald-200 border-emerald-700/50'
   return (
     <span className={`${small ? 'text-[10px]' : 'text-[10px]'} px-1.5 py-0.5 rounded border font-semibold ${cls}`}>
-      {drop ? 'ALERT + DROP' : 'ALERT'}
+      {block ? 'ALERT + BLOCK' : drop ? 'ALERT + DROP' : 'ALERT'}
     </span>
   )
 }
@@ -642,17 +706,20 @@ function ReturnLegend() {
       <h4 className="text-[10px] uppercase tracking-wide text-gray-500">What match(flow) returns</h4>
       <LegendRow code="return False" desc="ignore (no match)" tone="gray" />
       <LegendRow code='return "reason"' desc="ALERT only" tone="green" />
-      <LegendRow code='{"match": True, "drop": "<expr>"}' desc="ALERT + block future traffic" tone="amber" />
+      <LegendRow code='{"match": True, "drop": "<expr>"}' desc="ALERT + block future traffic (async)" tone="amber" />
+      <LegendRow code='{"match": True, "drop": True}' desc="ALERT + block THIS request now (needs Blocking)" tone="red" />
       <p className="text-[10px] text-gray-600 pt-1 leading-snug">
-        Drop expressions are content-only (<code className="text-gray-500">body</code>/<code className="text-gray-500">url</code>/<code className="text-gray-500">header</code>/<code className="text-gray-500">service</code>);
-        IP/port fields are rejected (SNAT-unsafe).
+        <code className="text-gray-500">drop</code> as an expression blocks <em>future</em> matching traffic
+        (content-only: <code className="text-gray-500">body</code>/<code className="text-gray-500">url</code>/<code className="text-gray-500">header</code>/<code className="text-gray-500">service</code>;
+        IP/port rejected, SNAT-unsafe). <code className="text-gray-500">drop: True</code> drops the current
+        request inline — only when the filter has <strong>Blocking</strong> on.
       </p>
     </div>
   )
 }
 
 function LegendRow({ code, desc, tone }) {
-  const dot = { gray: 'bg-gray-500', green: 'bg-emerald-400', amber: 'bg-amber-400' }[tone]
+  const dot = { gray: 'bg-gray-500', green: 'bg-emerald-400', amber: 'bg-amber-400', red: 'bg-rose-400' }[tone]
   return (
     <div className="flex items-start gap-2">
       <span className={`mt-1 w-1.5 h-1.5 rounded-full flex-shrink-0 ${dot}`} />
