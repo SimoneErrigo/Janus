@@ -772,11 +772,27 @@ _SIG_DB = [
 
 # ---- QR decoding (pure Python; PNG -> module matrix -> data) ----
 # Best-effort decoder for clean, axis-aligned QR codes (as produced by upload
-# tooling), versions 1-10, numeric/alnum/byte, all masks. No error correction:
+# tooling), all versions 1-40, numeric/alnum/byte, all masks. No error correction:
 # it reads the data codewords of an undamaged symbol. Returns [] on any trouble.
 
-_QR_ALIGN = {1: [], 2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30], 6: [6, 34],
-             7: [6, 22, 38], 8: [6, 24, 42], 9: [6, 26, 46], 10: [6, 28, 50]}
+# Alignment-pattern centres and EC block structure for all 40 versions (this
+# table is generated from / verified against the QR spec, so any realistic
+# payload — the last event had ~850-byte QR PNGs — decodes, not just small ones).
+_QR_ALIGN = {1: [],
+    2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30], 6: [6, 34],
+    7: [6, 22, 38], 8: [6, 24, 42], 9: [6, 26, 46], 10: [6, 28, 50],
+    11: [6, 30, 54], 12: [6, 32, 58], 13: [6, 34, 62], 14: [6, 26, 46, 66],
+    15: [6, 26, 48, 70], 16: [6, 26, 50, 74], 17: [6, 30, 54, 78],
+    18: [6, 30, 56, 82], 19: [6, 30, 58, 86], 20: [6, 34, 62, 90],
+    21: [6, 28, 50, 72, 94], 22: [6, 26, 50, 74, 98], 23: [6, 30, 54, 78, 102],
+    24: [6, 28, 54, 80, 106], 25: [6, 32, 58, 84, 110], 26: [6, 30, 58, 86, 114],
+    27: [6, 34, 62, 90, 118], 28: [6, 26, 50, 74, 98, 122],
+    29: [6, 30, 54, 78, 102, 126], 30: [6, 26, 52, 78, 104, 130],
+    31: [6, 30, 56, 82, 108, 134], 32: [6, 34, 60, 86, 112, 138],
+    33: [6, 30, 58, 86, 114, 142], 34: [6, 34, 62, 90, 118, 146],
+    35: [6, 30, 54, 78, 102, 126, 150], 36: [6, 24, 50, 76, 102, 128, 154],
+    37: [6, 28, 54, 80, 106, 132, 158], 38: [6, 32, 58, 84, 110, 136, 162],
+    39: [6, 26, 54, 82, 110, 138, 166], 40: [6, 30, 58, 86, 114, 142, 170]}
 # (version, level) -> (ec_codewords_per_block, [(num_blocks, data_cw_per_block), ...])
 _QR_ECB = {
     (1, "L"): (7, [(1, 19)]), (1, "M"): (10, [(1, 16)]), (1, "Q"): (13, [(1, 13)]), (1, "H"): (17, [(1, 9)]),
@@ -789,6 +805,36 @@ _QR_ECB = {
     (8, "L"): (24, [(2, 97)]), (8, "M"): (22, [(2, 38), (2, 39)]), (8, "Q"): (22, [(4, 18), (2, 19)]), (8, "H"): (26, [(4, 14), (2, 15)]),
     (9, "L"): (30, [(2, 116)]), (9, "M"): (22, [(3, 36), (2, 37)]), (9, "Q"): (20, [(4, 16), (4, 17)]), (9, "H"): (24, [(4, 12), (4, 13)]),
     (10, "L"): (18, [(2, 68), (2, 69)]), (10, "M"): (26, [(4, 43), (1, 44)]), (10, "Q"): (24, [(6, 19), (2, 20)]), (10, "H"): (28, [(6, 15), (2, 16)]),
+    (11, "L"): (20, [(4, 81)]), (11, "M"): (30, [(1, 50), (4, 51)]), (11, "Q"): (28, [(4, 22), (4, 23)]), (11, "H"): (24, [(3, 12), (8, 13)]),
+    (12, "L"): (24, [(2, 92), (2, 93)]), (12, "M"): (22, [(6, 36), (2, 37)]), (12, "Q"): (26, [(4, 20), (6, 21)]), (12, "H"): (28, [(7, 14), (4, 15)]),
+    (13, "L"): (26, [(4, 107)]), (13, "M"): (22, [(8, 37), (1, 38)]), (13, "Q"): (24, [(8, 20), (4, 21)]), (13, "H"): (22, [(12, 11), (4, 12)]),
+    (14, "L"): (30, [(3, 115), (1, 116)]), (14, "M"): (24, [(4, 40), (5, 41)]), (14, "Q"): (20, [(11, 16), (5, 17)]), (14, "H"): (24, [(11, 12), (5, 13)]),
+    (15, "L"): (22, [(5, 87), (1, 88)]), (15, "M"): (24, [(5, 41), (5, 42)]), (15, "Q"): (30, [(5, 24), (7, 25)]), (15, "H"): (24, [(11, 12), (7, 13)]),
+    (16, "L"): (24, [(5, 98), (1, 99)]), (16, "M"): (28, [(7, 45), (3, 46)]), (16, "Q"): (24, [(15, 19), (2, 20)]), (16, "H"): (30, [(3, 15), (13, 16)]),
+    (17, "L"): (28, [(1, 107), (5, 108)]), (17, "M"): (28, [(10, 46), (1, 47)]), (17, "Q"): (28, [(1, 22), (15, 23)]), (17, "H"): (28, [(2, 14), (17, 15)]),
+    (18, "L"): (30, [(5, 120), (1, 121)]), (18, "M"): (26, [(9, 43), (4, 44)]), (18, "Q"): (28, [(17, 22), (1, 23)]), (18, "H"): (28, [(2, 14), (19, 15)]),
+    (19, "L"): (28, [(3, 113), (4, 114)]), (19, "M"): (26, [(3, 44), (11, 45)]), (19, "Q"): (26, [(17, 21), (4, 22)]), (19, "H"): (26, [(9, 13), (16, 14)]),
+    (20, "L"): (28, [(3, 107), (5, 108)]), (20, "M"): (26, [(3, 41), (13, 42)]), (20, "Q"): (30, [(15, 24), (5, 25)]), (20, "H"): (28, [(15, 15), (10, 16)]),
+    (21, "L"): (28, [(4, 116), (4, 117)]), (21, "M"): (26, [(17, 42)]), (21, "Q"): (28, [(17, 22), (6, 23)]), (21, "H"): (30, [(19, 16), (6, 17)]),
+    (22, "L"): (28, [(2, 111), (7, 112)]), (22, "M"): (28, [(17, 46)]), (22, "Q"): (30, [(7, 24), (16, 25)]), (22, "H"): (24, [(34, 13)]),
+    (23, "L"): (30, [(4, 121), (5, 122)]), (23, "M"): (28, [(4, 47), (14, 48)]), (23, "Q"): (30, [(11, 24), (14, 25)]), (23, "H"): (30, [(16, 15), (14, 16)]),
+    (24, "L"): (30, [(6, 117), (4, 118)]), (24, "M"): (28, [(6, 45), (14, 46)]), (24, "Q"): (30, [(11, 24), (16, 25)]), (24, "H"): (30, [(30, 16), (2, 17)]),
+    (25, "L"): (26, [(8, 106), (4, 107)]), (25, "M"): (28, [(8, 47), (13, 48)]), (25, "Q"): (30, [(7, 24), (22, 25)]), (25, "H"): (30, [(22, 15), (13, 16)]),
+    (26, "L"): (28, [(10, 114), (2, 115)]), (26, "M"): (28, [(19, 46), (4, 47)]), (26, "Q"): (28, [(28, 22), (6, 23)]), (26, "H"): (30, [(33, 16), (4, 17)]),
+    (27, "L"): (30, [(8, 122), (4, 123)]), (27, "M"): (28, [(22, 45), (3, 46)]), (27, "Q"): (30, [(8, 23), (26, 24)]), (27, "H"): (30, [(12, 15), (28, 16)]),
+    (28, "L"): (30, [(3, 117), (10, 118)]), (28, "M"): (28, [(3, 45), (23, 46)]), (28, "Q"): (30, [(4, 24), (31, 25)]), (28, "H"): (30, [(11, 15), (31, 16)]),
+    (29, "L"): (30, [(7, 116), (7, 117)]), (29, "M"): (28, [(21, 45), (7, 46)]), (29, "Q"): (30, [(1, 23), (37, 24)]), (29, "H"): (30, [(19, 15), (26, 16)]),
+    (30, "L"): (30, [(5, 115), (10, 116)]), (30, "M"): (28, [(19, 47), (10, 48)]), (30, "Q"): (30, [(15, 24), (25, 25)]), (30, "H"): (30, [(23, 15), (25, 16)]),
+    (31, "L"): (30, [(13, 115), (3, 116)]), (31, "M"): (28, [(2, 46), (29, 47)]), (31, "Q"): (30, [(42, 24), (1, 25)]), (31, "H"): (30, [(23, 15), (28, 16)]),
+    (32, "L"): (30, [(17, 115)]), (32, "M"): (28, [(10, 46), (23, 47)]), (32, "Q"): (30, [(10, 24), (35, 25)]), (32, "H"): (30, [(19, 15), (35, 16)]),
+    (33, "L"): (30, [(17, 115), (1, 116)]), (33, "M"): (28, [(14, 46), (21, 47)]), (33, "Q"): (30, [(29, 24), (19, 25)]), (33, "H"): (30, [(11, 15), (46, 16)]),
+    (34, "L"): (30, [(13, 115), (6, 116)]), (34, "M"): (28, [(14, 46), (23, 47)]), (34, "Q"): (30, [(44, 24), (7, 25)]), (34, "H"): (30, [(59, 16), (1, 17)]),
+    (35, "L"): (30, [(12, 121), (7, 122)]), (35, "M"): (28, [(12, 47), (26, 48)]), (35, "Q"): (30, [(39, 24), (14, 25)]), (35, "H"): (30, [(22, 15), (41, 16)]),
+    (36, "L"): (30, [(6, 121), (14, 122)]), (36, "M"): (28, [(6, 47), (34, 48)]), (36, "Q"): (30, [(46, 24), (10, 25)]), (36, "H"): (30, [(2, 15), (64, 16)]),
+    (37, "L"): (30, [(17, 122), (4, 123)]), (37, "M"): (28, [(29, 46), (14, 47)]), (37, "Q"): (30, [(49, 24), (10, 25)]), (37, "H"): (30, [(24, 15), (46, 16)]),
+    (38, "L"): (30, [(4, 122), (18, 123)]), (38, "M"): (28, [(13, 46), (32, 47)]), (38, "Q"): (30, [(48, 24), (14, 25)]), (38, "H"): (30, [(42, 15), (32, 16)]),
+    (39, "L"): (30, [(20, 117), (4, 118)]), (39, "M"): (28, [(40, 47), (7, 48)]), (39, "Q"): (30, [(43, 24), (22, 25)]), (39, "H"): (30, [(10, 15), (67, 16)]),
+    (40, "L"): (30, [(19, 118), (6, 119)]), (40, "M"): (28, [(18, 47), (31, 48)]), (40, "Q"): (30, [(34, 24), (34, 25)]), (40, "H"): (30, [(20, 15), (61, 16)]),
 }
 _QR_ALNUM = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
 
@@ -868,6 +914,163 @@ def _png_matrix(d):
         return out
     except Exception:
         return None
+
+
+def _gif_matrix(d):
+    """Decode the first frame of a GIF (LZW) to a dark-pixel matrix. None on
+    failure. Handles interlaced frames and global/local colour tables."""
+    if d[:6] not in (b"GIF87a", b"GIF89a"):
+        return None
+    try:
+        width = int.from_bytes(d[6:8], "little")
+        height = int.from_bytes(d[8:10], "little")
+        packed = d[10]
+        pos = 13
+        gct = None
+        if packed & 0x80:
+            n = 2 << (packed & 7)
+            gct = d[pos:pos + 3 * n]
+            pos += 3 * n
+        while pos < len(d):
+            b = d[pos]
+            if b == 0x21:               # extension: skip sub-blocks
+                pos += 2
+                while pos < len(d) and d[pos]:
+                    pos += 1 + d[pos]
+                pos += 1
+            elif b == 0x2c:             # image descriptor
+                iw = int.from_bytes(d[pos + 5:pos + 7], "little")
+                ih = int.from_bytes(d[pos + 7:pos + 9], "little")
+                ipacked = d[pos + 9]
+                interlaced = bool(ipacked & 0x40)
+                pos += 10
+                lct = gct
+                if ipacked & 0x80:
+                    n = 2 << (ipacked & 7)
+                    lct = d[pos:pos + 3 * n]
+                    pos += 3 * n
+                min_code = d[pos]; pos += 1
+                data = bytearray()
+                while pos < len(d) and d[pos]:
+                    ln = d[pos]
+                    data += d[pos + 1:pos + 1 + ln]
+                    pos += 1 + ln
+                idx = _lzw_gif(min_code, bytes(data))
+                w, h = iw or width, ih or height
+                pal = lct or b""
+                rows = [[False] * w for _ in range(h)]
+                order = list(range(h))
+                if interlaced:
+                    order = (list(range(0, h, 8)) + list(range(4, h, 8)) +
+                             list(range(2, h, 4)) + list(range(1, h, 2)))
+                k = 0
+                for ry in order:
+                    for x in range(w):
+                        if k < len(idx):
+                            ci = idx[k] * 3
+                            if ci + 2 < len(pal):
+                                lum = 0.299 * pal[ci] + 0.587 * pal[ci + 1] + 0.114 * pal[ci + 2]
+                                rows[ry][x] = lum < 128
+                        k += 1
+                return rows
+            else:
+                break
+    except Exception:
+        return None
+    return None
+
+
+def _lzw_gif(min_code, data):
+    clear = 1 << min_code
+    end = clear + 1
+    size = min_code + 1
+    table = [[i] for i in range(clear)] + [[], []]
+    out, prev, bitpos = [], None, 0
+    nbits = len(data) * 8
+    while bitpos + size <= nbits:
+        code = 0
+        for i in range(size):
+            if (data[bitpos >> 3] >> (bitpos & 7)) & 1:
+                code |= 1 << i
+            bitpos += 1
+        if code == clear:
+            table = [[i] for i in range(clear)] + [[], []]
+            size = min_code + 1
+            prev = None
+            continue
+        if code == end:
+            break
+        if code < len(table):
+            entry = table[code]
+        elif prev is not None:
+            entry = prev + prev[:1]
+        else:
+            break
+        out.extend(entry)
+        if prev is not None:
+            table.append(prev + entry[:1])
+            if len(table) == (1 << size) and size < 12:
+                size += 1
+        prev = entry
+    return out
+
+
+def _bmp_matrix(d):
+    """Decode an uncompressed BMP to a dark-pixel matrix (bpp 1/4/8/24/32)."""
+    if d[:2] != b"BM":
+        return None
+    try:
+        off = int.from_bytes(d[10:14], "little")
+        hsize = int.from_bytes(d[14:18], "little")
+        width = int.from_bytes(d[18:22], "little", signed=True)
+        height = int.from_bytes(d[22:26], "little", signed=True)
+        bpp = int.from_bytes(d[28:30], "little")
+        if int.from_bytes(d[30:34], "little") != 0:   # only BI_RGB
+            return None
+        top_down = height < 0
+        height = abs(height)
+        pal = []
+        if bpp <= 8:
+            po = 14 + hsize
+            ncol = int.from_bytes(d[46:50], "little") or (1 << bpp)
+            for i in range(ncol):
+                pal.append((d[po + i * 4 + 2], d[po + i * 4 + 1], d[po + i * 4]))
+        row_size = ((bpp * width + 31) // 32) * 4
+        out = []
+        for row in range(height):
+            y = row if top_down else height - 1 - row
+            line = d[off + y * row_size: off + y * row_size + row_size]
+            px = []
+            for x in range(width):
+                if bpp == 1:
+                    r, g, b = pal[(line[x >> 3] >> (7 - (x & 7))) & 1]
+                elif bpp == 4:
+                    r, g, b = pal[(line[x >> 1] >> (4 if x % 2 == 0 else 0)) & 0xf]
+                elif bpp == 8:
+                    r, g, b = pal[line[x]]
+                elif bpp == 24:
+                    b, g, r = line[x * 3], line[x * 3 + 1], line[x * 3 + 2]
+                elif bpp == 32:
+                    b, g, r = line[x * 4], line[x * 4 + 1], line[x * 4 + 2]
+                else:
+                    return None
+                px.append(0.299 * r + 0.587 * g + 0.114 * b < 128)
+            out.append(px)
+        return out
+    except Exception:
+        return None
+
+
+def _image_matrix(d):
+    """Dark-pixel matrix from PNG / GIF / BMP bytes (lossless formats a QR is
+    shipped in), or None."""
+    if d.startswith(b"\x89PNG\r\n\x1a\n"):
+        return _png_matrix(d)
+    if d[:6] in (b"GIF87a", b"GIF89a"):
+        return _gif_matrix(d)
+    if d[:2] == b"BM":
+        return _bmp_matrix(d)
+    return None
 
 
 def _qr_modules(px):
@@ -972,7 +1175,7 @@ def _qr_reserved(size, version):
 def _qr_decode(data):
     """Decode a QR code from PNG bytes -> list of decoded strings ([] if none)."""
     try:
-        px = _png_matrix(_as_bytes(data))
+        px = _image_matrix(_as_bytes(data))
         if px is None:
             return []
         mods = _qr_modules(px)
@@ -1067,7 +1270,7 @@ def _qr_parse(final, version):
             if mode == 0:
                 break
             if mode == 1:      # numeric
-                cnt = take(12 if version >= 10 else 10)
+                cnt = take(10 if version < 10 else 12 if version < 27 else 14)
                 s = ""
                 while cnt >= 3:
                     s += "%03d" % take(10)
@@ -1078,7 +1281,7 @@ def _qr_parse(final, version):
                     s += "%d" % take(4)
                 out.append(s)
             elif mode == 2:    # alphanumeric
-                cnt = take(11 if version >= 10 else 9)
+                cnt = take(9 if version < 10 else 11 if version < 27 else 13)
                 s = ""
                 while cnt >= 2:
                     v = take(11)
@@ -1278,9 +1481,9 @@ class _Util:
 
     @staticmethod
     def qr_decode(data):
-        """Decode a QR code from PNG bytes → list of decoded strings ([] if the
-        image isn't a decodable QR). Best-effort: clean, axis-aligned QR codes,
-        versions 1-10, numeric/alphanumeric/byte modes, all masks."""
+        """Decode a QR code from an image (PNG/GIF/BMP) → list of decoded strings
+        ([] if it isn't a decodable QR). Best-effort: clean, axis-aligned QR
+        codes, all versions 1-40, numeric/alphanumeric/byte modes, all masks."""
         return _qr_decode(_as_bytes(data))
 
     @staticmethod

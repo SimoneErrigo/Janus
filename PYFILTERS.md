@@ -116,7 +116,7 @@ payload and drop immediately. Pass `flow.content` (exact bytes) for binary.
 | `util.magic(data)` | sniffed file type (`png`,`jpg`,`pdf`,`zip`,`svg`,…) or `""` |
 | `util.content_type_ok(ct, data)` | declared Content-Type matches the bytes |
 | `util.trailing_data(data)` | bytes appended after an image's end (polyglot) |
-| `util.qr_decode(data)` | decode a QR code from PNG bytes → list of strings (versions 1-10) |
+| `util.qr_decode(data)` | decode a QR code from a PNG/GIF/BMP image → list of strings (all versions 1-40) |
 | `util.text_layers(data, qr=False)` | every readable text layer: raw strings + PNG chunks / PDF streams / ZIP entries / QR |
 | `util.find_payload(data, categories=None, qr=False)` | first attack signature (sqli/shell/php/xss/xxe/template/traversal) in any layer, else `None` |
 | `util.scan(data, patterns, qr=False)` / `util.strings(data)` / `util.inspect(data, qr=False)` | custom regex scan / printable runs / quick report |

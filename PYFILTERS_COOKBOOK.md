@@ -34,7 +34,7 @@ and drop immediately without pulling the whole thing apart by hand.
 | `util.magic(data)` | sniffed file type (`png`,`jpg`,`pdf`,`zip`,`svg`,…) or `""` |
 | `util.content_type_ok(ct, data)` | declared Content-Type is consistent with the bytes |
 | `util.trailing_data(data)` | bytes appended after an image's logical end (polyglot) |
-| `util.qr_decode(data)` | decode a QR code from PNG bytes → list of strings (v1-10) |
+| `util.qr_decode(data)` | decode a QR code from a PNG/GIF/BMP image → list of strings (v1-40) |
 | `util.text_layers(data, qr=False)` | every readable text layer: raw strings + decoded PNG chunks / PDF streams / ZIP entries / QR |
 | `util.find_payload(data, categories=None, qr=False)` | first attack signature (SQLi/shell/php/xss/xxe/template/traversal) found in any layer, else `None` |
 | `util.scan(data, patterns, qr=False)` | search every text layer with your own regex list |
