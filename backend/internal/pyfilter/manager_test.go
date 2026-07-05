@@ -116,6 +116,39 @@ def match(flow):
 	}
 }
 
+func TestUtilQRAndFilePayload(t *testing.T) {
+	m := newTestManager(t)
+	// A filter that decodes an uploaded image (incl. a QR code) and drops it when
+	// a known attack signature is smuggled inside. Modelled on the real "SQLi
+	// hidden in a QR PNG" upload challenge.
+	code := `
+def match(flow):
+    hit = util.find_payload(flow.content, qr=True)
+    if hit:
+        return {"drop": True, "reason": hit["category"] + ":" + hit["label"]}
+    return False
+`
+	// QR PNG (version 2) encoding "' OR '1'='1' -- " — the payload lives in the QR
+	// modules, so raw byte scanning can't see it; it must be decoded.
+	sqliQR := "iVBORw0KGgoAAAANSUhEUgAAADoAAAA6AQAAAADJwHeFAAAAoUlEQVR42oWRsQpDMQhFQ10D+RXBNZBfF1wD/RXhrgH7SinoG9oMIZzhXL1p8Tnafjy8TaNG+mjfgxCKhUxoibEUwk/cyRqVxDQUjzcRKVkReI+SyFE5ys/sgW3z7DmH2ShnnY4eWs19+8rEeVO3nOWbdXDZVEwOjUymjGvuYnYBRtlrsvCtQwVqh4Lrro1ddrr13FE9PGNQzepkKPP8/eUXjDapUBwIFWcAAAAASUVORK5CYII="
+	// A benign QR ("order-4815162342") — the checker's legitimate upload.
+	benignQR := "iVBORw0KGgoAAAANSUhEUgAAADoAAAA6AQAAAADJwHeFAAAAnklEQVR42oVRMQoDMQwz9VrIVwxaA/56wOtBvmLIGnAPSunphtaDCUKOZFnqXUN+PFJsQHQ85FOrsJqvK6JmMBACaTfE9MapLpP+SQFYqyq7nza+yEaDm9LUUd7iOuUuqcQZoTGJI12rXdX3qcPIEvQirT0P9yDO02Ey2TNWBjk0CwTvnpGT80Eqp+pnc+aUJWdoC8ckrR4YtOn/K78AfHmnXjvychoAAAAASUVORK5CYII="
+
+	drops := func(b64 string) bool {
+		mm, se, err := m.Test("qr", code, Flow{"body_b64": b64}, 1)
+		if err != nil || se != "" {
+			t.Fatalf("err=%v scriptErr=%s", err, se)
+		}
+		return len(mm) == 1 && mm[0].Block
+	}
+	if !drops(sqliQR) {
+		t.Error("QR carrying an SQL injection must be decoded and dropped")
+	}
+	if drops(benignQR) {
+		t.Error("benign QR must NOT drop (checker false positive)")
+	}
+}
+
 func TestFlowErgonomicAccessors(t *testing.T) {
 	m := newTestManager(t)
 	code := `

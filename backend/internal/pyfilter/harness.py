@@ -22,6 +22,9 @@ User scripts each define:
         #   util.entropy(b)  util.longest_run(b)  util.repeated_block(b)
         #   util.magic(b)  util.content_type_ok(ct, b)  util.trailing_data(b)
         #   util.normpath(p)  util.uri_scheme(s)  util.path_escapes(p)
+        #   # deep file/image inspection (decodes QR + hidden text layers):
+        #   util.find_payload(b, qr=True)  util.qr_decode(b)  util.inspect(b)
+        #   util.text_layers(b)  util.scan(b, patterns)  util.strings(b)
         #
         # TCP streams (a continuous byte flow, not one-message-per-chunk):
         #   flow.conn                       # dict persisting for the whole TCP
@@ -609,6 +612,495 @@ def _as_text(x):
     return str(x)
 
 
+# --- file inspection: text layers, signatures, QR decoding --------------------
+# Goal: given an uploaded file/image, decode its bytes, pull out *every* text
+# layer a payload could hide in (including compressed ones that `strings` can't
+# see — PNG text chunks, PDF Flate streams, ZIP entries — and a QR code's decoded
+# content), then match it against a curated attack-signature database so a filter
+# can drop immediately. All stdlib-only (zlib, zipfile).
+
+import zlib
+import zipfile
+import io
+
+
+def _strings(data, min_len=4):
+    """Printable-ASCII runs of length >= min_len (like the `strings` command)."""
+    d = _as_bytes(data)
+    out, cur = [], bytearray()
+    for b in d:
+        if 0x20 <= b <= 0x7e:
+            cur.append(b)
+        else:
+            if len(cur) >= min_len:
+                out.append(cur.decode("ascii"))
+            cur = bytearray()
+    if len(cur) >= min_len:
+        out.append(cur.decode("ascii"))
+    return out
+
+
+def _png_chunks(d):
+    """Yield (type, chunk_data) for a PNG, best-effort."""
+    i = 8
+    n = len(d)
+    while i + 8 <= n:
+        ln = int.from_bytes(d[i:i + 4], "big")
+        typ = d[i + 4:i + 8]
+        body = d[i + 8:i + 8 + ln]
+        yield typ, body
+        i += 12 + ln  # length + type + data + CRC
+        if typ == b"IEND":
+            break
+
+
+def _png_text(d):
+    """Decoded values of PNG tEXt/zTXt/iTXt chunks (payloads hide here — zTXt is
+    zlib-compressed, so raw `strings` never sees it)."""
+    out = []
+    try:
+        for typ, body in _png_chunks(d):
+            if typ == b"tEXt":
+                _, _, val = body.partition(b"\x00")
+                out.append(val.decode("latin1", "replace"))
+            elif typ == b"zTXt":
+                kw, _, rest = body.partition(b"\x00")
+                comp = rest[1:] if rest else b""
+                try:
+                    out.append(zlib.decompress(comp).decode("latin1", "replace"))
+                except Exception:
+                    pass
+            elif typ == b"iTXt":
+                parts = body.split(b"\x00", 5)
+                if len(parts) >= 6:
+                    flag = parts[1][:1]
+                    txt = parts[5]
+                    if flag == b"\x01":
+                        try:
+                            txt = zlib.decompress(txt)
+                        except Exception:
+                            pass
+                    out.append(_as_text(txt))
+    except Exception:
+        pass
+    return out
+
+
+def _pdf_text(d):
+    """Raw PDF plus every FlateDecode stream inflated — surfaces /JavaScript,
+    /OpenAction, /Launch and text hidden inside compressed streams."""
+    out = [d.decode("latin1", "replace")]
+    for m in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", d, re.S):
+        try:
+            out.append(zlib.decompress(m.group(1)).decode("latin1", "replace"))
+        except Exception:
+            pass
+    return out
+
+
+def _zip_text(d):
+    """ZIP/Office entry names + inflated text entries (macros, embedded files)."""
+    out = []
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(d))
+        out.append("\n".join(zf.namelist()))
+        for name in zf.namelist():
+            try:
+                info = zf.getinfo(name)
+                if info.file_size <= 262144:
+                    raw = zf.read(name)
+                    if _Util.printable_ratio(raw) > 0.7:
+                        out.append(raw.decode("latin1", "replace"))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+
+# Curated attack signatures. Kept specific so a benign uploaded file/image the
+# checker sends won't match — matches mean an actual payload was smuggled in.
+def _sig(*pairs):
+    return [(re.compile(p, re.I | re.S), lbl) for p, lbl in pairs]
+
+
+_SIG_DB = [
+    ("sqli", _sig(
+        (r"\bunion\b[\s/*]+\bselect\b", "UNION SELECT"),
+        (r"\bor\b\s+['\"]?\d+['\"]?\s*=\s*['\"]?\d+", "OR n=n"),
+        (r"'\s*or\s+'?1'?\s*=\s*'?1", "' OR 1=1"),
+        (r";\s*drop\s+table\b", "DROP TABLE"),
+        (r"\b(sleep|benchmark|pg_sleep)\s*\(", "time-based SQLi"),
+        (r"\binto\s+outfile\b|\bload_file\s*\(", "file SQLi"),
+        (r"\binformation_schema\b", "information_schema"),
+        (r"\bxp_cmdshell\b", "xp_cmdshell"),
+    )),
+    ("shell", _sig(
+        (r"/bin/(?:ba|z|d)?sh\b", "/bin/sh"),
+        (r"\b(?:ba)?sh\s+-i\b", "interactive shell"),
+        (r"\bnc(?:at)?\b[^\n]*\s-e\b", "nc -e"),
+        (r"/dev/tcp/\d", "/dev/tcp reverse shell"),
+        (r"\b(?:os\.system|subprocess\.(?:call|Popen|run)|pty\.spawn)\s*\(", "python exec"),
+        (r"\bpowershell\b[^\n]*(?:-enc|-e |downloadstring|iex)", "powershell payload"),
+        (r"\b(?:system|passthru|shell_exec|popen|proc_open)\s*\(", "command exec"),
+    )),
+    ("php", _sig(
+        (r"<\?php\b|<\?=", "PHP tag"),
+        (r"\beval\s*\(\s*\$", "PHP eval($var)"),
+        (r"\b(?:base64_decode|assert|create_function)\s*\(", "PHP dynamic exec"),
+    )),
+    ("xss", _sig(
+        (r"<script[\s>]", "<script>"),
+        (r"\bon(?:error|load|click|mouseover)\s*=", "inline event handler"),
+        (r"javascript:", "javascript: URI"),
+    )),
+    ("xxe", _sig(
+        (r"<!ENTITY\b", "XML entity"),
+        (r"<!DOCTYPE[^>]+SYSTEM\b", "external DOCTYPE"),
+    )),
+    ("template", _sig(
+        (r"\{\{[^}]*(?:config|self|request|__|\.__)[^}]*\}\}", "SSTI {{...}}"),
+        (r"\$\{[^}]*(?:T\(|Runtime|exec)[^}]*\}", "SSTI ${...}"),
+    )),
+    ("traversal", _sig(
+        (r"(?:\.\./){2,}|(?:\.\.\\){2,}", "path traversal"),
+        (r"/etc/passwd\b|/etc/shadow\b", "sensitive file"),
+        (r"\bfile://", "file:// scheme"),
+    )),
+]
+
+
+# ---- QR decoding (pure Python; PNG -> module matrix -> data) ----
+# Best-effort decoder for clean, axis-aligned QR codes (as produced by upload
+# tooling), versions 1-10, numeric/alnum/byte, all masks. No error correction:
+# it reads the data codewords of an undamaged symbol. Returns [] on any trouble.
+
+_QR_ALIGN = {1: [], 2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30], 6: [6, 34],
+             7: [6, 22, 38], 8: [6, 24, 42], 9: [6, 26, 46], 10: [6, 28, 50]}
+# (version, level) -> (ec_codewords_per_block, [(num_blocks, data_cw_per_block), ...])
+_QR_ECB = {
+    (1, "L"): (7, [(1, 19)]), (1, "M"): (10, [(1, 16)]), (1, "Q"): (13, [(1, 13)]), (1, "H"): (17, [(1, 9)]),
+    (2, "L"): (10, [(1, 34)]), (2, "M"): (16, [(1, 28)]), (2, "Q"): (22, [(1, 22)]), (2, "H"): (28, [(1, 16)]),
+    (3, "L"): (15, [(1, 55)]), (3, "M"): (26, [(1, 44)]), (3, "Q"): (18, [(2, 17)]), (3, "H"): (22, [(2, 13)]),
+    (4, "L"): (20, [(1, 80)]), (4, "M"): (18, [(2, 32)]), (4, "Q"): (26, [(2, 24)]), (4, "H"): (16, [(4, 9)]),
+    (5, "L"): (26, [(1, 108)]), (5, "M"): (24, [(2, 43)]), (5, "Q"): (18, [(2, 15), (2, 16)]), (5, "H"): (22, [(2, 11), (2, 12)]),
+    (6, "L"): (18, [(2, 68)]), (6, "M"): (16, [(4, 27)]), (6, "Q"): (24, [(4, 19)]), (6, "H"): (28, [(4, 15)]),
+    (7, "L"): (20, [(2, 78)]), (7, "M"): (18, [(4, 31)]), (7, "Q"): (18, [(2, 14), (4, 15)]), (7, "H"): (26, [(4, 13), (1, 14)]),
+    (8, "L"): (24, [(2, 97)]), (8, "M"): (22, [(2, 38), (2, 39)]), (8, "Q"): (22, [(4, 18), (2, 19)]), (8, "H"): (26, [(4, 14), (2, 15)]),
+    (9, "L"): (30, [(2, 116)]), (9, "M"): (22, [(3, 36), (2, 37)]), (9, "Q"): (20, [(4, 16), (4, 17)]), (9, "H"): (24, [(4, 12), (4, 13)]),
+    (10, "L"): (18, [(2, 68), (2, 69)]), (10, "M"): (26, [(4, 43), (1, 44)]), (10, "Q"): (24, [(6, 19), (2, 20)]), (10, "H"): (28, [(6, 15), (2, 16)]),
+}
+_QR_ALNUM = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
+
+
+def _png_matrix(d):
+    """Decode a (non-interlaced) PNG to a 2D list of booleans (True = dark).
+    Handles gray/palette/rgb(a), bit depths 1/2/4/8. None on failure."""
+    if not d.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+    try:
+        width = height = bitd = ctype = interlace = None
+        idat = bytearray()
+        plte = None
+        for typ, body in _png_chunks(d):
+            if typ == b"IHDR":
+                width, height, bitd, ctype = int.from_bytes(body[0:4], "big"), \
+                    int.from_bytes(body[4:8], "big"), body[8], body[9]
+                interlace = body[12]
+            elif typ == b"PLTE":
+                plte = body
+            elif typ == b"IDAT":
+                idat += body
+        if not width or interlace:
+            return None
+        raw = zlib.decompress(bytes(idat))
+        chan = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ctype]
+        bpp = max(1, (bitd * chan + 7) // 8)
+        stride = (width * chan * bitd + 7) // 8
+        rows, prev = [], bytearray(stride)
+        pos = 0
+        for _ in range(height):
+            ft = raw[pos]; pos += 1
+            line = bytearray(raw[pos:pos + stride]); pos += stride
+            for i in range(len(line)):
+                a = line[i - bpp] if i >= bpp else 0
+                b = prev[i]
+                c = prev[i - bpp] if i >= bpp else 0
+                if ft == 1:
+                    line[i] = (line[i] + a) & 0xff
+                elif ft == 2:
+                    line[i] = (line[i] + b) & 0xff
+                elif ft == 3:
+                    line[i] = (line[i] + (a + b) // 2) & 0xff
+                elif ft == 4:
+                    p = a + b - c
+                    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                    pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                    line[i] = (line[i] + pr) & 0xff
+            rows.append(bytes(line))
+            prev = line
+        # unpack samples -> luminance -> dark
+        maxv = (1 << bitd) - 1
+        out = []
+        for line in rows:
+            samples = []
+            if bitd == 8:
+                samples = list(line)
+            else:
+                for byte in line:
+                    for s in range(8 // bitd):
+                        shift = 8 - bitd * (s + 1)
+                        samples.append((byte >> shift) & maxv)
+            px = []
+            for x in range(width):
+                base = x * chan
+                if ctype == 3 and plte:
+                    idx = samples[x] * 3
+                    r, g, b = plte[idx], plte[idx + 1], plte[idx + 2]
+                    lum = 0.299 * r + 0.587 * g + 0.114 * b
+                elif ctype in (0, 4):
+                    lum = samples[base] * 255.0 / maxv
+                else:  # rgb / rgba
+                    r, g, b = samples[base], samples[base + 1], samples[base + 2]
+                    lum = (0.299 * r + 0.587 * g + 0.114 * b) * 255.0 / maxv
+                px.append(lum < 128)
+            out.append(px)
+        return out
+    except Exception:
+        return None
+
+
+def _qr_modules(px):
+    """Given a dark-pixel matrix of a clean, scaled QR (with any quiet zone),
+    recover the size x size module matrix. None on failure."""
+    h = len(px)
+    w = len(px[0]) if h else 0
+    rmin = rmax = cmin = cmax = None
+    for r in range(h):
+        for c in range(w):
+            if px[r][c]:
+                if rmin is None:
+                    rmin, rmax, cmin, cmax = r, r, c, c
+                rmax = r
+                if c < cmin:
+                    cmin = c
+                if c > cmax:
+                    cmax = c
+    if rmin is None:
+        return None
+    bw = cmax - cmin + 1
+    # module size from the top-left finder's 7-module top edge
+    run = 0
+    while cmin + run <= cmax and px[rmin][cmin + run]:
+        run += 1
+    if run < 7:
+        return None
+    ms = run / 7.0
+    size = int(round(bw / ms))
+    if size < 21 or (size - 17) % 4 != 0:
+        return None
+    step = bw / size
+    mods = []
+    for r in range(size):
+        row = []
+        for c in range(size):
+            y = int(rmin + (r + 0.5) * step)
+            x = int(cmin + (c + 0.5) * step)
+            row.append(1 if (0 <= y < h and 0 <= x < w and px[y][x]) else 0)
+        mods.append(row)
+    return mods
+
+
+def _qr_mask(p, r, c):
+    if p == 0:
+        return (r + c) % 2 == 0
+    if p == 1:
+        return r % 2 == 0
+    if p == 2:
+        return c % 3 == 0
+    if p == 3:
+        return (r + c) % 3 == 0
+    if p == 4:
+        return (r // 2 + c // 3) % 2 == 0
+    if p == 5:
+        return (r * c) % 2 + (r * c) % 3 == 0
+    if p == 6:
+        return ((r * c) % 2 + (r * c) % 3) % 2 == 0
+    return ((r + c) % 2 + (r * c) % 3) % 2 == 0
+
+
+def _bch15(data5):
+    d = data5 << 10
+    for i in range(4, -1, -1):
+        if (d >> (10 + i)) & 1:
+            d ^= 0x537 << i
+    return (data5 << 10) | (d & 0x3ff)
+
+
+_QR_FORMATS = {}
+for _data5 in range(32):
+    _QR_FORMATS[_bch15(_data5) ^ 0x5412] = _data5
+_QR_ECLEVEL = {1: "L", 0: "M", 3: "Q", 2: "H"}
+
+
+def _qr_reserved(size, version):
+    res = [[False] * size for _ in range(size)]
+
+    def block(r0, c0, h, w):
+        for r in range(r0, r0 + h):
+            for c in range(c0, c0 + w):
+                if 0 <= r < size and 0 <= c < size:
+                    res[r][c] = True
+    block(0, 0, 9, 9)                 # TL finder + separator + format
+    block(0, size - 8, 9, 8)          # TR finder + format
+    block(size - 8, 0, 8, 9)          # BL finder + format
+    for i in range(size):             # timing
+        res[6][i] = True
+        res[i][6] = True
+    centers = _QR_ALIGN.get(version, [])
+    for a in centers:
+        for b in centers:
+            if (a in (6,) and b in (6,)) or (a == 6 and b == centers[-1]) or (a == centers[-1] and b == 6):
+                continue
+            block(a - 2, b - 2, 5, 5)
+    if version >= 7:
+        block(0, size - 11, 6, 3)
+        block(size - 11, 0, 3, 6)
+    return res
+
+
+def _qr_decode(data):
+    """Decode a QR code from PNG bytes -> list of decoded strings ([] if none)."""
+    try:
+        px = _png_matrix(_as_bytes(data))
+        if px is None:
+            return []
+        mods = _qr_modules(px)
+        if mods is None:
+            return []
+        size = len(mods)
+        version = (size - 17) // 4
+        if version not in _QR_ALIGN:
+            return []
+        # format info (copy around the top-left finder); modules are [row][col]
+        fb = 0
+        for i in range(6):
+            fb |= mods[i][8] << i
+        fb |= mods[7][8] << 6
+        fb |= mods[8][8] << 7
+        fb |= mods[8][7] << 8
+        for i in range(9, 15):
+            fb |= mods[8][14 - i] << i
+        best, bestd = None, 99
+        for cand, d5 in _QR_FORMATS.items():
+            dist = bin(cand ^ fb).count("1")
+            if dist < bestd:
+                bestd, best = dist, d5
+        if best is None:
+            return []
+        mask = best & 7
+        ec = _QR_ECLEVEL[(best >> 3) & 3]
+        res = _qr_reserved(size, version)
+        # read codewords (zigzag, right-to-left column pairs), unmasking data
+        bits = []
+        up = True
+        col = size - 1
+        while col > 0:
+            if col == 6:
+                col -= 1
+            for i in range(size):
+                r = size - 1 - i if up else i
+                for c in (col, col - 1):
+                    if not res[r][c]:
+                        bit = mods[r][c]
+                        if _qr_mask(mask, r, c):
+                            bit ^= 1
+                        bits.append(bit)
+            up = not up
+            col -= 2
+        codewords = []
+        for i in range(0, len(bits) - 7, 8):
+            v = 0
+            for b in bits[i:i + 8]:
+                v = (v << 1) | b
+            codewords.append(v)
+        ecw, groups = _QR_ECB[(version, ec)]
+        blocks = []
+        for count, dcw in groups:
+            blocks += [dcw] * count
+        total_data = sum(blocks)
+        stream = codewords[:total_data]
+        maxd = max(blocks)
+        per_block = [[] for _ in blocks]
+        idx = 0
+        for i in range(maxd):
+            for b, dcw in enumerate(blocks):
+                if i < dcw and idx < len(stream):
+                    per_block[b].append(stream[idx])
+                    idx += 1
+        final = bytes(x for blk in per_block for x in blk)
+        return _qr_parse(final, version)
+    except Exception:
+        return []
+
+
+def _qr_parse(final, version):
+    bits = []
+    for byte in final:
+        for i in range(7, -1, -1):
+            bits.append((byte >> i) & 1)
+    pos, total = 0, len(bits)
+
+    def take(n):
+        nonlocal pos
+        if pos + n > total:
+            raise IndexError
+        v = 0
+        for _ in range(n):
+            v = (v << 1) | bits[pos]
+            pos += 1
+        return v
+    out = []
+    try:
+        while pos + 4 <= total:
+            mode = take(4)
+            if mode == 0:
+                break
+            if mode == 1:      # numeric
+                cnt = take(12 if version >= 10 else 10)
+                s = ""
+                while cnt >= 3:
+                    s += "%03d" % take(10)
+                    cnt -= 3
+                if cnt == 2:
+                    s += "%02d" % take(7)
+                elif cnt == 1:
+                    s += "%d" % take(4)
+                out.append(s)
+            elif mode == 2:    # alphanumeric
+                cnt = take(11 if version >= 10 else 9)
+                s = ""
+                while cnt >= 2:
+                    v = take(11)
+                    s += _QR_ALNUM[v // 45] + _QR_ALNUM[v % 45]
+                    cnt -= 2
+                if cnt == 1:
+                    s += _QR_ALNUM[take(6)]
+                out.append(s)
+            elif mode == 4:    # byte
+                cnt = take(16 if version >= 10 else 8)
+                raw = bytes(take(8) for _ in range(cnt))
+                out.append(raw.decode("utf-8", "replace"))
+            elif mode == 7:    # ECI: skip one assignment byte, keep decoding
+                take(8)
+                continue
+            else:
+                break
+    except Exception:
+        pass
+    return ["".join(out)] if out else []
+
+
 class _Util:
     """Analysis helpers. Available in every filter as `util`."""
 
@@ -754,6 +1246,91 @@ class _Util:
                 i += 2 + ((d[i + 2] << 8) | d[i + 3])
             return b""
         return b""
+
+    # -- deep file inspection: text layers, signatures, QR --
+    @staticmethod
+    def strings(data, min_len=4):
+        """Printable-ASCII runs (like the `strings` command) as a list."""
+        return _strings(data, min_len)
+
+    @staticmethod
+    def text_layers(data, qr=False):
+        """Every readable text layer of a file as (source, text) pairs — the raw
+        printable strings PLUS decoded content that `strings` can't see: PNG
+        tEXt/zTXt/iTXt chunks, inflated PDF streams, ZIP/Office entries, and
+        (when qr=True) a QR code's decoded payload."""
+        d = _as_bytes(data)
+        layers = [("bytes", "\n".join(_strings(d)))]
+        kind = _Util.magic(d)
+        if kind == "png":
+            for t in _png_text(d):
+                layers.append(("png:text", t))
+        elif kind == "pdf":
+            for t in _pdf_text(d):
+                layers.append(("pdf:stream", t))
+        elif kind == "zip":
+            for t in _zip_text(d):
+                layers.append(("zip:entry", t))
+        if qr:
+            for t in _qr_decode(d):
+                layers.append(("qr", t))
+        return layers
+
+    @staticmethod
+    def qr_decode(data):
+        """Decode a QR code from PNG bytes → list of decoded strings ([] if the
+        image isn't a decodable QR). Best-effort: clean, axis-aligned QR codes,
+        versions 1-10, numeric/alphanumeric/byte modes, all masks."""
+        return _qr_decode(_as_bytes(data))
+
+    @staticmethod
+    def find_payload(data, categories=None, qr=False):
+        """Scan every text layer for a known attack signature. Returns a dict
+        {category, label, source, match} on the first hit, else None — so a
+        filter can do `if util.find_payload(flow.content, qr=True): drop`.
+        categories optionally restricts to e.g. ("sqli","shell")."""
+        for src, text in _Util.text_layers(data, qr=qr):
+            if not text:
+                continue
+            for cat, pats in _SIG_DB:
+                if categories and cat not in categories:
+                    continue
+                for rx, lbl in pats:
+                    m = rx.search(text)
+                    if m:
+                        return {"category": cat, "label": lbl,
+                                "source": src, "match": m.group(0)[:120]}
+        return None
+
+    @staticmethod
+    def scan(data, patterns, qr=False):
+        """Search every text layer with your own regex/substring patterns.
+        Returns the list of matched strings (empty if none)."""
+        if isinstance(patterns, (str, bytes)) or hasattr(patterns, "search"):
+            patterns = [patterns]
+        compiled = [p if hasattr(p, "search") else re.compile(_as_text(p), re.I | re.S)
+                    for p in patterns]
+        hits = []
+        for _, text in _Util.text_layers(data, qr=qr):
+            for rx in compiled:
+                m = rx.search(text or "")
+                if m:
+                    hits.append(m.group(0)[:120])
+        return hits
+
+    @staticmethod
+    def inspect(data, qr=False):
+        """A quick structured report for the Test panel: file type, size,
+        appended (polyglot) bytes, the text-layer sources found, and the first
+        attack signature (if any)."""
+        d = _as_bytes(data)
+        return {
+            "type": _Util.magic(d) or "?",
+            "size": len(d),
+            "trailing": len(_Util.trailing_data(d)),
+            "layers": [s for s, _ in _Util.text_layers(d, qr=qr)],
+            "payload": _Util.find_payload(d, qr=qr),
+        }
 
     # -- paths / URIs --
     @staticmethod

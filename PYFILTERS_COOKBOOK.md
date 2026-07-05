@@ -34,6 +34,11 @@ and drop immediately without pulling the whole thing apart by hand.
 | `util.magic(data)` | sniffed file type (`png`,`jpg`,`pdf`,`zip`,`svg`,…) or `""` |
 | `util.content_type_ok(ct, data)` | declared Content-Type is consistent with the bytes |
 | `util.trailing_data(data)` | bytes appended after an image's logical end (polyglot) |
+| `util.qr_decode(data)` | decode a QR code from PNG bytes → list of strings (v1-10) |
+| `util.text_layers(data, qr=False)` | every readable text layer: raw strings + decoded PNG chunks / PDF streams / ZIP entries / QR |
+| `util.find_payload(data, categories=None, qr=False)` | first attack signature (SQLi/shell/php/xss/xxe/template/traversal) found in any layer, else `None` |
+| `util.scan(data, patterns, qr=False)` | search every text layer with your own regex list |
+| `util.inspect(data, qr=False)` | quick report: type, size, trailing, layers, first payload |
 | `util.normpath(p)` | URL-decoded, `.`/`..`/`//`-folded path |
 | `util.uri_scheme(s)` | scheme if `s` carries one (`telnet`, `file`, …) else `""` |
 | `util.path_escapes(p)` | a (relative) path is absolute / traverses out / has a scheme or NUL |
@@ -53,7 +58,7 @@ and drop immediately without pulling the whole thing apart by hand.
 6. [Reject malformed JSON (error-leak)](#6-reject-malformed-json-error-leak) · Blocking
 7. [A file field must be canonical base64](#7-a-file-field-must-be-canonical-base64) · Blocking
 8. [Content-Type must match the bytes](#8-content-type-must-match-the-bytes) · Blocking
-9. [Polyglot: data appended after an image](#9-polyglot-data-appended-after-an-image) · Blocking
+9. [Malicious content inside an uploaded image (polyglot / QR / metadata)](#9-malicious-content-inside-an-uploaded-image-polyglot--qr--metadata) · Blocking
 10. [Static path traversal / SSRF](#10-static-path-traversal--ssrf) · Blocking
 11. [Algorithm allowlist](#11-algorithm-allowlist) · Blocking
 
@@ -225,21 +230,37 @@ def match(flow):
 *Checker uploads a real PNG with `image/png`; the sniff matches. Unknown/
 unenforced types return True, so non-image endpoints are never touched.*
 
-### 9. Polyglot: data appended after an image
-*A file that is a valid image plus a smuggled payload after the image's end
-(curl-config / archive / script).* `util.trailing_data` bounds PNG/JPEG precisely.
+### 9. Malicious content inside an uploaded image (polyglot / QR / metadata)
+*The server decodes an uploaded image/file and acts on what's inside — a QR that
+carries an SQL injection, a rev-shell appended after the image, a payload hidden
+in a PNG text chunk / PDF stream.* `util.find_payload` decodes every text layer
+(including a **QR code** and zlib-compressed chunks `strings` can't see) and
+matches a curated signature DB; `util.trailing_data` catches raw polyglots.
 
 ```python
 DIRECTION = "request"
 
 def match(flow):
-    if flow.method == "POST" and flow.path.endswith("/images"):
+    if flow.method == "POST" and flow.path.endswith(("/upload", "/images", "/avatar")):
         data = flow.content
+        hit = util.find_payload(data, qr=True)          # scans bytes, chunks, QR…
+        if hit:
+            return {"drop": True, "reason": "%s in upload (%s): %s" % (
+                hit["category"], hit["source"], hit["label"])}
         if util.magic(data) in ("png", "jpg") and util.trailing_data(data):
-            return {"drop": True, "reason": "%d bytes appended after the image" % len(util.trailing_data(data))}
+            return {"drop": True, "reason": "%d bytes appended after the image"
+                    % len(util.trailing_data(data))}
     return False
 ```
-*A checker's clean image ends exactly at `IEND`/EOI, so `trailing_data` is empty.*
+*The checker uploads a clean image / a benign QR: no signature matches in any
+layer and the image ends exactly at `IEND`/EOI, so nothing drops. The signatures
+are specific (`UNION SELECT`, `/dev/tcp/…`, `<?php`, …) — an ordinary photo won't
+contain them. Narrow the categories (e.g. `util.find_payload(data, ("sqli",),
+qr=True)`) to the one the service is actually vulnerable to.*
+
+To inspect what a filter sees, run `util.inspect(flow.content, qr=True)` in the
+Test panel — it reports the file type, appended bytes, the text layers found, and
+the first signature hit.
 
 ### 10. Static path traversal / SSRF
 *CCalendar — `/static//etc/passwd` and `/static/http://api/...` escape the
