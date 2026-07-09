@@ -13,7 +13,7 @@ services:
     ports: !reset []
     environment:
       - DATA_DIR=/data
-      - API_PORT=8080
+      - API_PORT=9090
       - API_BIND=0.0.0.0
       - ENV_PATH=/dev/null
       - REDIS_ADDR=127.0.0.1:6379
