@@ -335,3 +335,82 @@ func TestRaw_Bytes(t *testing.T) {
 		t.Error("raw contains negative")
 	}
 }
+
+func TestLengthAccessor(t *testing.T) {
+	p := basePacket() // body is 35 bytes, url "/api/admin/login" is 16, raw is 8 bytes
+	bodyLen := len(p.body)
+	urlLen := len(p.url)
+	rawLen := len(p.raw)
+
+	cases := []struct {
+		src  string
+		want bool
+	}{
+		{fmt.Sprintf("body.length == %d", bodyLen), true},
+		{fmt.Sprintf("body.length > %d", bodyLen-1), true},
+		{fmt.Sprintf("body.length < %d", bodyLen), false},
+		{fmt.Sprintf("url.len == %d", urlLen), true},
+		{fmt.Sprintf("url.size >= %d", urlLen), true},
+		{fmt.Sprintf("raw.length == %d", rawLen), true},
+		{"header.User-Agent.length == 8", true}, // "curl/7.0"
+		{"header.User-Agent.length > 100", false},
+		{"header.Authorization.length >= 10", true},
+		{"body.length in (1, 2, 35)", true},
+		{"method.length == 4", true}, // POST
+	}
+	for _, c := range cases {
+		got := mustEval(t, c.src, p)
+		if got != c.want {
+			t.Errorf("%q = %v, want %v", c.src, got, c.want)
+		}
+	}
+}
+
+func TestLengthRejectsNonText(t *testing.T) {
+	// status is an int field; .length makes no sense there.
+	if _, err := Compile("status.length > 3"); err == nil {
+		t.Error("expected error for .length on an int field")
+	}
+	// bare `.length` with no operator should not silently pass.
+	if _, err := Compile("body.length"); err == nil {
+		t.Error("expected error for `.length` without a comparison")
+	}
+}
+
+func TestLengthStaysResidualInSQL(t *testing.T) {
+	ast, err := Parse("body.length > 4000")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	c, err := CompileSQL(ast)
+	if err != nil {
+		t.Fatalf("compile sql: %v", err)
+	}
+	if c.Where != "" {
+		t.Errorf("expected no SQL pushdown for length, got Where=%q", c.Where)
+	}
+	if c.Residual == nil {
+		t.Error("expected a residual evaluator for a length predicate")
+	}
+}
+
+func TestFieldsUsed(t *testing.T) {
+	ast, err := Parse(`body contains "x" AND (header.Cookie contains "s" OR url startswith "/a") AND src == "1.2.3.4"`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	got := FieldsUsed(ast)
+	want := map[string]bool{"body": true, "header": true, "url": true, "src": true}
+	if len(got) != len(want) {
+		t.Fatalf("got %v", got)
+	}
+	for _, f := range got {
+		if !want[f] {
+			t.Errorf("unexpected field %q", f)
+		}
+	}
+	// nil expression -> empty
+	if len(FieldsUsed(nil)) != 0 {
+		t.Error("nil node should yield no fields")
+	}
+}

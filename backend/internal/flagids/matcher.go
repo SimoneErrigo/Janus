@@ -109,20 +109,37 @@ type FlagScanner struct {
 	scanString func(s string) bool
 	// fallback regex for unsupported patterns
 	regex *regexp.Regexp
+	// decodeURL also scans a percent-decoded copy of the input, so
+	// URL-encoded flags are caught even when the raw bytes don't match.
+	decodeURL bool
 }
 
 // NewFlagScanner creates an optimized scanner based on the flag regex pattern.
 // Known patterns get hardware-accelerated byte scanning. Unknown patterns
 // fall back to Go's regexp engine.
-func NewFlagScanner(flagRegex string) *FlagScanner {
+//
+// caseInsensitive matches flags regardless of ASCII case (a leading "(?i)" in
+// the pattern implies the same). decodeURL additionally scans a percent-decoded
+// copy of the traffic so URL-encoded flags are still detected.
+func NewFlagScanner(flagRegex string, caseInsensitive, decodeURL bool) *FlagScanner {
 	if flagRegex == "" {
 		return nil
 	}
 
-	fs := &FlagScanner{}
+	// Honor an inline "(?i)" flag as a case-insensitive request and strip it
+	// from the pattern fed to the fast-path parsers (which don't understand
+	// regexp flags).
+	ci := caseInsensitive
+	pat := flagRegex
+	if strings.HasPrefix(pat, "(?i)") {
+		ci = true
+		pat = pat[len("(?i)"):]
+	}
+
+	fs := &FlagScanner{decodeURL: decodeURL}
 
 	// Try to parse known CTF flag patterns and build optimized scanners
-	if spec := parseSuffixPattern(flagRegex); spec != nil {
+	if spec := parseSuffixPattern(pat, ci); spec != nil {
 		// Pattern like [A-Z0-9]{31}= or [a-f0-9]{32}: or [A-Za-z0-9]{24}$
 		// Strategy: scan for suffix byte, validate preceding N chars against charset
 		fs.scanBytes = func(data []byte) bool {
@@ -134,20 +151,25 @@ func NewFlagScanner(flagRegex string) *FlagScanner {
 		return fs
 	}
 
-	if prefix, inner := parsePrefixPattern(flagRegex); prefix != "" {
+	if prefix, inner := parsePrefixPattern(pat, ci); prefix != "" {
 		// Pattern like FLAG{...} or CTF{[a-f0-9]+} or CCIT{.*}
 		// Strategy: scan for prefix string, then validate content if inner regex exists
+		prefixLower := strings.ToLower(prefix)
 		fs.scanBytes = func(data []byte) bool {
-			return prefixScanBytes(data, prefix, inner)
+			return prefixScanBytes(data, prefix, prefixLower, inner, ci)
 		}
 		fs.scanString = func(s string) bool {
-			return prefixScanString(s, prefix, inner)
+			return prefixScanString(s, prefix, prefixLower, inner, ci)
 		}
 		return fs
 	}
 
 	// Unknown pattern: fall back to compiled regexp
-	re, err := regexp.Compile(flagRegex)
+	compilePat := pat
+	if ci && !strings.HasPrefix(compilePat, "(?i)") {
+		compilePat = "(?i)" + compilePat
+	}
+	re, err := regexp.Compile(compilePat)
 	if err != nil {
 		return nil
 	}
@@ -162,7 +184,15 @@ func (fs *FlagScanner) MatchBytes(data []byte) bool {
 	if fs == nil {
 		return false
 	}
-	return fs.scanBytes(data)
+	if fs.scanBytes(data) {
+		return true
+	}
+	if fs.decodeURL {
+		if dec, changed := lenientPercentDecode(data); changed {
+			return fs.scanBytes(dec)
+		}
+	}
+	return false
 }
 
 // MatchString returns true if s contains a flag.
@@ -170,20 +200,69 @@ func (fs *FlagScanner) MatchString(s string) bool {
 	if fs == nil {
 		return false
 	}
-	return fs.scanString(s)
+	if fs.scanString(s) {
+		return true
+	}
+	if fs.decodeURL {
+		if dec, changed := lenientPercentDecode([]byte(s)); changed {
+			return fs.scanString(string(dec))
+		}
+	}
+	return false
+}
+
+// lenientPercentDecode decodes "%HH" escapes in-place, leaving any invalid or
+// non-escape byte untouched. It returns the decoded bytes and whether any
+// escape was actually decoded (so callers can skip a redundant re-scan). Unlike
+// net/url it never errors on malformed input, which matters for binary traffic.
+func lenientPercentDecode(data []byte) ([]byte, bool) {
+	idx := bytes.IndexByte(data, '%')
+	if idx < 0 {
+		return data, false
+	}
+	out := make([]byte, 0, len(data))
+	out = append(out, data[:idx]...)
+	changed := false
+	for i := idx; i < len(data); i++ {
+		if data[i] == '%' && i+2 < len(data) && isHexByte(data[i+1]) && isHexByte(data[i+2]) {
+			out = append(out, hexNib(data[i+1])<<4|hexNib(data[i+2]))
+			i += 2
+			changed = true
+			continue
+		}
+		out = append(out, data[i])
+	}
+	return out, changed
+}
+
+func isHexByte(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+}
+
+func hexNib(b byte) byte {
+	switch {
+	case b >= '0' && b <= '9':
+		return b - '0'
+	case b >= 'a' && b <= 'f':
+		return b - 'a' + 10
+	default:
+		return b - 'A' + 10
+	}
 }
 
 // --- Suffix-anchored pattern: [CHARSET]{N}SUFFIX ---
 
 type suffixSpec struct {
-	suffix  byte   // the suffix byte to scan for (e.g. '=')
-	length  int    // number of chars before suffix (e.g. 31)
-	charSet [256]bool // allowed characters in the prefix
+	suffix   byte      // the suffix byte to scan for (e.g. '=')
+	suffixCI bool      // when true, the suffix byte matches either ASCII case
+	length   int       // number of chars before suffix (e.g. 31)
+	charSet  [256]bool // allowed characters in the prefix
 }
 
 // parseSuffixPattern tries to parse patterns like [A-Z0-9]{31}= into a suffixSpec.
 // Supports common CTF formats: [A-Z0-9]{31}=, [a-f0-9]{32}:, etc.
-func parseSuffixPattern(pattern string) *suffixSpec {
+// When ci is set the prefix charset (and a letter suffix) match either ASCII case.
+func parseSuffixPattern(pattern string, ci bool) *suffixSpec {
 	// Must match: [<charset>]{<N>}<single-char-suffix>
 	if len(pattern) < 6 || pattern[0] != '[' {
 		return nil
@@ -245,21 +324,76 @@ func parseSuffixPattern(pattern string) *suffixSpec {
 		return nil
 	}
 
-	return &suffixSpec{
-		suffix:  suffix[0],
-		length:  length,
-		charSet: charSet,
+	// Case-insensitive: for every allowed letter also allow its counterpart,
+	// so [A-Z0-9] matches lowercase hex/base32 flags too.
+	suffixCI := false
+	if ci {
+		for c := byte('A'); c <= 'Z'; c++ {
+			if charSet[c] {
+				charSet[c+32] = true
+			}
+		}
+		for c := byte('a'); c <= 'z'; c++ {
+			if charSet[c] {
+				charSet[c-32] = true
+			}
+		}
+		b := suffix[0]
+		suffixCI = (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
 	}
+
+	return &suffixSpec{
+		suffix:   suffix[0],
+		suffixCI: suffixCI,
+		length:   length,
+		charSet:  charSet,
+	}
+}
+
+// indexSuffix returns the offset of the next suffix byte in data at/after start,
+// honoring case-insensitive matching, or -1.
+func indexSuffix(data []byte, start int, spec *suffixSpec) int {
+	idx := bytes.IndexByte(data[start:], spec.suffix)
+	if !spec.suffixCI {
+		if idx < 0 {
+			return -1
+		}
+		return start + idx
+	}
+	alt := caseSwap(spec.suffix)
+	idxAlt := bytes.IndexByte(data[start:], alt)
+	switch {
+	case idx < 0 && idxAlt < 0:
+		return -1
+	case idx < 0:
+		return start + idxAlt
+	case idxAlt < 0:
+		return start + idx
+	default:
+		if idx < idxAlt {
+			return start + idx
+		}
+		return start + idxAlt
+	}
+}
+
+func caseSwap(b byte) byte {
+	switch {
+	case b >= 'A' && b <= 'Z':
+		return b + 32
+	case b >= 'a' && b <= 'z':
+		return b - 32
+	}
+	return b
 }
 
 func suffixScanBytes(data []byte, spec *suffixSpec) bool {
 	start := 0
 	for {
-		idx := bytes.IndexByte(data[start:], spec.suffix)
-		if idx < 0 {
+		pos := indexSuffix(data, start, spec)
+		if pos < 0 {
 			return false
 		}
-		pos := start + idx
 		if pos >= spec.length {
 			valid := true
 			for j := pos - spec.length; j < pos; j++ {
@@ -277,34 +411,15 @@ func suffixScanBytes(data []byte, spec *suffixSpec) bool {
 }
 
 func suffixScanString(s string, spec *suffixSpec) bool {
-	start := 0
-	for {
-		idx := strings.IndexByte(s[start:], spec.suffix)
-		if idx < 0 {
-			return false
-		}
-		pos := start + idx
-		if pos >= spec.length {
-			valid := true
-			for j := pos - spec.length; j < pos; j++ {
-				if !spec.charSet[s[j]] {
-					valid = false
-					break
-				}
-			}
-			if valid {
-				return true
-			}
-		}
-		start = pos + 1
-	}
+	return suffixScanBytes([]byte(s), spec)
 }
 
 // --- Prefix-anchored pattern: PREFIX{...} ---
 
 // parsePrefixPattern tries to parse patterns like FLAG{.*} or CCIT{[a-f0-9]+}
 // Returns the literal prefix (e.g. "FLAG{") and an optional inner regex for content validation.
-func parsePrefixPattern(pattern string) (prefix string, inner *regexp.Regexp) {
+// When ci is set the inner-content regex is compiled case-insensitively.
+func parsePrefixPattern(pattern string, ci bool) (prefix string, inner *regexp.Regexp) {
 	// Look for literal chars followed by {
 	braceIdx := -1
 	for i, c := range pattern {
@@ -339,22 +454,59 @@ func parsePrefixPattern(pattern string) (prefix string, inner *regexp.Regexp) {
 	}
 
 	// Try to compile the inner part as a regex for validation
-	re, err := regexp.Compile("^" + innerStr + "$")
+	anchor := "^" + innerStr + "$"
+	if ci {
+		anchor = "(?i)" + anchor
+	}
+	re, err := regexp.Compile(anchor)
 	if err != nil {
 		return "", nil
 	}
 	return prefix, re
 }
 
-func prefixScanBytes(data []byte, prefix string, inner *regexp.Regexp) bool {
-	prefixBytes := []byte(prefix)
+// indexPrefix finds the next occurrence of the prefix in data at/after start,
+// matching case-insensitively when ci is set (prefixLower must be the
+// lowercased prefix in that case). Returns -1 when not found.
+func indexPrefix(data []byte, start int, prefix, prefixLower string, ci bool) int {
+	if !ci {
+		idx := bytes.Index(data[start:], []byte(prefix))
+		if idx < 0 {
+			return -1
+		}
+		return start + idx
+	}
+	pl := []byte(prefixLower)
+	for i := start; i+len(pl) <= len(data); i++ {
+		match := true
+		for j := 0; j < len(pl); j++ {
+			if toLowerByte(data[i+j]) != pl[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+func toLowerByte(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + 32
+	}
+	return b
+}
+
+func prefixScanBytes(data []byte, prefix, prefixLower string, inner *regexp.Regexp, ci bool) bool {
 	start := 0
 	for {
-		idx := bytes.Index(data[start:], prefixBytes)
+		idx := indexPrefix(data, start, prefix, prefixLower, ci)
 		if idx < 0 {
 			return false
 		}
-		pos := start + idx + len(prefixBytes)
+		pos := idx + len(prefix)
 		// Find closing }
 		closeIdx := bytes.IndexByte(data[pos:], '}')
 		if closeIdx >= 0 {
@@ -366,21 +518,6 @@ func prefixScanBytes(data []byte, prefix string, inner *regexp.Regexp) bool {
 	}
 }
 
-func prefixScanString(s string, prefix string, inner *regexp.Regexp) bool {
-	start := 0
-	for {
-		idx := strings.Index(s[start:], prefix)
-		if idx < 0 {
-			return false
-		}
-		pos := start + idx + len(prefix)
-		// Find closing }
-		closeIdx := strings.IndexByte(s[pos:], '}')
-		if closeIdx >= 0 {
-			if inner == nil || inner.MatchString(s[pos:pos+closeIdx]) {
-				return true
-			}
-		}
-		start = pos
-	}
+func prefixScanString(s string, prefix, prefixLower string, inner *regexp.Regexp, ci bool) bool {
+	return prefixScanBytes([]byte(s), prefix, prefixLower, inner, ci)
 }

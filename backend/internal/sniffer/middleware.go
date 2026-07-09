@@ -2,6 +2,7 @@ package sniffer
 
 import (
 	"bytes"
+	"encoding/base64"
 	"io"
 	"log"
 	"net"
@@ -17,6 +18,27 @@ import (
 )
 
 const maxBodyCapture = 1 << 20 // 1 MB
+
+// PyBlockMatch is a blocking Python-filter verdict on a request: a script asked
+// to drop the current request inline (in real time).
+type PyBlockMatch struct {
+	Script string
+	Reason string
+}
+
+// PyResult is the outcome of the inline (synchronous) Python filters on a
+// request: the matches that asked to block, plus an optional rewritten body.
+type PyResult struct {
+	Blocks    []PyBlockMatch
+	NewBody   []byte // rewritten body to forward (only when Rewritten)
+	Rewritten bool
+}
+
+// PyBlockFunc synchronously evaluates the inline (blocking) Python filters
+// against a request/message flow and returns their verdict (block and/or
+// rewrite). It runs on the hot path, so implementations must be bounded and fail
+// open. A nil func disables inline blocking/rewriting.
+type PyBlockFunc func(flow map[string]any) PyResult
 
 func roundFromFlagIDMatches(matches []flagids.FlagMatch, fallback int) int {
 	round := 0
@@ -54,7 +76,7 @@ func CheckFlagID(checker FlagIDChecker, url, headers string, body []byte) (bool,
 
 // HTTPMiddleware returns an http.Handler that logs requests/responses and evaluates drop rules.
 // getFlagIDChecker is called per request so updates from SetFlagIDChecker apply without restarting the proxy.
-func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore, dropEngine *dropper.Engine, flagRegex *regexp.Regexp, flagScanner *flagids.FlagScanner, getFlagIDChecker func() FlagIDChecker, shouldCapture func() bool, shouldApplyFlagIDsOnIngest func() bool) http.Handler {
+func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore, dropEngine *dropper.Engine, flagRegex *regexp.Regexp, flagScanner *flagids.FlagScanner, getFlagIDChecker func() FlagIDChecker, shouldCapture func() bool, shouldApplyFlagIDsOnIngest func() bool, pyBlock PyBlockFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
@@ -103,8 +125,6 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 
 		captureEnabled := shouldCapture == nil || shouldCapture()
 		applyFlagIDsNow := shouldApplyFlagIDsOnIngest == nil || shouldApplyFlagIDsOnIngest()
-		// In static mode without capture, still persist drops and alert-triggering traffic so Alerts/Blocks stay useful.
-		mustPersistReq := captureEnabled || shouldDrop || len(alertRules) > 0
 
 		// Check flagged status and flag ID containment
 		flagged := CheckFlagged(flagRegex, flagScanner, r.URL.String(), headersStr, reqBody)
@@ -112,6 +132,60 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		if applyFlagIDsNow {
 			containsFlagID, matchedFlagIDs, flagIDRound = CheckFlagID(getFlagIDChecker(), r.URL.String(), headersStr, reqBody)
 		}
+
+		// Inline (synchronous) Python filters: evaluate the blocking scripts
+		// against the request before forwarding, so a match ({"drop": True}) can
+		// drop it in real time. Runs on the hot path but is bounded + fail-open
+		// inside pyBlock, so a stuck/dead script never stalls traffic.
+		var pyBlockAlerts []*Alert
+		if pyBlock != nil {
+			flow := map[string]any{
+				"service":         svc.ID,
+				"direction":       string(DirectionRequest),
+				"method":          r.Method,
+				"url":             r.URL.String(),
+				"status":          0,
+				"src":             srcIP,
+				"dst":             dstIP,
+				"sport":           srcPort,
+				"dport":           dstPort,
+				"headers":         reqHeaders,
+				"body":            string(reqBody),
+				"body_b64":        base64.StdEncoding.EncodeToString(reqBody),
+				"flagged":         flagged,
+				"contains_flagid": containsFlagID,
+				"timestamp":       start.Unix(),
+			}
+			res := pyBlock(flow)
+			for _, bm := range res.Blocks {
+				matchedRules = append(matchedRules, MatchedRuleInfo{
+					ID:      "pyfilter:" + bm.Script,
+					Name:    "Python block (" + bm.Script + ")",
+					Action:  "drop",
+					Pattern: bm.Reason,
+					Scope:   "python",
+				})
+				pyBlockAlerts = append(pyBlockAlerts, &Alert{
+					RuleID:         "pyfilter:" + bm.Script,
+					ServiceID:      svc.ID,
+					SrcIP:          srcIP,
+					Timestamp:      start,
+					PatternMatched: bm.Reason,
+				})
+				shouldDrop = true
+			}
+			// Inline rewrite: swap the request body before forwarding + logging
+			// (only when we're not about to drop it).
+			if res.Rewritten && !shouldDrop {
+				reqBody = res.NewBody
+				r.Body = io.NopCloser(bytes.NewReader(reqBody))
+				r.ContentLength = int64(len(reqBody))
+				r.Header.Set("Content-Length", strconv.Itoa(len(reqBody)))
+			}
+		}
+
+		// In static mode without capture, still persist drops and alert-triggering traffic so Alerts/Blocks stay useful.
+		mustPersistReq := captureEnabled || shouldDrop || len(alertRules) > 0 || len(pyBlockAlerts) > 0
 
 		// Session ID: ties request + response from the same TCP connection.
 		// Even with SNAT (all traffic from same IP), src_port is unique per connection.
@@ -142,7 +216,7 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 			reqPacket.MatchedRules = []MatchedRuleInfo{}
 		}
 		if mustPersistReq {
-			alertTemplates := make([]*Alert, 0, len(alertRules))
+			alertTemplates := make([]*Alert, 0, len(alertRules)+len(pyBlockAlerts))
 			for _, rule := range alertRules {
 				alertTemplates = append(alertTemplates, &Alert{
 					RuleID:         rule.ID,
@@ -152,6 +226,7 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 					PatternMatched: rule.Pattern,
 				})
 			}
+			alertTemplates = append(alertTemplates, pyBlockAlerts...)
 			if err := store.Enqueue(reqPacket, alertTemplates); err != nil {
 				log.Printf("[%s] sniffer: failed to log request: %v", svc.Name, err)
 			}

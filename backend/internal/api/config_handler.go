@@ -13,6 +13,13 @@ import (
 type configResponse struct {
 	TeamPassword     string `json:"team_password"`
 	FlagRegex        string `json:"flag_regex"`
+	// Flag detection tuning (configured via env: FLAG_REGEX_CASE_INSENSITIVE,
+	// FLAG_DECODE_URL). Reported read-only for the dashboard to display.
+	FlagRegexCaseInsensitive bool `json:"flag_regex_case_insensitive"`
+	FlagDecodeURL            bool `json:"flag_decode_url"`
+	// TeamIP is the implicit bind host for services whose listen address omits
+	// a host (env: TEAM_IP).
+	TeamIP string `json:"team_ip"`
 
 	// Flag ID settings
 	FlagIDEnabled      bool   `json:"flagid_enabled"`
@@ -78,6 +85,9 @@ func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, configResponse{
 		TeamPassword:             cfg.TeamPassword,
 		FlagRegex:                cfg.FlagRegex,
+		FlagRegexCaseInsensitive: cfg.FlagRegexCaseInsensitive,
+		FlagDecodeURL:            cfg.FlagDecodeURL,
+		TeamIP:                   cfg.TeamIP,
 		FlagIDEnabled:            pollerCfg.Enabled,
 		FlagIDAPIURL:             pollerCfg.APIURL,
 		FlagIDTeamID:             pollerCfg.TeamID,
@@ -213,6 +223,9 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, configResponse{
 		TeamPassword:             cfg.TeamPassword,
 		FlagRegex:                cfg.FlagRegex,
+		FlagRegexCaseInsensitive: cfg.FlagRegexCaseInsensitive,
+		FlagDecodeURL:            cfg.FlagDecodeURL,
+		TeamIP:                   cfg.TeamIP,
 		FlagIDEnabled:            pollerCfg.Enabled,
 		FlagIDAPIURL:             pollerCfg.APIURL,
 		FlagIDTeamID:             pollerCfg.TeamID,

@@ -102,6 +102,29 @@ func compilePredicate(pr *Predicate) (EvalFunc, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown field %q", pr.Field)
 	}
+
+	// Length accessor (`<field>.length`): byte length of a string/bytes/header
+	// field, compared as an integer.
+	if pr.Length {
+		switch field.Type {
+		case TypeString, TypeBytes, TypeHeaders:
+		default:
+			return nil, fmt.Errorf(".length is only valid on text fields, not %q", pr.Field)
+		}
+		if !opCompatible(TypeInt, pr.Op) {
+			return nil, fmt.Errorf("operator %q not supported on %q.length", pr.Op, pr.Field)
+		}
+		fname := pr.Field
+		headerName := pr.HeaderName
+		lengthOf := func(p PacketView) int64 {
+			if fname == "raw" {
+				return int64(len(p.RawBytes()))
+			}
+			return int64(len(readString(p, fname, headerName)))
+		}
+		return compileIntComparison(lengthOf, pr)
+	}
+
 	if !opCompatible(field.Type, pr.Op) {
 		return nil, fmt.Errorf("operator %q not supported on field %q", pr.Op, pr.Field)
 	}
@@ -125,39 +148,7 @@ func compilePredicate(pr *Predicate) (EvalFunc, error) {
 	// Int predicate.
 	if field.Type == TypeInt {
 		fname := pr.Field
-		switch pr.Op {
-		case OpIn:
-			nums, err := intList(pr.Value)
-			if err != nil {
-				return nil, err
-			}
-			set := make(map[int64]struct{}, len(nums))
-			for _, n := range nums {
-				set[n] = struct{}{}
-			}
-			return func(p PacketView) bool {
-				_, ok := set[readInt(p, fname)]
-				return ok
-			}, nil
-		}
-		want, err := intValue(pr.Value)
-		if err != nil {
-			return nil, err
-		}
-		switch pr.Op {
-		case OpEq:
-			return func(p PacketView) bool { return readInt(p, fname) == want }, nil
-		case OpNeq:
-			return func(p PacketView) bool { return readInt(p, fname) != want }, nil
-		case OpGT:
-			return func(p PacketView) bool { return readInt(p, fname) > want }, nil
-		case OpLT:
-			return func(p PacketView) bool { return readInt(p, fname) < want }, nil
-		case OpGTE:
-			return func(p PacketView) bool { return readInt(p, fname) >= want }, nil
-		case OpLTE:
-			return func(p PacketView) bool { return readInt(p, fname) <= want }, nil
-		}
+		return compileIntComparison(func(p PacketView) int64 { return readInt(p, fname) }, pr)
 	}
 
 	// String / bytes / headers predicate.
@@ -264,6 +255,46 @@ func compilePredicate(pr *Predicate) (EvalFunc, error) {
 		}, nil
 	}
 	return nil, fmt.Errorf("internal: unhandled op %q on string field %q", pr.Op, pr.Field)
+}
+
+// compileIntComparison builds an evaluator that compares an integer produced by
+// get against the predicate's value. Shared by real int fields and the
+// `.length` accessor.
+func compileIntComparison(get func(PacketView) int64, pr *Predicate) (EvalFunc, error) {
+	switch pr.Op {
+	case OpIn:
+		nums, err := intList(pr.Value)
+		if err != nil {
+			return nil, err
+		}
+		set := make(map[int64]struct{}, len(nums))
+		for _, n := range nums {
+			set[n] = struct{}{}
+		}
+		return func(p PacketView) bool {
+			_, ok := set[get(p)]
+			return ok
+		}, nil
+	}
+	want, err := intValue(pr.Value)
+	if err != nil {
+		return nil, err
+	}
+	switch pr.Op {
+	case OpEq:
+		return func(p PacketView) bool { return get(p) == want }, nil
+	case OpNeq:
+		return func(p PacketView) bool { return get(p) != want }, nil
+	case OpGT:
+		return func(p PacketView) bool { return get(p) > want }, nil
+	case OpLT:
+		return func(p PacketView) bool { return get(p) < want }, nil
+	case OpGTE:
+		return func(p PacketView) bool { return get(p) >= want }, nil
+	case OpLTE:
+		return func(p PacketView) bool { return get(p) <= want }, nil
+	}
+	return nil, fmt.Errorf("internal: unhandled int op %q", pr.Op)
 }
 
 func stringValue(v Value) (string, error) {

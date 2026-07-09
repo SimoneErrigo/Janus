@@ -26,6 +26,12 @@ Copy the example and edit the few competition-specific values:
 cp .env.example .env
 ```
 
+Notable knobs (all documented in `.env.example`):
+
+- `TEAM_IP` — your team address; services with an empty listen host bind to it, so you don't retype `10.60.x.y` for every service.
+- `FLAG_REGEX_CASE_INSENSITIVE` / `FLAG_DECODE_URL` — catch flags that are case-mismatched or URL-encoded (e.g. `…%3D`).
+- `PYFILTER_ENABLED` — the mitmproxy-style Python filter engine (see [Python filters](#python-filters-scriptable)).
+
 ### 2. Deploy
 
 ```bash
@@ -111,6 +117,122 @@ Each rule has an action: **drop** (block), **alert** (log only), or **both**. Fl
 #### Attack Presets
 
 **Presets** opens a library of ready-made rules for common CTF attack patterns. Pick categories and individual rules, choose target services, and create them in bulk. Categories: SQLi, XSS, Path Traversal, Command Injection, XXE, SSTI, PHP/Python/Node.js code exec, SSRF, Deserialization, Auth Bypass, NoSQLi, IDOR, Web Shells, File Upload, Flag Exfiltration.
+
+#### Python filters (scriptable)
+
+When the filter DSL can't express what you need — anything **stateful** or
+cross-packet — use the **Python Filters** page (mitmproxy-style). Each script
+defines a top-level `match(flow)` function that runs against every captured
+packet; module-level state persists across calls, so you can count or correlate
+over time. Matches surface on the **Alerts** page.
+
+```python
+# Alert when the same user logs in more than once.
+logins = {}
+
+def match(flow):
+    if flow.method == "POST" and flow.path == "/login":
+        user = (flow.json() or {}).get("user")   # parsed body, None-safe
+        if user:
+            logins[user] = logins.get(user, 0) + 1
+            if logins[user] > 1:
+                return f"repeated login for {user} (#{logins[user]})"
+    return False
+```
+
+`match(flow)` returns one of:
+
+| return | meaning |
+| --- | --- |
+| `False` / `None` | no match |
+| `True` | match, no reason |
+| `"reason string"` | match, shown on the **Alerts** page |
+| `{"match": True, "reason": "...", "drop": True}` | match **and** drop this message now (inline — needs **Blocking**) |
+
+`drop` and `block` are synonyms and any truthy value counts, so `{"drop": True}`
+and `{"drop": "some reason"}` both drop.
+
+`flow` is a **forgiving object** (still a dict, so `flow["body"]` /
+`flow.get(...)` keep working): a missing field reads as `""`, so filters are
+quick to write and never crash. Handy accessors — `flow.method` / `url` / `path`
+/ `status` / `service`, `flow.direction` with `flow.is_request` /
+`flow.is_response`, `flow.flagged` / `flow.contains_flagid`,
+`flow.headers["Cookie"]` (case-insensitive), `flow.query["id"]`,
+`flow.cookies["session"]`, `flow.json()` / `flow.body` (str) / `flow.content`
+(bytes), `flow.request` / `flow.response` (the correlated side, never `None`),
+and recent history `flow.messages[-1]` / `flow.recent(3)` / `flow.last_request`.
+Works for HTTP and TCP. Scripts run in a bundled `python3` interpreter; a hung or
+broken script is isolated and never blocks traffic. Toggle the whole engine with
+`PYFILTER_ENABLED` and point at a specific interpreter with `PYFILTER_PYTHON`.
+
+**Requests and responses.** `match(flow)` runs once per message on **both**
+directions. Branch on `flow.is_request` / `flow.is_response` (or read the other
+side through `flow.request` / `flow.response`) to decide what to inspect, rewrite,
+or drop — an inline filter can act on a response just as it does on a request.
+
+Non-blocking filters run **async** and can only alert — they see the packet
+after it's already forwarded, so they can't change it. To act on traffic in real
+time, mark the filter **Blocking**.
+
+**Inline (real-time) blocking.** A **Blocking** filter runs *synchronously* on
+the proxy path, so returning `{"drop": True}` drops the **current** message in
+real time: a request is stopped before it reaches the backend, a response before
+it reaches the client (a 403 for HTTP, a closed connection for TCP). It costs
+~tens of µs per message on that service and is bounded + fail-open (a stuck
+script lets traffic through).
+
+**Inline (real-time) rewriting.** A Blocking filter can also *modify* the current
+message before Janus forwards it: assign `flow.body = "..."` (text) or
+`flow.content = b"..."` (exact bytes) inside `match()`. It works on requests and
+responses alike — e.g. redact a flag from a response so the client never sees it,
+without dropping the connection. The rewrite applies whether or not you also
+return a match; like blocking it is inline-only (async filters can't mutate).
+
+**TCP streams.** For binary/CLI services (a continuous byte flow, not one message
+per chunk), `flow.lines` yields the complete lines reassembled across chunks and
+`flow.conn` is a dict that persists for the whole connection (both directions) —
+so stream filters don't hand-roll a byte buffer or a per-connection state map.
+`flow.conn` is **private to each filter**: two filters can use the same key name
+without colliding. For line-based CLI menus, `flow.commands(spec)` goes further
+and parses the stream into commands for you, handling cross-packet buffering and
+flag-ID tracking — so you write the grammar, not a state machine. Each `spec`
+entry maps a trigger line to `(name, arg_spec)`, where `arg_spec` is either the
+number of argument lines **or a tuple of field names**. With names, read the
+arguments by name (`cmd.user`) — don't unpack `cmd.args`, since different
+commands can have different arities:
+
+```python
+# Declare it once; DIRECTION lets Janus skip the response side for you.
+DIRECTION = "request"
+CMDS = {
+    b"1": ("register", ("user", "pw")),   # trigger -> (name, field names)
+    b"2": ("login",    ("user", "pw")),
+    b"6": ("getvip",   ("flight",)),
+}
+
+def match(flow):
+    for cmd in flow.commands(CMDS):        # cmd.name / cmd.flagid / named args
+        if cmd.name == "register":
+            flow.conn.setdefault("regs", set()).add(cmd.pw)
+        elif cmd.name == "login" and cmd.flagid and cmd.pw in flow.conn.get("regs", set()):
+            return {"drop": True, "reason": "login as flag-ID reusing a registered password"}
+    return False
+```
+
+`cmd.arg(i)` reads the i-th argument positionally (returns `b""` if absent), so a
+missing field never raises. The older `(name, n_args)` count form still works and
+exposes the plain `cmd.args` list.
+
+You can **test** a script right on the page before enabling it: build a
+Request/Response sample, or load a real captured packet (or a whole
+request+response **flow**) from traffic. Whole-flow tests run `match()` over the
+packets in order — so correlating/stateful scripts see the sequence — and show a
+per-packet verdict. A `Repeat` control re-runs the sample so counting logic
+(e.g. "2nd login") can fire, and the result labels each match as **Alert** or
+**Alert + Block**.
+
+Full API reference: [PYFILTERS.md](PYFILTERS.md). A big set of worked examples
+(easy → advanced, HTTP and TCP): [PYFILTERS_COOKBOOK.md](PYFILTERS_COOKBOOK.md).
 
 ### 8. Custom protocols
 
@@ -254,6 +376,15 @@ The response includes `stats_a`, `stats_b`, `new_routes`, `gone_routes`, `change
 | POST           | `/api/rules/bulk-delete`   | Delete a list of rule IDs                    |
 | GET            | `/api/rules/presets`       | List attack preset categories                |
 | POST           | `/api/rules/presets/apply` | Apply selected presets to services           |
+
+### Python filters
+
+| Method         | Endpoint                  | Description                                       |
+| -------------- | ------------------------- | ------------------------------------------------- |
+| GET / POST     | `/api/pyfilters`          | List (with engine status) / create a filter script |
+| GET/PUT/DELETE | `/api/pyfilters/{id}`     | Get / update / delete a script                    |
+| GET            | `/api/pyfilter-engine/status` | Engine health (python availability, worker, counts) |
+| POST           | `/api/pyfilter-engine/test`   | Evaluate a script against a sample flow or packet |
 
 ### Custom protocols
 

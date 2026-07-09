@@ -1,5 +1,7 @@
 package filter
 
+import "sort"
+
 // Node is the AST root interface for parsed expressions.
 type Node interface {
 	isNode()
@@ -19,9 +21,12 @@ type BoolLit struct{ Value bool }
 
 // Predicate is a leaf comparison: <field> <op> <value>.
 // HeaderName is populated only for the special "header.<name>" form.
+// Length is set for the "<field>.length" form (aliases .len/.size), which
+// compares the byte length of a string/bytes/header field as an integer.
 type Predicate struct {
 	Field      string
 	HeaderName string
+	Length     bool
 	Op         Op
 	Value      Value
 }
@@ -31,6 +36,39 @@ func (AndNode) isNode()   {}
 func (NotNode) isNode()   {}
 func (BoolLit) isNode()   {}
 func (Predicate) isNode() {}
+
+// FieldsUsed returns the sorted, de-duplicated set of canonical field names
+// referenced by the predicates in an expression. Useful for policy checks such
+// as "this expression must not touch network/identity fields".
+func FieldsUsed(node Node) []string {
+	seen := map[string]struct{}{}
+	var walk func(Node)
+	walk = func(n Node) {
+		switch v := n.(type) {
+		case *OrNode:
+			for _, c := range v.Children {
+				walk(c)
+			}
+		case *AndNode:
+			for _, c := range v.Children {
+				walk(c)
+			}
+		case *NotNode:
+			walk(v.Child)
+		case *Predicate:
+			seen[canonicalField(v.Field)] = struct{}{}
+		}
+	}
+	if node != nil {
+		walk(node)
+	}
+	out := make([]string, 0, len(seen))
+	for f := range seen {
+		out = append(out, f)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // Op is a predicate operator.
 type Op string

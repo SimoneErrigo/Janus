@@ -91,6 +91,29 @@ id >= 5000                               # everything captured after #5000
 
 ---
 
+## Length (`.length`)
+
+Append `.length` (aliases `.len`, `.size`) to any text field — `body`, `url`,
+`raw`, `method`, `header`, or `header.<name>` — to compare its **byte length**
+as an integer. Works with every int operator (`==`, `!=`, `>`, `<`, `>=`, `<=`,
+`in`).
+
+```text
+body.length > 4000                       # unusually large body
+body.length < 8                          # suspiciously tiny
+url.length > 200                         # long URL (encoded payload?)
+raw.length >= 65000                      # near-jumbo TCP payload
+header.length > 8192                     # bloated header block
+header.User-Agent.length > 512           # oversized UA
+header.Cookie.length in (0, 1)           # empty/near-empty cookie
+method.length > 7                        # weird HTTP verb
+```
+
+Length predicates are evaluated in-process (not pushed to SQL), same as
+`raw` / `header.<name>` — so on the Traffic page they fall back to polling.
+
+---
+
 ## Boolean shortcuts
 
 ```text

@@ -41,6 +41,7 @@ func Parse(code string) (*storage.CustomProtocol, []string, error) {
 	var warns []string
 	enums := map[string]map[string]string{}
 	structs := map[string][]storage.ProtocolField{}
+	enumFieldOf := map[string]string{} // struct name -> its enum-typed field (for dispatch)
 	var endian storage.Endian
 	endianSet := false
 
@@ -55,38 +56,61 @@ func Parse(code string) (*storage.CustomProtocol, []string, error) {
 			enums[cl.name] = tbl
 		}
 	}
+	// With exactly one enum we can safely attach it to fields packed from a
+	// `.value` attribute; with several we can't tell which one applies.
+	soleEnum := ""
+	if len(enums) == 1 {
+		for n := range enums {
+			soleEnum = n
+		}
+	}
 
-	// Structs: every struct.pack(...) line is attributed to its innermost
-	// enclosing non-enum class and contributes its fields to that struct.
-	for i, line := range lines {
-		if !strings.Contains(line, "struct.pack(") {
+	// One struct per non-enum class, parsed with the class's local-variable
+	// context so custom payload-building logic (bit-packed grids,
+	// length-prefixed blobs) maps onto a field instead of being dropped.
+	for ci, cl := range classes {
+		if cl.isEnum {
 			continue
 		}
-		name := "Message"
-		if cl := innermostClass(classes, i, indentOf(line)); cl != nil {
-			name = cl.name
-		}
-		fields, e, eSet, w := parseStructLine(line, name)
+		fields, e, eSet, enumField, w := parseClassStruct(classes, ci, lines, soleEnum)
 		warns = append(warns, w...)
 		if eSet {
 			if !endianSet {
 				endian, endianSet = e, true
 			} else if e != endian {
-				warns = append(warns, fmt.Sprintf("struct %q uses %s-endian but protocol is already %s-endian; keeping %s", name, e, endian, endian))
+				warns = append(warns, fmt.Sprintf("struct %q uses %s-endian but protocol is already %s-endian; keeping %s", cl.name, e, endian, endian))
 			}
 		}
 		if len(fields) > 0 {
-			structs[name] = append(structs[name], fields...)
+			structs[cl.name] = append(structs[cl.name], fields...)
+			if enumField != "" {
+				enumFieldOf[cl.name] = enumField
+			}
 		}
 	}
 
-	// struct.unpack is how replies are usually decoded, but in real clients
-	// that logic is spread across helper functions (proto_get_u32, ...) and
-	// can't be reconstructed mechanically. Flag it so the user knows to fill
-	// in the response side by hand.
+	// struct.pack lines outside any class become a single "Message" struct so
+	// pasting a bare packing expression still yields something.
+	for i, line := range lines {
+		if !strings.Contains(line, "struct.pack(") || insideAnyClass(classes, i) {
+			continue
+		}
+		fields, e, eSet, w := parseBytesLine(line, "Message", nil, nil, soleEnum)
+		warns = append(warns, w...)
+		if eSet && !endianSet {
+			endian, endianSet = e, true
+		}
+		if len(fields) > 0 {
+			structs["Message"] = append(structs["Message"], fields...)
+		}
+	}
+
+	// Replies are usually decoded with struct.unpack spread across helper
+	// functions and conditionals; that control flow can't be reconstructed
+	// mechanically, so point the user at the Response tab.
 	for _, line := range lines {
 		if strings.Contains(line, "struct.unpack(") {
-			warns = append(warns, "struct.unpack detected: response/reply layout was not imported — define response fields manually")
+			warns = append(warns, "struct.unpack detected: response layout wasn't imported automatically — wire Response fields in the editor (the imported structs are there to copy from)")
 			break
 		}
 	}
@@ -106,6 +130,16 @@ func Parse(code string) (*storage.CustomProtocol, []string, error) {
 		Enums:   enums,
 		Structs: structs,
 	}
+
+	// Request auto-wiring: many clients prepend a header struct to every
+	// request body (the `hdr.bytes + data` idiom). When we can see that, lay
+	// the request out as the header fields followed by a dispatch on the
+	// header's enum field so the paste decodes immediately.
+	if req, w := buildRequestFields(lines, structs, enumFieldOf); req != nil {
+		proto.RequestFields = req
+		warns = append(warns, w...)
+	}
+
 	return proto, warns, nil
 }
 
@@ -169,20 +203,98 @@ func indentOf(line string) int {
 	return n
 }
 
-// innermostClass returns the deepest-nested non-enum class whose body covers
-// lineIdx and whose header is less indented than the line itself.
-func innermostClass(classes []classInfo, lineIdx, lineIndent int) *classInfo {
-	var best *classInfo
-	for i := range classes {
-		c := &classes[i]
-		if c.isEnum || lineIdx <= c.start || lineIdx >= c.end || c.indent >= lineIndent {
-			continue
-		}
-		if best == nil || c.indent > best.indent {
-			best = c
+// insideAnyClass reports whether line lineIdx falls within any class body.
+func insideAnyClass(classes []classInfo, lineIdx int) bool {
+	for _, c := range classes {
+		if lineIdx > c.start && lineIdx < c.end {
+			return true
 		}
 	}
-	return best
+	return false
+}
+
+// ownBodyLines returns the line indices that belong directly to class ci —
+// inside its body but not inside any more-deeply-nested class. This lets us
+// treat each class as its own struct without the outer class swallowing the
+// struct.pack lines of the classes nested in it.
+func ownBodyLines(classes []classInfo, ci int) []int {
+	c := classes[ci]
+	var out []int
+	for j := c.start + 1; j < c.end; j++ {
+		nested := false
+		for k := range classes {
+			if k == ci {
+				continue
+			}
+			d := classes[k]
+			if d.start > c.start && d.end <= c.end && j >= d.start && j < d.end {
+				nested = true // j lives in a class nested inside c
+				break
+			}
+		}
+		if !nested {
+			out = append(out, j)
+		}
+	}
+	return out
+}
+
+var selfAssignRe = regexp.MustCompile(`^\s*self\.(\w+)\s*=\s*(.+)$`)
+var localVarRe = regexp.MustCompile(`^\s*([A-Za-z_]\w*)\s*=\s*(.+)$`)
+
+// parseClassStruct turns one non-enum class into a struct. It first scans the
+// class body for `self.x = ...` assignments (to spot enum-typed attributes)
+// and plain `name = ...` locals (so payload-building logic can be resolved),
+// then expands every struct.pack line in the class into fields. The returned
+// enumField, if any, is the field the request dispatch should key on.
+func parseClassStruct(classes []classInfo, ci int, lines []string, soleEnum string) ([]storage.ProtocolField, storage.Endian, bool, string, []string) {
+	own := ownBodyLines(classes, ci)
+
+	enumAttrs := map[string]bool{}
+	localVars := map[string]string{}
+	for _, j := range own {
+		line := stripComment(lines[j])
+		if m := selfAssignRe.FindStringSubmatch(line); m != nil {
+			// `self.type = type.value` marks `type` as carrying an enum value.
+			if strings.Contains(m[2], ".value") {
+				enumAttrs[m[1]] = true
+			}
+			continue
+		}
+		if m := localVarRe.FindStringSubmatch(line); m != nil {
+			localVars[m[1]] = strings.TrimSpace(m[2])
+		}
+	}
+
+	var fields []storage.ProtocolField
+	var warns []string
+	var endian storage.Endian
+	endianSet := false
+	for _, j := range own {
+		if !strings.Contains(lines[j], "struct.pack(") {
+			continue
+		}
+		fs, e, eSet, w := parseBytesLine(lines[j], classes[ci].name, localVars, enumAttrs, soleEnum)
+		warns = append(warns, w...)
+		if eSet && !endianSet {
+			endian, endianSet = e, true
+		}
+		fields = append(fields, fs...)
+	}
+
+	// The dispatch source is the first enum-typed integer field — one linked to
+	// an enum (direct `x.value`) or flagged via a `self.x = y.value` attribute.
+	enumField := ""
+	for _, f := range fields {
+		if !isIntType(f.Type) {
+			continue
+		}
+		if f.EnumRef != "" || enumAttrs[f.Name] {
+			enumField = f.Name
+			break
+		}
+	}
+	return fields, endian, endianSet, enumField, warns
 }
 
 var enumMemberRe = regexp.MustCompile(`^\s*([A-Za-z_]\w*)\s*=\s*(.+?)\s*(?:#.*)?$`)
@@ -253,8 +365,12 @@ type formatSpec struct {
 	defaultName string // used when no argument name is available
 }
 
-// parseStructLine turns a single line containing struct.pack(...) into fields.
-func parseStructLine(line, structName string) ([]storage.ProtocolField, storage.Endian, bool, []string) {
+// parseBytesLine turns a single line containing struct.pack(...) into fields.
+// localVars/enumAttrs carry the enclosing class context (nil when parsing a
+// bare top-level expression): localVars lets a computed-length payload be
+// resolved to a bytes_computed field, and enumAttrs links `.value` fields to
+// the sole enum.
+func parseBytesLine(line, structName string, localVars map[string]string, enumAttrs map[string]bool, soleEnum string) ([]storage.ProtocolField, storage.Endian, bool, []string) {
 	expr := stripComment(line)
 	if idx := strings.Index(expr, "return "); idx >= 0 {
 		expr = expr[idx+len("return "):]
@@ -270,14 +386,14 @@ func parseStructLine(line, structName string) ([]storage.ProtocolField, storage.
 	for i := 0; i < len(terms); i++ {
 		term := strings.TrimSpace(terms[i])
 		if !strings.Contains(term, "struct.pack(") {
-			// Bare trailing payload (e.g. `+ self.data`) without a length
-			// prefix: best we can do is a remaining-bytes field.
+			// Bare trailing payload (e.g. `+ self.data`) not consumed by a
+			// preceding length prefix: best we can do is a remaining-bytes field.
 			name := argName(term)
 			if name == "" {
 				name = "payload"
 			}
 			fields = append(fields, storage.ProtocolField{Name: name, Type: storage.FieldRemaining})
-			warns = append(warns, fmt.Sprintf("struct %q: term %q is variable-length; imported %q as remaining_bytes — consider bytes_computed", structName, term, name))
+			warns = append(warns, fmt.Sprintf("struct %q: term %q is variable-length with no length prefix; imported %q as remaining_bytes", structName, term, name))
 			continue
 		}
 
@@ -287,35 +403,225 @@ func parseStructLine(line, structName string) ([]storage.ProtocolField, storage.
 			endian, endianSet = e, true
 		}
 
-		// Length-prefix idiom: struct.pack('<B'|'<H', len(x)) followed by the
-		// payload term x. Collapse the two into one length-prefixed field.
-		if len(specs) == 1 && isIntType(specs[0].ftype) && len(args) == 1 &&
-			isLenCall(args[0]) && i+1 < len(terms) &&
-			!strings.Contains(terms[i+1], "struct.pack(") {
+		// A length-delimited payload appears when this pack's last argument is
+		// len(x) and the next term is that payload x. This covers both a pure
+		// length prefix (`pack('<H', len(x)) + x`) and a length carried inside a
+		// larger header (`pack('<BH', op.value, len(x)) + x`).
+		payloadFollows := i+1 < len(terms) && !strings.Contains(terms[i+1], "struct.pack(")
+		lastIsLen := len(specs) > 0 && specs[len(specs)-1].consumesArg &&
+			isIntType(specs[len(specs)-1].ftype) && len(args) > 0 && isLenCall(args[len(args)-1])
+
+		if payloadFollows && lastIsLen {
 			payload := strings.TrimSpace(terms[i+1])
-			pname := argName(payload)
-			if pname == "" {
-				pname = "payload"
+			lenType := specs[len(specs)-1].ftype
+			prefixName := argName(args[len(args)-1]) // x from len(x)
+
+			if len(specs) == 1 {
+				// Pure length prefix. Prefer capturing custom packing logic
+				// (bit-packed grids) as bytes_computed, then a length-prefixed
+				// string, and finally a length field + bytes_computed blob.
+				if comp, ok := computedPayload(payload, prefixName, lenType, localVars, structName, &warns); ok {
+					fields = append(fields, comp...)
+					i++
+					continue
+				}
+				pname := argName(payload)
+				if pname == "" {
+					pname = "payload"
+				}
+				if lp, ok := lpStringType(lenType); ok {
+					fields = append(fields, storage.ProtocolField{Name: pname, Type: lp})
+					warns = append(warns, fmt.Sprintf("struct %q: field %q imported as %s; switch to a bytes_lp_* type if the payload is binary", structName, pname, lp))
+				} else {
+					lenName := prefixName + "_len"
+					fields = append(fields,
+						storage.ProtocolField{Name: lenName, Type: lenType},
+						storage.ProtocolField{Name: pname, Type: storage.FieldBytesComp, LengthFrom: lenName},
+					)
+				}
+				i++
+				continue
 			}
-			if lp, ok := lpStringType(specs[0].ftype); ok {
-				fields = append(fields, storage.ProtocolField{Name: pname, Type: lp})
-				warns = append(warns, fmt.Sprintf("struct %q: field %q imported as %s; switch to a bytes_lp_* type if the payload is binary", structName, pname, lp))
+
+			// Length carried inside a multi-field header: emit the whole header
+			// (the last field is the length), then the payload as bytes_computed
+			// keyed on it.
+			emitted := emitSpecs(specs, args, soleEnum)
+			fields = append(fields, emitted...)
+			lenName := emitted[len(emitted)-1].Name
+			if bcf, ok := computedBytesField(payload, lenName, localVars, structName, &warns); ok {
+				fields = append(fields, bcf)
 			} else {
-				// No length-prefixed type wider than 16 bits exists.
-				fields = append(fields,
-					storage.ProtocolField{Name: pname + "_len", Type: specs[0].ftype},
-					storage.ProtocolField{Name: pname, Type: storage.FieldRemaining},
-				)
-				warns = append(warns, fmt.Sprintf("struct %q: %s length prefix has no built-in length-prefixed type; imported %q as a length field + remaining_bytes — consider bytes_computed", structName, specs[0].ftype, pname))
+				pname := argName(payload)
+				if pname == "" || pname == lenName {
+					pname = "payload"
+				}
+				fields = append(fields, storage.ProtocolField{Name: pname, Type: storage.FieldBytesComp, LengthFrom: lenName})
 			}
-			i++ // consumed the payload term too
+			i++
 			continue
 		}
 
-		fs := emitSpecs(specs, args)
-		fields = append(fields, fs...)
+		fields = append(fields, emitSpecs(specs, args, soleEnum)...)
+	}
+
+	// Attach the sole enum to fields packed from a `self.x = y.value`
+	// attribute (the direct `y.value` case is already linked in emitSpecs).
+	if soleEnum != "" && len(enumAttrs) > 0 {
+		for idx := range fields {
+			if enumAttrs[fields[idx].Name] && isIntType(fields[idx].Type) && fields[idx].EnumRef == "" {
+				fields[idx].EnumRef = soleEnum
+			}
+		}
 	}
 	return fields, endian, endianSet, warns
+}
+
+var bitBufMulRe = regexp.MustCompile(`^\[\s*0\s*\]\s*\*\s*(.+)$`)         // [0] * <sizeExpr>
+var bitBufCtorRe = regexp.MustCompile(`^(?:bytearray|bytes)\s*\((.+)\)$`) // bytearray(<sizeExpr>)
+var floorDivRe = regexp.MustCompile(`//\s*(\d+)`)                         // // 8
+var lenCallRe = regexp.MustCompile(`len\(\s*([A-Za-z_][\w.]*)\s*\)`)      // len(cells)
+var forInRe = regexp.MustCompile(`for\s+\w+\s+in\s+([A-Za-z_][\w.]*)`)    // for row in self.board
+
+// computedPayload expresses a computed-length payload as a prefix integer
+// field plus a bytes_computed field. The canonical shape is a bit-packed grid:
+//
+//	cells = [c for row in self.board for c in row]
+//	bs    = [0] * ((len(cells) + 7) // 8)
+//	return struct.pack('<Q', len(self.board)) + bytes(bs)
+//
+// which imports as: board:<int>, bs:bytes_computed(board × board ÷ 8). Used for
+// a pure length prefix; the multi-field-header case emits the length field
+// separately and calls computedBytesField directly.
+func computedPayload(payload, prefixName string, prefixType storage.FieldType, localVars map[string]string, structName string, warns *[]string) ([]storage.ProtocolField, bool) {
+	if prefixName == "" {
+		return nil, false
+	}
+	bcf, ok := computedBytesField(payload, prefixName, localVars, structName, warns)
+	if !ok {
+		return nil, false
+	}
+	return []storage.ProtocolField{
+		{Name: prefixName, Type: prefixType},
+		bcf,
+	}, true
+}
+
+// computedBytesField turns a payload buffer whose byte length is built from a
+// bit-packing expression into a single bytes_computed field keyed on an
+// already-known length field (lenField). It understands the buffer being sized
+// as `[0] * (...)`, `bytearray(...)` or `bytes(...)`, a `// N` bit-to-byte
+// divisor, and a flattened 2D grid (`for .. for ..`) which multiplies the
+// length by itself. Returns ok=false when the payload isn't a recognizable
+// computed buffer.
+func computedBytesField(payload, lenField string, localVars map[string]string, structName string, warns *[]string) (storage.ProtocolField, bool) {
+	if localVars == nil {
+		return storage.ProtocolField{}, false
+	}
+	bufVar := argName(payload) // bytes(bs) -> bs, bs -> bs
+	if bufVar == "" {
+		return storage.ProtocolField{}, false
+	}
+	def := strings.TrimSpace(localVars[bufVar])
+	if def == "" {
+		return storage.ProtocolField{}, false
+	}
+	sizeExpr := ""
+	if m := bitBufMulRe.FindStringSubmatch(def); m != nil {
+		sizeExpr = m[1]
+	} else if m := bitBufCtorRe.FindStringSubmatch(def); m != nil {
+		sizeExpr = m[1]
+	} else {
+		return storage.ProtocolField{}, false
+	}
+	lm := lenCallRe.FindStringSubmatch(sizeExpr)
+	if lm == nil {
+		return storage.ProtocolField{}, false // size isn't len(...)-based
+	}
+	div := 0
+	if d := floorDivRe.FindStringSubmatch(sizeExpr); d != nil {
+		div, _ = strconv.Atoi(d[1])
+	}
+	inner := argName(lm[1]) // len(self.bits) -> bits, len(cells) -> cells
+
+	// A double comprehension (`for .. for ..`) flattens a 2D grid, so the byte
+	// count is prefix × prefix; a single loop keeps it linear.
+	dims, base := 1, inner
+	if idef, ok := localVars[inner]; ok {
+		fors := forInRe.FindAllStringSubmatch(idef, -1)
+		if len(fors) >= 1 {
+			base = argName(fors[0][1]) // self.board -> board
+		}
+		if len(fors) >= 2 {
+			dims = 2
+		}
+	}
+
+	f := storage.ProtocolField{Name: bufVar, Type: storage.FieldBytesComp, LengthFrom: lenField}
+	if div > 1 {
+		f.LengthDiv = div
+	}
+	if dims >= 2 && base == lenField {
+		f.LengthMulFrom = lenField // prefix × prefix (square grid)
+	} else if dims >= 2 && base != "" && base != lenField {
+		*warns = append(*warns, fmt.Sprintf("struct %q: bit-packed payload flattens %q but the length prefix counts %q; imported bytes_computed keys off %q — set the ×multiplier in the editor", structName, base, lenField, lenField))
+	}
+	return f, true
+}
+
+var bytesConcatRe = regexp.MustCompile(`(\w+)\.bytes\s*\+`)          // hdr.bytes + data
+var ctorAssignRe = regexp.MustCompile(`^\s*(\w+)\s*=\s*[\w.]*?(\w+)\s*\(`) // hdr = Network.ReqHdr(...)
+
+// buildRequestFields lays out the request when the client prepends a header
+// struct to every body (`<var>.bytes + data`). It flattens the header struct
+// and appends a dispatch on the header's enum field (or a remaining-bytes body
+// when there's no enum to key on). Returns nil when no header idiom is found,
+// leaving the request for the user to build manually.
+func buildRequestFields(lines []string, structs map[string][]storage.ProtocolField, enumFieldOf map[string]string) ([]storage.ProtocolField, []string) {
+	headerVar := ""
+	for _, line := range lines {
+		if m := bytesConcatRe.FindStringSubmatch(stripComment(line)); m != nil {
+			headerVar = m[1]
+			break
+		}
+	}
+	if headerVar == "" {
+		return nil, nil
+	}
+
+	// Resolve the variable to the struct it was built from. It might be a
+	// struct name directly (`ReqHdr.bytes`) or a local bound to a constructor.
+	headerStruct := ""
+	if _, ok := structs[headerVar]; ok {
+		headerStruct = headerVar
+	} else {
+		for _, line := range lines {
+			m := ctorAssignRe.FindStringSubmatch(stripComment(line))
+			if m == nil || m[1] != headerVar {
+				continue
+			}
+			if _, ok := structs[m[2]]; ok {
+				headerStruct = m[2]
+				break
+			}
+		}
+	}
+	if headerStruct == "" {
+		return nil, nil
+	}
+
+	hdr := structs[headerStruct]
+	req := make([]storage.ProtocolField, len(hdr))
+	copy(req, hdr)
+	var warns []string
+	if ef := enumFieldOf[headerStruct]; ef != "" {
+		req = append(req, storage.ProtocolField{Name: "body", Type: storage.FieldDispatch, DispatchOn: ef})
+		warns = append(warns, fmt.Sprintf("request auto-wired as header %q + dispatch on %q — add a struct named after each %q label so bodies decode; unknown types show as raw bytes", headerStruct, ef, ef))
+	} else {
+		req = append(req, storage.ProtocolField{Name: "body", Type: storage.FieldRemaining})
+		warns = append(warns, fmt.Sprintf("request auto-wired as header %q + remaining body; no enum field to dispatch on — set one in the Request tab if the body varies by type", headerStruct))
+	}
+	return req, warns
 }
 
 // parsePack extracts the format string and argument expressions from a single
@@ -337,15 +643,30 @@ func parsePack(term string) ([]formatSpec, []string, storage.Endian, bool, []str
 	return specs, trimAll(parts[1:]), endian, endianSet, warns
 }
 
-// emitSpecs pairs each arg-consuming spec with the next packed argument name.
-func emitSpecs(specs []formatSpec, args []string) []storage.ProtocolField {
+// emitSpecs pairs each arg-consuming spec with the next packed argument. Names
+// come from the argument (`self.ts` -> "ts"); a `len(x)` argument names its
+// field "x_len" since it's the length of a following payload, and an argument
+// carrying an enum value (`op.value`) is linked to soleEnum when there is one.
+func emitSpecs(specs []formatSpec, args []string, soleEnum string) []storage.ProtocolField {
 	out := make([]storage.ProtocolField, 0, len(specs))
 	ai := 0
 	for _, sp := range specs {
 		name := ""
+		isEnum := false
 		if sp.consumesArg && ai < len(args) {
-			name = argName(args[ai])
+			arg := args[ai]
 			ai++
+			switch {
+			case isLenCall(arg):
+				if inner := argName(arg); inner != "" {
+					name = inner + "_len"
+				}
+			default:
+				name = argName(arg)
+				if soleEnum != "" && strings.Contains(arg, ".value") {
+					isEnum = true
+				}
+			}
 		}
 		if name == "" {
 			if sp.defaultName != "" {
@@ -357,6 +678,9 @@ func emitSpecs(specs []formatSpec, args []string) []storage.ProtocolField {
 		f := storage.ProtocolField{Name: name, Type: sp.ftype}
 		if sp.length > 0 {
 			f.Length = sp.length
+		}
+		if isEnum && isIntType(sp.ftype) {
+			f.EnumRef = soleEnum
 		}
 		out = append(out, f)
 	}
@@ -460,10 +784,13 @@ func mapType(c byte) (storage.FieldType, bool) {
 
 var identRe = regexp.MustCompile(`[A-Za-z_]\w*`)
 var wrapperCallRe = regexp.MustCompile(`^(?:len|bytes|bytearray|int|str|struct\.pack|struct\.unpack)\s*\((.*)\)\s*$`)
+var numLiteralRe = regexp.MustCompile(`^[+-]?(0[xXbBoO][0-9A-Fa-f]+|\d[\d_]*\.?\d*([eE][+-]?\d+)?)$`)
 
 // argName extracts a sensible field name from a packed argument expression:
 // `self.ts` -> "ts", `self.type.value` -> "type", `len(self.data)` -> "data",
-// `bytes(bs)` -> "bs". Returns "" when nothing usable is found.
+// `bytes(bs)` -> "bs". A bare numeric literal (`0xdeadbeef`, `42`) has no
+// meaningful name, so it — and anything else with no usable identifier —
+// returns "".
 func argName(expr string) string {
 	s := strings.TrimSpace(expr)
 	for {
@@ -472,6 +799,9 @@ func argName(expr string) string {
 			break
 		}
 		s = strings.TrimSpace(m[1])
+	}
+	if numLiteralRe.MatchString(s) {
+		return ""
 	}
 	toks := identRe.FindAllString(s, -1)
 	for i := len(toks) - 1; i >= 0; i-- {

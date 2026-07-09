@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
 	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
+	"github.com/SimoneErrigo/Janus/backend/internal/pyfilter"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 	"github.com/SimoneErrigo/Janus/backend/internal/sysstat"
@@ -59,19 +61,27 @@ func main() {
 		redisCache.SetServiceRules(serviceID, rules)
 	})
 
-	// Compile flag regex for packet flagging
+	// Compile flag regex for packet flagging. When case-insensitivity is
+	// requested (env flag or an inline "(?i)"), ensure the compiled fallback
+	// regex honors it too.
+	effectiveFlagPattern := cfg.FlagRegex
+	if cfg.FlagRegexCaseInsensitive && effectiveFlagPattern != "" &&
+		!strings.HasPrefix(effectiveFlagPattern, "(?i)") {
+		effectiveFlagPattern = "(?i)" + effectiveFlagPattern
+	}
 	var flagRegex *regexp.Regexp
-	if cfg.FlagRegex != "" {
-		flagRegex, err = regexp.Compile(cfg.FlagRegex)
+	if effectiveFlagPattern != "" {
+		flagRegex, err = regexp.Compile(effectiveFlagPattern)
 		if err != nil {
 			log.Printf("Warning: invalid FLAG_REGEX %q: %v", cfg.FlagRegex, err)
 		}
 	}
 
 	// Build optimized flag scanner from the regex pattern
-	flagScanner := flagids.NewFlagScanner(cfg.FlagRegex)
+	flagScanner := flagids.NewFlagScanner(cfg.FlagRegex, cfg.FlagRegexCaseInsensitive, cfg.FlagDecodeURL)
 	if flagScanner != nil {
-		log.Printf("Flag scanner: optimized byte-level scanner active for pattern %q", cfg.FlagRegex)
+		log.Printf("Flag scanner active for pattern %q (case_insensitive=%v, decode_url=%v)",
+			cfg.FlagRegex, cfg.FlagRegexCaseInsensitive, cfg.FlagDecodeURL)
 	}
 
 	proxyMgr := proxy.NewManager(packetStore, ruleStore, flagRegex, flagScanner)
@@ -106,9 +116,76 @@ func main() {
 	// happen via the listener below — but no packets flow yet because the
 	// proxy services aren't started until further down.
 	packetHub := api.NewPacketStreamHub(flagIDPoller)
+
+	// Python filter engine (mitmproxy-style scriptable filtering). Matches are
+	// recorded as alerts (rule_id "pyfilter:<script>"), evaluated asynchronously
+	// off the proxy hot path. Inert until the operator enables a script.
+	var pyMgr *pyfilter.Manager
+	if cfg.PyFilterEnabled {
+		pyMgr = pyfilter.NewManager(pyfilter.Config{
+			DataDir:    cfg.DataDir,
+			PythonPath: cfg.PyFilterPython,
+			OnMatch: func(flow pyfilter.Flow, m pyfilter.Match) {
+				pid, _ := flow["id"].(int64)
+				svcID, _ := flow["service"].(string)
+				srcIP, _ := flow["src"].(string)
+				reason := m.Name
+				if m.Reason != "" {
+					reason = m.Name + ": " + m.Reason
+				}
+				alert := &sniffer.Alert{
+					PacketID:       pid,
+					RuleID:         "pyfilter:" + m.Script,
+					ServiceID:      svcID,
+					SrcIP:          srcIP,
+					Timestamp:      time.Now(),
+					PatternMatched: reason,
+				}
+				if err := packetStore.InsertAlert(alert); err != nil {
+					log.Printf("pyfilter: failed to record alert: %v", err)
+					return
+				}
+				packetHub.Notify()
+			},
+		})
+		defer pyMgr.Close()
+		st := pyMgr.Status()
+		if st.Available {
+			log.Printf("Python filters enabled (interpreter: %s)", st.PythonPath)
+		} else {
+			log.Printf("Python filters enabled but no python3 interpreter found — scripts will not run")
+		}
+
+		// Inline blocking: filters marked "Blocking" run synchronously on the
+		// request hot path so a match returning {"drop": True} drops the current
+		// request in real time. Bounded + fail-open inside EvaluateBlocking.
+		proxyMgr.SetPyBlockFn(func(flow map[string]any) sniffer.PyResult {
+			matches, newBody := pyMgr.EvaluateBlocking(flow)
+			var res sniffer.PyResult
+			for _, mt := range matches {
+				if !mt.Block {
+					continue
+				}
+				reason := mt.Name
+				if mt.Reason != "" {
+					reason = mt.Name + ": " + mt.Reason
+				}
+				res.Blocks = append(res.Blocks, sniffer.PyBlockMatch{Script: mt.Script, Reason: reason})
+			}
+			if newBody != nil {
+				res.NewBody = newBody
+				res.Rewritten = true
+			}
+			return res
+		})
+	}
+
 	packetStore.SetPacketChangeListener(func(kind sniffer.PacketChangeKind, pkt *sniffer.Packet) {
 		if kind == sniffer.PacketChangeInsert && pkt != nil {
 			packetHub.PushPacket(pkt)
+			if pyMgr != nil {
+				pyMgr.Submit(api.FlowFromPacket(pkt))
+			}
 		} else {
 			packetHub.Notify()
 		}
@@ -150,7 +227,7 @@ func main() {
 	cleanupMgr.Start()
 
 	statsCollector := sysstat.NewCollector(packetStore, redisCache, cfg.DataDir)
-	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller, redisCache, statsCollector, packetHub, captureCtrl, cfg.ProtoDir)
+	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller, redisCache, statsCollector, packetHub, captureCtrl, cfg.ProtoDir, pyMgr)
 
 	// Graceful shutdown
 	go func() {

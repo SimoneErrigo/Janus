@@ -22,6 +22,7 @@ const navSections = [
     title: 'Defense',
     items: [
       { to: '/rules', label: 'Rules', icon: ShieldIcon },
+      { to: '/pyfilters', label: 'Python Filters', icon: PythonIcon },
       { to: '/blocks', label: 'Blocks', icon: BlockIcon },
       { to: '/alerts', label: 'Alerts', icon: AlertIcon },
     ],
@@ -234,6 +235,16 @@ function AlertIcon(props) {
     <svg {...props} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
       <line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" />
+    </svg>
+  )
+}
+
+function PythonIcon(props) {
+  return (
+    <svg {...props} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9 3h4a3 3 0 0 1 3 3v3a3 3 0 0 1-3 3H8a3 3 0 0 0-3 3v0" />
+      <path d="M15 21h-4a3 3 0 0 1-3-3V15a3 3 0 0 1 3-3h5a3 3 0 0 0 3-3v0" />
+      <circle cx="9.5" cy="6.5" r="0.6" fill="currentColor" /><circle cx="14.5" cy="17.5" r="0.6" fill="currentColor" />
     </svg>
   )
 }

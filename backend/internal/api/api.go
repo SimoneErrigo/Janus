@@ -13,6 +13,7 @@ import (
 	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
 	"github.com/SimoneErrigo/Janus/backend/internal/protodecode"
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
+	"github.com/SimoneErrigo/Janus/backend/internal/pyfilter"
 	"github.com/SimoneErrigo/Janus/backend/internal/rounddiff"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
@@ -35,11 +36,12 @@ type Server struct {
 	protoCache     *protodecode.Cache
 	protoDir       string
 	roundDiffCache *rounddiff.Cache
+	pyfilter       *pyfilter.Manager
 	mux            *http.ServeMux
 }
 
 // NewServer creates a new API server.
-func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager, flagIDPoller *flagids.Poller, cacheClient *cache.Client, statsCollector *sysstat.Collector, packetHub *PacketStreamHub, captureCtrl *sniffer.CaptureController, protoDir string) *Server {
+func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager, flagIDPoller *flagids.Poller, cacheClient *cache.Client, statsCollector *sysstat.Collector, packetHub *PacketStreamHub, captureCtrl *sniffer.CaptureController, protoDir string, pyMgr *pyfilter.Manager) *Server {
 	s := &Server{
 		store:          store,
 		proxy:          proxyMgr,
@@ -55,6 +57,7 @@ func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniff
 		protoCache:     protodecode.NewCache(),
 		protoDir:       protoDir,
 		roundDiffCache: rounddiff.NewCache(128, 30*time.Minute),
+		pyfilter:       pyMgr,
 		mux:            http.NewServeMux(),
 	}
 	s.routes()
@@ -149,6 +152,14 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/pcap/import", s.handlePcapImport)
 	protected.HandleFunc("/api/pcap/import/", s.handlePcapImportStatus)
 	protected.HandleFunc("/api/round-diff", s.handleRoundDiff)
+	// Python filters (mitmproxy-style scriptable filtering). Engine endpoints
+	// live under /api/pyfilter-engine/ rather than /api/pyfilters/ so they
+	// can't ever be shadowed by a script whose slug is "status" or "test"
+	// (slugID allows both).
+	protected.HandleFunc("/api/pyfilter-engine/status", s.handlePyFilterStatus)
+	protected.HandleFunc("/api/pyfilter-engine/test", s.handlePyFilterTest)
+	protected.HandleFunc("/api/pyfilters", s.handlePyFilters)
+	protected.HandleFunc("/api/pyfilters/", s.handlePyFilterByID)
 
 	s.mux.Handle("/api/", s.authMiddleware(protected))
 }
@@ -292,6 +303,8 @@ func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	applyServiceDefaults(&svc)
+
 	if err := validateService(&svc); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -320,6 +333,8 @@ func (s *Server) updateService(w http.ResponseWriter, r *http.Request, id string
 	}
 
 	svc.ID = id
+
+	applyServiceDefaults(&svc)
 
 	if err := validateService(&svc); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)

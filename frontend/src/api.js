@@ -210,6 +210,14 @@ export const api = {
   getConfig: () => request('/config'),
   updateConfig: (data) => request('/config', { method: 'PUT', body: data }),
 
+  // Python filters (mitmproxy-style scriptable filtering)
+  listPyFilters: () => request('/pyfilters'),
+  getPyFilterStatus: () => request('/pyfilter-engine/status'),
+  createPyFilter: (data) => request('/pyfilters', { method: 'POST', body: data }),
+  updatePyFilter: (id, data) => request(`/pyfilters/${encodeURIComponent(id)}`, { method: 'PUT', body: data }),
+  deletePyFilter: (id) => request(`/pyfilters/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  testPyFilter: (data) => request('/pyfilter-engine/test', { method: 'POST', body: data }),
+
   // Flag IDs
   getFlagIDs: () => request('/flagids'),
   getFlagIDStatus: () => request('/flagids/status'),
