@@ -1,10 +1,15 @@
-# Python filters — cookbook
+# Python filters — advanced examples
 
 Worked `match(flow)` filters, from one-liners to stateful attack detectors, for
 HTTP and TCP services. Most are modelled on **real A/D vulnerabilities**, and each
 is written **ad-hoc so it drops the exploit without ever matching the checker's
 normal traffic** — the note under each one says exactly why the checker slips
 through. For the full API see [PYFILTERS.md](PYFILTERS.md).
+
+These are deliberately service-specific recipes, not copy-and-enable defaults.
+If this is your first filter, begin with the smaller examples in
+[PYFILTERS_QUICKSTART.md](PYFILTERS_QUICKSTART.md), then test the adapted script
+against a captured packet or a whole flow before enabling it.
 
 Tags: **Alert** returns a reason string (works on any filter). **Blocking** drops
 or rewrites the current message and needs the *Blocking* checkbox (inline on TCP
@@ -14,6 +19,11 @@ Return values: `False`/`None` ignore · `"reason"` alert · `{"drop": True, "rea
 drop now · assign `flow.body` / `flow.content` rewrite. `DIRECTION = "request"`/`"response"`
 at module level restricts the side. Module globals persist; `flow.conn` is
 per-TCP-connection state (private to each filter).
+
+The test panel accepts a single packet or an ordered request/response flow. Use
+**Repeat** to exercise counters and other stateful logic. A successful test only
+becomes an inline block or rewrite on live traffic when the script is also marked
+**Blocking**.
 
 ## `util.*` — payload analysis helpers
 

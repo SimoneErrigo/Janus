@@ -4,6 +4,9 @@ A filter defines `match(flow)`. It runs on **every message**: each HTTP request/
 or each TCP chunk. Same API for HTTP and TCP — a missing field reads as `""` (never
 crashes). Module-level state persists across calls (use it to count / correlate).
 
+New to PyFilters? Start with [PYFILTERS_QUICKSTART.md](PYFILTERS_QUICKSTART.md).
+For fuller A/D recipes, use [PYFILTERS_EXAMPLES.md](PYFILTERS_EXAMPLES.md).
+
 ```python
 def match(flow):
     ...
@@ -41,7 +44,7 @@ def match(flow):
 | `flow.is_request` / `flow.is_response` | bool |
 | `flow.src` / `flow.dst` / `flow.sport` / `flow.dport` | endpoints |
 | `flow.body` | body as `str` (settable → rewrite) |
-| `flow.content` | body as exact `bytes` (settable → rewrite) |
+| `flow.content` / `flow.bytes` | body as exact `bytes` (settable → rewrite) |
 | `flow.json(default=None)` | parsed JSON body |
 | `flow.flagged` / `flow.contains_flagid` | a flag / a known flag-ID appears in this message |
 | `flow["x"]`, `flow.get("x")` | raw dict access still works |
@@ -98,6 +101,25 @@ different arities — read by name or with `cmd.arg(i)` instead.
 flow.body = flow.body.replace("foo", "bar")            # HTTP request body (str)
 flow.content = flow.content.replace(b"\x00", b"\xff")  # exact bytes (TCP, binary-safe)
 ```
+
+The rewritten content is forwarded only by an inline **Blocking** filter. For
+HTTP that means a request; for TCP it can be a request or a response. An async
+filter can return alerts but cannot modify traffic that has already been
+forwarded.
+
+## Test a filter before enabling it
+
+The **PyFilters** page can run an unsaved script in isolation. Supply one sample
+request/response, load a captured packet, or load a complete reconstructed flow.
+For a complete flow, `match()` runs over the packets in order, so module state,
+`flow.request`, `flow.response`, `flow.conn`, and `flow.commands()` see the same
+sequence they would see live.
+
+Use **Repeat** to replay that sequence in the same script instance. For example,
+a counter that alerts on the second login needs a repeat of at least `2`. The
+result shows one verdict per packet, including any alert, requested block, and
+best-effort rewritten body. A test validates script logic; the live effect still
+depends on whether the script is enabled and marked **Blocking**.
 
 ## Analysis helpers (`util`)
 
@@ -158,5 +180,6 @@ def match(flow):
     return False
 ```
 
-More recipes — easy to advanced, HTTP and TCP — in
-[PYFILTERS_COOKBOOK.md](PYFILTERS_COOKBOOK.md).
+More recipes — easy to advanced, HTTP and TCP — are in
+[PYFILTERS_EXAMPLES.md](PYFILTERS_EXAMPLES.md). The deliberately small first
+examples are in [PYFILTERS_QUICKSTART.md](PYFILTERS_QUICKSTART.md).
