@@ -188,7 +188,11 @@ def parse_mapping(raw: str) -> PortMapping | None:
 
 
 def has_janus_comment(line: str) -> bool:
-    return COMMENT_MAPPING_KEY in line or COMMENT_PORT_KEY in line
+    return (
+        COMMENT_MAPPING_KEY in line
+        or COMMENT_PORT_KEY in line
+        or re.fullmatch(r"\s*#\s*\d+\s*", line) is not None
+    )
 
 
 def extract_restore_mapping(tail: str, current: PortMapping) -> str | None:
@@ -203,6 +207,11 @@ def extract_restore_mapping(tail: str, current: PortMapping) -> str | None:
             original_port = part.split(":", 1)[1].strip()
             if original_port.isdigit():
                 return f"127.0.0.1:{original_port}:{current.container_port}"
+    # Compatibility with the original helper, which saved only the checker
+    # port as a bare numeric comment: "127.0.0.1:10002:3000 #5000".
+    if len(parts) == 1 and parts[0].isdigit():
+        bind = f"{current.bind_ip}:" if current.bind_ip else ""
+        return f"{bind}{parts[0]}:{current.container_port}"
     return None
 
 
@@ -212,6 +221,7 @@ def remove_janus_comment(tail: str) -> str:
     keep = [
         part.strip() for part in tail.strip()[1:].split("|")
         if not part.strip().startswith((f"{COMMENT_MAPPING_KEY}:", f"{COMMENT_PORT_KEY}:"))
+        and not part.strip().isdigit()
     ]
     return f" # {' | '.join(filter(None, keep))}" if any(keep) else ""
 

@@ -51,7 +51,17 @@ class Network():
         @property
         def bytes(self):
             cells = [cell for row in self.board for cell in row]
+            bs = [0] * ((len(cells) + 7) // 8)
+            for i, cell in enumerate(cells):
+                if cell == Marker.FLAG:
+                    bs[i // 8] |= 1 << (i % 8)
             return struct.pack('<Q', len(self.board)) + bytes(bs)
+
+    @staticmethod
+    def net_send_req(conn, type, data):
+        hdr = Network.ReqHdr(type, len(data))
+        req = hdr.bytes + data
+        conn.sendall(req)
 
     @staticmethod
     def proto_get_u8(conn):
@@ -113,6 +123,10 @@ func TestParseSampleClient(t *testing.T) {
 			t.Errorf("ReqHdr[%d] type = %q, want %q", i, hdr[i].Type, wt)
 		}
 	}
+	// `self.type = type.value` links the type field to the sole enum.
+	if typeField, ok := findField(hdr, "type"); !ok || typeField.EnumRef != "ReqType" {
+		t.Errorf("ReqHdr type field = %+v, want enum_ref ReqType", typeField)
+	}
 
 	// Str struct: single length-prefixed field from `pack('<B', len(x)) + x`.
 	str, ok := proto.Structs["Str"]
@@ -123,18 +137,120 @@ func TestParseSampleClient(t *testing.T) {
 		t.Errorf("Str field = %+v, want data/string_lp_u8", str[0])
 	}
 
-	// Board struct: u64 length has no length-prefixed type, so it becomes a
-	// length field + remaining_bytes.
+	// Board struct: the u64 dimension prefix followed by the bit-packed cells,
+	// imported as board:u64 + bs:bytes_computed(board × board ÷ 8).
 	board, ok := proto.Structs["Board"]
 	if !ok {
 		t.Fatalf("Board struct not parsed")
 	}
-	if _, ok := findField(board, "bs_len"); !ok {
-		t.Errorf("Board missing bs_len field: %v", fieldNames(board))
+	dim, ok := findField(board, "board")
+	if !ok || dim.Type != storage.FieldU64 {
+		t.Errorf("Board dimension field = %+v, want board/u64", dim)
 	}
-	rem, ok := findField(board, "bs")
-	if !ok || rem.Type != storage.FieldRemaining {
-		t.Errorf("Board bs field = %+v, want remaining_bytes", rem)
+	cells, ok := findField(board, "bs")
+	if !ok || cells.Type != storage.FieldBytesComp {
+		t.Fatalf("Board bs field = %+v, want bytes_computed", cells)
+	}
+	if cells.LengthFrom != "board" || cells.LengthMulFrom != "board" || cells.LengthDiv != 8 {
+		t.Errorf("Board bs geometry = from %q mul %q div %d, want board/board/8",
+			cells.LengthFrom, cells.LengthMulFrom, cells.LengthDiv)
+	}
+
+	// Request auto-wiring: header fields + dispatch on the enum-typed field.
+	if len(proto.RequestFields) == 0 {
+		t.Fatalf("RequestFields not auto-wired")
+	}
+	last := proto.RequestFields[len(proto.RequestFields)-1]
+	if last.Type != storage.FieldDispatch || last.DispatchOn != "type" {
+		t.Errorf("request dispatch field = %+v, want dispatch on 'type'", last)
+	}
+	if got := fieldNames(proto.RequestFields); !equalStrings(got, []string{"ts", "type", "len", "body"}) {
+		t.Errorf("RequestFields = %v, want ts/type/len/body", got)
+	}
+}
+
+// TestParseBoardOnly checks the user-facing "paste just the Board class" flow:
+// the bit-packing custom logic is captured without any surrounding context.
+func TestParseBoardOnly(t *testing.T) {
+	code := `
+class Board():
+    def __init__(self, board):
+        self.board = board
+
+    def bytes(self):
+        cells = [cell for row in self.board for cell in row]
+        bs = [0] * ((len(cells) + 7) // 8)
+        for i, cell in enumerate(cells):
+            if cell == Marker.FLAG:
+                bs[i // 8] |= 1 << (i % 8)
+        return struct.pack('<Q', len(self.board)) + bytes(bs)
+`
+	proto, _, err := Parse(code)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	board, ok := proto.Structs["Board"]
+	if !ok || len(board) != 2 {
+		t.Fatalf("Board struct = %v, want two fields", board)
+	}
+	if board[0].Name != "board" || board[0].Type != storage.FieldU64 {
+		t.Errorf("Board[0] = %+v, want board/u64", board[0])
+	}
+	if board[1].Type != storage.FieldBytesComp || board[1].LengthMulFrom != "board" || board[1].LengthDiv != 8 {
+		t.Errorf("Board[1] = %+v, want bytes_computed board×board÷8", board[1])
+	}
+}
+
+// TestParseEnumOnly checks the other user-facing flow: pasting just an Enum
+// class sets up the enum table with no structs required.
+func TestParseEnumOnly(t *testing.T) {
+	code := `
+class ReqType(Enum):
+    SIGNUP = 0
+    LOGIN = 1
+    CREATE_BOARD = 2
+    QUIT = 7
+`
+	proto, _, err := Parse(code)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	rt := proto.Enums["ReqType"]
+	if rt["0"] != "SIGNUP" || rt["7"] != "QUIT" || len(rt) != 4 {
+		t.Errorf("ReqType = %v, want 4 entries incl SIGNUP/QUIT", rt)
+	}
+}
+
+// TestNoDecorators verifies the parser doesn't depend on @property /
+// @staticmethod: the same class without decorators imports identically.
+func TestNoDecorators(t *testing.T) {
+	code := `
+class ReqHdr():
+    def __init__(self, type, len):
+        self.ts = int(time.time())
+        self.type = type.value
+        self.len = len
+
+    def bytes(self):
+        return struct.pack('<IBH', self.ts, self.type, self.len)
+
+class ReqType(Enum):
+    SIGNUP = 0
+    LOGIN = 1
+`
+	proto, _, err := Parse(code)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	hdr, ok := proto.Structs["ReqHdr"]
+	if !ok {
+		t.Fatalf("ReqHdr not parsed without decorators")
+	}
+	if got := fieldNames(hdr); !equalStrings(got, []string{"ts", "type", "len"}) {
+		t.Errorf("ReqHdr fields = %v, want ts/type/len", got)
+	}
+	if tf, _ := findField(hdr, "type"); tf.EnumRef != "ReqType" {
+		t.Errorf("type field enum_ref = %q, want ReqType", tf.EnumRef)
 	}
 }
 
@@ -145,6 +261,114 @@ func TestParseUnpackWarning(t *testing.T) {
 	}
 	if !containsSubstr(warns, "struct.unpack detected") {
 		t.Errorf("expected struct.unpack warning, got %v", warns)
+	}
+}
+
+// TestDirectValueAndInlineLength covers two variations common in other clients:
+// the enum value is packed directly (`op.value`, no intermediate attribute) and
+// the payload length lives inside a multi-field pack rather than its own prefix.
+func TestDirectValueAndInlineLength(t *testing.T) {
+	code := `
+class Op(Enum):
+    PING = 0
+    PONG = 1
+
+class Msg():
+    def bytes(self):
+        return struct.pack('<BH', self.op.value, len(self.payload)) + self.payload
+`
+	proto, _, err := Parse(code)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	msg := proto.Structs["Msg"]
+	if got := fieldNames(msg); !equalStrings(got, []string{"op", "payload_len", "payload"}) {
+		t.Fatalf("Msg fields = %v, want op/payload_len/payload", got)
+	}
+	if msg[0].EnumRef != "Op" {
+		t.Errorf("op enum_ref = %q, want Op (direct .value not linked)", msg[0].EnumRef)
+	}
+	if msg[2].Type != storage.FieldBytesComp || msg[2].LengthFrom != "payload_len" {
+		t.Errorf("payload = %+v, want bytes_computed from payload_len", msg[2])
+	}
+}
+
+// TestBytearrayBitBuffer checks the bit-packed grid idiom is recognized when
+// the buffer is built with bytearray(...) instead of [0] * (...).
+func TestBytearrayBitBuffer(t *testing.T) {
+	code := `
+class Grid():
+    def __init__(self, board):
+        self.board = board
+    def bytes(self):
+        cells = [c for row in self.board for c in row]
+        buf = bytearray((len(cells) + 7) // 8)
+        return struct.pack('<Q', len(self.board)) + bytes(buf)
+`
+	proto, _, err := Parse(code)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	g := proto.Structs["Grid"]
+	if len(g) != 2 || g[0].Name != "board" || g[0].Type != storage.FieldU64 {
+		t.Fatalf("Grid[0] = %+v, want board/u64", g)
+	}
+	if g[1].Type != storage.FieldBytesComp || g[1].LengthFrom != "board" || g[1].LengthMulFrom != "board" || g[1].LengthDiv != 8 {
+		t.Errorf("Grid[1] = %+v, want bytes_computed board×board÷8", g[1])
+	}
+}
+
+// TestNumericLiteralField ensures a magic-number field doesn't get a garbage
+// name derived from the hex literal.
+func TestNumericLiteralField(t *testing.T) {
+	code := `
+class Packet():
+    def bytes(self):
+        return struct.pack('>IH', 0xdeadbeef, len(self.name)) + self.name
+`
+	proto, _, err := Parse(code)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if proto.Endian != storage.EndianBig {
+		t.Errorf("endian = %q, want big", proto.Endian)
+	}
+	p := proto.Structs["Packet"]
+	if p[0].Name != "field1" || p[0].Type != storage.FieldU32 {
+		t.Errorf("magic field = %+v, want field1/u32 (no garbage name)", p[0])
+	}
+	if got := fieldNames(p); !equalStrings(got, []string{"field1", "name_len", "name"}) {
+		t.Errorf("Packet fields = %v, want field1/name_len/name", got)
+	}
+}
+
+// TestOneDimBitBuffer checks a linear (non-grid) bit-packed payload keeps the
+// prefix count without a spurious ×multiplier.
+func TestOneDimBitBuffer(t *testing.T) {
+	code := `
+class Flags():
+    def __init__(self, bits):
+        self.bits = bits
+    def bytes(self):
+        packed = [0] * ((len(self.bits) + 7) // 8)
+        return struct.pack('<H', len(self.bits)) + bytes(packed)
+`
+	proto, warns, err := Parse(code)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	f := proto.Structs["Flags"]
+	if len(f) != 2 || f[0].Name != "bits" || f[0].Type != storage.FieldU16 {
+		t.Fatalf("Flags[0] = %+v, want bits/u16", f)
+	}
+	comp := f[1]
+	if comp.Type != storage.FieldBytesComp || comp.LengthFrom != "bits" || comp.LengthDiv != 8 || comp.LengthMulFrom != "" {
+		t.Errorf("Flags[1] = %+v, want bytes_computed from bits ÷8 (no multiplier)", comp)
+	}
+	for _, w := range warns {
+		if containsSubstr([]string{w}, "check the multiplier") || containsSubstr([]string{w}, "set the ×multiplier") {
+			t.Errorf("unexpected multiplier warning for 1-D buffer: %q", w)
+		}
 	}
 }
 

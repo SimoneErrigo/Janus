@@ -6,6 +6,8 @@ type Protocol string
 const (
 	ProtocolHTTP  Protocol = "http"
 	ProtocolHTTPS Protocol = "https"
+	ProtocolWS    Protocol = "ws"
+	ProtocolWSS   Protocol = "wss"
 	ProtocolHTTP2 Protocol = "h2"
 	ProtocolGRPC  Protocol = "grpc"
 	ProtocolTCP   Protocol = "tcp"
