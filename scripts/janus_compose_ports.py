@@ -21,8 +21,8 @@ from pathlib import Path
 
 PORT_MIN = 11500
 PORT_MAX = 12000
-PROTOCOLS = ("http", "https", "h2", "grpc", "tcp")
-TLS_PROTOCOLS = {"https", "h2", "grpc"}
+PROTOCOLS = ("http", "https", "ws", "wss", "h2", "grpc", "tcp")
+TLS_PROTOCOLS = {"https", "wss", "h2", "grpc"}
 COMMENT_MAPPING_KEY = "janus-original-mapping"
 COMMENT_PORT_KEY = "janus-original-port"
 COMPOSE_NAMES = {"compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml"}
@@ -41,6 +41,57 @@ PORT_CHECK_WARNING_SHOWN = False
 
 PORT_LINE_RE = re.compile(
     r"""^(?P<indent>\s*)-\s*(?P<quote>["']?)(?P<mapping>[^"'\s#]+)(?P=quote)(?P<tail>\s*(?:\#.*)?)$"""
+)
+EXPLICIT_WEBSOCKET_PROTOCOL_RE = re.compile(
+    r"\bjanus[._-]protocol\s*[:=]\s*[\"']?(wss?)\b", re.IGNORECASE
+)
+WEBSOCKET_SERVER_HINTS = (
+    (
+        "handshake/upgrade WebSocket",
+        re.compile(
+            r"(?:"
+            r"upgrade\s*[:=]\s*[\"']?websocket\b|"
+            r"sec-websocket-(?:key|accept)\b|"
+            r"proxy_set_header\s+upgrade\b|"
+            r"server\s*\.\s*on\s*\(\s*[\"']upgrade[\"']"
+            r")",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "API server WebSocket",
+        re.compile(
+            r"(?:"
+            r"websockets?\s*\.\s*serve\s*\(|"
+            r"new\s+websocketserver\s*\(|"
+            r"websocket\s*\.\s*(?:server|upgrader)\b|"
+            r"@[\w.]+\s*\.\s*websocket\s*\(|"
+            r"websocket\s*\.\s*accept\s*\(|"
+            r"websocketresponse\s*\(|websocketroute\s*\(|websockethandler\b|"
+            r"(?:app|router)\s*\.\s*ws\s*\(|"
+            r"websocket_?upgrade\b|"
+            r"acceptwebsocketasync\s*\(|"
+            r"usewebsockets\s*\(|"
+            r"registerwebsockethandlers\s*\(|"
+            r"@serverendpoint\s*\("
+            r")",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "framework/libreria server WebSocket",
+        re.compile(
+            r"(?:"
+            r"gorilla/websocket|nhooyr\.io/websocket|github\.com/coder/websocket|"
+            r"tokio[-_]tungstenite|websocketpp|beast/websocket|"
+            r"warp::ws\b|actix_web_actors::ws\b|rocket_ws\b|"
+            r"flask[-_]sock|websocket_urlpatterns|asyncwebsocketconsumer|"
+            r"ratchet\\messagecomponentinterface|"
+            r"[\"']socket\.io[\"']|socketio\s*\.\s*(?:server|asyncserver)\s*\("
+            r")",
+            re.IGNORECASE,
+        ),
+    ),
 )
 
 
@@ -451,6 +502,22 @@ def find_tls_files(paths: list[Path]) -> tuple[Path | None, Path | None, Path | 
     return (certs[0] if certs else None, keys[0] if keys else None, cas[0] if cas else None)
 
 
+def explicit_websocket_protocol(compose_text: str) -> str:
+    """Return an operator-provided ws/wss Compose hint, if present.
+
+    Ambiguous services can use a Compose label such as
+    ``janus.protocol=ws`` or ``janus.protocol=wss``. The label selects the
+    Janus listener protocol only; backend TLS is still inferred separately.
+    """
+    match = EXPLICIT_WEBSOCKET_PROTOCOL_RE.search(compose_text)
+    return match.group(1).lower() if match else ""
+
+
+def websocket_evidence(text: str) -> list[str]:
+    """Return distinct high-confidence WebSocket server hints from sources."""
+    return [description for description, pattern in WEBSOCKET_SERVER_HINTS if pattern.search(text)]
+
+
 def infer_service(plan: PortPlan) -> Inference:
     roots, explicit, compose_text = service_sources(plan.compose, plan.service)
     paths = list(source_files(roots, explicit))
@@ -466,6 +533,8 @@ def infer_service(plan: PortPlan) -> Inference:
         except OSError:
             pass
     text = "\n".join(text_parts)
+    explicit_ws = explicit_websocket_protocol(compose_text)
+    websocket = websocket_evidence(text)
     grpc = bool(protos) or any(hint in text for hint in ("grpc.server", "grpc_server", "grpcio", "add_insecure_port", "add_secure_port"))
     h2 = any(hint in text for hint in ("http2", "http/2", "h2c", "nextprotos"))
     http = (
@@ -478,18 +547,26 @@ def infer_service(plan: PortPlan) -> Inference:
     )
     tls = any(hint in text for hint in (
         "ssl_server_credentials", "add_secure_port", "listenandservetls", "ssl_context",
-        "certfile", "keyfile", "ssl_certificate", "listen 443", "server-cert", "server_key",
+        "sslcontext", "ssl.wrap_socket", "https.createserver", "tls.createserver",
+        "tls.listen(", "certfile", "keyfile", "ssl_certificate", "listen 443",
+        "listen ssl", "server-cert", "server_key", "tokio_rustls", "tokio-rustls",
     )) or plan.container_port == 443
     cert, key, ca = find_tls_files(paths)
     if cert and key:
         tls = True
 
-    if grpc:
+    if explicit_ws:
+        protocol = explicit_ws
+        evidence = [f"protocollo {explicit_ws} esplicito nel Compose (janus.protocol)"]
+    elif grpc:
         protocol = "grpc"
         evidence = ["riferimenti gRPC/.proto nel build context"]
     elif h2:
         protocol = "h2"
         evidence = ["riferimenti HTTP/2 nel build context"]
+    elif websocket:
+        protocol = "wss" if tls else "ws"
+        evidence = websocket
     elif http:
         protocol = "https" if tls else "http"
         evidence = ["frontend/framework o porta HTTP"]
@@ -754,6 +831,16 @@ The selected Janus root is printed before review. By default the script writes
 Janus/data/services.json, Janus/certs/ and Janus/protos/. Inside the container,
 Janus/data/services.json is mounted as /data/services.json. Restart the Janus
 backend after applying changes so it reloads the service configuration.
+
+Protocol detection is heuristic and every suggestion remains editable. For an
+ambiguous WebSocket service, add a Compose label to make the listener protocol
+explicit:
+
+    labels:
+      - "janus.protocol=ws"       # or wss
+
+The listener protocol and "Backend uses TLS" are independent, so WS-to-WSS and
+WSS-to-WS layouts remain selectable during review.
 """,
     )
     parser.add_argument("paths", nargs="*", type=Path, help="service directories or Compose files (default: scan below cwd)")
