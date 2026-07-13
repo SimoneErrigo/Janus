@@ -116,6 +116,10 @@ listener. TLS fields are
 `target_tls`. A gRPC service can set `proto_paths`; a TCP service can set
 `protocol_id` to bind a custom decoder.
 
+Captured WebSocket application messages use method `WS`, retain the handshake
+URL and session ID, and expose their decoded payload in `body`/`body_string`.
+`X-Janus-WebSocket-Opcode` identifies `text` or `binary` messages.
+
 ### Rules and packet search
 
 The `pattern` field of a rule and the `q` parameter of packet/alert searches

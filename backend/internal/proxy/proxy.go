@@ -516,6 +516,7 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 	}
 
 	reverseProxy := httputil.NewSingleHostReverseProxy(targetURL)
+	m.configureWebSocketReverseProxy(reverseProxy, svc)
 	if svc.TargetTLS {
 		// Challenge backends commonly use a self-signed certificate. This is
 		// also what lets a public ws listener connect to a private wss backend.
@@ -585,6 +586,7 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 	}
 
 	reverseProxy := httputil.NewSingleHostReverseProxy(targetURL)
+	m.configureWebSocketReverseProxy(reverseProxy, svc)
 	reverseProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		log.Printf("[%s] proxy error: %v", svc.Name, err)
 		w.WriteHeader(http.StatusBadGateway)

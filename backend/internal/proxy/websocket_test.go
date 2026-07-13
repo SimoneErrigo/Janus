@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
 
@@ -32,6 +35,11 @@ func TestWebSocketProtocolsProxyFrames(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			backend := newWebSocketEchoServer(t, tt.backendTLS)
 			defer backend.Close()
+			packetStore, err := sniffer.NewPacketStore(t.TempDir())
+			if err != nil {
+				t.Fatalf("NewPacketStore: %v", err)
+			}
+			defer packetStore.Close()
 
 			port := freeTCPPort(t)
 			svc := &storage.Service{
@@ -48,7 +56,7 @@ func TestWebSocketProtocolsProxyFrames(t *testing.T) {
 				svc.TLSMode = storage.TLSModeSelfSigned
 			}
 
-			manager := NewManager(nil, nil, nil, nil)
+			manager := NewManager(packetStore, nil, nil, nil)
 			if err := manager.StartService(svc); err != nil {
 				t.Fatalf("StartService: %v", err)
 			}
@@ -64,7 +72,58 @@ func TestWebSocketProtocolsProxyFrames(t *testing.T) {
 			}
 
 			assertWebSocketEcho(t, conn, "/socket", "janus-websocket")
+			messages := waitForWebSocketMessages(t, packetStore, svc.ID, 2)
+			if messages[0].Direction != sniffer.DirectionRequest || messages[1].Direction != sniffer.DirectionResponse {
+				t.Fatalf("message directions = [%s, %s], want [request, response]", messages[0].Direction, messages[1].Direction)
+			}
+			for _, message := range messages {
+				if message.BodyString != "janus-websocket" {
+					t.Errorf("captured %s body = %q, want clear websocket payload", message.Direction, message.BodyString)
+				}
+				if message.Headers["X-Janus-WebSocket-Opcode"] != "text" {
+					t.Errorf("captured %s opcode = %q, want text", message.Direction, message.Headers["X-Janus-WebSocket-Opcode"])
+				}
+				if message.URL != "/socket" {
+					t.Errorf("captured %s URL = %q, want /socket", message.Direction, message.URL)
+				}
+			}
+			if messages[0].SessionID == "" || messages[0].SessionID != messages[1].SessionID {
+				t.Errorf("captured session IDs = [%q, %q], want the same non-empty session", messages[0].SessionID, messages[1].SessionID)
+			}
 		})
+	}
+}
+
+func TestWebSocketFrameParserUnmasksAndReassembles(t *testing.T) {
+	type capturedMessage struct {
+		opcode  byte
+		payload []byte
+	}
+	var captured []capturedMessage
+	parser := newWebSocketFrameParser(func(opcode byte, payload []byte) {
+		captured = append(captured, capturedMessage{opcode: opcode, payload: append([]byte(nil), payload...)})
+	})
+
+	wire := append([]byte{}, testWebSocketFrame(false, webSocketOpcodeText, true, []byte("hello "))...)
+	wire = append(wire, testWebSocketFrame(true, 0x9, true, []byte("ping"))...)
+	wire = append(wire, testWebSocketFrame(true, webSocketOpcodeContinuation, true, []byte("world"))...)
+	binaryPayload := bytes.Repeat([]byte{0xa5}, 130) // exercises the 16-bit extended length
+	wire = append(wire, testWebSocketFrame(true, webSocketOpcodeBinary, false, binaryPayload)...)
+
+	// Deliberately split at every byte to prove TCP chunk boundaries do not
+	// need to line up with WebSocket frame boundaries.
+	for _, b := range wire {
+		parser.Feed([]byte{b})
+	}
+
+	if len(captured) != 2 {
+		t.Fatalf("captured %d messages, want 2", len(captured))
+	}
+	if captured[0].opcode != webSocketOpcodeText || string(captured[0].payload) != "hello world" {
+		t.Errorf("fragmented text = opcode %d payload %q, want text/hello world", captured[0].opcode, captured[0].payload)
+	}
+	if captured[1].opcode != webSocketOpcodeBinary || !bytes.Equal(captured[1].payload, binaryPayload) {
+		t.Errorf("extended binary message was not reconstructed correctly")
 	}
 }
 
@@ -101,6 +160,10 @@ func newWebSocketEchoServer(t *testing.T, useTLS bool) *httptest.Server {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 			http.Error(w, "expected websocket upgrade", http.StatusBadRequest)
+			return
+		}
+		if got := r.Header.Get("Sec-WebSocket-Extensions"); got != "x-janus-test" {
+			t.Errorf("backend Sec-WebSocket-Extensions = %q, want only preserved x-janus-test", got)
 			return
 		}
 		hijacker, ok := w.(http.Hijacker)
@@ -177,7 +240,7 @@ func dialWebSocketProxy(t *testing.T, addr string, useTLS bool) net.Conn {
 
 func assertWebSocketEcho(t *testing.T, conn net.Conn, path, message string) {
 	t.Helper()
-	if _, err := fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: challenge.local\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", path); err != nil {
+	if _, err := fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: challenge.local\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits, x-janus-test\r\n\r\n", path); err != nil {
 		t.Fatalf("write upgrade request: %v", err)
 	}
 
@@ -219,14 +282,63 @@ func assertWebSocketEcho(t *testing.T, conn net.Conn, path, message string) {
 }
 
 func maskedTextFrame(payload []byte) []byte {
+	return testWebSocketFrame(true, webSocketOpcodeText, true, payload)
+}
+
+func testWebSocketFrame(fin bool, opcode byte, masked bool, payload []byte) []byte {
+	first := opcode
+	if fin {
+		first |= 0x80
+	}
+	second := byte(0)
+	if masked {
+		second = 0x80
+	}
+
+	frame := []byte{first}
+	switch {
+	case len(payload) < 126:
+		frame = append(frame, second|byte(len(payload)))
+	case len(payload) <= 0xffff:
+		frame = append(frame, second|126, 0, 0)
+		binary.BigEndian.PutUint16(frame[len(frame)-2:], uint16(len(payload)))
+	default:
+		frame = append(frame, second|127, 0, 0, 0, 0, 0, 0, 0, 0)
+		binary.BigEndian.PutUint64(frame[len(frame)-8:], uint64(len(payload)))
+	}
+
+	if !masked {
+		return append(frame, payload...)
+	}
 	mask := [4]byte{0x12, 0x34, 0x56, 0x78}
-	frame := make([]byte, 0, 2+len(mask)+len(payload))
-	frame = append(frame, 0x81, 0x80|byte(len(payload)))
 	frame = append(frame, mask[:]...)
 	for i, b := range payload {
 		frame = append(frame, b^mask[i%len(mask)])
 	}
 	return frame
+}
+
+func waitForWebSocketMessages(t *testing.T, store *sniffer.PacketStore, serviceID string, want int) []*sniffer.Packet {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		packets, _, err := store.Query(sniffer.PacketQuery{
+			ServiceID: serviceID,
+			Method:    "WS",
+			SortOrder: "asc",
+			Limit:     20,
+		})
+		if err != nil {
+			t.Fatalf("query websocket messages: %v", err)
+		}
+		if len(packets) >= want {
+			return packets[:want]
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("captured %d websocket messages, want %d", len(packets), want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func readMaskedTextFrame(reader io.Reader) ([]byte, error) {

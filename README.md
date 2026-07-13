@@ -93,6 +93,10 @@ For a WebSocket service choose `ws`, or `wss` when clients connect to Janus
 over TLS. `wss` uses the same TLS modes and certificate fields as `https`.
 `Backend uses TLS` independently controls whether Janus connects to the target
 using TLS, so both WS-to-WSS and WSS-to-WS deployments are supported.
+After the upgrade, Janus unmasks client frames, reassembles fragmented messages,
+and records text/binary messages up to 1 MiB in **Traffic** with method `WS`.
+The negotiated `permessage-deflate` extension is removed so text payloads remain
+inspectable; other WebSocket extensions are preserved.
 
 ## What Janus provides
 
