@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
+	flowmodel "github.com/SimoneErrigo/Janus/backend/internal/flow"
+	"github.com/SimoneErrigo/Janus/backend/internal/framing"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
@@ -19,7 +22,8 @@ import (
 const maxTCPCapture = 1 << 20 // 1 MB per direction per connection
 
 func (m *Manager) startTCPProxy(ctx context.Context, cancel context.CancelFunc, svc *storage.Service) (*runningProxy, error) {
-	listenAddr := fmt.Sprintf("0.0.0.0:%d", svc.ListenPort)
+	spec := svc.RuntimeSpec()
+	listenAddr := m.serviceListenAddress(spec)
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		cancel()
@@ -67,11 +71,19 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 
 	srcIP, srcPortStr, _ := net.SplitHostPort(clientConn.RemoteAddr().String())
 	srcPort, _ := strconv.Atoi(srcPortStr)
-	dstIP := svc.ListenAddr
-	dstPort := svc.ListenPort
+	spec := svc.RuntimeSpec()
+	dstIP := spec.Listener.Address
+	dstPort := spec.Listener.Port
 	sessionID := sniffer.MakeSessionID(svc.ID, srcIP, srcPort)
 
-	backendConn, err := net.DialTimeout("tcp", svc.TargetAddr, 10*time.Second)
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	var backendConn net.Conn
+	var err error
+	if spec.Upstream.TLS {
+		backendConn, err = tls.DialWithDialer(dialer, "tcp", spec.Upstream.Address, &tls.Config{InsecureSkipVerify: true})
+	} else {
+		backendConn, err = dialer.DialContext(ctx, "tcp", spec.Upstream.Address)
+	}
 	if err != nil {
 		log.Printf("[%s] TCP dial backend error: %v", svc.Name, err)
 		return
@@ -100,13 +112,23 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 
 	var wg sync.WaitGroup
 	wg.Add(2)
+	requestFrames, err := framing.NewReader(clientConn, spec.Framing)
+	if err != nil {
+		log.Printf("[%s] TCP request framing error: %v", svc.Name, err)
+		return
+	}
+	responseFrames, err := framing.NewReader(backendConn, spec.Framing)
+	if err != nil {
+		log.Printf("[%s] TCP response framing error: %v", svc.Name, err)
+		return
+	}
 
 	// Client -> Backend (request direction) — evaluate rules on every chunk.
 	// No defer closeBoth here: on natural EOF we half-close instead of tearing
 	// down both sides, so the response goroutine can drain any late data.
 	go func() {
 		defer wg.Done()
-		m.sniffCopyWithRules(backendConn, clientConn, svc, sessionID, srcIP, srcPort, dstIP, dstPort, sniffer.DirectionRequest, closeBoth)
+		m.sniffCopyWithRules(backendConn, requestFrames, svc, sessionID, srcIP, srcPort, dstIP, dstPort, sniffer.DirectionRequest, closeBoth)
 		// Request side is done (natural EOF, write error, or drop).
 		// Half-close the write side so the backend knows the client is done,
 		// then arm a linger deadline so the response goroutine drains any
@@ -124,7 +146,7 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 	go func() {
 		defer wg.Done()
 		defer closeBoth()
-		m.sniffCopyWithRules(clientConn, backendConn, svc, sessionID, dstIP, dstPort, srcIP, srcPort, sniffer.DirectionResponse, closeBoth)
+		m.sniffCopyWithRules(clientConn, responseFrames, svc, sessionID, dstIP, dstPort, srcIP, srcPort, sniffer.DirectionResponse, closeBoth)
 	}()
 
 	done := make(chan struct{})
@@ -146,14 +168,22 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 // inline rewrite swaps the forwarded bytes. Each chunk is logged as a separate
 // packet. Used for both directions: the regex dropper engine runs on requests
 // only, while inline Python filters (pyBlock) run on requests and responses.
-func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.Service, sessionID string, srcIP string, srcPort int, dstIP string, dstPort int, dir sniffer.Direction, closeBoth func()) {
-	buf := make([]byte, 32*1024)
+func (m *Manager) sniffCopyWithRules(dst io.Writer, src *framing.Reader, svc *storage.Service, sessionID string, srcIP string, srcPort int, dstIP string, dstPort int, dir sniffer.Direction, closeBoth func()) {
 	engine := m.engineFor(svc)
 
 	for {
-		n, readErr := src.Read(buf)
-		if n > 0 {
-			chunk := buf[:n]
+		chunk, readErr := src.Next()
+		if len(chunk) > 0 {
+			flaggedAtBoundary := sniffer.CheckFlagged(m.flagRegex, m.flagScanner, "", "", chunk)
+			containsFlagIDAtBoundary, _, _ := sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", chunk)
+			view := flowmodel.PacketView{
+				Service: svc.ID, Session: sessionID, OccurredAt: time.Now(),
+				Source:       flowmodel.Endpoint{IP: srcIP, Port: srcPort},
+				Destination:  flowmodel.Endpoint{IP: dstIP, Port: dstPort},
+				ProtocolName: string(svc.Protocol), DirectionName: string(dir),
+				Payload: chunk, BodyText: string(chunk), Raw: chunk,
+				FlaggedValue: flaggedAtBoundary, ContainsFlagIDValue: containsFlagIDAtBoundary,
+			}
 
 			// Evaluate rules on this chunk. The regex dropper engine is
 			// request-only (its rules and IP/port scopes are written for
@@ -164,11 +194,7 @@ func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.
 			var alertRules []dropper.Rule
 
 			if engine != nil && dir == sniffer.DirectionRequest {
-				result := engine.EvaluateActions(&dropper.HTTPRequest{
-					ServiceID: svc.ID,
-					RawBytes:  chunk,
-					Body:      chunk,
-				})
+				result := engine.EvaluateView(view)
 				for _, rule := range result.AllMatched {
 					matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{
 						ID:      rule.ID,
@@ -186,11 +212,10 @@ func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.
 			// (close the connection) or rewrite the bytes before we forward them.
 			// Exact bytes ride as base64 so binary payloads survive JSON.
 			var pyBlockAlerts []*sniffer.Alert
+			rewritten := false
 			if pyBlock := m.currentPyBlockFn(); pyBlock != nil {
 				// Tag flag/flagID presence up front so inline filters can use
 				// flow.flagged / flow.contains_flagid without parsing.
-				pyFlagged := sniffer.CheckFlagged(m.flagRegex, m.flagScanner, "", "", chunk)
-				pyContainsFlagID, _, _ := sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", chunk)
 				flow := map[string]any{
 					"service":         svc.ID,
 					"direction":       string(dir),
@@ -201,8 +226,8 @@ func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.
 					"protocol":        string(svc.Protocol),
 					"body":            string(chunk),
 					"body_b64":        base64.StdEncoding.EncodeToString(chunk),
-					"flagged":         pyFlagged,
-					"contains_flagid": pyContainsFlagID,
+					"flagged":         flaggedAtBoundary,
+					"contains_flagid": containsFlagIDAtBoundary,
 				}
 				res := pyBlock(flow)
 				for _, bm := range res.Blocks {
@@ -223,6 +248,7 @@ func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.
 					shouldDrop = true
 				}
 				if res.Rewritten && !shouldDrop {
+					rewritten = true
 					chunk = res.NewBody // forward + log the rewritten bytes
 				}
 			}
@@ -259,6 +285,7 @@ func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.
 					ContainsFlagID: containsFlagID,
 					MatchedFlagIDs: matchedFlagIDs,
 					FlagIDRound:    flagIDRound,
+					Verdict:        sniffer.VerdictFor(dir, matchedRules, shouldDrop, rewritten, true),
 				}
 				alertTemplates := make([]*sniffer.Alert, 0, len(alertRules)+len(pyBlockAlerts))
 				for _, rule := range alertRules {
@@ -286,6 +313,9 @@ func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.
 			if _, writeErr := dst.Write(chunk); writeErr != nil {
 				return
 			}
+		}
+		if readErr != nil && readErr != io.EOF {
+			log.Printf("[%s] TCP framing/read error: %v", svc.Name, readErr)
 		}
 		if readErr != nil {
 			return

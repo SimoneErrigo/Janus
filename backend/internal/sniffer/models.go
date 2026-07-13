@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
+	flowmodel "github.com/SimoneErrigo/Janus/backend/internal/flow"
 )
 
 // PacketChangeKind tells packet listeners why they should refresh (e.g. SSE clients).
@@ -83,6 +84,9 @@ type Packet struct {
 	// Body as raw bytes (base64-encoded in JSON) and as string if valid UTF-8
 	Body       []byte `json:"body,omitempty"`
 	BodyString string `json:"body_string,omitempty"`
+	// CaptureTruncated means Janus forwarded the full body but retained only
+	// the configured capture prefix for inspection.
+	CaptureTruncated bool `json:"capture_truncated,omitempty"`
 
 	// Filtering metadata
 	MatchedRules   []MatchedRuleInfo `json:"matched_rules"`
@@ -101,6 +105,10 @@ type Packet struct {
 	// Lite indicates this packet was returned from a summary list query without
 	// full headers/body. Clients should refetch by ID when full detail is needed.
 	Lite bool `json:"lite,omitempty"`
+
+	// Verdict records what was requested and what actually happened on the
+	// data plane. Older rows are reconstructed during reads.
+	Verdict flowmodel.Verdict `json:"verdict"`
 }
 
 // FlagIDChecker checks if text contains any current flag ID value.

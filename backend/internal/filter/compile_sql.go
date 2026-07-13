@@ -194,8 +194,12 @@ func tryPushPredicate(pr *Predicate) (string, []any, bool) {
 		return tryPushBool(field.SQLColumn, pr)
 	case TypeInt:
 		return tryPushInt(field.SQLColumn, pr)
-	case TypeString, TypeHeaders:
+	case TypeString:
 		return tryPushString(field, pr)
+	case TypeHeaders:
+		// Headers are stored as JSON while live evaluation uses canonical
+		// "Name: Value" lines. Keep them residual to preserve exact semantics.
+		return "", nil, false
 	case TypeBytes:
 		return "", nil, false
 	}
@@ -283,29 +287,30 @@ func tryPushString(field Field, pr *Predicate) (string, []any, bool) {
 			return "", nil, false
 		}
 		return col + " != ?", []any{s}, true
-	case OpContains, OpIContains:
-		// SQLite's LIKE is ASCII case-insensitive by default for both columns,
-		// so contains and icontains push to the same fragment. case-sensitive
-		// `contains` is preserved in residual when we can't push (we can:
-		// LIKE in SQLite is already CI for ASCII, which is what users expect
-		// of `contains` in this UI).
+	case OpContains:
 		s, err := stringValue(pr.Value)
 		if err != nil {
 			return "", nil, false
 		}
-		return col + " LIKE ?", []any{"%" + likeEscape(s) + "%"}, true
+		// instr is literal and case-sensitive, exactly like strings.Contains.
+		return "instr(" + col + ", ?) > 0", []any{s}, true
+	case OpIContains:
+		// SQLite lower()/LIKE only guarantee ASCII semantics while the live Go
+		// evaluator uses Unicode strings.ToLower. Residual evaluation is slower
+		// but authoritative.
+		return "", nil, false
 	case OpStartsWith:
 		s, err := stringValue(pr.Value)
 		if err != nil {
 			return "", nil, false
 		}
-		return col + " LIKE ?", []any{likeEscape(s) + "%"}, true
+		return "substr(" + col + ", 1, length(?)) = ?", []any{s, s}, true
 	case OpEndsWith:
 		s, err := stringValue(pr.Value)
 		if err != nil {
 			return "", nil, false
 		}
-		return col + " LIKE ?", []any{"%" + likeEscape(s)}, true
+		return "substr(" + col + ", -length(?)) = ?", []any{s, s}, true
 	case OpIn:
 		items, err := stringList(pr.Value)
 		if err != nil || len(items) == 0 {
@@ -352,15 +357,4 @@ func tryPushPeer(pr *Predicate) (string, []any, bool) {
 			[]any{s, s}, true
 	}
 	return "", nil, false
-}
-
-// likeEscape escapes the SQL LIKE wildcards `%` and `_` so user input can't
-// match unintended rows. We don't set an ESCAPE clause here because none of
-// the existing legacy params do — keeping behavior consistent. The current
-// store does the same (raw "%" + value + "%") so user-supplied wildcards
-// already "work" but we at least normalize backslashes.
-func likeEscape(s string) string {
-	// Match the legacy buildWhere() behavior: no escaping. This keeps results
-	// identical to the existing query path; users who want regex use `matches`.
-	return s
 }

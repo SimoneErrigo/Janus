@@ -25,9 +25,48 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRuleByID(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/api/rules/")
-	if id == "" {
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/rules/"), "/")
+	if rest == "" {
 		http.Error(w, "missing rule ID", http.StatusBadRequest)
+		return
+	}
+	parts := strings.Split(rest, "/")
+	id := parts[0]
+	if len(parts) == 2 {
+		switch parts[1] {
+		case "revisions":
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			writeJSON(w, http.StatusOK, s.ruleStore.ListRevisions(id))
+			return
+		case "rollback":
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			var body struct {
+				Revision int `json:"revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Revision <= 0 {
+				http.Error(w, "a positive revision is required", http.StatusBadRequest)
+				return
+			}
+			if err := s.ruleStore.RollbackRule(id, body.Revision); err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			rule, _ := s.ruleStore.GetRule(id)
+			writeJSON(w, http.StatusOK, rule)
+			return
+		default:
+			http.Error(w, "unknown rule action", http.StatusNotFound)
+			return
+		}
+	}
+	if len(parts) > 2 {
+		http.Error(w, "invalid rule path", http.StatusNotFound)
 		return
 	}
 

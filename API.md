@@ -52,6 +52,8 @@ presence indicator in the dashboard.
 |  | GET | `/api/packets/decoded-custom?packet_id=N[&protocol_id=P]` | Decode with a custom protocol |
 | Rules | GET, POST | `/api/rules` | List or create rules |
 |  | GET, PUT, DELETE | `/api/rules/{id}` | Read, update, or delete a rule |
+|  | GET | `/api/rules/{id}/revisions` | List immutable rule revisions |
+|  | POST | `/api/rules/{id}/rollback` | Activate an old snapshot as a new revision |
 |  | POST | `/api/rules/bulk-delete` | Remove rules by ID |
 |  | GET | `/api/rules/presets` | List attack-preset categories |
 |  | POST | `/api/rules/presets/apply` | Apply selected presets to services |
@@ -110,6 +112,10 @@ presence indicator in the dashboard.
 ```
 
 `protocol` is one of `http`, `https`, `ws`, `wss`, `h2`, `grpc`, or `tcp`.
+It is the only architectural choice required from the user. Janus returns a
+generated `spec` containing `listener`, `application`, `upstream`, and
+`framing`, plus `model_version`; clients should treat these fields as
+read-only preset output. Legacy service records are migrated automatically.
 WebSocket services use `ws` for a cleartext listener and `wss` for a TLS
 listener. TLS fields are
 `tls_mode` (`selfsigned` or `challenge`), `cert_file`, `key_file`, and
@@ -137,6 +143,15 @@ method == "POST" AND url contains "/login" AND body matches "(?i)union"
 
 See [FILTERS.md](FILTERS.md) for the complete language. Legacy packet search
 parameters (`contains`, `regex`, `src_ip`, ...) remain available.
+
+Successful `POST /api/filter/validate` responses also include `fields` and
+`server_required`. The latter is true when browser-side evaluation cannot be
+guaranteed equivalent to the backend.
+
+Captured packets include `verdict` (`decision`, `outcome`, `phase`, `applied`,
+and matching rule IDs). `outcome=dropped` means bytes were actually stopped;
+`would_drop` records a post-forward match. `capture_truncated=true` means only
+the inspection copy was limited—the complete body was still forwarded.
 
 ### PyFilters
 

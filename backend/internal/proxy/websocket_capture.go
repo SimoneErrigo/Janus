@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
+	flowmodel "github.com/SimoneErrigo/Janus/backend/internal/flow"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
@@ -203,22 +204,16 @@ func (m *Manager) processWebSocketMessage(svc *storage.Service, meta websocketCa
 	shouldDrop := false
 	var alertRules []dropper.Rule
 	if engine := m.engineFor(svc); engine != nil && dir == sniffer.DirectionRequest {
-		result := engine.EvaluateActions(&dropper.HTTPRequest{
-			ServiceID:      svc.ID,
-			Headers:        "X-Janus-WebSocket-Opcode: " + opcodeName + "\n",
-			Body:           body,
-			RawBytes:       body,
-			URL:            meta.url,
-			Method:         "WS",
-			Protocol:       string(svc.Protocol),
-			Direction:      string(dir),
-			SrcIP:          srcIP,
-			DstIP:          dstIP,
-			SrcPort:        srcPort,
-			DstPort:        dstPort,
-			Flagged:        pyFlagged,
-			ContainsFlagID: pyContainsFlagID,
-		})
+		view := flowmodel.PacketView{
+			Service: svc.ID, Session: meta.sessionID, OccurredAt: time.Now(),
+			Source:       flowmodel.Endpoint{IP: srcIP, Port: srcPort},
+			Destination:  flowmodel.Endpoint{IP: dstIP, Port: dstPort},
+			ProtocolName: string(svc.Protocol), DirectionName: string(dir),
+			MethodName: "WS", URLValue: meta.url, HeaderValues: headers,
+			Payload: body, BodyText: string(body), Raw: body,
+			FlaggedValue: pyFlagged, ContainsFlagIDValue: pyContainsFlagID,
+		}
+		result := engine.EvaluateView(view)
 		for _, rule := range result.AllMatched {
 			matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{
 				ID:      rule.ID,
@@ -316,6 +311,7 @@ func (m *Manager) processWebSocketMessage(svc *storage.Service, meta websocketCa
 			ContainsFlagID: containsFlagID,
 			MatchedFlagIDs: matchedFlagIDs,
 			FlagIDRound:    flagIDRound,
+			Verdict:        sniffer.VerdictFor(dir, matchedRules, shouldDrop, rewritten, true),
 		}
 		alerts := make([]*sniffer.Alert, 0, len(alertRules)+len(pyBlockAlerts))
 		for _, rule := range alertRules {
@@ -355,15 +351,17 @@ func (m *Manager) dropOversizedWebSocketMessage(svc *storage.Service, meta webso
 	message := fmt.Sprintf("WebSocket %s message dropped: %d bytes exceeds %d-byte filtering limit", opcodeName, size, maxWebSocketMessageCapture)
 
 	if m.packetStore != nil {
+		limitMatches := []sniffer.MatchedRuleInfo{{
+			ID: "janus:websocket-message-limit", Name: "WebSocket message size limit",
+			Action: "drop", Pattern: fmt.Sprintf("size > %d", maxWebSocketMessageCapture), Scope: "body",
+		}}
 		pkt := &sniffer.Packet{
 			ServiceID: svc.ID, SessionID: meta.sessionID, Timestamp: time.Now(),
 			SrcIP: srcIP, SrcPort: srcPort, DstIP: dstIP, DstPort: dstPort,
 			Protocol: string(svc.Protocol), Direction: dir, Method: "WS", URL: meta.url,
 			Headers: headers, BodyString: message,
-			MatchedRules: []sniffer.MatchedRuleInfo{{
-				ID: "janus:websocket-message-limit", Name: "WebSocket message size limit",
-				Action: "drop", Pattern: fmt.Sprintf("size > %d", maxWebSocketMessageCapture), Scope: "body",
-			}},
+			MatchedRules: limitMatches,
+			Verdict:      sniffer.VerdictFor(dir, limitMatches, true, false, true),
 		}
 		if err := m.packetStore.Enqueue(pkt, nil); err != nil {
 			log.Printf("[%s] sniffer: failed to log oversized WebSocket message: %v", svc.Name, err)

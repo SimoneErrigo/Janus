@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
+
+	"github.com/SimoneErrigo/Janus/backend/internal/filter"
 )
 
 // OnChangeFunc is called after a rule is created, updated, or deleted.
@@ -15,13 +18,15 @@ type OnChangeFunc func(serviceID string)
 
 // RuleStore provides thread-safe access to drop rules stored in a JSON file.
 type RuleStore struct {
-	mu       sync.RWMutex
-	filePath string
-	rules    map[string]*Rule // rule ID -> rule
-	onChange OnChangeFunc
+	mu                sync.RWMutex
+	filePath          string
+	revisionsFilePath string
+	rules             map[string]*Rule // rule ID -> rule
+	revisions         map[string][]RuleRevision
+	onChange          OnChangeFunc
 	// version is bumped on every rule mutation; the engine uses it to detect
 	// stale compiled bundles without scanning the rule list per packet.
-	version  int64
+	version int64
 }
 
 // Version returns the current rule-store version. Bumped after every
@@ -35,10 +40,18 @@ func (s *RuleStore) Version() int64 {
 // NewRuleStore creates a new RuleStore that persists to the given data directory.
 func NewRuleStore(dataDir string) (*RuleStore, error) {
 	s := &RuleStore{
-		filePath: filepath.Join(dataDir, "rules.json"),
-		rules:    make(map[string]*Rule),
+		filePath:          filepath.Join(dataDir, "rules.json"),
+		revisionsFilePath: filepath.Join(dataDir, "rule_revisions.json"),
+		rules:             make(map[string]*Rule),
+		revisions:         make(map[string][]RuleRevision),
 	}
 	if err := s.load(); err != nil {
+		return nil, err
+	}
+	if err := s.loadRevisions(); err != nil {
+		return nil, err
+	}
+	if err := s.ensureCurrentRevisions(); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -103,10 +116,24 @@ func (s *RuleStore) CreateRule(r *Rule) error {
 	if cp.Expression == "" {
 		cp.Expression = DeriveExpression(&cp)
 	}
+	if _, err := filter.Compile(cp.Expression); err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("invalid rule expression: %w", err)
+	}
+	cp.Revision = 1
+	cp.UpdatedAt = time.Now().Unix()
+	if err := s.appendRevisionLocked(cp); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	s.rules[r.ID] = &cp
 	err := s.save()
+	if err != nil {
+		delete(s.rules, r.ID)
+	}
 	if err == nil {
 		s.version++
+		*r = cp
 	}
 	s.mu.Unlock()
 	if err == nil {
@@ -119,7 +146,8 @@ func (s *RuleStore) CreateRule(r *Rule) error {
 func (s *RuleStore) UpdateRule(r *Rule) error {
 	s.mu.Lock()
 
-	if _, exists := s.rules[r.ID]; !exists {
+	previous, exists := s.rules[r.ID]
+	if !exists {
 		s.mu.Unlock()
 		return fmt.Errorf("rule with ID %q not found", r.ID)
 	}
@@ -127,10 +155,27 @@ func (s *RuleStore) UpdateRule(r *Rule) error {
 	if cp.Expression == "" {
 		cp.Expression = DeriveExpression(&cp)
 	}
+	if _, err := filter.Compile(cp.Expression); err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("invalid rule expression: %w", err)
+	}
+	cp.Revision = previous.Revision + 1
+	if cp.Revision < 2 {
+		cp.Revision = 2
+	}
+	cp.UpdatedAt = time.Now().Unix()
+	if err := s.appendRevisionLocked(cp); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	s.rules[r.ID] = &cp
 	err := s.save()
+	if err != nil {
+		s.rules[r.ID] = previous
+	}
 	if err == nil {
 		s.version++
+		*r = cp
 	}
 	s.mu.Unlock()
 	if err == nil {
@@ -151,6 +196,9 @@ func (s *RuleStore) DeleteRule(id string) error {
 	serviceID := r.ServiceID
 	delete(s.rules, id)
 	err := s.save()
+	if err != nil {
+		s.rules[id] = r
+	}
 	if err == nil {
 		s.version++
 	}
@@ -179,6 +227,11 @@ func (s *RuleStore) DeleteRules(ids []string) (int, error) {
 		return 0, nil
 	}
 	err := s.save()
+	if err != nil {
+		// Reloading restores the last atomically persisted state.
+		s.rules = make(map[string]*Rule)
+		_ = s.load()
+	}
 	if err == nil {
 		s.version++
 	}
@@ -218,6 +271,11 @@ func (s *RuleStore) load() error {
 				migrated = true
 			}
 		}
+		if r.Revision <= 0 {
+			r.Revision = 1
+			r.UpdatedAt = time.Now().Unix()
+			migrated = true
+		}
 		s.rules[r.ID] = r
 	}
 	if migrated {
@@ -238,5 +296,109 @@ func (s *RuleStore) save() error {
 	if err != nil {
 		return fmt.Errorf("marshaling rules: %w", err)
 	}
-	return os.WriteFile(s.filePath, data, 0644)
+	return writeFileAtomic(s.filePath, data, 0644)
+}
+
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".janus-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+func (s *RuleStore) loadRevisions() error {
+	data, err := os.ReadFile(s.revisionsFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("reading rule revisions: %w", err)
+	}
+	if err := json.Unmarshal(data, &s.revisions); err != nil {
+		return fmt.Errorf("parsing rule revisions: %w", err)
+	}
+	return nil
+}
+
+func (s *RuleStore) saveRevisionsLocked() error {
+	data, err := json.MarshalIndent(s.revisions, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling rule revisions: %w", err)
+	}
+	if err := writeFileAtomic(s.revisionsFilePath, data, 0600); err != nil {
+		return fmt.Errorf("writing rule revisions: %w", err)
+	}
+	return nil
+}
+
+func (s *RuleStore) appendRevisionLocked(rule Rule) error {
+	history := s.revisions[rule.ID]
+	s.revisions[rule.ID] = append(history, RuleRevision{Rule: rule, RecordedAt: time.Now().Unix()})
+	if err := s.saveRevisionsLocked(); err != nil {
+		s.revisions[rule.ID] = history
+		return err
+	}
+	return nil
+}
+
+func (s *RuleStore) ensureCurrentRevisions() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	for id, rule := range s.rules {
+		history := s.revisions[id]
+		if len(history) == 0 || history[len(history)-1].Rule.Revision < rule.Revision {
+			s.revisions[id] = append(history, RuleRevision{Rule: *rule, RecordedAt: time.Now().Unix()})
+			changed = true
+		}
+	}
+	if changed {
+		return s.saveRevisionsLocked()
+	}
+	return nil
+}
+
+// ListRevisions returns immutable snapshots ordered from oldest to newest.
+func (s *RuleStore) ListRevisions(id string) []RuleRevision {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	history := s.revisions[id]
+	return append([]RuleRevision(nil), history...)
+}
+
+// RollbackRule activates a previous snapshot as a new revision.
+func (s *RuleStore) RollbackRule(id string, revision int) error {
+	s.mu.RLock()
+	var snapshot *Rule
+	for _, item := range s.revisions[id] {
+		if item.Rule.Revision == revision {
+			copy := item.Rule
+			snapshot = &copy
+			break
+		}
+	}
+	s.mu.RUnlock()
+	if snapshot == nil {
+		return fmt.Errorf("revision %d for rule %q not found", revision, id)
+	}
+	return s.UpdateRule(snapshot)
 }

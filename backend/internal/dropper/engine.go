@@ -12,6 +12,12 @@ type RulesCache interface {
 	GetServiceRules(serviceID string) ([]*Rule, bool)
 }
 
+// RuleSource is the persistence port required by the hot-path evaluator.
+type RuleSource interface {
+	ListRules(serviceID string) []*Rule
+	Version() int64
+}
+
 // Engine evaluates drop/alert rules against request data.
 //
 // The engine is expression-driven:
@@ -24,7 +30,7 @@ type RulesCache interface {
 // The compiled bundle is cached and refreshed whenever the rule-store
 // version changes (notifyChange already runs on every CRUD).
 type Engine struct {
-	ruleStore *RuleStore
+	ruleStore RuleSource
 	cache     RulesCache
 
 	mu     sync.RWMutex
@@ -32,7 +38,7 @@ type Engine struct {
 }
 
 // NewEngine creates a new drop engine.
-func NewEngine(ruleStore *RuleStore) *Engine {
+func NewEngine(ruleStore RuleSource) *Engine {
 	return &Engine{ruleStore: ruleStore}
 }
 
@@ -146,8 +152,13 @@ func (e *Engine) compile(serviceID string, version int64) *compiledBundle {
 
 // EvaluateActions checks all enabled rules and returns categorized matches.
 func (e *Engine) EvaluateActions(req *HTTPRequest) EvalResult {
-	bundle := e.getBundle(req.ServiceID)
-	view := newView(req)
+	return e.EvaluateView(newView(req))
+}
+
+// EvaluateView is the canonical live entry point. HTTPRequest remains as a
+// compatibility adapter for older integrations and tests.
+func (e *Engine) EvaluateView(view filter.PacketView) EvalResult {
+	bundle := e.getBundle(view.ServiceID())
 	var setView filter.PacketView = view
 	if bundle.hasBatch {
 		set := bundle.scanner.Scan(view)

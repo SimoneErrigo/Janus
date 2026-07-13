@@ -532,6 +532,8 @@ function treeNeedsServerFilter(node) {
   if (node.kind === 'predicate') {
     const f = node.field
     if (f === 'body' || f === 'raw' || f === 'header') return true
+    if (node.op === 'matches' || node.length) return true
+    if ((f === 'src' || f === 'dst' || f === 'peer') && String(node.value || '').includes('/')) return true
     return false
   }
   for (const c of (node.children || [])) {

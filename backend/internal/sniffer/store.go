@@ -14,17 +14,18 @@ import (
 	"unicode/utf8"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/filter"
+	flowmodel "github.com/SimoneErrigo/Janus/backend/internal/flow"
 	_ "modernc.org/sqlite"
 )
 
 // packetSelectCols is the standard column list for packet SELECTs.
-const packetSelectCols = "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged, contains_flagid, matched_flagids, flagid_round"
+const packetSelectCols = "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, capture_truncated, matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, verdict"
 
 // packetSummaryCols is the slim column list for list-view queries: skips
 // body (raw blob), body_string (returned truncated via substr below), and
 // matched_flagids JSON. Headers are still selected because the row cell
 // preview falls back to body_string substring when URL is empty.
-const packetSummaryCols = "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, substr(body_string, 1, 80), matched_rules, flagged, contains_flagid, flagid_round"
+const packetSummaryCols = "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, substr(body_string, 1, 80), capture_truncated, matched_rules, flagged, contains_flagid, flagid_round, verdict"
 
 // PacketStore handles SQLite persistence for captured packets.
 // Uses separate read/write connection pools for WAL-mode concurrency:
@@ -173,6 +174,7 @@ func migrate(db *sql.DB) error {
 			headers       TEXT    NOT NULL DEFAULT '{}',
 			body          BLOB,
 			body_string   TEXT    NOT NULL DEFAULT '',
+			capture_truncated INTEGER NOT NULL DEFAULT 0,
 			matched_rules    TEXT    NOT NULL DEFAULT '[]',
 			flagged          INTEGER NOT NULL DEFAULT 0,
 			contains_flagid  INTEGER NOT NULL DEFAULT 0,
@@ -198,6 +200,8 @@ func migrate(db *sql.DB) error {
 		"ALTER TABLE packets ADD COLUMN matched_flagids TEXT NOT NULL DEFAULT '[]'",
 		"ALTER TABLE packets ADD COLUMN flagid_round INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE packets ADD COLUMN has_drop_match INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE packets ADD COLUMN verdict TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE packets ADD COLUMN capture_truncated INTEGER NOT NULL DEFAULT 0",
 		// inserted_at tracks when the row was added to *this* DB, distinct
 		// from the wire timestamp. Cleanup-by-age uses it so imports of old
 		// PCAPs aren't immediately wiped just because their capture clock
@@ -237,6 +241,9 @@ func migrate(db *sql.DB) error {
 	// Backfill existing rows once after migration.
 	// A row is considered dropped if any matched rule has action drop/both.
 	db.Exec("UPDATE packets SET has_drop_match = CASE WHEN (matched_rules LIKE '%\"action\":\"drop\"%' OR matched_rules LIKE '%\"action\":\"both\"%') THEN 1 ELSE 0 END WHERE has_drop_match = 0")
+	// A response was already forwarded by the legacy pipeline before its rules
+	// were evaluated, so it must never be migrated as an actual drop.
+	db.Exec("UPDATE packets SET has_drop_match = 0 WHERE direction = 'response'")
 
 	// Step 6: alerts table
 	_, err = db.Exec(`
@@ -340,6 +347,38 @@ func autoFillBodyString(p *Packet) {
 	}
 }
 
+// ensurePacketVerdict reconstructs a conservative verdict for legacy callers
+// and rows. New data-plane paths set Verdict explicitly before persistence.
+func ensurePacketVerdict(p *Packet) {
+	if p == nil || p.Verdict.Outcome != "" {
+		return
+	}
+	hasDrop, hasAlert := false, false
+	ruleIDs := make([]string, 0, len(p.MatchedRules))
+	for _, rule := range p.MatchedRules {
+		ruleIDs = append(ruleIDs, rule.ID)
+		switch rule.Action {
+		case "drop":
+			hasDrop = true
+		case "both":
+			hasDrop, hasAlert = true, true
+		case "alert":
+			hasAlert = true
+		}
+	}
+	phase := string(p.Direction)
+	switch {
+	case hasDrop && p.Direction == DirectionRequest:
+		p.Verdict = flowmodel.Verdict{Decision: flowmodel.DecisionDrop, Outcome: flowmodel.OutcomeDropped, Phase: phase, Applied: true, RuleIDs: ruleIDs}
+	case hasDrop:
+		p.Verdict = flowmodel.Verdict{Decision: flowmodel.DecisionDrop, Outcome: flowmodel.OutcomeWouldDrop, Phase: phase, Applied: false, RuleIDs: ruleIDs}
+	case hasAlert:
+		p.Verdict = flowmodel.Verdict{Decision: flowmodel.DecisionAlert, Outcome: flowmodel.OutcomeForwarded, Phase: phase, Applied: true, RuleIDs: ruleIDs}
+	default:
+		p.Verdict = flowmodel.Forwarded(phase)
+	}
+}
+
 // isBinaryContentType reports whether the headers declare a body format that
 // shouldn't be rendered as text (gRPC, protobuf, raw octets). The check is
 // case-insensitive and tolerant of "type/subtype; charset=…" suffixes.
@@ -374,6 +413,7 @@ func isBinaryContentType(headers map[string]string) bool {
 // Insert stores a packet in the database.
 func (s *PacketStore) Insert(p *Packet) error {
 	autoFillBodyString(p)
+	ensurePacketVerdict(p)
 
 	headersJSON, err := json.Marshal(p.Headers)
 	if err != nil {
@@ -393,12 +433,17 @@ func (s *PacketStore) Insert(p *Packet) error {
 	if p.ContainsFlagID {
 		containsFlagIDInt = 1
 	}
+	captureTruncatedInt := 0
+	if p.CaptureTruncated {
+		captureTruncatedInt = 1
+	}
 	hasDropMatchInt := 0
-	for _, r := range p.MatchedRules {
-		switch r.Action {
-		case "drop", "both":
-			hasDropMatchInt = 1
-		}
+	if p.Verdict.Outcome == flowmodel.OutcomeDropped {
+		hasDropMatchInt = 1
+	}
+	verdictJSON, err := json.Marshal(p.Verdict)
+	if err != nil {
+		verdictJSON = []byte("{}")
 	}
 
 	if p.MatchedFlagIDs == nil {
@@ -412,10 +457,10 @@ func (s *PacketStore) Insert(p *Packet) error {
 	insertedAt := time.Now().UTC().Format(time.RFC3339Nano)
 	res, err := s.execInsertRetry(`
 		INSERT INTO packets (service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port,
-			protocol, direction, method, url, status, headers, body, body_string,
+			protocol, direction, method, url, status, headers, body, body_string, capture_truncated,
 			matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, has_drop_match,
-			inserted_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			inserted_at, verdict)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ServiceID, p.SessionID,
 		p.Timestamp.UTC().Format(time.RFC3339Nano),
 		p.SrcIP, p.SrcPort,
@@ -423,10 +468,10 @@ func (s *PacketStore) Insert(p *Packet) error {
 		p.Protocol, p.Direction,
 		p.Method, p.URL, p.Status,
 		string(headersJSON),
-		p.Body, p.BodyString,
+		p.Body, p.BodyString, captureTruncatedInt,
 		string(matchedRulesJSON), flaggedInt, containsFlagIDInt,
 		string(matchedFlagIDsJSON), p.FlagIDRound, hasDropMatchInt,
-		insertedAt,
+		insertedAt, string(verdictJSON),
 	)
 	if err != nil {
 		return fmt.Errorf("inserting packet: %w", err)
@@ -452,6 +497,7 @@ func (s *PacketStore) Enqueue(pkt *Packet, alerts []*Alert) error {
 	if pkt.MatchedRules == nil {
 		pkt.MatchedRules = []MatchedRuleInfo{}
 	}
+	ensurePacketVerdict(pkt)
 	select {
 	case s.queue <- batchItem{pkt: pkt, alerts: alerts}:
 		return nil
@@ -521,8 +567,8 @@ func (s *PacketStore) flushBatch(batch []batchItem) {
 	}
 
 	// --- Build packet INSERT ---
-	const packetCols = 22
-	rowPlaceholder := "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+	const packetCols = 24
+	rowPlaceholder := "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 	placeholders := make([]string, len(batch))
 	args := make([]interface{}, 0, len(batch)*packetCols)
 	insertedAt := time.Now().UTC().Format(time.RFC3339Nano)
@@ -542,6 +588,11 @@ func (s *PacketStore) flushBatch(batch []batchItem) {
 		if err != nil {
 			matchedFlagIDsJSON = []byte("[]")
 		}
+		ensurePacketVerdict(p)
+		verdictJSON, err := json.Marshal(p.Verdict)
+		if err != nil {
+			verdictJSON = []byte("{}")
+		}
 
 		flaggedInt := 0
 		if p.Flagged {
@@ -551,12 +602,13 @@ func (s *PacketStore) flushBatch(batch []batchItem) {
 		if p.ContainsFlagID {
 			containsFlagIDInt = 1
 		}
+		captureTruncatedInt := 0
+		if p.CaptureTruncated {
+			captureTruncatedInt = 1
+		}
 		hasDropMatchInt := 0
-		for _, r := range p.MatchedRules {
-			switch r.Action {
-			case "drop", "both":
-				hasDropMatchInt = 1
-			}
+		if p.Verdict.Outcome == flowmodel.OutcomeDropped {
+			hasDropMatchInt = 1
 		}
 
 		args = append(args,
@@ -567,17 +619,17 @@ func (s *PacketStore) flushBatch(batch []batchItem) {
 			p.Protocol, p.Direction,
 			p.Method, p.URL, p.Status,
 			string(headersJSON),
-			p.Body, p.BodyString,
+			p.Body, p.BodyString, captureTruncatedInt,
 			string(matchedRulesJSON), flaggedInt, containsFlagIDInt,
 			string(matchedFlagIDsJSON), p.FlagIDRound, hasDropMatchInt,
-			insertedAt,
+			insertedAt, string(verdictJSON),
 		)
 	}
 
 	query := `INSERT INTO packets (service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port,
-		protocol, direction, method, url, status, headers, body, body_string,
+		protocol, direction, method, url, status, headers, body, body_string, capture_truncated,
 		matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, has_drop_match,
-		inserted_at)
+		inserted_at, verdict)
 		VALUES ` + strings.Join(placeholders, ",")
 
 	res, err := s.execInsertRetry(query, args...)
@@ -815,15 +867,16 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 		var headersJSON string
 		var matchedRulesJSON string
 		var matchedFlagIDsJSON string
-		var flaggedInt, containsFlagIDInt int
+		var verdictJSON string
+		var flaggedInt, containsFlagIDInt, captureTruncatedInt int
 		if err := rows.Scan(
 			&p.ID, &p.ServiceID, &p.SessionID, &ts,
 			&p.SrcIP, &p.SrcPort, &p.DstIP, &p.DstPort,
 			&p.Protocol, &p.Direction,
 			&p.Method, &p.URL, &p.Status,
-			&headersJSON, &p.Body, &p.BodyString,
+			&headersJSON, &p.Body, &p.BodyString, &captureTruncatedInt,
 			&matchedRulesJSON, &flaggedInt, &containsFlagIDInt,
-			&matchedFlagIDsJSON, &p.FlagIDRound,
+			&matchedFlagIDsJSON, &p.FlagIDRound, &verdictJSON,
 		); err != nil {
 			return nil, fmt.Errorf("scanning packet: %w", err)
 		}
@@ -831,6 +884,7 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 		p.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
 		p.Flagged = flaggedInt != 0
 		p.ContainsFlagID = containsFlagIDInt != 0
+		p.CaptureTruncated = captureTruncatedInt != 0
 
 		if headersJSON != "" && headersJSON != "{}" {
 			json.Unmarshal([]byte(headersJSON), &p.Headers)
@@ -843,6 +897,10 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 		if matchedFlagIDsJSON != "" && matchedFlagIDsJSON != "[]" {
 			json.Unmarshal([]byte(matchedFlagIDsJSON), &p.MatchedFlagIDs)
 		}
+		if verdictJSON != "" && verdictJSON != "{}" {
+			json.Unmarshal([]byte(verdictJSON), &p.Verdict)
+		}
+		ensurePacketVerdict(p)
 
 		if p.MatchedRules == nil {
 			p.MatchedRules = []MatchedRuleInfo{}
@@ -875,16 +933,16 @@ func (s *PacketStore) scanPacketsSummary(querySQL string, args []interface{}) ([
 	var packets []*Packet
 	for rows.Next() {
 		p := &Packet{Lite: true}
-		var ts, bodyPreview, matchedRulesJSON string
-		var flaggedInt, containsFlagIDInt int
+		var ts, bodyPreview, matchedRulesJSON, verdictJSON string
+		var flaggedInt, containsFlagIDInt, captureTruncatedInt int
 		if err := rows.Scan(
 			&p.ID, &p.ServiceID, &p.SessionID, &ts,
 			&p.SrcIP, &p.SrcPort, &p.DstIP, &p.DstPort,
 			&p.Protocol, &p.Direction,
 			&p.Method, &p.URL, &p.Status,
-			&bodyPreview,
+			&bodyPreview, &captureTruncatedInt,
 			&matchedRulesJSON, &flaggedInt, &containsFlagIDInt,
-			&p.FlagIDRound,
+			&p.FlagIDRound, &verdictJSON,
 		); err != nil {
 			return nil, fmt.Errorf("scanning packet summary: %w", err)
 		}
@@ -892,6 +950,7 @@ func (s *PacketStore) scanPacketsSummary(querySQL string, args []interface{}) ([
 		p.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
 		p.Flagged = flaggedInt != 0
 		p.ContainsFlagID = containsFlagIDInt != 0
+		p.CaptureTruncated = captureTruncatedInt != 0
 		p.BodyString = bodyPreview
 
 		if matchedRulesJSON != "" && matchedRulesJSON != "[]" {
@@ -900,6 +959,10 @@ func (s *PacketStore) scanPacketsSummary(querySQL string, args []interface{}) ([
 		if p.MatchedRules == nil {
 			p.MatchedRules = []MatchedRuleInfo{}
 		}
+		if verdictJSON != "" && verdictJSON != "{}" {
+			json.Unmarshal([]byte(verdictJSON), &p.Verdict)
+		}
+		ensurePacketVerdict(p)
 		p.MatchedFlagIDs = []string{}
 
 		s.annotateRound(p)
@@ -921,15 +984,16 @@ func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
 	var headersJSON string
 	var matchedRulesJSON string
 	var matchedFlagIDsJSON string
-	var flaggedInt, containsFlagIDInt int
+	var verdictJSON string
+	var flaggedInt, containsFlagIDInt, captureTruncatedInt int
 	if err := row.Scan(
 		&p.ID, &p.ServiceID, &p.SessionID, &ts,
 		&p.SrcIP, &p.SrcPort, &p.DstIP, &p.DstPort,
 		&p.Protocol, &p.Direction,
 		&p.Method, &p.URL, &p.Status,
-		&headersJSON, &p.Body, &p.BodyString,
+		&headersJSON, &p.Body, &p.BodyString, &captureTruncatedInt,
 		&matchedRulesJSON, &flaggedInt, &containsFlagIDInt,
-		&matchedFlagIDsJSON, &p.FlagIDRound,
+		&matchedFlagIDsJSON, &p.FlagIDRound, &verdictJSON,
 	); err != nil {
 		return nil, err
 	}
@@ -937,6 +1001,7 @@ func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
 	p.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
 	p.Flagged = flaggedInt != 0
 	p.ContainsFlagID = containsFlagIDInt != 0
+	p.CaptureTruncated = captureTruncatedInt != 0
 
 	if headersJSON != "" && headersJSON != "{}" {
 		json.Unmarshal([]byte(headersJSON), &p.Headers)
@@ -947,6 +1012,10 @@ func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
 	if matchedFlagIDsJSON != "" && matchedFlagIDsJSON != "[]" {
 		json.Unmarshal([]byte(matchedFlagIDsJSON), &p.MatchedFlagIDs)
 	}
+	if verdictJSON != "" && verdictJSON != "{}" {
+		json.Unmarshal([]byte(verdictJSON), &p.Verdict)
+	}
+	ensurePacketVerdict(p)
 	if p.MatchedRules == nil {
 		p.MatchedRules = []MatchedRuleInfo{}
 	}

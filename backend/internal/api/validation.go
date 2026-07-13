@@ -14,15 +14,12 @@ import (
 // retype their team address for every service: leaving listen_addr empty (or
 // giving just a ":port"/port form) binds the service to TEAM_IP.
 func applyServiceDefaults(svc *storage.Service) {
-	teamIP := strings.TrimSpace(config.Get().TeamIP)
-	if teamIP == "" {
-		return
-	}
+	teamIP := strings.TrimSpace(config.Get().DataPlane.DefaultBind)
 	addr := strings.TrimSpace(svc.ListenAddr)
 	switch {
-	case addr == "":
+	case addr == "" && teamIP != "":
 		svc.ListenAddr = teamIP
-	case strings.HasPrefix(addr, ":"):
+	case strings.HasPrefix(addr, ":") && teamIP != "":
 		// ":8080" — a bare port; adopt TEAM_IP as the host and, when
 		// listen_port wasn't set separately, take the port from here too.
 		if svc.ListenPort == 0 {
@@ -30,6 +27,17 @@ func applyServiceDefaults(svc *storage.Service) {
 		}
 		svc.ListenAddr = teamIP
 	}
+
+	// TLS-capable presets should work after selecting the protocol alone.
+	// Self-signed is the safe CTF default; challenge certificates remain an
+	// optional advanced override.
+	switch svc.Protocol {
+	case storage.ProtocolHTTPS, storage.ProtocolWSS, storage.ProtocolHTTP2, storage.ProtocolGRPC:
+		if svc.TLSMode == storage.TLSModeNone {
+			svc.TLSMode = storage.TLSModeSelfSigned
+		}
+	}
+	svc.ApplyProtocolPreset()
 }
 
 // serviceIDPattern restricts service IDs to characters that survive URL paths

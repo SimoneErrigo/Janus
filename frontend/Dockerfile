@@ -14,6 +14,7 @@ RUN chmod +x /docker-entrypoint.sh
 
 ENV API_BACKEND=127.0.0.1
 ENV FRONTEND_BIND=0.0.0.0
+ENV FRONTEND_PORT=3000
 
 EXPOSE 3000
 ENTRYPOINT ["/docker-entrypoint.sh"]

@@ -85,6 +85,7 @@ func main() {
 	}
 
 	proxyMgr := proxy.NewManager(packetStore, ruleStore, flagRegex, flagScanner)
+	proxyMgr.SetDataPlaneBindMode(cfg.DataPlane.BindMode)
 	proxyMgr.SetRulesCache(redisCache)
 	captureCtrl := sniffer.NewCaptureController(cfg.TrafficMode)
 	proxyMgr.SetCaptureController(captureCtrl)
@@ -244,8 +245,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	addr := ":" + cfg.APIPort
-	addr = cfg.APIBind + addr
+	addr := cfg.ControlPlane.Bind + ":" + cfg.ControlPlane.Port
 	log.Printf("Janus API listening on %s", addr)
 	if err := http.ListenAndServe(addr, apiServer.Handler()); err != nil {
 		log.Fatalf("API server error: %v", err)

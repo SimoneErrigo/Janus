@@ -9,6 +9,16 @@ import (
 	"sync"
 )
 
+type ControlPlaneConfig struct {
+	Bind string
+	Port string
+}
+
+type DataPlaneConfig struct {
+	DefaultBind string
+	BindMode    string
+}
+
 // Config holds the global configuration loaded from .env.
 type Config struct {
 	TeamPassword string
@@ -22,11 +32,14 @@ type Config struct {
 	DataDir       string
 	APIPort       string
 	APIBind       string
+	ControlPlane  ControlPlaneConfig
+	DataPlane     DataPlaneConfig
 
 	// TeamIP is our team's address on the competition network. When a
 	// service's listen address omits the host (e.g. ":8080" or just a port),
 	// the proxy binds it to TeamIP instead of every interface.
-	TeamIP string
+	TeamIP       string
+	DataBindMode string
 
 	// Cleanup settings
 	CleanupMaxAgeMinutes int
@@ -88,6 +101,7 @@ func Load(envPath string) (*Config, error) {
 			FlagIDFormat:             "cyberchallenge",
 			ProtoDir:                 "/protos",
 			PyFilterEnabled:          true,
+			DataBindMode:             "configured",
 		}
 
 		env, err := parseEnvFile(envPath)
@@ -113,6 +127,9 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v, ok := env["TEAM_IP"]; ok {
 			cfg.TeamIP = strings.TrimSpace(v)
+		}
+		if v, ok := env["DATA_BIND_MODE"]; ok && v != "" {
+			cfg.DataBindMode = strings.ToLower(strings.TrimSpace(v))
 		}
 		if v, ok := env["DATA_DIR"]; ok {
 			cfg.DataDir = v
@@ -197,6 +214,9 @@ func Load(envPath string) (*Config, error) {
 		if v := os.Getenv("TEAM_IP"); v != "" {
 			cfg.TeamIP = strings.TrimSpace(v)
 		}
+		if v := os.Getenv("DATA_BIND_MODE"); v != "" {
+			cfg.DataBindMode = strings.ToLower(strings.TrimSpace(v))
+		}
 		if v := os.Getenv("DATA_DIR"); v != "" {
 			cfg.DataDir = v
 		}
@@ -268,6 +288,13 @@ func Load(envPath string) (*Config, error) {
 		if cfg.PcapExportDir == "" {
 			cfg.PcapExportDir = cfg.DataDir + "/pcap"
 		}
+		// Materialize the logical plane split while preserving the legacy env
+		// variables as the public configuration surface.
+		cfg.ControlPlane = ControlPlaneConfig{Bind: cfg.APIBind, Port: cfg.APIPort}
+		if cfg.DataBindMode != "configured" && cfg.DataBindMode != "wildcard" {
+			cfg.DataBindMode = "configured"
+		}
+		cfg.DataPlane = DataPlaneConfig{DefaultBind: cfg.TeamIP, BindMode: cfg.DataBindMode}
 
 		instance = cfg
 	})

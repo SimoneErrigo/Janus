@@ -63,6 +63,10 @@ frontend proxies `/api` to the backend; the normal Compose stack does not
 publish the backend API as a separate host port. Service ports must be listed
 in `docker-compose.yml` when Docker cannot use host networking.
 
+Redis is optional. The default single-process setup uses SQLite plus in-memory
+compiled rule bundles. To enable the cache adapter, set `REDIS_ADDR=redis:6379`
+and start Compose with `--profile cache`.
+
 For a Linux competition VM, host networking lets Janus bind arbitrary original
 service ports:
 
@@ -88,6 +92,17 @@ In **Services**, add the checker-facing listener and its new backend address.
 Janus generates the service ID when it is omitted. Enable the service to start
 its listener immediately. The page also shows bind failures and can retry a
 listener after the target service is rebuilt.
+
+The protocol selector is a preset: Janus automatically derives transport,
+application profile, client-side TLS, upstream TLS and framing into the
+versioned service model. Existing `services.json` records are migrated on first
+load. No manual conversion is required; advanced certificate/decoder settings
+remain available under **Advanced settings**.
+
+The standard bridge Compose profile binds listeners inside the container on
+the wildcard address while preserving the configured checker-facing IP. The
+competition host-network profile binds the configured IP directly. This is
+selected by the Compose profiles; the service form needs no extra option.
 
 For a WebSocket service choose `ws`, or `wss` when clients connect to Janus
 over TLS. `wss` uses the same TLS modes and certificate fields as `https`.
@@ -158,10 +173,10 @@ bypass generic filtering. Messages larger than 1 MiB are dropped and audited.
 
 ## Performance and storage
 
-Janus uses SQLite WAL with separate read/write pools, Redis as a rule-evaluation
-cache, Aho-Corasick matching for Flag IDs, optimized flag scanning, and batched
-SSE delivery. Redis is a cache only: traffic and configuration remain correct if
-it is unavailable.
+Janus uses SQLite WAL with separate read/write pools, per-service compiled rule
+bundles, Aho-Corasick matching for Flag IDs, optimized flag scanning, and
+batched SSE delivery. Redis is an optional cache adapter: traffic and
+configuration remain correct when it is disabled or unavailable.
 
 Runtime data, saved PyFilters, SQLite data, and exported PCAPs live beneath
 `DATA_DIR` (mounted as `./data` by Compose). Treat this directory as operational

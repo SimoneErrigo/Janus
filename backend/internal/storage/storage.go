@@ -75,6 +75,7 @@ func (s *Store) CreateService(svc *Service) error {
 	}
 
 	cp := *svc
+	cp.ApplyProtocolPreset()
 	s.services[svc.ID] = &cp
 	return s.save()
 }
@@ -89,6 +90,7 @@ func (s *Store) UpdateService(svc *Service) error {
 	}
 
 	cp := *svc
+	cp.ApplyProtocolPreset()
 	s.services[svc.ID] = &cp
 	return s.save()
 }
@@ -120,8 +122,17 @@ func (s *Store) load() error {
 		return fmt.Errorf("parsing services file: %w", err)
 	}
 
+	migrated := false
 	for _, svc := range list {
+		if svc.Migrate() {
+			migrated = true
+		}
 		s.services[svc.ID] = svc
+	}
+	if migrated {
+		if err := s.save(); err != nil {
+			return fmt.Errorf("persisting migrated services: %w", err)
+		}
 	}
 	return nil
 }
@@ -137,7 +148,7 @@ func (s *Store) save() error {
 		return fmt.Errorf("marshaling services: %w", err)
 	}
 
-	if err := os.WriteFile(s.filePath, data, 0644); err != nil {
+	if err := writeAtomic(s.filePath, data, 0644); err != nil {
 		return fmt.Errorf("writing services file: %w", err)
 	}
 	return nil
@@ -250,8 +261,33 @@ func (s *Store) saveProtocols() error {
 	if err != nil {
 		return fmt.Errorf("marshaling protocols: %w", err)
 	}
-	if err := os.WriteFile(s.protocolFilePath, data, 0644); err != nil {
+	if err := writeAtomic(s.protocolFilePath, data, 0644); err != nil {
 		return fmt.Errorf("writing protocols file: %w", err)
 	}
 	return nil
+}
+
+func writeAtomic(path string, data []byte, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".janus-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
 }

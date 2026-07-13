@@ -22,7 +22,7 @@ import (
 
 // Server holds the REST API dependencies.
 type Server struct {
-	store          *storage.Store
+	store          storage.Repository
 	proxy          *proxy.Manager
 	packetStore    *sniffer.PacketStore
 	ruleStore      *dropper.RuleStore
@@ -41,7 +41,7 @@ type Server struct {
 }
 
 // NewServer creates a new API server.
-func NewServer(store *storage.Store, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager, flagIDPoller *flagids.Poller, cacheClient *cache.Client, statsCollector *sysstat.Collector, packetHub *PacketStreamHub, captureCtrl *sniffer.CaptureController, protoDir string, pyMgr *pyfilter.Manager) *Server {
+func NewServer(store storage.Repository, proxyMgr *proxy.Manager, packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, cleanupMgr *cleanup.Manager, flagIDPoller *flagids.Poller, cacheClient *cache.Client, statsCollector *sysstat.Collector, packetHub *PacketStreamHub, captureCtrl *sniffer.CaptureController, protoDir string, pyMgr *pyfilter.Manager) *Server {
 	s := &Server{
 		store:          store,
 		proxy:          proxyMgr,

@@ -226,6 +226,7 @@ export default function Services() {
 
 function ServiceForm({ service, onSave, onCancel }) {
   const [form, setForm] = useState(service)
+  const [showAdvanced, setShowAdvanced] = useState(false)
   const [discoveredProtos, setDiscoveredProtos] = useState({ dir: '', files: [] })
   const [customProtocols, setCustomProtocols] = useState([])
 
@@ -282,34 +283,46 @@ function ServiceForm({ service, onSave, onCancel }) {
         <Field label="Listen Address" value={form.listen_addr} onChange={(v) => set('listen_addr', v)} placeholder="e.g. 10.10.0.1" />
         <Field label="Listen Port" value={form.listen_port} onChange={(v) => set('listen_port', v)} placeholder="e.g. 8080" type="number" />
         <Field label="Target Address" value={form.target_addr} onChange={(v) => set('target_addr', v)} placeholder="e.g. 127.0.0.1:9080" />
-        <div className="flex items-center gap-2">
-          <input type="checkbox" checked={form.target_tls || false} onChange={(e) => set('target_tls', e.target.checked)} className="accent-cyan-500" id="target-tls" />
-          <label htmlFor="target-tls" className="text-sm text-gray-400">Backend uses TLS</label>
-        </div>
         <div>
           <label className="block text-sm text-gray-400 mb-1">Protocol</label>
           <select value={form.protocol} onChange={(e) => set('protocol', e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500">
             {protocols.map((p) => <option key={p} value={p}>{p.toUpperCase()}</option>)}
           </select>
+          <p className="text-xs text-gray-600 mt-1">Transport, application mode, client TLS and framing are configured automatically.</p>
         </div>
-        {needsTLS && (
+        <div className="col-span-2 border-t border-gray-800 pt-3">
+          <button
+            type="button"
+            onClick={() => setShowAdvanced((v) => !v)}
+            className="text-sm text-gray-400 hover:text-cyan-300 cursor-pointer"
+          >
+            {showAdvanced ? '▾ Hide advanced settings' : '▸ Advanced settings'}
+          </button>
+        </div>
+        {showAdvanced && (
           <>
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">TLS Mode</label>
-              <select value={form.tls_mode} onChange={(e) => set('tls_mode', e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500">
-                {tlsModes.map((m) => <option key={m} value={m}>{m || 'None'}</option>)}
-              </select>
+            <div className="flex items-center gap-2">
+              <input type="checkbox" checked={form.target_tls || false} onChange={(e) => set('target_tls', e.target.checked)} className="accent-cyan-500" id="target-tls" />
+              <label htmlFor="target-tls" className="text-sm text-gray-400">Backend uses TLS</label>
             </div>
-            {form.tls_mode === 'challenge' && (
+            {needsTLS && (
               <>
-                <Field label="Cert File Path" value={form.cert_file} onChange={(v) => set('cert_file', v)} placeholder="/path/to/cert.pem" />
-                <Field label="Key File Path" value={form.key_file} onChange={(v) => set('key_file', v)} placeholder="/path/to/key.pem" />
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">Client TLS certificate</label>
+                  <select value={form.tls_mode} onChange={(e) => set('tls_mode', e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500">
+                    {tlsModes.map((m) => <option key={m} value={m}>{m || 'Automatic self-signed'}</option>)}
+                  </select>
+                </div>
+                {form.tls_mode === 'challenge' && (
+                  <>
+                    <Field label="Cert File Path" value={form.cert_file} onChange={(v) => set('cert_file', v)} placeholder="/path/to/cert.pem" />
+                    <Field label="Key File Path" value={form.key_file} onChange={(v) => set('key_file', v)} placeholder="/path/to/key.pem" />
+                  </>
+                )}
               </>
             )}
-          </>
-        )}
-        {supportsProtos && (
-          <div className="col-span-2">
+            {supportsProtos && (
+              <div className="col-span-2">
             <label className="block text-sm text-gray-400 mb-1">
               .proto File Paths
               <span className="text-gray-600 ml-2 text-xs">
@@ -356,9 +369,9 @@ function ServiceForm({ service, onSave, onCancel }) {
                 Drop them into the mounted volume and they'll appear here (and be used as fallback).
               </div>
             )}
-          </div>
-        )}
-        <div className="col-span-2">
+              </div>
+            )}
+            <div className="col-span-2">
           <label className="block text-sm text-gray-400 mb-1">
             Custom Protocol (decoder)
             <span className="text-gray-600 ml-2 text-xs">
@@ -373,7 +386,9 @@ function ServiceForm({ service, onSave, onCancel }) {
             <option value="">— None —</option>
             {customProtocols.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
           </select>
-        </div>
+            </div>
+          </>
+        )}
         <div className="flex items-center gap-2 col-span-2">
           <input type="checkbox" checked={form.enabled} onChange={(e) => set('enabled', e.target.checked)} className="accent-cyan-500" id="enabled" />
           <label htmlFor="enabled" className="text-sm text-gray-400">Enabled (start proxy immediately)</label>

@@ -15,6 +15,7 @@ import (
 
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
 	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
+	flowmodel "github.com/SimoneErrigo/Janus/backend/internal/flow"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
 
@@ -77,7 +78,7 @@ func CheckFlagID(checker FlagIDChecker, url, headers string, body []byte) (bool,
 
 // HTTPMiddleware returns an http.Handler that logs requests/responses and evaluates drop rules.
 // getFlagIDChecker is called per request so updates from SetFlagIDChecker apply without restarting the proxy.
-func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore, dropEngine *dropper.Engine, flagRegex *regexp.Regexp, flagScanner *flagids.FlagScanner, getFlagIDChecker func() FlagIDChecker, shouldCapture func() bool, shouldApplyFlagIDsOnIngest func() bool, pyBlock PyBlockFunc) http.Handler {
+func HTTPMiddleware(next http.Handler, svc *storage.Service, store PacketSink, dropEngine *dropper.Engine, flagRegex *regexp.Regexp, flagScanner *flagids.FlagScanner, getFlagIDChecker func() FlagIDChecker, shouldCapture func() bool, shouldApplyFlagIDsOnIngest func() bool, pyBlock PyBlockFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
@@ -89,28 +90,45 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		dstIP := svc.ListenAddr
 		dstPort := svc.ListenPort
 
-		// Capture request body (limited)
-		var reqBody []byte
-		if r.Body != nil {
-			reqBody, _ = io.ReadAll(io.LimitReader(r.Body, maxBodyCapture))
-			r.Body = io.NopCloser(bytes.NewReader(reqBody))
+		// Capture a finite prefix without ever replacing the forwarded body by
+		// that prefix. Unknown-length streams are captured as the backend reads.
+		reqBody, reqBodyTruncated, streamingCapture, err := prepareRequestCapture(r)
+		if err != nil {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
 		}
 
 		// Collect request headers
 		reqHeaders := flattenHeaders(r.Header)
 		headersStr := flattenHeadersString(r.Header)
 
-		// Evaluate rules before inserting
+		captureEnabled := shouldCapture == nil || shouldCapture()
+		applyFlagIDsNow := shouldApplyFlagIDsOnIngest == nil || shouldApplyFlagIDsOnIngest()
+
+		// Compute metadata before rule evaluation so live rules see the same
+		// canonical fields as historical searches.
+		flagged := CheckFlagged(flagRegex, flagScanner, r.URL.String(), headersStr, reqBody)
+		containsFlagID, matchedFlagIDs, flagIDRound := false, []string(nil), 0
+		if applyFlagIDsNow {
+			containsFlagID, matchedFlagIDs, flagIDRound = CheckFlagID(getFlagIDChecker(), r.URL.String(), headersStr, reqBody)
+		}
+		sessionID := MakeSessionID(svc.ID, srcIP, srcPort)
+		reqView := flowmodel.PacketView{
+			Service: svc.ID, Session: sessionID, OccurredAt: start,
+			Source:       flowmodel.Endpoint{IP: srcIP, Port: srcPort},
+			Destination:  flowmodel.Endpoint{IP: dstIP, Port: dstPort},
+			ProtocolName: string(svc.Protocol), DirectionName: string(DirectionRequest),
+			MethodName: r.Method, URLValue: r.URL.String(), HeaderValues: reqHeaders,
+			Payload: reqBody, BodyText: string(reqBody),
+			FlaggedValue: flagged, ContainsFlagIDValue: containsFlagID,
+		}
+
+		// Evaluate rules before inserting/forwarding.
 		var matchedRules []MatchedRuleInfo
 		shouldDrop := false
 		var alertRules []dropper.Rule
 		if dropEngine != nil {
-			result := dropEngine.EvaluateActions(&dropper.HTTPRequest{
-				ServiceID: svc.ID,
-				Headers:   headersStr,
-				Body:      reqBody,
-				URL:       r.URL.String(),
-			})
+			result := dropEngine.EvaluateView(reqView)
 			for _, rule := range result.AllMatched {
 				matchedRules = append(matchedRules, MatchedRuleInfo{
 					ID:      rule.ID,
@@ -124,21 +142,12 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 			alertRules = result.AlertRules
 		}
 
-		captureEnabled := shouldCapture == nil || shouldCapture()
-		applyFlagIDsNow := shouldApplyFlagIDsOnIngest == nil || shouldApplyFlagIDsOnIngest()
-
-		// Check flagged status and flag ID containment
-		flagged := CheckFlagged(flagRegex, flagScanner, r.URL.String(), headersStr, reqBody)
-		containsFlagID, matchedFlagIDs, flagIDRound := false, []string(nil), 0
-		if applyFlagIDsNow {
-			containsFlagID, matchedFlagIDs, flagIDRound = CheckFlagID(getFlagIDChecker(), r.URL.String(), headersStr, reqBody)
-		}
-
 		// Inline (synchronous) Python filters: evaluate the blocking scripts
 		// against the request before forwarding, so a match ({"drop": True}) can
 		// drop it in real time. Runs on the hot path but is bounded + fail-open
 		// inside pyBlock, so a stuck/dead script never stalls traffic.
 		var pyBlockAlerts []*Alert
+		requestRewritten := false
 		if pyBlock != nil {
 			flow := map[string]any{
 				"service":         svc.ID,
@@ -177,7 +186,8 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 			}
 			// Inline rewrite: swap the request body before forwarding + logging
 			// (only when we're not about to drop it).
-			if res.Rewritten && !shouldDrop {
+			if res.Rewritten && !shouldDrop && streamingCapture == nil {
+				requestRewritten = true
 				reqBody = res.NewBody
 				r.Body = io.NopCloser(bytes.NewReader(reqBody))
 				r.ContentLength = int64(len(reqBody))
@@ -188,35 +198,36 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		// In static mode without capture, still persist drops and alert-triggering traffic so Alerts/Blocks stay useful.
 		mustPersistReq := captureEnabled || shouldDrop || len(alertRules) > 0 || len(pyBlockAlerts) > 0
 
-		// Session ID: ties request + response from the same TCP connection.
-		// Even with SNAT (all traffic from same IP), src_port is unique per connection.
-		sessionID := MakeSessionID(svc.ID, srcIP, srcPort)
-
 		// Build and insert request packet
 		reqPacket := &Packet{
-			ServiceID:      svc.ID,
-			SessionID:      sessionID,
-			Timestamp:      start,
-			SrcIP:          srcIP,
-			SrcPort:        srcPort,
-			DstIP:          dstIP,
-			DstPort:        dstPort,
-			Protocol:       string(svc.Protocol),
-			Direction:      DirectionRequest,
-			Method:         r.Method,
-			URL:            r.URL.String(),
-			Headers:        reqHeaders,
-			Body:           reqBody,
-			MatchedRules:   matchedRules,
-			Flagged:        flagged,
-			ContainsFlagID: containsFlagID,
-			MatchedFlagIDs: matchedFlagIDs,
-			FlagIDRound:    flagIDRound,
+			ServiceID:        svc.ID,
+			SessionID:        sessionID,
+			Timestamp:        start,
+			SrcIP:            srcIP,
+			SrcPort:          srcPort,
+			DstIP:            dstIP,
+			DstPort:          dstPort,
+			Protocol:         string(svc.Protocol),
+			Direction:        DirectionRequest,
+			Method:           r.Method,
+			URL:              r.URL.String(),
+			Headers:          reqHeaders,
+			Body:             reqBody,
+			CaptureTruncated: reqBodyTruncated,
+			MatchedRules:     matchedRules,
+			Flagged:          flagged,
+			ContainsFlagID:   containsFlagID,
+			MatchedFlagIDs:   matchedFlagIDs,
+			FlagIDRound:      flagIDRound,
+			Verdict:          VerdictFor(DirectionRequest, matchedRules, shouldDrop, requestRewritten, true),
 		}
 		if reqPacket.MatchedRules == nil {
 			reqPacket.MatchedRules = []MatchedRuleInfo{}
 		}
-		if mustPersistReq {
+		persistRequest := func() {
+			if !mustPersistReq {
+				return
+			}
 			alertTemplates := make([]*Alert, 0, len(alertRules)+len(pyBlockAlerts))
 			for _, rule := range alertRules {
 				alertTemplates = append(alertTemplates, &Alert{
@@ -235,14 +246,45 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 
 		// Drop if rules matched
 		if shouldDrop {
+			persistRequest()
 			log.Printf("[%s] DROP: %d rule(s) matched request %s %s", svc.Name, len(matchedRules), r.Method, r.URL.String())
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
+		}
+		if streamingCapture == nil {
+			persistRequest()
 		}
 
 		// Wrap response writer to capture status and body
 		rw := &responseCapture{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(rw, r)
+		if streamingCapture != nil {
+			reqPacket.Body = streamingCapture.Bytes()
+			reqPacket.CaptureTruncated = streamingCapture.Truncated()
+			reqPacket.Flagged = CheckFlagged(flagRegex, flagScanner, r.URL.String(), headersStr, reqPacket.Body)
+			if applyFlagIDsNow {
+				reqPacket.ContainsFlagID, reqPacket.MatchedFlagIDs, reqPacket.FlagIDRound = CheckFlagID(getFlagIDChecker(), r.URL.String(), headersStr, reqPacket.Body)
+			}
+			// Unknown-length streams cannot be safely buffered before forwarding.
+			// Re-evaluate the captured prefix after forwarding so detections remain
+			// visible, but record drop matches truthfully as would_drop.
+			if dropEngine != nil {
+				reqView.Payload = reqPacket.Body
+				reqView.BodyText = string(reqPacket.Body)
+				reqView.FlaggedValue = reqPacket.Flagged
+				reqView.ContainsFlagIDValue = reqPacket.ContainsFlagID
+				postResult := dropEngine.EvaluateView(reqView)
+				matchedRules = matchedRules[:0]
+				for _, rule := range postResult.AllMatched {
+					matchedRules = append(matchedRules, MatchedRuleInfo{ID: rule.ID, Name: rule.Name, Action: string(rule.Action), Pattern: rule.Pattern, Scope: string(rule.Scope)})
+				}
+				alertRules = postResult.AlertRules
+				reqPacket.MatchedRules = matchedRules
+				reqPacket.Verdict = VerdictFor(DirectionRequest, matchedRules, false, false, false)
+				mustPersistReq = captureEnabled || len(matchedRules) > 0
+			}
+			persistRequest()
+		}
 
 		// Log response packet
 		respHeaders := flattenHeaders(rw.Header())
@@ -258,12 +300,16 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		var respMatchedRules []MatchedRuleInfo
 		var respAlertRules []dropper.Rule
 		if dropEngine != nil {
-			respResult := dropEngine.EvaluateActions(&dropper.HTTPRequest{
-				ServiceID: svc.ID,
-				Headers:   respHeadersStr,
-				Body:      respBody,
-				URL:       r.URL.String(),
-			})
+			respView := flowmodel.PacketView{
+				Service: svc.ID, Session: sessionID, OccurredAt: time.Now(),
+				Source:       flowmodel.Endpoint{IP: dstIP, Port: dstPort},
+				Destination:  flowmodel.Endpoint{IP: srcIP, Port: srcPort},
+				ProtocolName: string(svc.Protocol), DirectionName: string(DirectionResponse),
+				MethodName: r.Method, URLValue: r.URL.String(), StatusCode: rw.statusCode,
+				HeaderValues: respHeaders, Payload: respBody, BodyText: string(respBody),
+				FlaggedValue: respFlagged, ContainsFlagIDValue: respContainsFlagID,
+			}
+			respResult := dropEngine.EvaluateView(respView)
 			for _, rule := range respResult.AllMatched {
 				respMatchedRules = append(respMatchedRules, MatchedRuleInfo{
 					ID:      rule.ID,
@@ -281,25 +327,27 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 		mustPersistResp := captureEnabled || len(respAlertRules) > 0
 
 		respPacket := &Packet{
-			ServiceID:      svc.ID,
-			SessionID:      sessionID,
-			Timestamp:      time.Now(),
-			SrcIP:          dstIP,
-			SrcPort:        dstPort,
-			DstIP:          srcIP,
-			DstPort:        srcPort,
-			Protocol:       string(svc.Protocol),
-			Direction:      DirectionResponse,
-			Method:         r.Method,
-			URL:            r.URL.String(),
-			Status:         rw.statusCode,
-			Headers:        respHeaders,
-			Body:           respBody,
-			MatchedRules:   respMatchedRules,
-			Flagged:        respFlagged,
-			ContainsFlagID: respContainsFlagID,
-			MatchedFlagIDs: respMatchedFlagIDs,
-			FlagIDRound:    respFlagIDRound,
+			ServiceID:        svc.ID,
+			SessionID:        sessionID,
+			Timestamp:        time.Now(),
+			SrcIP:            dstIP,
+			SrcPort:          dstPort,
+			DstIP:            srcIP,
+			DstPort:          srcPort,
+			Protocol:         string(svc.Protocol),
+			Direction:        DirectionResponse,
+			Method:           r.Method,
+			URL:              r.URL.String(),
+			Status:           rw.statusCode,
+			Headers:          respHeaders,
+			Body:             respBody,
+			CaptureTruncated: rw.truncated,
+			MatchedRules:     respMatchedRules,
+			Flagged:          respFlagged,
+			ContainsFlagID:   respContainsFlagID,
+			MatchedFlagIDs:   respMatchedFlagIDs,
+			FlagIDRound:      respFlagIDRound,
+			Verdict:          VerdictFor(DirectionResponse, respMatchedRules, false, false, false),
 		}
 		if mustPersistResp {
 			alertTemplates := make([]*Alert, 0, len(respAlertRules))
@@ -318,6 +366,62 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store *PacketStore,
 			}
 		}
 	})
+}
+
+// replayReadCloser replays a captured prefix and then continues with the
+// original request body while preserving Close propagation.
+type replayReadCloser struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (r *replayReadCloser) Close() error { return r.closer.Close() }
+
+// streamingBodyCapture observes bytes only when the upstream consumes them.
+type streamingBodyCapture struct {
+	source    io.ReadCloser
+	body      bytes.Buffer
+	truncated bool
+}
+
+func (c *streamingBodyCapture) Read(p []byte) (int, error) {
+	n, err := c.source.Read(p)
+	if n > 0 {
+		remaining := maxBodyCapture - c.body.Len()
+		if remaining > 0 {
+			keep := n
+			if keep > remaining {
+				keep = remaining
+			}
+			_, _ = c.body.Write(p[:keep])
+		}
+		if n > remaining {
+			c.truncated = true
+		}
+	}
+	return n, err
+}
+
+func (c *streamingBodyCapture) Close() error    { return c.source.Close() }
+func (c *streamingBodyCapture) Bytes() []byte   { return append([]byte(nil), c.body.Bytes()...) }
+func (c *streamingBodyCapture) Truncated() bool { return c.truncated }
+
+func prepareRequestCapture(r *http.Request) ([]byte, bool, *streamingBodyCapture, error) {
+	if r.Body == nil {
+		return nil, false, nil, nil
+	}
+	if r.ContentLength < 0 {
+		capture := &streamingBodyCapture{source: r.Body}
+		r.Body = capture
+		return nil, false, capture, nil
+	}
+	prefix, err := io.ReadAll(io.LimitReader(r.Body, maxBodyCapture))
+	if err != nil {
+		return nil, false, nil, err
+	}
+	truncated := r.ContentLength > int64(len(prefix))
+	r.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), r.Body), closer: r.Body}
+	return prefix, truncated, nil, nil
 }
 
 // CheckFlagged checks whether any of the packet content matches a flag pattern.
@@ -358,6 +462,7 @@ type responseCapture struct {
 	statusCode  int
 	body        bytes.Buffer
 	wroteHeader bool
+	truncated   bool
 }
 
 func (rc *responseCapture) WriteHeader(code int) {
@@ -369,13 +474,18 @@ func (rc *responseCapture) WriteHeader(code int) {
 }
 
 func (rc *responseCapture) Write(b []byte) (int, error) {
-	if rc.body.Len() < maxBodyCapture {
-		remaining := maxBodyCapture - rc.body.Len()
+	before := rc.body.Len()
+	if before < maxBodyCapture {
+		remaining := maxBodyCapture - before
 		if len(b) > remaining {
 			rc.body.Write(b[:remaining])
+			rc.truncated = true
 		} else {
 			rc.body.Write(b)
 		}
+	}
+	if before >= maxBodyCapture && len(b) > 0 {
+		rc.truncated = true
 	}
 	return rc.ResponseWriter.Write(b)
 }

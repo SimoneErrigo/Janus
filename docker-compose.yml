@@ -8,7 +8,7 @@ services:
       - DATA_DIR=/data
       - API_PORT=9090
       - ENV_PATH=/dev/null
-      - REDIS_ADDR=redis:6379
+      - DATA_BIND_MODE=wildcard
     volumes:
       - ./data:/data
       - ./certs:/certs
@@ -22,11 +22,10 @@ services:
       - "6006:6006"
       - "1337:1337"
       - "8081:8081"
-    depends_on:
-      - redis
     restart: unless-stopped
 
   redis:
+    profiles: ["cache"]
     image: redis:7-alpine
     command: >
       sh -c '
@@ -37,7 +36,7 @@ services:
       fi'
     env_file: .env
     ports:
-      - "127.0.0.1:6380:6380"
+      - "127.0.0.1:6380:6379"
     restart: unless-stopped
 
   frontend:
@@ -47,6 +46,7 @@ services:
     environment:
       - API_BACKEND=janus
       - FRONTEND_BIND=0.0.0.0
+      - FRONTEND_PORT=3000
     ports:
       - "0.0.0.0:2999:3000"
     depends_on:

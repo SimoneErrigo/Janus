@@ -48,6 +48,16 @@ type Rule struct {
 	Enabled    bool   `json:"enabled"`
 	Action     Action `json:"action"`
 	CreatedBy  string `json:"created_by,omitempty"` // display name of the user who created this rule
+	Revision   int    `json:"revision"`
+	UpdatedAt  int64  `json:"updated_at,omitempty"`
+}
+
+// RuleRevision is an immutable snapshot written before a revision becomes
+// active. The separate history allows rollback without changing the compact
+// rules.json format consumed by existing installations.
+type RuleRevision struct {
+	Rule       Rule  `json:"rule"`
+	RecordedAt int64 `json:"recorded_at"`
 }
 
 // IsFlagRule returns true if this rule is an auto-generated flag rule.

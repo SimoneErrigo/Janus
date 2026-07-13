@@ -1,6 +1,9 @@
 package filter
 
-import "sort"
+import (
+	"sort"
+	"strings"
+)
 
 // Node is the AST root interface for parsed expressions.
 type Node interface {
@@ -68,6 +71,51 @@ func FieldsUsed(node Node) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// NeedsServerEvaluation reports expressions whose browser-side evaluation
+// cannot be guaranteed identical to Go/SQLite (payload fields absent from SSE,
+// RE2 regexes, CIDRs, header JSON and byte-length semantics).
+func NeedsServerEvaluation(node Node) bool {
+	needs := false
+	var walk func(Node)
+	walk = func(n Node) {
+		if needs || n == nil {
+			return
+		}
+		switch v := n.(type) {
+		case *OrNode:
+			for _, child := range v.Children {
+				walk(child)
+			}
+		case *AndNode:
+			for _, child := range v.Children {
+				walk(child)
+			}
+		case *NotNode:
+			walk(v.Child)
+		case *Predicate:
+			field := canonicalField(v.Field)
+			if field == "body" || field == "raw" || field == "header" || v.Length || v.Op == OpMatches {
+				needs = true
+				return
+			}
+			if field == "src" || field == "dst" || field == "peer" {
+				if strings.Contains(v.Value.Str, "/") {
+					needs = true
+					return
+				}
+				for _, item := range v.Value.List {
+					if strings.Contains(item.Str, "/") {
+						needs = true
+						return
+					}
+				}
+			}
+		}
+	}
+	walk(node)
+	return needs
 }
 
 // Op is a predicate operator.
