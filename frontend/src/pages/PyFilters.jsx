@@ -407,7 +407,7 @@ export default function PyFilters() {
                   {s.blocking && (
                     <span
                       className="text-[10px] px-1.5 py-0.5 rounded border bg-rose-900/40 text-rose-300 border-rose-700/50"
-                      title="Inline blocking — runs synchronously and can drop the current request"
+                      title="Inline blocking — can drop or rewrite the current request and TCP/WebSocket responses"
                     >
                       INLINE
                     </span>
@@ -463,7 +463,7 @@ export default function PyFilters() {
             </label>
             <label
               className="flex items-center gap-1.5 text-xs text-gray-400 select-none cursor-pointer"
-              title="Run this filter synchronously on the proxy path so it can act on the CURRENT message in real time — return {'drop': True} to drop it, or assign flow.body / flow.content to rewrite it. Works on requests and (for TCP) responses. Adds ~tens of µs per message on this service; a stuck script fails open."
+              title="Run this filter synchronously on the proxy path so it can act on the CURRENT message in real time — return {'drop': True} to drop it, or assign flow.body / flow.content to rewrite it. Works on requests and (for TCP and WebSocket) responses. Adds ~tens of µs per message on this service; a stuck script fails open."
             >
               <input
                 type="checkbox"

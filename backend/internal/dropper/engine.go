@@ -47,11 +47,21 @@ type MatchResult struct {
 
 // HTTPRequest holds the data extracted from an HTTP request for matching.
 type HTTPRequest struct {
-	ServiceID string
-	Headers   string // flattened headers as a single string
-	Body      []byte
-	URL       string
-	RawBytes  []byte // full raw bytes if available
+	ServiceID      string
+	Headers        string // flattened headers as a single string
+	Body           []byte
+	URL            string
+	RawBytes       []byte // full raw bytes if available
+	Method         string
+	Status         int
+	Protocol       string
+	Direction      string
+	SrcIP          string
+	DstIP          string
+	SrcPort        int
+	DstPort        int
+	Flagged        bool
+	ContainsFlagID bool
 }
 
 // compiledBundle is the per-service hot-path artifact: one Aho-Corasick

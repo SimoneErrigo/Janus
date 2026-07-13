@@ -7,9 +7,8 @@ import (
 )
 
 // httpRequestView adapts dropper.HTTPRequest to filter.PacketView for the
-// hot-path rules engine. Fields the proxy middleware doesn't carry today
-// (src/dst/method/status/...) report empty/zero. Predicates referencing
-// those simply won't match — none of the auto-migrated rules use them.
+// hot-path rules engine. Callers populate the protocol metadata they know;
+// unavailable fields retain their zero value and simply do not match.
 type httpRequestView struct{ req *HTTPRequest }
 
 func newView(req *HTTPRequest) filter.PacketView {
@@ -20,17 +19,22 @@ func (v httpRequestView) ID() int64          { return 0 }
 func (v httpRequestView) BodyString() string { return string(v.req.Body) }
 func (v httpRequestView) BodyBytes() []byte  { return v.req.Body }
 func (v httpRequestView) URL() string        { return v.req.URL }
-func (v httpRequestView) Method() string     { return "" }
-func (v httpRequestView) Status() int        { return 0 }
+func (v httpRequestView) Method() string     { return v.req.Method }
+func (v httpRequestView) Status() int        { return v.req.Status }
 func (v httpRequestView) Round() int         { return 0 }
-func (v httpRequestView) Protocol() string   { return "" }
+func (v httpRequestView) Protocol() string   { return v.req.Protocol }
 func (v httpRequestView) ServiceID() string  { return v.req.ServiceID }
-func (v httpRequestView) Direction() string  { return "" }
-func (v httpRequestView) SrcIP() string      { return "" }
-func (v httpRequestView) DstIP() string      { return "" }
-func (v httpRequestView) PeerIP() string     { return "" }
-func (v httpRequestView) SrcPort() int       { return 0 }
-func (v httpRequestView) DstPort() int       { return 0 }
+func (v httpRequestView) Direction() string  { return v.req.Direction }
+func (v httpRequestView) SrcIP() string      { return v.req.SrcIP }
+func (v httpRequestView) DstIP() string      { return v.req.DstIP }
+func (v httpRequestView) PeerIP() string {
+	if v.req.Direction == "response" {
+		return v.req.DstIP
+	}
+	return v.req.SrcIP
+}
+func (v httpRequestView) SrcPort() int { return v.req.SrcPort }
+func (v httpRequestView) DstPort() int { return v.req.DstPort }
 
 // Header looks up a single header value by case-insensitive name within the
 // flattened header text the middleware passes in. Format expected: lines of
@@ -57,6 +61,6 @@ func (v httpRequestView) Header(name string) string {
 
 func (v httpRequestView) HeadersText() string  { return v.req.Headers }
 func (v httpRequestView) RawBytes() []byte     { return v.req.RawBytes }
-func (v httpRequestView) Flagged() bool        { return false }
-func (v httpRequestView) ContainsFlagID() bool { return false }
+func (v httpRequestView) Flagged() bool        { return v.req.Flagged }
+func (v httpRequestView) ContainsFlagID() bool { return v.req.ContainsFlagID }
 func (v httpRequestView) Dropped() bool        { return false }

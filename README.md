@@ -94,9 +94,12 @@ over TLS. `wss` uses the same TLS modes and certificate fields as `https`.
 `Backend uses TLS` independently controls whether Janus connects to the target
 using TLS, so both WS-to-WSS and WSS-to-WS deployments are supported.
 After the upgrade, Janus unmasks client frames, reassembles fragmented messages,
-and records text/binary messages up to 1 MiB in **Traffic** with method `WS`.
-The negotiated `permessage-deflate` extension is removed so text payloads remain
-inspectable; other WebSocket extensions are preserved.
+and exposes text/binary messages in clear form in **Traffic** with method `WS`.
+Rules can drop a client message before it reaches the backend; blocking
+PyFilters can drop or rewrite messages in either direction without closing the
+WebSocket session. Subprotocol negotiation is preserved, while WebSocket
+extensions are disabled because they can transform the application payload and
+bypass generic filtering. Messages larger than 1 MiB are dropped and audited.
 
 ## What Janus provides
 
@@ -106,7 +109,7 @@ inspectable; other WebSocket extensions are preserved.
   can create a selected set of rules for multiple services.
 - **PyFilters** — stateful Python scripts for detections that cannot be
   expressed in the DSL. Async scripts alert; blocking scripts can stop or
-  rewrite the current request (and TCP response). Start with
+  rewrite the current request (and TCP/WebSocket response). Start with
   [PYFILTERS_QUICKSTART.md](PYFILTERS_QUICKSTART.md).
 - **Protocols** — gRPC decoding from `.proto` files and editable custom binary
   decoders. Definitions support fixed, length-prefixed, computed-length, enum,

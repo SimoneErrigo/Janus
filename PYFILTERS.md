@@ -1,8 +1,10 @@
 # Python filters — reference
 
-A filter defines `match(flow)`. It runs on **every message**: each HTTP request/response,
-or each TCP chunk. Same API for HTTP and TCP — a missing field reads as `""` (never
-crashes). Module-level state persists across calls (use it to count / correlate).
+A filter defines `match(flow)`. It runs on **every message**: each HTTP
+request/response, each TCP chunk, or each complete WebSocket text/binary
+message. The same API works across HTTP, TCP, WS, and WSS — a missing field
+reads as `""` (never crashes). Module-level state persists across calls (use it
+to count / correlate).
 
 New to PyFilters? Start with [PYFILTERS_QUICKSTART.md](PYFILTERS_QUICKSTART.md).
 For fuller A/D recipes, use [PYFILTERS_EXAMPLES.md](PYFILTERS_EXAMPLES.md).
@@ -29,14 +31,14 @@ def match(flow):
 
 | filter kind | sees | can drop / rewrite the current message? |
 |---|---|---|
-| **Blocking** (inline) | TCP: requests + responses · HTTP: requests | TCP: both directions · HTTP: requests only |
-| **Async** (default) | everything (HTTP + TCP, both directions) | no — alert only (message already forwarded) |
+| **Blocking** (inline) | TCP/WS/WSS: requests + responses · HTTP: requests | TCP/WS/WSS: both directions · HTTP: requests only |
+| **Async** (default) | everything (HTTP + TCP + WS/WSS, both directions) | no — alert only (message already forwarded) |
 
-> Dropping/rewriting a **response** inline is available for **TCP** services today
+> Dropping/rewriting a **response** inline is available for **TCP and WebSocket** services today
 > (HTTP response bodies are still forwarded before filters run — a response-side
 > HTTP filter can only alert).
 
-## Read — HTTP & TCP
+## Read — HTTP, TCP & WebSocket
 
 | accessor | meaning |
 |---|---|
@@ -48,6 +50,21 @@ def match(flow):
 | `flow.json(default=None)` | parsed JSON body |
 | `flow.flagged` / `flow.contains_flagid` | a flag / a known flag-ID appears in this message |
 | `flow["x"]`, `flow.get("x")` | raw dict access still works |
+
+## WebSocket messages
+
+Janus invokes `match(flow)` once for each reassembled text or binary message,
+not once per frame. `flow.method == "WS"`, `flow.url` is the upgrade URL,
+`flow.protocol` is `ws` or `wss`, and
+`flow.headers["X-Janus-WebSocket-Opcode"]` is `text` or `binary`. Text is
+available through `flow.body`; exact text or binary bytes are available through
+`flow.content` / `flow.bytes`.
+
+A Blocking filter can drop or rewrite either direction. Dropping suppresses
+only the current message and leaves the WebSocket session alive. Janus preserves
+subprotocol negotiation but disables WebSocket extensions so transformed or
+compressed payloads cannot bypass filtering. Messages larger than 1 MiB are
+dropped before forwarding.
 
 ## Read — HTTP only
 
@@ -98,14 +115,14 @@ different arities — read by name or with `cmd.arg(i)` instead.
 ## Rewrite (Blocking filters only)
 
 ```python
-flow.body = flow.body.replace("foo", "bar")            # HTTP request body (str)
-flow.content = flow.content.replace(b"\x00", b"\xff")  # exact bytes (TCP, binary-safe)
+flow.body = flow.body.replace("foo", "bar")            # HTTP/WS text body (str)
+flow.content = flow.content.replace(b"\x00", b"\xff")  # exact bytes (TCP/WS, binary-safe)
 ```
 
 The rewritten content is forwarded only by an inline **Blocking** filter. For
-HTTP that means a request; for TCP it can be a request or a response. An async
-filter can return alerts but cannot modify traffic that has already been
-forwarded.
+HTTP that means a request; for TCP and WebSocket it can be a request or a
+response. An async filter can return alerts but cannot modify traffic that has
+already been forwarded.
 
 ## Test a filter before enabling it
 
@@ -180,6 +197,6 @@ def match(flow):
     return False
 ```
 
-More recipes — easy to advanced, HTTP and TCP — are in
+More recipes — easy to advanced, HTTP, TCP, and WebSocket — are in
 [PYFILTERS_EXAMPLES.md](PYFILTERS_EXAMPLES.md). The deliberately small first
 examples are in [PYFILTERS_QUICKSTART.md](PYFILTERS_QUICKSTART.md).

@@ -11,7 +11,7 @@ Empty expression matches everything. Keywords case-insensitive (`AND` = `and`).
 service == "minecclicker"
 service in ("web", "api", "auth")
 proto == "tcp"
-proto in ("http", "https", "h2")
+proto in ("http", "https", "ws", "wss", "h2")
 src == "10.10.0.1"
 src in (10.0.0.0/8)
 src in (10.0.0.0/8, 192.168.0.0/16)
@@ -88,6 +88,13 @@ id >= 5000                               # everything captured after #5000
 ```
 
 `id` is the packet's autoincrement number — the same `#` shown in the Traffic table and packet detail. Aliases: `packet_id`, `pkt`, `num`.
+
+For `ws` and `wss`, one packet is one complete text or binary WebSocket
+message, including messages received as multiple fragments. Its decoded,
+unmasked payload is available through `body` and `raw`, `method` is `WS`, and
+`header.X-Janus-WebSocket-Opcode` is `text` or `binary`. A drop rule acts on
+client-to-backend messages and discards only the current message; the WebSocket
+connection stays open.
 
 ---
 
@@ -176,6 +183,10 @@ url startswith "/admin" AND method != "GET"
 
 # Raw-byte payload pattern on TCP service → drop
 proto == "tcp" AND raw contains "\x00\x01\x02ATTACK"
+
+# WebSocket command → drop only this client message, keep the session alive
+method == "WS" AND header.X-Janus-WebSocket-Opcode == "text"
+  AND body contains '"command":"debug"'
 
 # Buffer-overflow-shaped body (long run of A's) → drop
 service == "minecclicker" AND raw contains "AAAAAAAAAAAAAAAAAAAAAAAA"
