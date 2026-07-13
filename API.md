@@ -109,7 +109,9 @@ presence indicator in the dashboard.
 }
 ```
 
-`protocol` is one of `http`, `https`, `h2`, `grpc`, or `tcp`. TLS fields are
+`protocol` is one of `http`, `https`, `ws`, `wss`, `h2`, `grpc`, or `tcp`.
+WebSocket services use `ws` for a cleartext listener and `wss` for a TLS
+listener. TLS fields are
 `tls_mode` (`selfsigned` or `challenge`), `cert_file`, `key_file`, and
 `target_tls`. A gRPC service can set `proto_paths`; a TCP service can set
 `protocol_id` to bind a custom decoder.

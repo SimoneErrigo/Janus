@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { api } from '../api'
 import ErrorBanner from '../components/ErrorBanner'
 
-const protocols = ['http', 'https', 'h2', 'grpc', 'tcp']
+const protocols = ['http', 'https', 'ws', 'wss', 'h2', 'grpc', 'tcp']
 const tlsModes = ['', 'selfsigned', 'challenge']
 
 const emptyService = {
@@ -241,7 +241,7 @@ function ServiceForm({ service, onSave, onCancel }) {
     setForm((f) => ({ ...f, [field]: value }))
   }
 
-  const needsTLS = ['https', 'h2', 'grpc'].includes(form.protocol)
+  const needsTLS = ['https', 'wss', 'h2', 'grpc'].includes(form.protocol)
   // gRPC is HTTP/2 with protobuf bodies; allow proto_paths for both since users
   // sometimes configure their service as `h2` even when carrying gRPC traffic.
   const supportsProtos = form.protocol === 'grpc' || form.protocol === 'h2'

@@ -1,6 +1,7 @@
 package sniffer
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
 	"io"
@@ -384,6 +385,22 @@ func (rc *responseCapture) Flush() {
 	if f, ok := rc.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack preserves protocol upgrades (notably WebSocket) through the capture
+// middleware. httputil.ReverseProxy must take ownership of the client
+// connection after the backend returns 101 Switching Protocols; hiding the
+// underlying http.Hijacker makes the upgrade fail with a 502.
+func (rc *responseCapture) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := rc.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, http.ErrNotSupported
+	}
+	if !rc.wroteHeader {
+		rc.statusCode = http.StatusSwitchingProtocols
+		rc.wroteHeader = true
+	}
+	return h.Hijack()
 }
 
 func flattenHeadersString(h http.Header) string {

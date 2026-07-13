@@ -103,14 +103,14 @@ func validateService(svc *storage.Service) error {
 	}
 
 	switch svc.Protocol {
-	case storage.ProtocolHTTP, storage.ProtocolHTTPS, storage.ProtocolHTTP2, storage.ProtocolGRPC, storage.ProtocolTCP:
+	case storage.ProtocolHTTP, storage.ProtocolHTTPS, storage.ProtocolWS, storage.ProtocolWSS, storage.ProtocolHTTP2, storage.ProtocolGRPC, storage.ProtocolTCP:
 		// valid
 	default:
-		return fmt.Errorf("protocol must be one of: http, https, h2, grpc, tcp")
+		return fmt.Errorf("protocol must be one of: http, https, ws, wss, h2, grpc, tcp")
 	}
 
 	// TLS validation also only matters if the proxy will actually start.
-	if svc.Enabled && (svc.Protocol == storage.ProtocolHTTPS || svc.Protocol == storage.ProtocolHTTP2 || svc.Protocol == storage.ProtocolGRPC) {
+	if svc.Enabled && (svc.Protocol == storage.ProtocolHTTPS || svc.Protocol == storage.ProtocolWSS || svc.Protocol == storage.ProtocolHTTP2 || svc.Protocol == storage.ProtocolGRPC) {
 		switch svc.TLSMode {
 		case storage.TLSModeSelfSigned, storage.TLSModeChallenge:
 			// valid

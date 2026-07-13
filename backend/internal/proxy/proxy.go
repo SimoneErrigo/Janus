@@ -458,9 +458,9 @@ func (m *Manager) attemptBind(rp *runningProxy) error {
 	var inner *runningProxy
 	var err error
 	switch rp.service.Protocol {
-	case storage.ProtocolHTTP:
+	case storage.ProtocolHTTP, storage.ProtocolWS:
 		inner, err = m.startHTTPProxy(ctx, cancel, rp.service)
-	case storage.ProtocolHTTPS, storage.ProtocolHTTP2, storage.ProtocolGRPC:
+	case storage.ProtocolHTTPS, storage.ProtocolWSS, storage.ProtocolHTTP2, storage.ProtocolGRPC:
 		inner, err = m.startTLSProxy(ctx, cancel, rp.service)
 	case storage.ProtocolTCP:
 		inner, err = m.startTCPProxy(ctx, cancel, rp.service)
@@ -505,13 +505,26 @@ func (m *Manager) retryLoop(rp *runningProxy) {
 }
 
 func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc, svc *storage.Service) (*runningProxy, error) {
-	targetURL, err := url.Parse("http://" + svc.TargetAddr)
+	targetScheme := "http"
+	if svc.TargetTLS {
+		targetScheme = "https"
+	}
+	targetURL, err := url.Parse(targetScheme + "://" + svc.TargetAddr)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("invalid target address: %w", err)
 	}
 
 	reverseProxy := httputil.NewSingleHostReverseProxy(targetURL)
+	if svc.TargetTLS {
+		// Challenge backends commonly use a self-signed certificate. This is
+		// also what lets a public ws listener connect to a private wss backend.
+		reverseProxy.Transport = &http.Transport{
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			TLSHandshakeTimeout: 10 * time.Second,
+			IdleConnTimeout:     90 * time.Second,
+		}
+	}
 	reverseProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		log.Printf("[%s] proxy error: %v", svc.Name, err)
 		w.WriteHeader(http.StatusBadGateway)
@@ -530,12 +543,7 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine, m.flagRegex, m.flagScanner, m.currentFlagIDChecker, m.shouldCapture, m.shouldApplyFlagIDsOnIngest, m.currentPyBlockFn())
 	}
 
-	server := &http.Server{
-		Handler:      handler,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
+	server := newProxyHTTPServer(handler, svc.Protocol)
 
 	rp := &runningProxy{
 		service:  svc,
@@ -626,18 +634,16 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 		return nil, fmt.Errorf("TLS listen on %s: %w", listenAddr, err)
 	}
 
-	server := &http.Server{
-		Handler:      handler,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
+	server := newProxyHTTPServer(handler, svc.Protocol)
 
-	// Enable HTTP/2 on the server
-	if err := http2.ConfigureServer(server, &http2.Server{}); err != nil {
-		cancel()
-		listener.Close()
-		return nil, fmt.Errorf("configuring HTTP/2: %w", err)
+	// A WSS listener deliberately advertises only HTTP/1.1: WebSocket uses the
+	// RFC 6455 Upgrade handshake, not HTTP/2 extended CONNECT.
+	if svc.Protocol != storage.ProtocolWSS {
+		if err := http2.ConfigureServer(server, &http2.Server{}); err != nil {
+			cancel()
+			listener.Close()
+			return nil, fmt.Errorf("configuring HTTP/2: %w", err)
+		}
 	}
 
 	rp := &runningProxy{
@@ -659,4 +665,23 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 	}()
 
 	return rp, nil
+}
+
+// newProxyHTTPServer keeps the normal defensive HTTP timeouts while allowing
+// WebSocket connections to remain open. Once a request is upgraded, net/http
+// hands the underlying connection to ReverseProxy; a ReadTimeout/WriteTimeout
+// would otherwise terminate a healthy WS/WSS tunnel after 30 seconds.
+func newProxyHTTPServer(handler http.Handler, protocol storage.Protocol) *http.Server {
+	server := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if protocol == storage.ProtocolWS || protocol == storage.ProtocolWSS {
+		server.ReadTimeout = 0
+		server.WriteTimeout = 0
+	}
+	return server
 }

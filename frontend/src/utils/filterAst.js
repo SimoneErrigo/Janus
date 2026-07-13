@@ -36,7 +36,7 @@ export const FIELD_GROUPS = [
     label: 'Network',
     fields: [
       { name: 'service', type: 'string', desc: 'Service ID' },
-      { name: 'proto',   type: 'string', desc: 'http | https | h2 | grpc | tcp' },
+      { name: 'proto',   type: 'string', desc: 'http | https | ws | wss | h2 | grpc | tcp' },
       { name: 'src',     type: 'string', desc: 'Source IP (CIDR ok)' },
       { name: 'dst',     type: 'string', desc: 'Destination IP (CIDR ok)' },
       { name: 'peer',    type: 'string', desc: 'Direction-aware peer IP' },

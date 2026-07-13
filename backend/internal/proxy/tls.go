@@ -18,14 +18,29 @@ import (
 
 // buildTLSConfig creates a tls.Config based on the service TLS mode.
 func buildTLSConfig(svc *storage.Service) (*tls.Config, error) {
+	var (
+		cfg *tls.Config
+		err error
+	)
 	switch svc.TLSMode {
 	case storage.TLSModeSelfSigned:
-		return selfSignedTLSConfig(svc.ListenAddr)
+		cfg, err = selfSignedTLSConfig(svc.ListenAddr)
 	case storage.TLSModeChallenge:
-		return challengeTLSConfig(svc.CertFile, svc.KeyFile)
+		cfg, err = challengeTLSConfig(svc.CertFile, svc.KeyFile)
 	default:
 		return nil, fmt.Errorf("unsupported TLS mode: %q", svc.TLSMode)
 	}
+	if err != nil {
+		return nil, err
+	}
+
+	// RFC 6455 WebSocket upgrades use HTTP/1.1. Advertising h2 for a WSS-only
+	// listener can make a browser negotiate HTTP/2, where the classic Upgrade
+	// handshake is unavailable (extended CONNECT is a separate protocol).
+	if svc.Protocol == storage.ProtocolWSS {
+		cfg.NextProtos = []string{"http/1.1"}
+	}
+	return cfg, nil
 }
 
 // selfSignedTLSConfig generates a self-signed certificate for the given address.

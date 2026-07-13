@@ -9,8 +9,8 @@ without changing the checker-facing endpoint.
 checker / opponents -> Janus (original service port) -> service (new local port)
 ```
 
-It supports HTTP/1.1, HTTPS/TLS, HTTP/2, gRPC, and raw TCP. Traffic can be
-decoded with `.proto` files or custom binary protocol definitions.
+It supports HTTP/1.1, HTTPS/TLS, WebSocket (WS/WSS), HTTP/2, gRPC, and raw TCP.
+Traffic can be decoded with `.proto` files or custom binary protocol definitions.
 
 ## Documentation
 
@@ -88,6 +88,11 @@ In **Services**, add the checker-facing listener and its new backend address.
 Janus generates the service ID when it is omitted. Enable the service to start
 its listener immediately. The page also shows bind failures and can retry a
 listener after the target service is rebuilt.
+
+For a WebSocket service choose `ws`, or `wss` when clients connect to Janus
+over TLS. `wss` uses the same TLS modes and certificate fields as `https`.
+`Backend uses TLS` independently controls whether Janus connects to the target
+using TLS, so both WS-to-WSS and WSS-to-WS deployments are supported.
 
 ## What Janus provides
 
