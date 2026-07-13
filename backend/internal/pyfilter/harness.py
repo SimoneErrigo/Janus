@@ -6,7 +6,7 @@ User scripts each define:
     def match(flow):
         # `flow` is still a dict (flow["body"], flow.get(...) work), plus a
         # forgiving, quick-to-write API — a missing field reads as "" (never
-        # crashes). Works for HTTP and TCP, in every mode.
+        # crashes). Works for HTTP, TCP, and WebSocket, in every mode.
         #
         #   flow.method / url / path / status / service / direction
         #   flow.is_request / flow.is_response
@@ -42,7 +42,8 @@ User scripts each define:
         # flow.is_request / flow.is_response (or flow.direction) to tell them
         # apart, or set a module-level DIRECTION = "request" | "response" to have
         # Janus skip the other side for you. A Blocking filter can drop or
-        # rewrite either a request or a response in real time.
+        # rewrite either a request or a response in real time for TCP and
+        # WebSocket; HTTP supports requests inline.
         #
         # return one of:
         #   False / None            -> no match
@@ -51,13 +52,15 @@ User scripts each define:
         #   {"match": True, "reason": "...", "drop": True}   (or "block": True)
         #       -> match; drops the CURRENT message in real time (inline): a
         #          request is blocked before it reaches the backend, a response
-        #          before it reaches the client (the connection is closed). Only
+        #          before it reaches the client. TCP closes the connection;
+        #          WebSocket drops only the current message and stays open. Only
         #          takes effect for scripts marked "Blocking", which run
         #          synchronously on the proxy hot path. Any truthy "drop" value
         #          works, so {"drop": "some reason"} blocks too.
         #
-        # Inline REWRITE (Blocking filters only): assign flow.body = "..." (HTTP)
-        # or flow.content = b"..." (TCP) to rewrite the current message before
+        # Inline REWRITE (Blocking filters only): assign flow.body = "..."
+        # (HTTP / WebSocket text) or flow.content = b"..." (TCP / WebSocket)
+        # to rewrite the current message before
         # Janus forwards it — works on requests and responses (e.g. redact a
         # flag from a response). Applies whether or not you also return a match;
         # ignored for non-Blocking (async) filters.
@@ -133,7 +136,7 @@ SCRIPTS = {}
 
 # --- ergonomic flow object -------------------------------------------------
 # match(flow) receives a Flow: still a plain dict (flow["body"], flow.get(...)
-# keep working), plus forgiving attribute access + HTTP/TCP helpers so filters
+# keep working), plus forgiving attribute access + HTTP/TCP/WebSocket helpers so filters
 # are quick to write and never crash on a missing field.
 
 _HISTORY = {}        # service -> deque[Flow] of recently evaluated messages
@@ -264,7 +267,7 @@ def _parse_cookies(raw):
 
 class Flow(dict):
     """Ergonomic wrapper around the raw flow dict (still a dict, backward
-    compatible). Adds forgiving attribute access + HTTP/TCP helpers."""
+    compatible). Adds forgiving attribute access + HTTP/TCP/WebSocket helpers."""
 
     # -- core fields (forgiving: missing -> "" / 0) --
     @property
@@ -337,8 +340,8 @@ class Flow(dict):
 
     @property
     def content(self):
-        # Exact bytes (mutated value if rewritten, else base64 payload for TCP,
-        # else utf-8 of the text body).
+        # Exact bytes (mutated value if rewritten, else base64 payload for TCP
+        # or WebSocket, else utf-8 of the text body).
         nb = self.get("__new_bytes")
         if nb is not None:
             return nb

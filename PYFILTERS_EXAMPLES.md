@@ -1,7 +1,7 @@
 # Python filters — advanced examples
 
 Worked `match(flow)` filters, from one-liners to stateful attack detectors, for
-HTTP and TCP services. Most are modelled on **real A/D vulnerabilities**, and each
+HTTP, TCP, and WebSocket services. Most are modelled on **real A/D vulnerabilities**, and each
 is written **ad-hoc so it drops the exploit without ever matching the checker's
 normal traffic** — the note under each one says exactly why the checker slips
 through. For the full API see [PYFILTERS.md](PYFILTERS.md).
@@ -13,7 +13,7 @@ against a captured packet or a whole flow before enabling it.
 
 Tags: **Alert** returns a reason string (works on any filter). **Blocking** drops
 or rewrites the current message and needs the *Blocking* checkbox (inline on TCP
-requests + responses, and HTTP requests).
+and WebSocket requests + responses, and HTTP requests).
 
 Return values: `False`/`None` ignore · `"reason"` alert · `{"drop": True, "reason": …}`
 drop now · assign `flow.body` / `flow.content` rewrite. `DIRECTION = "request"`/`"response"`

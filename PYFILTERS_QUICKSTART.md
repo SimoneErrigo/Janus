@@ -29,7 +29,7 @@ raising an exception.
 | Type | What it does | Can it change live traffic? |
 | --- | --- | --- |
 | Async (default) | Evaluates after capture and creates alerts. | No. The message has already been forwarded. |
-| Blocking | Evaluates synchronously on the proxy path. | Yes. HTTP requests, plus TCP requests and responses, can be dropped or rewritten. |
+| Blocking | Evaluates synchronously on the proxy path. | Yes. HTTP requests, plus TCP and WebSocket requests and responses, can be dropped or rewritten. |
 
 For every message, use `flow.is_request` or `flow.is_response`. A module-level
 `DIRECTION = "request"` or `DIRECTION = "response"` saves Janus from invoking a
@@ -140,6 +140,10 @@ def match(flow):
 For multi-line commands use `flow.commands(...)`; for data that belongs to one
 TCP connection use `flow.conn`. Both are covered in the
 [full reference](PYFILTERS.md#tcp-streams-a-continuous-byte-flow-not-one-message-per-chunk).
+
+For WebSocket services, Janus calls the filter once per complete, decoded text
+or binary message. A Blocking drop removes only that message and keeps the
+session open; `flow.body` and `flow.content` rewrites work in both directions.
 
 ## Return values at a glance
 
