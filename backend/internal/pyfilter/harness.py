@@ -13,9 +13,14 @@ User scripts each define:
         #   flow.headers["Cookie"]          # case-insensitive, missing -> ""
         #   flow.query["id"]  flow.cookies["session"]   # forgiving dicts
         #   flow.body (str)   flow.bytes    flow.json()  # parsed body or None
+        #   flow.body_complete  flow.truncated           # safe body visibility
         #   flow.request / flow.response    # correlated sides (never None)
-        #   flow.messages[-1]               # most recent message (this service)
+        #   flow.messages[-1]               # recent messages (this connection)
         #   flow.recent(3)  flow.last_request  flow.requests  flow.responses
+        #   flow.size  flow.flags.count / known_count / body_count
+        #   flow.connection.age_ms / idle_ms / flags_in / flags_out
+        #   flow.connection.rate_in(2)  flow.connection.fingerprint()
+        #   flow.state.count("login", key=user, window=10)  # bounded state
         #
         # Payload analysis — `util` (injected into every filter), stdlib-only:
         #   util.is_base64(s)  util.valid_json(s)  util.extra_keys(obj, allowed)
@@ -27,9 +32,10 @@ User scripts each define:
         #   util.text_layers(b)  util.scan(b, patterns)  util.strings(b)
         #
         # TCP streams (a continuous byte flow, not one-message-per-chunk):
-        #   flow.conn                       # dict persisting for the whole TCP
+        #   flow.state                      # bounded dict persisting for this
         #                                   #   connection — your per-conn state,
         #                                   #   private to this filter
+        #   flow.conn                       # backward-compatible alias
         #   for line in flow.lines:         # complete lines, reassembled across
         #       ...                         #   chunks by Janus (bytes, exact)
         #   for cmd in flow.commands(       # parse a line-based CLI into commands
@@ -41,9 +47,12 @@ User scripts each define:
         # NOTE: match(flow) runs once per message, on BOTH directions. Use
         # flow.is_request / flow.is_response (or flow.direction) to tell them
         # apart, or set a module-level DIRECTION = "request" | "response" to have
-        # Janus skip the other side for you. A Blocking filter can drop or
-        # rewrite either a request or a response in real time for TCP and
-        # WebSocket; HTTP supports requests inline.
+        # Janus skip the other side for you. An Inline filter can drop or
+        # rewrite either side in real time. Ordinary HTTP/1 responses up to
+        # 1 MiB are enforceable; streamed, HTTP/2, and gRPC responses remain
+        # Observe-only. Unknown-length/chunked request bodies are forwarded as
+        # streams: inspect metadata inline and require flow.body_complete before
+        # a body-based decision or rewrite.
         #
         # return one of:
         #   False / None            -> no match
@@ -54,16 +63,19 @@ User scripts each define:
         #          request is blocked before it reaches the backend, a response
         #          before it reaches the client. TCP closes the connection;
         #          WebSocket drops only the current message and stays open. Only
-        #          takes effect for scripts marked "Blocking", which run
+        #          takes effect for scripts marked "Inline", which run
         #          synchronously on the proxy hot path. Any truthy "drop" value
         #          works, so {"drop": "some reason"} blocks too.
+        #   flow.alert("reason") / flow.drop("reason") / flow.close("reason")
+        #   flow.rewrite(new_content, "reason")
+        #       flow.close() also tears down the HTTP/TCP/WebSocket connection.
         #
-        # Inline REWRITE (Blocking filters only): assign flow.body = "..."
+        # Inline REWRITE (Inline filters only): assign flow.body = "..."
         # (HTTP / WebSocket text) or flow.content = b"..." (TCP / WebSocket)
         # to rewrite the current message before
         # Janus forwards it — works on requests and responses (e.g. redact a
         # flag from a response). Applies whether or not you also return a match;
-        # ignored for non-Blocking (async) filters.
+        # ignored for Observe (async) filters.
         return False
 
 Module-level state persists across calls, so a script can count things over
@@ -74,17 +86,19 @@ Protocol (one JSON object per line):
   -> {"cmd":"load","ok":bool,"errors":{id:msg}}
   <- {"cmd":"eval","id":N,"packet":{...}}
   -> {"id":N,"matches":[{"script","name","reason","error"}...]}
-  <- {"cmd":"test","id":N,"script":{...},"packet":{...}}
-  -> {"id":N,"matches":[...]}  or  {"id":N,"error":"..."}
   <- {"cmd":"ping"} -> {"pong":true}
 """
 import sys
 import json
 import base64
+import hashlib
 import math
 import posixpath
 import re
 import traceback
+import io
+import time
+from contextlib import redirect_stdout, redirect_stderr
 from collections import deque, OrderedDict, Counter
 from urllib.parse import urlsplit, parse_qs, unquote
 
@@ -139,23 +153,37 @@ SCRIPTS = {}
 # keep working), plus forgiving attribute access + HTTP/TCP/WebSocket helpers so filters
 # are quick to write and never crash on a missing field.
 
-_HISTORY = {}        # service -> deque[Flow] of recently evaluated messages
 _HISTORY_MAX = 32
+_HISTORY_TOTAL_MAX = 2048
+_HISTORY_BODY_MAX = 1 << 14
+_HISTORY_ORDER = deque()
 
-# Per-TCP-connection scratch, persisting across every chunk of a connection
-# (both directions):
+# Per-connection/session scratch for every supported protocol (both directions):
 #   "linebuf"  — internal line-reassembly buffer, shared (it's the raw byte
 #                stream, identical for every script)
 #   "state"    — flow.conn, namespaced per script id so two filters can use the
 #                same key name without clobbering each other
 #   "cmdstate" — internal flow.commands() pending state, per script id
-_CONNS = OrderedDict()   # conn_key -> {"linebuf": {}, "state": {sid: {}}, "cmdstate": {sid: {}}}
+_CONNS = OrderedDict()   # conn_key -> bounded connection state/history
 _CONNS_MAX = 4096
+_CONNS_TTL = 300.0
 _LINEBUF_MAX = 1 << 16   # cap a single unterminated line
+_STATE_KEYS_MAX = 256
+_STATE_BUCKETS_MAX = 128
+_STATE_EVENTS_MAX = 256
 
 
 def _conn_key(flow):
     # Direction-independent: request and response of the same connection share it.
+    explicit = flow.get("connection_id")
+    if explicit:
+        return str(explicit)
+    supplied = flow.get("connection")
+    if isinstance(supplied, dict) and supplied.get("id"):
+        return str(supplied["id"])
+    session = flow.get("session")
+    if session:
+        return "%s/session/%s" % (flow.get("service") or "", session)
     svc = flow.get("service") or ""
     a = (flow.get("src") or "", flow.get("sport") or 0)
     b = (flow.get("dst") or "", flow.get("dport") or 0)
@@ -165,13 +193,24 @@ def _conn_key(flow):
 
 def _conn_record(flow):
     k = _conn_key(flow)
+    now = time.monotonic()
+    cutoff = now - _CONNS_TTL
+    while _CONNS:
+        _, oldest = next(iter(_CONNS.items()))
+        if oldest.get("last_seen", now) >= cutoff:
+            break
+        _CONNS.popitem(last=False)
     rec = _CONNS.get(k)
     if rec is None:
-        rec = {"linebuf": {}, "state": {}, "cmdstate": {}}
+        rec = {
+            "linebuf": {}, "state": OrderedDict(), "cmdstate": OrderedDict(),
+            "history": deque(maxlen=_HISTORY_MAX), "last_seen": now,
+        }
         _CONNS[k] = rec
         if len(_CONNS) > _CONNS_MAX:
             _CONNS.popitem(last=False)   # evict the oldest connection
     else:
+        rec["last_seen"] = now
         _CONNS.move_to_end(k)
     return rec
 
@@ -265,6 +304,255 @@ def _parse_cookies(raw):
     return out
 
 
+class _ReadOnlyView:
+    """Tiny mapping/attribute view used for Janus-owned metadata."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data):
+        object.__setattr__(self, "_data", data or {})
+
+    def __getitem__(self, key):
+        return self._data.get(key, 0)
+
+    def __getattr__(self, key):
+        return self._data.get(key, 0)
+
+    def __setattr__(self, key, value):
+        raise AttributeError("Janus connection metadata is read-only")
+
+    def get(self, key, default=0):
+        return self._data.get(key, default)
+
+    def keys(self):
+        return self._data.keys()
+
+    def items(self):
+        return self._data.items()
+
+    def __repr__(self):
+        return repr(self._data)
+
+
+class _Flags(_ReadOnlyView):
+    def __getitem__(self, key):
+        return self.matched_ids if key == "matched_ids" else super().__getitem__(key)
+
+    @property
+    def matched_ids(self):
+        return tuple(self._data.get("matched_ids") or ())
+
+
+class _Connection(_ReadOnlyView):
+    def __getitem__(self, key):
+        if key == "recent":
+            return self.recent
+        if key == "current":
+            return self.current
+        return super().__getitem__(key)
+
+    @property
+    def current(self):
+        return _ReadOnlyView(self._data.get("current") or {})
+
+    @property
+    def recent(self):
+        return tuple(_ReadOnlyView(item) for item in (self._data.get("recent") or ()))
+
+    def fingerprint(self):
+        """Stable shape signature of recent + current metadata (never payload)."""
+        shapes = list(self._data.get("recent") or ())
+        current = self._data.get("current")
+        if current:
+            shapes.append(current)
+        raw = json.dumps(shapes, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    def _rate(self, key, seconds):
+        try:
+            seconds = max(0.001, min(float(seconds), _CONNS_TTL))
+        except Exception:
+            seconds = 2.0
+        try:
+            now = float(self._data.get("now") or time.time())
+        except Exception:
+            now = time.time()
+        cutoff = now - seconds
+        samples = self._data.get(key) or ()
+        return sum(1 for stamp in samples if float(stamp) >= cutoff) / seconds
+
+    def rate_in(self, seconds=2):
+        """Admitted request messages per second over the selected window."""
+        return self._rate("request_times", seconds)
+
+    def rate_out(self, seconds=2):
+        """Admitted response messages per second over the selected window."""
+        return self._rate("response_times", seconds)
+
+
+class _StateStats:
+    __slots__ = ("count", "mean", "median", "mad", "p95", "min", "max")
+
+    def __init__(self, values):
+        ordered = sorted(values)
+        self.count = len(ordered)
+        if not ordered:
+            self.mean = self.median = self.mad = self.p95 = self.min = self.max = 0.0
+            return
+        self.mean = sum(ordered) / len(ordered)
+        mid = len(ordered) // 2
+        self.median = (ordered[mid] if len(ordered) % 2 else
+                       (ordered[mid - 1] + ordered[mid]) / 2.0)
+        deviations = sorted(abs(value - self.median) for value in ordered)
+        dmid = len(deviations) // 2
+        self.mad = (deviations[dmid] if len(deviations) % 2 else
+                    (deviations[dmid - 1] + deviations[dmid]) / 2.0)
+        self.p95 = ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
+        self.min, self.max = ordered[0], ordered[-1]
+
+    def __repr__(self):
+        return "Stats(count=%d, mean=%.3f, median=%.3f, mad=%.3f, p95=%.3f)" % (
+            self.count, self.mean, self.median, self.mad, self.p95)
+
+
+def _state_token(value):
+    try:
+        token = repr(value)
+    except Exception:
+        token = "?"
+    return token[:256]
+
+
+def _bounded_window(value, default):
+    try:
+        return max(0.001, min(float(value), 86400.0))
+    except Exception:
+        return float(default)
+
+
+class _State(dict):
+    """Bounded per-(connection, filter) scratch mapping plus time-window helpers."""
+
+    def __init__(self):
+        super().__init__()
+        self._order = OrderedDict()
+        self._events = OrderedDict()
+        self._now = 0.0
+
+    def _touch(self, flow):
+        try:
+            stamp = float(flow.get("timestamp") or time.time())
+        except Exception:
+            stamp = time.time()
+        self._now = max(self._now, stamp)
+        return self
+
+    def __setitem__(self, key, value):
+        if key not in self and len(self) >= _STATE_KEYS_MAX:
+            oldest, _ = self._order.popitem(last=False)
+            dict.__delitem__(self, oldest)
+        dict.__setitem__(self, key, value)
+        self._order.pop(key, None)
+        self._order[key] = None
+
+    def __delitem__(self, key):
+        dict.__delitem__(self, key)
+        self._order.pop(key, None)
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def clear(self):
+        dict.clear(self)
+        self._order.clear()
+        self._events.clear()
+
+    def pop(self, key, *default):
+        if key not in self:
+            if default:
+                return default[0]
+            raise KeyError(key)
+        value = dict.pop(self, key)
+        self._order.pop(key, None)
+        return value
+
+    def popitem(self):
+        if not self:
+            raise KeyError("popitem(): dictionary is empty")
+        key, _ = self._order.popitem(last=True)
+        return key, dict.pop(self, key)
+
+    def update(self, *args, **kwargs):
+        for key, value in dict(*args, **kwargs).items():
+            self[key] = value
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+    def _bucket(self, kind, name, key=""):
+        bucket_key = (kind, _state_token(name), _state_token(key))
+        bucket = self._events.get(bucket_key)
+        if bucket is None:
+            if len(self._events) >= _STATE_BUCKETS_MAX:
+                self._events.popitem(last=False)
+            bucket = deque(maxlen=_STATE_EVENTS_MAX)
+            self._events[bucket_key] = bucket
+        else:
+            self._events.move_to_end(bucket_key)
+        return bucket
+
+    @staticmethod
+    def _prune(bucket, cutoff):
+        while bucket and bucket[0][0] < cutoff:
+            bucket.popleft()
+
+    def count(self, name, key="", window=10, amount=1):
+        """Record an event and return its weighted count inside the window."""
+        window = _bounded_window(window, 10)
+        try:
+            amount = float(amount)
+        except Exception:
+            amount = 1.0
+        bucket = self._bucket("count", name, key)
+        self._prune(bucket, self._now - window)
+        bucket.append((self._now, amount))
+        total = sum(value for _, value in bucket)
+        return int(total) if total.is_integer() else total
+
+    def seen(self, name, value="", ttl=300):
+        """Return whether value was recently seen, then remember it."""
+        ttl = _bounded_window(ttl, 300)
+        bucket = self._bucket("seen", name, value)
+        self._prune(bucket, self._now - ttl)
+        existed = bool(bucket)
+        bucket.append((self._now, 1))
+        return existed
+
+    def distinct(self, name, value, key="", window=60):
+        """Record value and return the number of distinct recent values."""
+        window = _bounded_window(window, 60)
+        bucket = self._bucket("distinct", name, key)
+        self._prune(bucket, self._now - window)
+        bucket.append((self._now, _state_token(value)))
+        return len({item for _, item in bucket})
+
+    def observe(self, name, value, key="", window=60):
+        """Record a number and return deterministic rolling statistics."""
+        window = _bounded_window(window, 60)
+        bucket = self._bucket("observe", name, key)
+        self._prune(bucket, self._now - window)
+        try:
+            number = float(value)
+        except Exception:
+            number = 0.0
+        if math.isfinite(number):
+            bucket.append((self._now, number))
+        return _StateStats([item for _, item in bucket])
+
+
 class Flow(dict):
     """Ergonomic wrapper around the raw flow dict (still a dict, backward
     compatible). Adds forgiving attribute access + HTTP/TCP/WebSocket helpers."""
@@ -285,6 +573,14 @@ class Flow(dict):
     @property
     def service(self):
         return self.get("service", "") or ""
+
+    @property
+    def session(self):
+        return self.get("session", "") or ""
+
+    @property
+    def protocol(self):
+        return self.get("protocol", "") or ""
 
     @property
     def direction(self):
@@ -315,6 +611,20 @@ class Flow(dict):
         return bool(self.get("contains_flagid"))
 
     @property
+    def size(self):
+        if "__new_bytes" in self:
+            return len(self.content)
+        return int(self.get("size", len(self.content)) or 0)
+
+    @property
+    def flags(self):
+        return _Flags(self.get("flags") or {})
+
+    @property
+    def connection(self):
+        return _Connection(self.get("connection") or {"id": _conn_key(self)})
+
+    @property
     def is_request(self):
         return self.direction == "request"
 
@@ -330,7 +640,7 @@ class Flow(dict):
 
     @body.setter
     def body(self, value):
-        # Rewrite the current message's body (inline/Blocking filters only).
+        # Rewrite the current message's body (Inline filters only).
         if isinstance(value, (bytes, bytearray)):
             self.content = bytes(value)
         else:
@@ -370,6 +680,20 @@ class Flow(dict):
         except Exception:
             return default
 
+    def alert(self, reason=""):
+        return {"match": True, "reason": str(reason)}
+
+    def drop(self, reason=""):
+        return {"match": True, "drop": True, "reason": str(reason)}
+
+    def close(self, reason=""):
+        # Ask Janus to reject the message and tear down its live connection.
+        return {"match": True, "drop": True, "close": True, "reason": str(reason)}
+
+    def rewrite(self, content, reason=""):
+        self.content = content
+        return {"match": bool(reason), "reason": str(reason)} if reason else False
+
     # -- headers / url parts (all forgiving) --
     @property
     def headers(self):
@@ -392,11 +716,17 @@ class Flow(dict):
     def cookies(self):
         return _parse_cookies(self.headers.get("cookie", ""))
 
-    # -- history / recency (per service, most-recent last) --
+    # -- history / recency (per connection, most-recent last) --
     @property
     def messages(self):
-        dq = _HISTORY.get(self.service)
-        return list(dq) if dq else [self]
+        dq = _conn_record(self)["history"]
+        if not dq:
+            return [self]
+        messages = list(dq)
+        # The current item stays live/settable (so messages[-1].content can
+        # rewrite inline); only older entries are bounded snapshots.
+        messages[-1] = self
+        return messages
 
     def recent(self, n=3):
         msgs = self.messages
@@ -438,16 +768,30 @@ class Flow(dict):
         # Namespacing by script id means two filters can use the same conn key
         # name without stepping on each other.
         sid = self.get("__sid") or ""
-        return _conn_record(self)[bucket].setdefault(sid, {})
+        namespaces = _conn_record(self)[bucket]
+        state = namespaces.get(sid)
+        if state is None:
+            if len(namespaces) >= _STATE_BUCKETS_MAX:
+                namespaces.popitem(last=False)
+            state = _State()
+            namespaces[sid] = state
+        else:
+            namespaces.move_to_end(sid)
+        return state._touch(self)
+
+    @property
+    def state(self):
+        """Bounded scratch state private to this connection and filter."""
+        return self._conn_ns("state")
 
     @property
     def conn(self):
-        """A dict that persists across every message of THIS TCP connection
-        (both directions, keyed by service + endpoints). Use it for per-
+        """A dict that persists across every message of THIS connection/session
+        (both directions, keyed by the canonical Janus session). Use it for per-
         connection state instead of a global keyed by src/port. Each filter
         gets its own namespace, so your keys never collide with another
         filter's."""
-        return self._conn_ns("state")
+        return self.state
 
     @property
     def lines(self):
@@ -510,16 +854,18 @@ class Flow(dict):
         flagid = bool(self.contains_flagid)
         out = []
         for line in self.lines:
-            line = line.strip()
-            if not line:
-                continue
             if cur is not None:                 # collecting a pending command's args
-                cur["args"].append(line)
+                # Empty lines are valid protocol arguments. Previously they were
+                # skipped, shifting every following field in the command.
+                cur["args"].append(line.strip())
                 cur["flag"] = cur["flag"] or flagid
                 if len(cur["args"]) >= cur["need"]:
                     out.append(Command(cur["name"], cur["args"], cur["flag"], cur["names"]))
                     cur = None
             else:
+                line = line.strip()
+                if not line:
+                    continue
                 hit = table.get(line)
                 if hit is not None:             # a trigger line -> start a command
                     name, need, names = hit
@@ -547,13 +893,35 @@ _EMPTY = Flow()
 
 
 def _record(flow):
-    """Append the flow to its service's bounded recent-history deque."""
-    svc = flow.get("service") or ""
-    dq = _HISTORY.get(svc)
-    if dq is None:
-        dq = deque(maxlen=_HISTORY_MAX)
-        _HISTORY[svc] = dq
-    dq.append(flow)
+    """Append to this connection's bounded history, never another client's."""
+    # Keep correlation useful without retaining every full upload/file body for
+    # every connection. Counters/fingerprints are complete Go metadata; history
+    # is a globally bounded inspection prefix.
+    content = flow.content
+    prefix = content[:_HISTORY_BODY_MAX]
+    # Large decoded trees and connection snapshots are derivable from the live
+    # message and would otherwise multiply memory across history entries.
+    snapshot = Flow({k: v for k, v in flow.items()
+                     if not str(k).startswith("__") and
+                     k not in ("body", "body_b64", "decoded", "connection")})
+    snapshot["body"] = prefix.decode("utf-8", "replace")
+    snapshot["body_b64"] = base64.b64encode(prefix).decode("ascii")
+    if len(content) > len(prefix):
+        snapshot["history_truncated"] = True
+    rec = _conn_record(flow)
+    rec["history"].append(snapshot)
+    _HISTORY_ORDER.append((_conn_key(flow), snapshot))
+    while len(_HISTORY_ORDER) > _HISTORY_TOTAL_MAX:
+        old_key, old_snapshot = _HISTORY_ORDER.popleft()
+        old_rec = _CONNS.get(old_key)
+        if old_rec is None:
+            continue
+        history = old_rec.get("history")
+        if history:
+            for index, item in enumerate(history):
+                if item is old_snapshot:
+                    del history[index]
+                    break
 
 
 def _rewrite_of(flow):
@@ -624,9 +992,6 @@ def _as_text(x):
 
 import zlib
 import zipfile
-import io
-
-
 def _strings(data, min_len=4):
     """Printable-ASCII runs of length >= min_len (like the `strings` command)."""
     d = _as_bytes(data)
@@ -1600,6 +1965,27 @@ class _Util:
 util = _Util()
 
 
+class _TailWriter:
+    """File-like last-N-character buffer; print() can never grow worker memory."""
+
+    __slots__ = ("cap", "tail")
+
+    def __init__(self, cap=4096):
+        self.cap, self.tail = max(0, int(cap)), ""
+
+    def write(self, value):
+        text = str(value)
+        if self.cap:
+            self.tail = (self.tail + text)[-self.cap:]
+        return len(text)
+
+    def flush(self):
+        return None
+
+    def getvalue(self):
+        return self.tail
+
+
 def _compile_scripts(scripts):
     """Compile+exec each script into its own namespace. Returns (loaded, errors)."""
     loaded = {}
@@ -1610,7 +1996,8 @@ def _compile_scripts(scripts):
         ns = {"util": util}
         try:
             code = compile(spec.get("code", ""), "<pyfilter:%s>" % name, "exec")
-            exec(code, ns)  # noqa: S102 - intentional user code execution
+            with redirect_stdout(_TailWriter(0)), redirect_stderr(_TailWriter(0)):
+                exec(code, ns)  # noqa: S102 - intentional user code execution
             fn = ns.get("match")
             if not callable(fn):
                 errors[sid] = "script must define a top-level match(flow) function"
@@ -1618,31 +2005,54 @@ def _compile_scripts(scripts):
             # Optional module-level DIRECTION = "request" | "response" lets a
             # script declare which side it cares about; Janus then skips the
             # other direction instead of the script guarding it every call.
-            loaded[sid] = {"name": name, "fn": fn, "direction": _norm_direction(ns.get("DIRECTION"))}
+            loaded[sid] = {
+                "name": name, "fn": fn, "direction": _norm_direction(ns.get("DIRECTION")),
+                "version": hashlib.sha256(spec.get("code", "").encode("utf-8")).hexdigest(),
+                "service_ids": spec.get("service_ids") or ["*"],
+                "directions": [str(v).lower() for v in (spec.get("directions") or [])],
+                "protocols": [str(v).lower() for v in (spec.get("protocols") or [])],
+            }
         except Exception:
             errors[sid] = _short_traceback()
     return loaded, errors
 
 
+def _reset_changed_script_state(previous, current):
+    """Drop only removed/updated filters' per-connection scratch namespaces."""
+    changed = {sid for sid, old in previous.items()
+               if sid not in current or old.get("version") != current[sid].get("version")}
+    if not changed:
+        return
+    for rec in _CONNS.values():
+        for bucket_name in ("state", "cmdstate"):
+            bucket = rec[bucket_name]
+            for sid in changed:
+                bucket.pop(sid, None)
+
+
 def _normalize(res):
-    """Turn a match() return value into {"reason","block"}, or None."""
+    """Turn a match() return value into a small action object, or None."""
     if res is None or res is False:
         return None
     if res is True:
-        return {"reason": "", "block": False}
+        return {"reason": "", "block": False, "close": False}
     if isinstance(res, str):
-        return {"reason": res, "block": False}
+        return {"reason": res[-4096:], "block": False, "close": False}
     if isinstance(res, dict):
         # "drop" and "block" are synonyms: both ask Janus to drop the CURRENT
-        # message inline (honored only for Blocking filters). Any truthy value
+        # message inline (honored only for Inline filters). Any truthy value
         # counts, so {"drop": True} and {"drop": "reason text"} both block.
-        block = bool(res.get("drop")) or bool(res.get("block"))
+        close = bool(res.get("close"))
+        block = bool(res.get("drop")) or bool(res.get("block")) or close
         # A drop/block directive implies a match even without an explicit "match".
         if res.get("match") or block:
-            return {"reason": str(res.get("reason", "")), "block": block}
+            reason = res.get("reason", "")
+            if not reason and isinstance(res.get("drop"), str):
+                reason = res["drop"]
+            return {"reason": str(reason)[-4096:], "block": block, "close": close}
         return None
     if res:
-        return {"reason": "", "block": False}
+        return {"reason": "", "block": False, "close": False}
     return None
 
 
@@ -1651,15 +2061,29 @@ def _evaluate(scripts, flow):
     if not isinstance(flow, Flow):
         flow = Flow(flow)
     _record(flow)  # record once per message, before any script runs
-    direction = flow.get("direction")
+    direction = str(flow.get("direction") or "").lower()
     matches = []
+    console = []
+    console_chars = 0
     for sid, s in scripts.items():
+        if "*" not in s["service_ids"] and flow.get("service") not in s["service_ids"]:
+            continue
+        if s["directions"] and direction not in s["directions"]:
+            continue
+        if s["protocols"] and str(flow.get("protocol") or "").lower() not in s["protocols"]:
+            continue
         # Skip scripts that declared DIRECTION for the other side.
         if s.get("direction") and direction and s["direction"] != direction:
             continue
         flow["__sid"] = sid   # namespaces flow.conn / flow.commands per script
         try:
-            res = s["fn"](flow)
+            output = _TailWriter(min(4096, max(0, 16384 - console_chars)))
+            with redirect_stdout(output), redirect_stderr(output):
+                res = s["fn"](flow)
+            text = output.getvalue().rstrip()
+            if text:
+                console.append({"script": sid, "text": text})
+                console_chars += len(text)
         except Exception:
             matches.append({
                 "script": sid, "name": s["name"],
@@ -1670,9 +2094,10 @@ def _evaluate(scripts, flow):
         if norm is not None:
             matches.append({
                 "script": sid, "name": s["name"],
-                "reason": norm["reason"], "block": norm["block"], "error": False,
+                "reason": norm["reason"], "block": norm["block"],
+                "close": norm["close"], "error": False,
             })
-    return matches, _rewrite_of(flow)
+    return matches, _rewrite_of(flow), console
 
 
 def _short_traceback():
@@ -1701,47 +2126,16 @@ def main():
             continue
         cmd = msg.get("cmd")
         if cmd == "load":
-            SCRIPTS, errors = _compile_scripts(msg.get("scripts", []))
+            loaded, errors = _compile_scripts(msg.get("scripts", []))
+            _reset_changed_script_state(SCRIPTS, loaded)
+            SCRIPTS = loaded
             _send({"cmd": "load", "ok": len(errors) == 0, "errors": errors})
         elif cmd == "eval":
-            matches, rewrite = _evaluate(SCRIPTS, msg.get("packet", {}))
-            reply = {"id": msg.get("id"), "matches": matches}
+            matches, rewrite, console = _evaluate(SCRIPTS, msg.get("packet", {}))
+            reply = {"id": msg.get("id"), "matches": matches, "console": console}
             if rewrite is not None:
                 reply["rewrite"] = rewrite
             _send(reply)
-        elif cmd == "test":
-            # Evaluate one script in isolation without disturbing loaded state.
-            # `packets` is an ordered sequence (a whole flow, or one packet);
-            # match() is called on each in turn so stateful/correlating scripts
-            # see the sequence. `repeat` re-runs the whole sequence N times.
-            # Returns per-step verdicts from the last pass.
-            loaded, errors = _compile_scripts([msg.get("script", {})])
-            if errors:
-                _send({"id": msg.get("id"), "error": list(errors.values())[0]})
-            else:
-                try:
-                    repeat = int(msg.get("repeat", 1))
-                except Exception:
-                    repeat = 1
-                if repeat < 1:
-                    repeat = 1
-                packets = msg.get("packets")
-                if not isinstance(packets, list) or not packets:
-                    packets = [msg.get("packet", {})]
-                steps = []
-                for _ in range(repeat):
-                    steps = []
-                    for f in packets:
-                        m, rewrite = _evaluate(loaded, f)
-                        step = {"matches": m}
-                        if rewrite is not None:
-                            step["rewrite"] = rewrite
-                        steps.append(step)
-                _send({
-                    "id": msg.get("id"),
-                    "steps": steps,
-                    "matches": steps[-1]["matches"] if steps else [],
-                })
         elif cmd == "ping":
             _send({"pong": True})
 

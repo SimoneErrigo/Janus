@@ -1,16 +1,19 @@
 package flagids
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -51,10 +54,15 @@ type Poller struct {
 	// Callback after successful fetch with the new current round number
 	onFetch func(currentRound int)
 
-	// Loop lifecycle
-	loopMu  sync.Mutex
-	stopCh  chan struct{}
-	running bool
+	// Loop lifecycle. Fetches are serialized so a manual refresh cannot race a
+	// scheduled one; generations keep an obsolete in-flight response from
+	// overwriting a newer configuration.
+	lifecycleMu sync.Mutex
+	cancel      context.CancelFunc
+	running     bool
+	generation  atomic.Uint64
+	loopWG      sync.WaitGroup
+	fetchMu     sync.Mutex
 }
 
 // PollerConfig holds the configurable fields for the poller.
@@ -113,58 +121,85 @@ func NewPoller(apiURL, teamID string, intervalSec int, enabled bool, format stri
 		roundDuration:    time.Duration(roundDurationSec) * time.Second,
 		competitionStart: competitionStart,
 		keepRounds:       keepRounds,
-		stopCh:           make(chan struct{}),
 	}
 }
 
 // Start begins the polling loop.
 func (p *Poller) Start() {
-	if !p.enabled {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if p.running {
+		return
+	}
+	p.mu.RLock()
+	enabled, apiURL := p.enabled, p.apiURL
+	teamID, interval, format := p.teamID, p.interval, p.format
+	roundDuration, keepRounds := p.roundDuration, p.keepRounds
+	p.mu.RUnlock()
+	if !enabled || apiURL == "" {
 		log.Println("Flag ID poller disabled")
 		return
 	}
-	p.loopMu.Lock()
-	p.stopCh = make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	p.cancel = cancel
 	p.running = true
-	p.loopMu.Unlock()
-	go p.loop()
+	gen := p.generation.Add(1)
+	p.loopWG.Add(1)
+	go p.loop(ctx, gen)
 	log.Printf("Flag ID poller started (url=%s, team=%s, interval=%s, format=%s, round_duration=%s, keep_rounds=%d)",
-		p.apiURL, p.teamID, p.interval, p.format, p.roundDuration, p.keepRounds)
+		apiURL, teamID, interval, format, roundDuration, keepRounds)
 }
 
 // Stop signals the poller to exit.
 func (p *Poller) Stop() {
-	p.loopMu.Lock()
-	defer p.loopMu.Unlock()
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
 	if p.running {
-		close(p.stopCh)
+		p.cancel()
 		p.running = false
 	}
+	p.generation.Add(1)
+	// Keep lifecycle operations serialized until the old generation is fully
+	// gone. Otherwise Reconfigure could add a replacement loop concurrently
+	// with this Wait and Stop could return while that loop was still running.
+	p.loopWG.Wait()
 }
 
 // Reconfigure updates the poller config and restarts if enabled.
 func (p *Poller) Reconfigure(cfg PollerConfig) {
-	p.loopMu.Lock()
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
 	if p.running {
-		close(p.stopCh)
+		p.cancel()
 		p.running = false
 	}
-	p.loopMu.Unlock()
+	gen := p.generation.Add(1)
+	// Wait for the cancelled generation (including its backfill callback) before
+	// publishing a new identity. This prevents old results from overlapping a
+	// reconfigured poller.
+	p.loopWG.Wait()
 
 	p.mu.Lock()
+	identityChanged := p.apiURL != cfg.APIURL || p.teamID != cfg.TeamID ||
+		(cfg.Format != "" && p.format != strings.ToLower(cfg.Format)) ||
+		(cfg.RoundDurationSec > 0 && p.roundDuration != time.Duration(cfg.RoundDurationSec)*time.Second)
 	p.apiURL = cfg.APIURL
 	p.teamID = cfg.TeamID
 	if cfg.IntervalSec > 0 {
 		p.interval = time.Duration(cfg.IntervalSec) * time.Second
 	}
 	if cfg.Format != "" {
-		p.format = cfg.Format
+		p.format = strings.ToLower(cfg.Format)
 	}
 	if cfg.RoundDurationSec > 0 {
 		p.roundDuration = time.Duration(cfg.RoundDurationSec) * time.Second
 	}
-	if cfg.CompetitionStart != "" {
+	if cfg.CompetitionStart == "" {
+		identityChanged = identityChanged || !p.competitionStart.IsZero()
+		p.competitionStart = time.Time{}
+	} else {
 		if t, err := time.Parse(time.RFC3339, cfg.CompetitionStart); err == nil {
+			identityChanged = identityChanged || !p.competitionStart.Equal(t)
 			p.competitionStart = t
 		}
 	}
@@ -172,14 +207,22 @@ func (p *Poller) Reconfigure(cfg PollerConfig) {
 		p.keepRounds = cfg.KeepRounds
 	}
 	p.enabled = cfg.Enabled
+	if identityChanged {
+		p.roundFlags = make(map[int]map[string][]string)
+		p.flagIDs = make(map[string][]string)
+		p.valueKeyMap = nil
+		p.matcher = nil
+		p.currentRound = 0
+		p.lastSnapshotHash = 0
+	}
 	p.mu.Unlock()
 
 	if cfg.Enabled && cfg.APIURL != "" {
-		p.loopMu.Lock()
-		p.stopCh = make(chan struct{})
+		ctx, cancel := context.WithCancel(context.Background())
+		p.cancel = cancel
 		p.running = true
-		p.loopMu.Unlock()
-		go p.loop()
+		p.loopWG.Add(1)
+		go p.loop(ctx, gen)
 		log.Printf("Flag ID poller reconfigured (url=%s, team=%s, interval=%s, format=%s)", cfg.APIURL, cfg.TeamID, p.interval, p.format)
 	} else {
 		log.Println("Flag ID poller disabled via reconfigure")
@@ -285,7 +328,7 @@ func (p *Poller) SetOnFetch(fn func(currentRound int)) {
 
 // FetchNow triggers an immediate flag ID fetch (blocking).
 func (p *Poller) FetchNow() {
-	p.fetch()
+	p.fetch(context.Background(), p.generation.Load())
 }
 
 // CurrentRound returns the latest round number known to the poller.
@@ -387,12 +430,9 @@ func (p *Poller) FindMatchingFlagIDs(text string) []FlagMatch {
 	return m.FindMatches(text)
 }
 
-func (p *Poller) loop() {
-	p.loopMu.Lock()
-	stopCh := p.stopCh
-	p.loopMu.Unlock()
-
-	p.fetch()
+func (p *Poller) loop(ctx context.Context, generation uint64) {
+	defer p.loopWG.Done()
+	p.fetch(ctx, generation)
 
 	for {
 		p.mu.RLock()
@@ -400,60 +440,77 @@ func (p *Poller) loop() {
 		p.mu.RUnlock()
 		timer := time.NewTimer(delay)
 		select {
-		case <-stopCh:
+		case <-ctx.Done():
 			timer.Stop()
 			return
 		case <-timer.C:
-			p.fetch()
+			p.fetch(ctx, generation)
 		}
 	}
 }
 
-func (p *Poller) fetch() {
+func (p *Poller) fetch(ctx context.Context, generation uint64) {
+	p.fetchMu.Lock()
+	defer p.fetchMu.Unlock()
+	if generation != p.generation.Load() {
+		return
+	}
 	p.mu.RLock()
 	apiURL := p.apiURL
 	teamID := p.teamID
 	format := p.format
+	roundDuration := p.roundDuration
+	competitionStart := p.competitionStart
+	keepRounds := p.keepRounds
 	p.mu.RUnlock()
 
-	url := apiURL
+	fetchURL, err := url.Parse(apiURL)
+	if err != nil || fetchURL.Scheme == "" || fetchURL.Host == "" {
+		p.setFetchError(generation, fmt.Sprintf("invalid API URL %q", apiURL))
+		return
+	}
 	// ForcAD's /flag_ids endpoint returns every team's flag IDs in one document
 	// and ignores a ?team= query — we resolve our team key client-side. Other
 	// formats use the query param to scope the request to one team.
 	if teamID != "" && format != "forcad" {
-		sep := "?"
-		if strings.Contains(url, "?") {
-			sep = "&"
-		}
-		url += sep + "team=" + teamID
+		query := fetchURL.Query()
+		query.Set("team", teamID)
+		fetchURL.RawQuery = query.Encode()
 	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL.String(), nil)
 	if err != nil {
-		p.mu.Lock()
-		p.lastError = fmt.Sprintf("fetch error: %v", err)
-		p.lastFetch = time.Now()
-		p.mu.Unlock()
-		log.Printf("Flag ID fetch error: %v", err)
+		p.setFetchError(generation, fmt.Sprintf("request error: %v", err))
+		return
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctx.Err() == nil {
+			p.setFetchError(generation, fmt.Sprintf("fetch error: %v", err))
+			log.Printf("Flag ID fetch error: %v", err)
+		}
 		return
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	const maxResponseBytes = 32 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		p.mu.Lock()
-		p.lastError = fmt.Sprintf("read error: %v", err)
-		p.lastFetch = time.Now()
-		p.mu.Unlock()
+		p.setFetchError(generation, fmt.Sprintf("read error: %v", err))
+		return
+	}
+	if len(body) > maxResponseBytes {
+		p.setFetchError(generation, "response exceeds 32 MiB")
 		return
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		p.mu.Lock()
-		p.lastError = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body))
-		p.lastFetch = time.Now()
-		p.mu.Unlock()
+		message := strings.TrimSpace(string(body))
+		if len(message) > 512 {
+			message = message[:512]
+		}
+		p.setFetchError(generation, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, message))
 		return
 	}
 
@@ -465,18 +522,15 @@ func (p *Poller) fetch() {
 	case "saarctf":
 		roundFlags, err = parseSaarCTFRounded(body, teamID)
 	case "faustctf":
-		roundFlags, err = parseFaustCTFRounded(body, teamID, p.roundDuration, p.competitionStart)
+		roundFlags, err = parseFaustCTFRounded(body, teamID, roundDuration, competitionStart)
 	case "forcad":
-		roundFlags, err = parseForcADRounded(body, teamID, p.roundDuration, p.competitionStart)
+		roundFlags, err = parseForcADRounded(body, teamID, roundDuration, competitionStart)
 	default:
 		roundFlags, err = parseCyberChallengeRounded(body)
 	}
 
 	if err != nil {
-		p.mu.Lock()
-		p.lastError = fmt.Sprintf("parse error: %v", err)
-		p.lastFetch = time.Now()
-		p.mu.Unlock()
+		p.setFetchError(generation, fmt.Sprintf("parse error: %v", err))
 		log.Printf("Flag ID parse error: %v", err)
 		return
 	}
@@ -488,10 +542,6 @@ func (p *Poller) fetch() {
 			maxRound = r
 		}
 	}
-
-	p.mu.RLock()
-	keepRounds := p.keepRounds
-	p.mu.RUnlock()
 
 	// Prune old rounds: keep only the last keepRounds rounds
 	if maxRound > 0 {
@@ -510,6 +560,9 @@ func (p *Poller) fetch() {
 	prevHash := p.lastSnapshotHash
 	p.mu.RUnlock()
 	if snapshotHash == prevHash {
+		if generation != p.generation.Load() {
+			return
+		}
 		p.mu.Lock()
 		p.lastFetch = time.Now()
 		p.lastError = ""
@@ -531,6 +584,9 @@ func (p *Poller) fetch() {
 		vkm = parseValueKeyMap(body)
 	}
 
+	if generation != p.generation.Load() {
+		return
+	}
 	p.mu.Lock()
 	p.roundFlags = roundFlags
 	p.currentRound = maxRound
@@ -555,8 +611,18 @@ func (p *Poller) fetch() {
 	curRound := p.currentRound
 	p.mu.RUnlock()
 	if onFetch != nil {
-		go onFetch(curRound)
+		onFetch(curRound)
 	}
+}
+
+func (p *Poller) setFetchError(generation uint64, message string) {
+	if generation != p.generation.Load() {
+		return
+	}
+	p.mu.Lock()
+	p.lastError = message
+	p.lastFetch = time.Now()
+	p.mu.Unlock()
 }
 
 func hashRoundFlags(roundFlags map[int]map[string][]string) uint64 {

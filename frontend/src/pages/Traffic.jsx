@@ -41,9 +41,8 @@ function bytesToHex(bytes, maxBytes = 1024 * 64) {
 const HighlightedText = memo(function HighlightedText({ text, contains, regex, flagidRegex }) {
   if (!text || (!contains && !regex && !flagidRegex)) return <>{text}</>
 
+	const ranges = []
   try {
-    const ranges = []
-
     const addMatches = (pattern, flags, cls) => {
       if (!pattern) return
       const re = new RegExp(pattern, flags)
@@ -61,29 +60,24 @@ const HighlightedText = memo(function HighlightedText({ text, contains, regex, f
     // FlagID highlights (cyan) — regex built from backend-provided matched values (tiny, 1-3 values)
     if (flagidRegex) addMatches(flagidRegex, 'g', 'bg-teal-500/30 text-teal-200 border-b border-teal-400/50')
 
-    if (ranges.length === 0) return <>{text}</>
-
-    ranges.sort((a, b) => a.start - b.start)
-    const merged = []
-    for (const r of ranges) {
-      if (merged.length === 0 || r.start >= merged[merged.length - 1].end) {
-        merged.push(r)
-      }
-    }
-
-    const parts = []
-    let pos = 0
-    for (const r of merged) {
-      if (r.start > pos) parts.push(<span key={`t${pos}`}>{text.slice(pos, r.start)}</span>)
-      parts.push(<mark key={`m${r.start}`} className={`${r.cls} rounded px-0.5`}>{r.text}</mark>)
-      pos = r.end
-    }
-    if (pos < text.length) parts.push(<span key={`t${pos}`}>{text.slice(pos)}</span>)
-
-    return <>{parts}</>
   } catch {
     return <>{text}</>
   }
+	if (ranges.length === 0) return <>{text}</>
+	ranges.sort((a, b) => a.start - b.start)
+	const merged = []
+	for (const range of ranges) {
+		if (merged.length === 0 || range.start >= merged[merged.length - 1].end) merged.push(range)
+	}
+	const parts = []
+	let pos = 0
+	for (const range of merged) {
+		if (range.start > pos) parts.push(<span key={`t${pos}`}>{text.slice(pos, range.start)}</span>)
+		parts.push(<mark key={`m${range.start}`} className={`${range.cls} rounded px-0.5`}>{range.text}</mark>)
+		pos = range.end
+	}
+	if (pos < text.length) parts.push(<span key={`t${pos}`}>{text.slice(pos)}</span>)
+	return <>{parts}</>
 })
 
 // Get the peer (external) IP from a packet
@@ -524,24 +518,6 @@ function DecodedFieldActionButton({ field, value, onAction }) {
   )
 }
 
-// SSE packets carry only metadata — no body, no headers. If a parsed
-// expression touches any of those fields, client-side evaluation is
-// unreliable and we fall back to periodic server polling.
-function treeNeedsServerFilter(node) {
-  if (!node) return false
-  if (node.kind === 'predicate') {
-    const f = node.field
-    if (f === 'body' || f === 'raw' || f === 'header') return true
-    if (node.op === 'matches' || node.length) return true
-    if ((f === 'src' || f === 'dst' || f === 'peer') && String(node.value || '').includes('/')) return true
-    return false
-  }
-  for (const c of (node.children || [])) {
-    if (treeNeedsServerFilter(c)) return true
-  }
-  return false
-}
-
 // Pull contains/icontains/startswith/endswith literals out of the parsed
 // expression tree so the table and detail panel can highlight matched
 // substrings inline. Negated branches are skipped. Each output field is a
@@ -587,13 +563,42 @@ function escapeForRegex(s) {
 }
 
 function hasDropAction(pkt) {
-  if (!pkt?.matched_rules?.length) return false
-  return pkt.matched_rules.some((r) => r.action === 'drop' || r.action === 'both')
+	return pkt?.dropped === true || pkt?.verdict?.outcome === 'dropped'
 }
 
 function hasAlertAction(pkt) {
   if (!pkt?.matched_rules?.length) return false
   return pkt.matched_rules.some((r) => r.action === 'alert' || r.action === 'both')
+}
+
+function ScoreBadge({ packet, detailed = false, baselineStart, baselineEnd }) {
+  const classification = packet?.classification
+  if (!classification) return <span className="text-gray-700">—</span>
+  const styles = {
+    likely_exploit: 'border-red-700/60 bg-red-950/50 text-red-300',
+    likely_checker: 'border-emerald-700/60 bg-emerald-950/50 text-emerald-300',
+    review: 'border-amber-700/60 bg-amber-950/40 text-amber-300',
+    insufficient_data: 'border-gray-700 bg-gray-800 text-gray-400',
+  }
+  const labels = {
+    likely_exploit: 'Exploit',
+    likely_checker: 'Checker',
+    review: 'Review',
+    insufficient_data: packet.round >= baselineStart && packet.round <= baselineEnd ? 'Baseline' : 'Low data',
+  }
+  const title = [
+    `Attack ${packet.attack_score || 0}/100`,
+    `Normal ${packet.normal_score || 0}/100`,
+    `Confidence ${packet.score_confidence || 0}/100`,
+    `Coverage ${packet.score_coverage || 0}%`,
+    ...(packet.score_reasons || []).map((r) => `${r.weight > 0 ? '+' : ''}${r.weight}: ${r.label}`),
+  ].join('\n')
+  return (
+    <span title={title} className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-medium whitespace-nowrap ${styles[classification] || styles.review}`}>
+      {labels[classification] || classification}
+	  <span className="font-mono opacity-75">{detailed ? `confidence ${packet.score_confidence || 0}/100` : `C${packet.score_confidence || 0}`}</span>
+    </span>
+  )
 }
 
 // ---- Main Traffic component ----
@@ -609,11 +614,18 @@ export default function Traffic() {
   const [customPickerOpen, setCustomPickerOpen] = useState(false) // opt-in picker for services with no bound protocol
   const [activeSessions, setActiveSessions] = useState([])
   const [selected, setSelected] = useState(null)
+	const [selectionError, setSelectionError] = useState('')
+	const selectionTokenRef = useRef(0)
+	const clearSelected = useCallback(() => {
+		selectionTokenRef.current++
+		setSelected(null)
+	}, [])
   const [flowMode, setFlowMode] = useState(null) // { packetId, packets, total }
   /** Packet id used when entering flow (API or session fallback); restored on Clear flow */
   const flowEntryPacketIdRef = useRef(null)
   /** When opening flow from another view, Clear flow navigates back and restores context */
   const flowReturnContextRef = useRef(null)
+  const flowRequestRef = useRef(0)
   const packetTableScrollRef = useRef(null)
   const [filtersCollapsed, setFiltersCollapsed] = useState(false)
   const [flagFilter, setFlagFilter] = useState(false)
@@ -625,6 +637,8 @@ export default function Traffic() {
   const [trafficMode, setTrafficMode] = useState('live')
   const [captureStatus, setCaptureStatus] = useState(null)
   const [captureBusy, setCaptureBusy] = useState(false)
+  const captureBusyRef = useRef(false)
+  const captureRequestRef = useRef(0)
   const [applyBusy, setApplyBusy] = useState(false)
   const [clearBusy, setClearBusy] = useState(false)
   const pausedRef = useRef(false)
@@ -638,7 +652,18 @@ export default function Traffic() {
   // The legacy `session_id`, `sort` and `limit` are kept as separate state
   // because they are either set programmatically (session_id during flow
   // mode) or are UI-only controls (sort/limit) that don't belong in the DSL.
-  const [expression, setExpression] = useState('')
+	const [draftExpression, setDraftExpression] = useState('')
+	const [appliedExpression, setAppliedExpression] = useState('')
+	const [expressionServerRequired, setExpressionServerRequired] = useState(false)
+	const [filterApplyError, setFilterApplyError] = useState('')
+	const [filterSchema, setFilterSchema] = useState(null)
+	const [expressionFields, setExpressionFields] = useState([])
+	const [scoringStatus, setScoringStatus] = useState(null)
+	const scoringRefreshTimerRef = useRef(null)
+	const scoringRequestRef = useRef(0)
+	const [searchDraft, setSearchDraft] = useState('')
+	const [appliedSearch, setAppliedSearch] = useState('')
+	const [searchScope, setSearchScope] = useState('all')
   // Service quick-filter: chips above the expression input. Kept as a separate
   // state so the user's typed expression isn't rewritten when toggling chips;
   // we merge the two into `effectiveExpression` only when querying / parsing.
@@ -669,6 +694,9 @@ export default function Traffic() {
     return () => {
       window.removeEventListener('mousemove', onMouseMove)
       window.removeEventListener('mouseup', onMouseUp)
+	  dragging.current = false
+	  document.body.style.cursor = ''
+	  document.body.style.userSelect = ''
     }
   }, [])
 
@@ -690,8 +718,10 @@ export default function Traffic() {
     const sp = new URLSearchParams(location.search || '')
     const svc = sp.get('service_id')
     if (!svc) return
-    if (expression.trim()) return
-    setExpression(`service == "${String(svc).replace(/"/g, '\\"')}"`)
+	if (appliedExpression.trim()) return
+	const initial = `service == "${String(svc).replace(/"/g, '\\"')}"`
+	setDraftExpression(initial)
+	setAppliedExpression(initial)
     // Remove query param to avoid re-applying on navigation within the app.
     navigate(location.pathname, { replace: true })
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -702,6 +732,36 @@ export default function Traffic() {
   // which scoreboard round the flow they're inspecting belongs to.
   const [flagIDStatus, setFlagIDStatus] = useState(null)
 
+	const loadScoringStatus = useCallback(async () => {
+		const request = ++scoringRequestRef.current
+		try {
+			const status = await api.getScoringStatus()
+			if (request === scoringRequestRef.current) setScoringStatus(status)
+		} catch { /* scoring is optional; the next poll retries */ }
+	}, [])
+
+  const loadCaptureStatus = useCallback(async () => {
+    if (captureBusyRef.current) return
+    const request = ++captureRequestRef.current
+    try {
+      const status = await api.getCaptureStatus()
+      if (request === captureRequestRef.current) setCaptureStatus(status)
+    } catch { /* capture status is optional; the next poll retries */ }
+  }, [])
+
+  const invalidateStatusRequests = useCallback(() => {
+    scoringRequestRef.current++
+    captureRequestRef.current++
+  }, [])
+
+	const scheduleScoringStatusRefresh = useCallback(() => {
+		if (scoringRefreshTimerRef.current) return
+		scoringRefreshTimerRef.current = setTimeout(() => {
+			scoringRefreshTimerRef.current = null
+			loadScoringStatus()
+		}, 1000)
+	}, [loadScoringStatus])
+
   useEffect(() => {
     api.listServices().then((data) => setServices(data || []))
     api.listProtocols().then((data) => setCustomProtocols(data || [])).catch(() => {})
@@ -710,25 +770,23 @@ export default function Traffic() {
       setFlagIDEnabled(!!cfg?.flagid_enabled)
       setTrafficMode(cfg?.traffic_mode || 'live')
     }).catch(() => {})
-    api.getCaptureStatus().then(setCaptureStatus).catch(() => {})
+    loadCaptureStatus()
     api.getFlagIDStatus().then(setFlagIDStatus).catch(() => {})
-  }, [])
-
-  // Compute the round number for a given timestamp using the poller's
-  // competition_start + round_duration_seconds. Only used to derive the
-  // "live now" current-round badge during idle periods — the per-packet
-  // round always comes from the backend (pkt.round).
-  const roundForTimestamp = useCallback((iso) => {
-    if (iso == null || iso === '') return null
-    const startStr = flagIDStatus?.competition_start
-    const dur = flagIDStatus?.round_duration_seconds
-    if (!startStr || !dur) return null
-    const start = Date.parse(startStr)
-    const t = typeof iso === 'number' ? iso : Date.parse(iso)
-    if (Number.isNaN(start) || Number.isNaN(t)) return null
-    if (t < start) return null
-    return Math.floor((t - start) / (dur * 1000)) + 1
-  }, [flagIDStatus])
+	api.getFilterSchema().then(setFilterSchema).catch(() => {})
+	let cancelled = false
+	let scoringPoll
+	async function pollScoring() {
+		await loadScoringStatus()
+		if (!cancelled) scoringPoll = setTimeout(pollScoring, 10000)
+	}
+	pollScoring()
+	return () => {
+		cancelled = true
+		clearTimeout(scoringPoll)
+		if (scoringRefreshTimerRef.current) clearTimeout(scoringRefreshTimerRef.current)
+		invalidateStatusRequests()
+	}
+  }, [invalidateStatusRequests, loadCaptureStatus, loadScoringStatus])
 
   const [currentRound, setCurrentRound] = useState(null)
 
@@ -736,14 +794,15 @@ export default function Traffic() {
     if (trafficMode !== 'static') return
     setPaused(false)
     pausedRef.current = false
-    const t = setInterval(async () => {
-      try {
-        const status = await api.getCaptureStatus()
-        setCaptureStatus(status)
-      } catch {}
-    }, 3000)
-    return () => clearInterval(t)
-  }, [trafficMode])
+    let cancelled = false
+    let timer
+    async function pollCapture() {
+      await loadCaptureStatus()
+      if (!cancelled) timer = setTimeout(pollCapture, 3000)
+    }
+    pollCapture()
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [loadCaptureStatus, trafficMode])
 
 
   // Force refetch when user hides/unhides packets. Bumping this key re-runs the
@@ -754,40 +813,60 @@ export default function Traffic() {
   // The chips append `service in (...)` (or `service == ...` for one) so the
   // user can keep editing their text expression without losing the chip state.
   const effectiveExpression = useMemo(() => {
-    const e = expression.trim()
+	const e = appliedExpression.trim()
     if (selectedServiceIDs.size === 0) return e
     const ids = Array.from(selectedServiceIDs)
     const list = ids.map((id) => `"${String(id).replace(/"/g, '\\"')}"`).join(', ')
     const svcExpr = ids.length === 1 ? `service == ${list}` : `service in (${list})`
     return e ? `(${e}) AND ${svcExpr}` : svcExpr
-  }, [expression, selectedServiceIDs])
+	}, [appliedExpression, selectedServiceIDs])
 
   // fetchPage: called by the hook for each page load
-  const fetchPage = useCallback(async (offset, limit) => {
+  const fetchPage = useCallback(async (offset, limit, cursor) => {
     const params = { ...hideParams() }
     params.limit = limit
+    // Keep the logical offset alongside the keyset cursor: SQL pagination uses
+    // the cursor, while bounded residual filters use the offset only to report
+    // a stable accumulated total.
     params.offset = offset
+    if (cursor) params.cursor = cursor
     params.sort = sortOrder
     if (effectiveExpression) params.q = effectiveExpression
+	if (appliedSearch) {
+	  if (searchScope === 'body') params.contains_body = appliedSearch
+	  else if (searchScope === 'headers') params.contains_headers = appliedSearch
+	  else if (searchScope === 'url') params.url = appliedSearch
+	  else params.contains = appliedSearch
+	}
     if (sessionFilter) params.session_id = sessionFilter
     if (flagFilter) params.flagged = 'true'
     if (flagIDFilter) params.contains_flagid = 'true'
     if (blockedFilter) params.dropped = 'true'
     params.summary = '1'
     const data = await api.getPackets(params)
-    return { items: data.packets || [], total: data.total }
-  }, [effectiveExpression, sessionFilter, sortOrder, flagFilter, flagIDFilter, blockedFilter, hideVersion])
+    const result = { items: data.packets || [], total: data.total, totalExact: data.total_exact, partial: data.partial }
+    if (Object.prototype.hasOwnProperty.call(data, 'next_cursor')) result.nextCursor = data.next_cursor
+    return result
+	// hideVersion intentionally invalidates hideParams(), whose values live in localStorage.
+	// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [effectiveExpression, appliedSearch, searchScope, sessionFilter, sortOrder, flagFilter, flagIDFilter, blockedFilter, hideVersion])
 
   const {
     items: packets,
     total,
     loading,
     hasMore,
+		totalExact,
+		partial: partialResults,
+		error: listError,
     sentinelRef: packetSentinelRef,
     prepend: prependPackets,
+		patchById: patchPacketsById,
     refresh: refreshPackets,
     reset: resetPackets,
   } = useInfiniteList({ fetchPage, pageSize: pageLimit })
+	const packetsRef = useRef(packets)
+	useEffect(() => { packetsRef.current = packets }, [packets])
 
   // Live current-round badge. This must run after useInfiniteList initializes
   // `packets`; otherwise a hard refresh renders the component while `packets`
@@ -838,12 +917,12 @@ export default function Traffic() {
     if (!effectiveExpression) return { tree: null, residual: false }
     const r = parseFilter(effectiveExpression)
     if (!r.ok) return { tree: null, residual: true } // syntax errors → fall back to server
-    return { tree: r.tree, residual: treeNeedsServerFilter(r.tree) }
-  }, [effectiveExpression])
+	return { tree: r.tree, residual: expressionServerRequired }
+	}, [effectiveExpression, expressionServerRequired])
 
   // Whenever any predicate touches a field SSE doesn't carry (body/raw/header),
   // we fall back to periodic server polling instead of client-side eval.
-  const hasTextFilters = parsedExpression.residual
+	const hasTextFilters = parsedExpression.residual || !!appliedSearch
 
   // Refs for SSE client-side filtering (stale-closure-safe).
   const expressionTreeRef = useRef(parsedExpression.tree)
@@ -877,8 +956,44 @@ export default function Traffic() {
       if (tree && !evaluateFilter(tree, p)) return false
       return true
     })
-    if (filtered.length > 0) prependPackets(filtered, sortOrderRef.current !== 'asc')
+    if (filtered.length > 0) {
+	  const descending = sortOrderRef.current !== 'asc'
+	  const scroller = packetTableScrollRef.current
+	  const preserveAnchor = descending && scroller && scroller.scrollTop > ROW_H
+	  const known = new Set(packetsRef.current.map((packet) => Number(packet.id)))
+	  const inserted = filtered.reduce((count, packet) => count + (known.has(Number(packet.id)) ? 0 : 1), 0)
+	  const previousTop = scroller?.scrollTop || 0
+	  prependPackets(filtered, descending)
+	  if (preserveAnchor && inserted > 0) {
+		requestAnimationFrame(() => {
+		  if (scroller) scroller.scrollTop = previousTop + inserted * ROW_H
+		})
+	  }
+	}
   }, [prependPackets])
+
+	const handleScoreUpdates = useCallback((updates) => {
+		if (!Array.isArray(updates) || updates.length === 0) return
+		patchPacketsById(updates)
+		const patches = new Map()
+		for (const update of updates) {
+			for (const id of update.packet_ids || []) patches.set(Number(id), update.score || {})
+		}
+		setSelected((packet) => {
+			const patch = packet ? patches.get(Number(packet.id)) : null
+			return patch ? { ...packet, ...patch } : packet
+		})
+		setFlowMode((current) => current ? {
+			...current,
+			packets: current.packets.map((packet) => {
+				const patch = patches.get(Number(packet.id))
+				return patch ? { ...packet, ...patch } : packet
+			}),
+		} : current)
+		const scoreFields = new Set(['classification', 'attack_score', 'normal_score', 'score_confidence', 'score_coverage'])
+		if (expressionFields.some((field) => scoreFields.has(field))) refreshPackets()
+		scheduleScoringStatusRefresh()
+	}, [patchPacketsById, expressionFields, refreshPackets, scheduleScoringStatusRefresh])
 
   // Reset + re-fetch when filters change (debounced 300ms). Runs regardless of
   // pause state so filter edits apply to the frozen view. `fetchPage` identity
@@ -897,17 +1012,31 @@ export default function Traffic() {
     if (paused) return
     const unsub = subscribePacketStream(
       hasTextFilters ? () => {} : handleNewPackets,
-      () => { if (!pausedRef.current) refreshPackets() },
+	  () => {
+		const refresh = pausedRef.current ? undefined : refreshPackets()
+		scheduleScoringStatusRefresh()
+		return refresh
+	  },
+	  handleScoreUpdates,
     )
     let poll
     if (hasTextFilters) {
-      poll = setInterval(() => { if (!pausedRef.current) refreshPackets() }, 2000)
+      let cancelled = false
+      const refresh = async () => {
+        if (!pausedRef.current) await refreshPackets()
+        if (!cancelled) poll = setTimeout(refresh, 2000)
+      }
+      poll = setTimeout(refresh, 2000)
+      return () => {
+        cancelled = true
+        unsub()
+        clearTimeout(poll)
+      }
     }
     return () => {
       unsub()
-      if (poll) clearInterval(poll)
     }
-  }, [handleNewPackets, refreshPackets, paused, hasTextFilters, trafficMode, captureStatus?.capturing])
+  }, [handleNewPackets, handleScoreUpdates, refreshPackets, scheduleScoringStatusRefresh, paused, hasTextFilters, trafficMode, captureStatus?.capturing])
 
 
   const [flowLoading, setFlowLoading] = useState(false)
@@ -918,11 +1047,13 @@ export default function Traffic() {
   // would leave gaps in the correlated sequence.
   const showFlow = useCallback(async (pkt, opts = {}) => {
     if (pkt?.id == null) return
+    const request = ++flowRequestRef.current
     if (!opts.preserveFlowReturn) flowReturnContextRef.current = null
     flowEntryPacketIdRef.current = pkt.id
     setFlowLoading(true)
     try {
       const data = await api.getPacketFlow(pkt.id)
+      if (request !== flowRequestRef.current) return
       const pkts = data.packets || []
       setFlowMode({
         packetId: pkt.id,
@@ -930,13 +1061,29 @@ export default function Traffic() {
         total: pkts.length,
       })
     } catch (err) {
+      if (request !== flowRequestRef.current) return
       console.error('Flow query failed, falling back to session_id:', err)
       setSessionFilter(pkt.session_id || '')
       setSortOrder('asc')
     } finally {
-      setFlowLoading(false)
+      if (request === flowRequestRef.current) setFlowLoading(false)
     }
   }, [])
+
+	async function setAnalystLabel(label) {
+		if (!selected?.id) return
+		const source = flowMode?.packets?.length ? flowMode.packets : [selected]
+		const ids = Array.from(new Set(source.map((packet) => packet.id).filter(Boolean))).slice(0, 500)
+		await api.labelPackets(ids, label)
+		setSelected((packet) => packet ? { ...packet, analyst_label: label } : packet)
+		if (flowMode) {
+			setFlowMode((current) => current ? {
+				...current,
+				packets: current.packets.map((packet) => ids.includes(packet.id) ? { ...packet, analyst_label: label } : packet),
+			} : current)
+		}
+		refreshPackets()
+	}
 
   function toggleFlagFilter() {
     setFlagFilter((v) => !v)
@@ -950,14 +1097,31 @@ export default function Traffic() {
     setBlockedFilter((prev) => !prev)
   }
 
-  function addQuickFilter(predicate) {
+	const commitExpression = useCallback(async (next = draftExpression) => {
+	  const candidate = (next || '').trim()
+	  if (!candidate) {
+		setAppliedExpression(''); setExpressionServerRequired(false); setExpressionFields([]); setFilterApplyError(''); return true
+	  }
+	  try {
+		const result = await api.validateFilter(candidate)
+		if (!result.ok) { setFilterApplyError(result.error || 'Invalid expression'); return false }
+		setAppliedExpression(candidate)
+		setExpressionServerRequired(!!result.server_required)
+		setExpressionFields(result.fields || [])
+		setFilterApplyError('')
+		return true
+	  } catch (err) {
+		setFilterApplyError(err.message || 'Validation failed')
+		return false
+	  }
+	}, [draftExpression])
+
+	function addQuickFilter(predicate) {
     if (!predicate) return
-    setExpression((prev) => {
-      const e = (prev || '').trim()
-      const norm = e.replace(/\s+/g, ' ')
-      if (norm.includes(predicate)) return e
-      return e ? `(${e}) AND ${predicate}` : predicate
-    })
+	const e = (draftExpression || '').trim()
+	const next = e.replace(/\s+/g, ' ').includes(predicate) ? e : (e ? `(${e}) AND ${predicate}` : predicate)
+	setDraftExpression(next)
+	commitExpression(next)
   }
 
   function togglePause() {
@@ -986,7 +1150,7 @@ export default function Traffic() {
   // or checkbox). Range selection works from anchor → target.
   const selectionAnchorRef = useRef(null)
 
-  function toggleSingleSelect(id) {
+  const toggleSingleSelect = useCallback((id) => {
     setSelectedPkts((prev) => {
       const next = new Set(prev)
       if (next.has(id)) next.delete(id)
@@ -994,7 +1158,7 @@ export default function Traffic() {
       return next
     })
     selectionAnchorRef.current = id
-  }
+  }, [])
 
   // Extend (or remove) selection from anchor → target. Used by shift+click on
   // both checkbox and row. Returns true if the action was handled.
@@ -1049,19 +1213,35 @@ export default function Traffic() {
     selectPacket(pkt)
   }
 
-  async function bulkDelete() {
+  const bulkDelete = useCallback(async () => {
     const ids = Array.from(selectedPkts)
     if (ids.length === 0) return
     // Per-user hide: doesn't affect teammates. Data stays in the DB; only this
     // user's view excludes the IDs via the exclude_ids query param.
     if (!confirm(`Hide ${ids.length} selected packet${ids.length !== 1 ? 's' : ''} from your view? (Teammates will still see them.)`)) return
     addHiddenIds(ids)
-    if (selected && ids.includes(selected.id)) setSelected(null)
+    if (selected && ids.includes(selected.id)) clearSelected()
     setSelectedPkts(new Set())
     selectionAnchorRef.current = null
     setHideVersion((v) => v + 1)
     resetPackets()
-  }
+  }, [selectedPkts, selected, clearSelected, resetPackets])
+
+	// Cleanup/filter refreshes can remove rows while their detail request or
+	// bulk selection is still active. Keep UI state constrained to the rows
+	// that actually remain in the current result window.
+	useEffect(() => {
+		if (flowMode || loading) return
+		const available = new Set(packets.map((packet) => Number(packet.id)))
+		setSelectedPkts((previous) => {
+			const next = new Set(Array.from(previous).filter((id) => available.has(Number(id))))
+			return next.size === previous.size ? previous : next
+		})
+		if (selectionAnchorRef.current != null && !available.has(Number(selectionAnchorRef.current))) {
+			selectionAnchorRef.current = null
+		}
+		if (selected?.id != null && !available.has(Number(selected.id))) clearSelected()
+	}, [packets, flowMode, loading, selected?.id, clearSelected])
 
   async function switchMode(newMode) {
     if (newMode === trafficMode) return
@@ -1074,7 +1254,7 @@ export default function Traffic() {
     try {
       const cfg = await api.updateConfig({ traffic_mode: newMode })
       setTrafficMode(cfg?.traffic_mode || newMode)
-      api.getCaptureStatus().then(setCaptureStatus).catch(() => {})
+      loadCaptureStatus()
       if (newMode === 'live') resetPackets()
     } catch (err) {
       console.error('Failed to switch traffic mode:', err)
@@ -1082,23 +1262,37 @@ export default function Traffic() {
   }
 
   async function handleStartCapture() {
+    if (captureBusyRef.current) return
+    captureBusyRef.current = true
+    const request = ++captureRequestRef.current
     setCaptureBusy(true)
+    setSelectionError('')
     try {
       const status = await api.startCapture()
-      setCaptureStatus(status)
+      if (request === captureRequestRef.current) setCaptureStatus(status)
       resetPackets()
+    } catch (err) {
+      if (request === captureRequestRef.current) setSelectionError(`Unable to start capture: ${err?.message || err}`)
     } finally {
+      captureBusyRef.current = false
       setCaptureBusy(false)
     }
   }
 
   async function handleStopCapture() {
+    if (captureBusyRef.current) return
+    captureBusyRef.current = true
+    const request = ++captureRequestRef.current
     setCaptureBusy(true)
+    setSelectionError('')
     try {
       const status = await api.stopCapture()
-      setCaptureStatus(status)
+      if (request === captureRequestRef.current) setCaptureStatus(status)
       resetPackets()
+    } catch (err) {
+      if (request === captureRequestRef.current) setSelectionError(`Unable to stop capture: ${err?.message || err}`)
     } finally {
+      captureBusyRef.current = false
       setCaptureBusy(false)
     }
   }
@@ -1120,7 +1314,7 @@ export default function Traffic() {
     setClearBusy(true)
     try {
       setClearCursor(new Date().toISOString())
-      setSelected(null)
+      clearSelected()
       setFlowMode(null)
       flowEntryPacketIdRef.current = null
       flowReturnContextRef.current = null
@@ -1147,21 +1341,27 @@ export default function Traffic() {
   // an earlier click overwriting a newer selection (also: if the user clicks
   // the SAME packet again, the older inflight fetch is invalidated so it
   // can't land after the second fetch and clobber the newer body).
-  const selectionTokenRef = useRef(0)
   const selectPacket = useCallback(async (pkt) => {
     if (!pkt) return
     const token = ++selectionTokenRef.current
     const needsRefetch = pkt.lite || pkt.body_string === undefined
+	setSelectionError('')
     setSelected(pkt)
     if (!needsRefetch) return
     try {
       const full = await api.getPacket(pkt.id)
       if (selectionTokenRef.current !== token) return
       setSelected(full)
-    } catch {}
-  }, [])
+    } catch (err) {
+	  if (selectionTokenRef.current !== token) return
+	  clearSelected()
+	  setSelectionError(`Packet #${pkt.id} is no longer available${err?.message ? `: ${err.message}` : '.'}`)
+	}
+  }, [clearSelected])
 
   const clearFlow = useCallback(() => {
+    flowRequestRef.current++
+    setFlowLoading(false)
     const anchorId = flowEntryPacketIdRef.current
     const ret = flowReturnContextRef.current
     flowEntryPacketIdRef.current = null
@@ -1207,7 +1407,7 @@ export default function Traffic() {
       // Esc — exit flow view, then clear the open packet / bulk selection
       if (e.key === 'Escape') {
         if (flowMode) { e.preventDefault(); clearFlow(); return }
-        if (selected) { e.preventDefault(); setSelected(null); return }
+        if (selected) { e.preventDefault(); clearSelected(); return }
         if (selectedPkts.size > 0) { e.preventDefault(); setSelectedPkts(new Set()); return }
         return
       }
@@ -1240,14 +1440,14 @@ export default function Traffic() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [flowMode, packets, selected, selectPacket, selectedPkts, toggleSingleSelect, bulkDelete, resetPackets, clearFlow])
+  }, [flowMode, packets, selected, selectPacket, selectedPkts, toggleSingleSelect, bulkDelete, resetPackets, clearFlow, clearSelected])
 
   useEffect(() => {
     const el = packetTableScrollRef.current
     if (!selected?.id || !el) return
     const row = el.querySelector(`tr[data-packet-id="${selected.id}"]`)
     if (row) {
-      row.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+	  row.scrollIntoView({ block: 'nearest', behavior: 'auto' })
       return
     }
     // Row is outside the virtualized window — compute target offset by index.
@@ -1256,15 +1456,15 @@ export default function Traffic() {
     if (idx < 0) return
     const target = idx * ROW_H
     if (target < el.scrollTop || target > el.scrollTop + el.clientHeight - ROW_H) {
-      el.scrollTo({ top: Math.max(0, target - el.clientHeight / 2), behavior: 'smooth' })
+	  el.scrollTo({ top: Math.max(0, target - el.clientHeight / 2), behavior: 'auto' })
     }
-  }, [selected?.id])
+  }, [selected?.id, flowMode, packets])
 
   // Close quick rule panel when selecting a different packet
   useEffect(() => { setShowQuickRule(false) }, [selected?.id])
 
   const isFlowActive = !!flowMode || !!sessionFilter
-  const hasActiveFilter = !!expression.trim() || selectedServiceIDs.size > 0 || flagFilter || flagIDFilter || blockedFilter
+	const hasActiveFilter = !!appliedExpression.trim() || !!appliedSearch || selectedServiceIDs.size > 0 || flagFilter || flagIDFilter || blockedFilter
 
   // Pull contains-style literals out of the parsed expression so the table
   // and detail panel can highlight matched substrings inline. Compound
@@ -1426,10 +1626,10 @@ export default function Traffic() {
       copyText(predicate).then(() => setEncodeStatus('copied'))
         .catch(() => setEncodeStatus('error'))
     } else if (kind === 'add') {
-      setExpression((prev) => {
-        const e = (prev || '').trim()
-        return e ? `(${e}) AND ${predicate}` : predicate
-      })
+		const e = (draftExpression || '').trim()
+		const next = e ? `(${e}) AND ${predicate}` : predicate
+		setDraftExpression(next)
+		commitExpression(next)
       setEncodeStatus('added')
     } else if (kind === 'rule') {
       const svcId = selected?.service_id
@@ -1449,7 +1649,7 @@ export default function Traffic() {
       })
     }
     setTimeout(() => setEncodeStatus(''), 2000)
-  }, [selected?.service_id, navigate])
+	}, [selected?.service_id, navigate, draftExpression, commitExpression])
   const handleDecodedFieldAction = useCallback(async (kind, field, value) => {
     if (!selected?.id || !decodedNamed?.method) return
     try {
@@ -1699,7 +1899,29 @@ export default function Traffic() {
           Filter {hasActiveFilter && <span className="bg-cyan-900/50 text-cyan-400 px-1.5 rounded text-[10px]">active</span>}
         </button>
         {!filtersCollapsed && (
-          <div className="space-y-2">
+		  <div className="space-y-2">
+			<form
+			  onSubmit={(e) => { e.preventDefault(); setAppliedSearch(searchDraft.trim()) }}
+			  className="flex items-center gap-2"
+			>
+			  <input
+				value={searchDraft}
+				onChange={(e) => setSearchDraft(e.target.value)}
+				placeholder="Search traffic literally…"
+				className="flex-1 min-w-0 bg-gray-900 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-cyan-500"
+			  />
+			  <select value={searchScope} onChange={(e) => setSearchScope(e.target.value)} className="bg-gray-800 border border-gray-700 rounded px-2 py-2 text-xs text-gray-300">
+				<option value="all">URL + body + headers</option>
+				<option value="body">Body</option>
+				<option value="headers">Headers</option>
+				<option value="url">URL</option>
+			  </select>
+			  <button type="submit" className="px-3 py-2 rounded bg-cyan-700 hover:bg-cyan-600 text-xs text-white cursor-pointer">Search</button>
+			  {(appliedSearch || searchDraft) && (
+				<button type="button" onClick={() => { setSearchDraft(''); setAppliedSearch('') }} className="px-2 py-2 text-xs text-gray-500 hover:text-red-300 cursor-pointer">Clear</button>
+			  )}
+			</form>
+			{searchDraft.trim() !== appliedSearch && <div className="text-[10px] text-amber-400">Press Enter or Search to apply.</div>}
             {services.length > 0 && (
               <div className="flex items-center gap-1.5 flex-wrap">
                 <span className="text-[10px] uppercase tracking-wide text-gray-600 mr-1">Services</span>
@@ -1740,12 +1962,24 @@ export default function Traffic() {
                 )}
               </div>
             )}
-            <FilterExpression
-              value={expression}
-              onChange={setExpression}
-              placeholder='e.g. body contains "pippo" AND NOT header.User-Agent contains "bot"'
-              compact
-            />
+			<details className="rounded border border-gray-800 bg-gray-950/30">
+			  <summary className="px-3 py-2 text-xs text-gray-400 cursor-pointer hover:text-cyan-300">Advanced DSL filters</summary>
+			  <div className="p-2 pt-0 space-y-2">
+				<FilterExpression
+				  value={draftExpression}
+				  onChange={setDraftExpression}
+				  placeholder='e.g. body contains "pippo" AND NOT header.User-Agent contains "bot"'
+				  compact
+				  schema={filterSchema}
+				/>
+				<div className="flex items-center gap-2">
+				  <button type="button" onClick={() => commitExpression()} className="px-3 py-1.5 rounded bg-cyan-700 hover:bg-cyan-600 text-xs text-white cursor-pointer">Apply DSL</button>
+				  <button type="button" onClick={() => { setDraftExpression(''); commitExpression('') }} className="px-3 py-1.5 text-xs text-gray-500 hover:text-red-300 cursor-pointer">Clear</button>
+				  {draftExpression.trim() !== appliedExpression && <span className="text-[10px] text-amber-400">Draft not applied</span>}
+				  {filterApplyError && <span className="text-[10px] text-red-400">{filterApplyError}</span>}
+				</div>
+			  </div>
+			</details>
             <div className="flex items-center gap-2 flex-wrap">
               {flagRegex && (
                 <button
@@ -1813,6 +2047,18 @@ export default function Traffic() {
               >
                 FlagID probes
               </button>
+			  <button
+				onClick={() => addQuickFilter('classification == "likely_exploit"')}
+				className="text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 bg-gray-800 text-gray-400 border border-gray-700 hover:text-red-300"
+			  >
+				Likely exploits
+			  </button>
+			  <button
+				onClick={() => addQuickFilter('classification == "review"')}
+				className="text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 bg-gray-800 text-gray-400 border border-gray-700 hover:text-amber-300"
+			  >
+				Needs review
+			  </button>
               <select
                 value={sortOrder}
                 onChange={(e) => setSortOrder(e.target.value)}
@@ -1825,9 +2071,48 @@ export default function Traffic() {
             </div>
           </div>
         )}
-      </div>
+	  </div>
+	  {scoringStatus?.available && (
+		<div className="mb-2 rounded border border-gray-800 bg-gray-900/60 px-3 py-2">
+		  <div className="flex items-center gap-2 flex-wrap">
+			<span className="text-[10px] uppercase tracking-wide text-gray-500" title="Static deterministic heuristics; these are packet counts, not probabilities">Janus score · captured packets</span>
+			{[
+			  ['likely_exploit', 'Exploit', 'border-red-800/60 bg-red-950/40 text-red-300'],
+			  ['review', 'Review', 'border-amber-800/60 bg-amber-950/30 text-amber-300'],
+			  ['likely_checker', 'Checker', 'border-emerald-800/60 bg-emerald-950/30 text-emerald-300'],
+			  ['insufficient_data', 'Baseline / low data', 'border-gray-700 bg-gray-800 text-gray-400'],
+			].map(([classification, label, style]) => (
+			  <button key={classification} type="button" onClick={() => addQuickFilter(`classification == "${classification}"`)} className={`rounded border px-2 py-1 text-[11px] cursor-pointer ${style}`}>
+				{label} <span className="ml-1 font-mono">{scoringStatus.counts?.[classification] || 0}</span>
+			  </button>
+			))}
+			<span className="ml-auto text-[10px] text-gray-600">confidence score · advisory only</span>
+		  </div>
+		  {(scoringStatus.services || []).length > 0 && (
+			<div className="mt-1.5 flex items-center gap-1.5 overflow-x-auto text-[10px]">
+			  <span className="text-gray-600 flex-shrink-0">
+				Baseline r{scoringStatus.baseline_start_round || 1}–{scoringStatus.baseline_end_round || 5}:
+			  </span>
+			  {scoringStatus.rebuilding && <span className="text-amber-400 flex-shrink-0">rebuilding…</span>}
+			  {scoringStatus.services.map((status) => {
+				const observed = status.rounds_observed?.length || 0
+				const target = scoringStatus.baseline_required_rounds || scoringStatus.opening_rounds || 5
+				const complete = status.complete === true
+				return <span key={status.service_id} className="flex-shrink-0 rounded border border-gray-800 bg-gray-950/50 px-1.5 py-0.5 text-gray-400" title={`${status.candidate_signatures || 0} clean candidates; trusted means repeated in every configured round; ${status.excluded_opening_flows || 0} suspicious, labeled, truncated or mixed-round flows excluded`}>
+				  {serviceName(status.service_id)}: <span className={complete ? 'text-emerald-400' : 'text-cyan-400'}>{observed}/{target}</span> · {status.trusted_signatures || 0} trusted
+				  {status.excluded_opening_flows > 0 && <span className="text-amber-500"> · {status.excluded_opening_flows} excluded</span>}
+				</span>
+			  })}
+			</div>
+		  )}
+		</div>
+	  )}
+	  {listError && <div className="mb-2 rounded border border-red-800/50 bg-red-950/30 px-3 py-2 text-xs text-red-300">{listError}</div>}
+	  {selectionError && <div className="mb-2 rounded border border-amber-800/50 bg-amber-950/30 px-3 py-2 text-xs text-amber-300">{selectionError}</div>}
+	  {partialResults && <div className="mb-2 rounded border border-amber-800/50 bg-amber-950/20 px-3 py-2 text-xs text-amber-300">Search stopped at the safe scan limit. Results are partial; narrow the service, round or content filter.</div>}
+	  {!partialResults && !totalExact && <div className="mb-2 rounded border border-gray-700 bg-gray-900/60 px-3 py-2 text-xs text-gray-400">The result rows are valid, but the displayed total is estimated to avoid an expensive full-database count.</div>}
 
-      {/* Packet table + detail split */}
+	  {/* Packet table + detail split */}
       <div className="flex-1 flex gap-0 min-h-0 overflow-hidden">
         {/* Table */}
         <div className="flex-1 flex flex-col min-h-0 min-w-0">
@@ -1847,6 +2132,7 @@ export default function Traffic() {
                   <th className="px-3 py-2 font-medium">Service</th>
                   <th className="px-3 py-2 font-medium">Dir</th>
                   <th className="px-3 py-2 font-medium">Status</th>
+				  <th className="px-3 py-2 font-medium">Janus score</th>
                   <th className="px-3 py-2 font-medium w-16"></th>
                   <th className="px-3 py-2 font-medium">Method</th>
                   <th className="px-3 py-2 font-medium">URL / Body</th>
@@ -1855,7 +2141,7 @@ export default function Traffic() {
               </thead>
               <tbody>
                 {topPad > 0 && (
-                  <tr aria-hidden="true" style={{ height: topPad }}><td colSpan="11" /></tr>
+				  <tr aria-hidden="true" style={{ height: topPad }}><td colSpan="12" /></tr>
                 )}
                 {visiblePackets.map((pkt) => {
                   const rowBg = pkt.matched_rules?.length > 0
@@ -1883,8 +2169,8 @@ export default function Traffic() {
                       <input
                         type="checkbox"
                         checked={selectedPkts.has(pkt.id)}
-                        onChange={(e) => handleCheckboxClick(pkt, e)}
-                        onClick={(e) => e.stopPropagation()}
+						readOnly
+						onClick={(e) => handleCheckboxClick(pkt, e)}
                         title="Select (Shift+click row or checkbox for range, Cmd/Ctrl+click row to toggle, Del to delete selection)"
                         className={`w-3.5 h-3.5 cursor-pointer accent-cyan-500 transition-opacity ${
                           selectedPkts.has(pkt.id) ? 'opacity-100' : 'opacity-40 group-hover:opacity-90'
@@ -1924,6 +2210,7 @@ export default function Traffic() {
                     <td className="px-3 py-1.5 text-xs">
                       {pkt.status > 0 && <span className={`${pkt.status < 400 ? 'text-green-400' : 'text-red-400'}`}>{pkt.status}</span>}
                     </td>
+					<td className="px-3 py-1.5 text-xs"><ScoreBadge packet={pkt} baselineStart={scoringStatus?.baseline_start_round || 1} baselineEnd={scoringStatus?.baseline_end_round || 5} /></td>
                     <td className="px-3 py-1.5">
                       <div className="flex items-center gap-1">
                         {pkt.flagged && <span className="text-yellow-400 text-xs" title="Contains flag">&#9873;</span>}
@@ -1951,17 +2238,17 @@ export default function Traffic() {
                   );
                 })}
                 {bottomPad > 0 && (
-                  <tr aria-hidden="true" style={{ height: bottomPad }}><td colSpan="11" /></tr>
+				  <tr aria-hidden="true" style={{ height: bottomPad }}><td colSpan="12" /></tr>
                 )}
                 {displayPackets.length === 0 && (
-                  <tr><td colSpan="11" className="text-center py-8 text-gray-600">No packets found</td></tr>
+				  <tr><td colSpan="12" className="text-center py-8 text-gray-600">No packets found</td></tr>
                 )}
               </tbody>
               {/* Infinite scroll sentinel — only shown outside flow mode */}
               {!flowMode && (
                 <tfoot>
                   <tr>
-                    <td colSpan="11" className="py-3 text-center text-xs text-gray-700">
+					<td colSpan="12" className="py-3 text-center text-xs text-gray-700">
                       <span ref={packetSentinelRef}>
                         {loading ? 'Loading…' : (!hasMore && packets.length > 0) ? '— end —' : ''}
                       </span>
@@ -2045,7 +2332,7 @@ export default function Traffic() {
                 )}
                 {paused ? 'Resume' : 'Pause'}
               </button>
-              <span>{displayTotal} packet{displayTotal !== 1 ? 's' : ''}{paused ? ' (paused)' : ''}</span>
+              <span>{!flowMode && !totalExact ? '≥' : ''}{displayTotal} packet{displayTotal !== 1 ? 's' : ''}{paused ? ' (paused)' : ''}</span>
               <div className="flex items-center text-xs rounded overflow-hidden border border-gray-700 ml-1">
                 {['live', 'static'].map((mode) => (
                   <button
@@ -2180,7 +2467,7 @@ export default function Traffic() {
                     Pin
                   </button>
                 </div>
-                <button onClick={() => setSelected(null)} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
+                <button onClick={clearSelected} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
               </div>
               <div className="p-3 space-y-2 text-sm">
                 {/* Quick Rule Panel */}
@@ -2204,6 +2491,41 @@ export default function Traffic() {
                   {selected.method && <div><span className="text-gray-500">Method </span><span className="text-gray-300">{selected.method}</span></div>}
                   {selected.status > 0 && <div><span className="text-gray-500">Status </span><span className={selected.status < 400 ? 'text-green-400' : 'text-red-400'}>{selected.status}</span></div>}
                 </div>
+
+				{selected.classification && (
+				  <div className="rounded border border-gray-700 bg-gray-800/40 p-2 text-xs">
+					<div className="flex items-center justify-between gap-2">
+					  <div className="flex items-center gap-2">
+						<span className="text-gray-400">Deterministic flow score</span>
+						<ScoreBadge packet={selected} detailed baselineStart={scoringStatus?.baseline_start_round || 1} baselineEnd={scoringStatus?.baseline_end_round || 5} />
+					  </div>
+					  <span className="text-gray-600" title="Informational score; it does not block traffic">advisory only</span>
+					</div>
+					<div className="mt-2 grid grid-cols-3 gap-2 text-center font-mono">
+					  <div><div className="text-red-300">{selected.attack_score || 0}</div><div className="text-[10px] text-gray-600">attack</div></div>
+					  <div><div className="text-emerald-300">{selected.normal_score || 0}</div><div className="text-[10px] text-gray-600">normal</div></div>
+					  <div><div className="text-cyan-300">{selected.score_coverage || 0}%</div><div className="text-[10px] text-gray-600">coverage</div></div>
+					</div>
+					{selected.score_reasons?.length > 0 && (
+					  <ul className="mt-2 space-y-0.5 text-gray-400">
+						{selected.score_reasons.map((reason, index) => (
+						  <li key={`${reason.code}-${index}`}><span className={reason.weight > 0 ? 'text-red-400' : 'text-emerald-400'}>{reason.weight > 0 ? '+' : ''}{reason.weight}</span> {reason.label}</li>
+						))}
+					  </ul>
+					)}
+					<div className="mt-2 flex items-center gap-1 border-t border-gray-700/60 pt-2">
+					  <span className="mr-1 text-gray-600" title="Manual annotation; exploit-labeled flows are excluded on the next baseline rebuild">Analyst label:</span>
+					  {['exploit', 'checker', 'normal'].map((label) => (
+						<button key={label} onClick={() => setAnalystLabel(label)}
+						  className={`rounded border px-1.5 py-0.5 capitalize cursor-pointer ${selected.analyst_label === label ? 'border-cyan-700 bg-cyan-950/40 text-cyan-300' : 'border-gray-700 text-gray-500 hover:text-gray-300'}`}>
+						  {label}
+						</button>
+					  ))}
+					  {selected.analyst_label && <button onClick={() => setAnalystLabel('')} className="ml-1 text-gray-600 hover:text-gray-300 cursor-pointer">clear</button>}
+					  {flowMode && <span className="ml-auto text-gray-700">applies to shown flow</span>}
+					</div>
+				  </div>
+				)}
 
                 {selected.url && (
                   <div className="text-xs">
@@ -2306,6 +2628,15 @@ export default function Traffic() {
                     )}
                   </div>
                 )}
+
+				{selected.decoded && Object.keys(selected.decoded).length > 0 && (
+				  <div className="flex-1">
+					<div className="text-gray-500 text-xs mb-1">Decoded protocol fields</div>
+					<pre className="bg-gray-800 rounded p-2 text-xs font-mono text-cyan-100 overflow-auto whitespace-pre-wrap break-all" style={{ maxHeight: '40vh' }}>
+					  {JSON.stringify(selected.decoded, null, 2)}
+					</pre>
+				  </div>
+				)}
 
                 {/* Custom-protocol decode. Only shown when a protocol is bound
                     to the service or the user explicitly opts in, so services

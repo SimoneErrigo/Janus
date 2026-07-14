@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Navigate, useNavigate } from 'react-router-dom'
 import { api, setToken, setDisplayName, getDisplayName, hasToken } from '../api'
 
 export default function Login() {
@@ -10,8 +10,7 @@ export default function Login() {
   const navigate = useNavigate()
 
   if (hasToken()) {
-    navigate('/', { replace: true })
-    return null
+    return <Navigate to="/" replace />
   }
 
   async function handleSubmit(e) {
@@ -24,7 +23,10 @@ export default function Login() {
       setDisplayName(data.display_name || displayName.trim())
       navigate('/', { replace: true })
     } catch (err) {
-      setError('Invalid password')
+      const message = err instanceof Error ? err.message.trim() : ''
+      setError(/invalid password|unauthorized/i.test(message)
+        ? 'Invalid password'
+        : `Login failed${message ? `: ${message}` : ''}`)
     } finally {
       setLoading(false)
     }
@@ -63,7 +65,7 @@ export default function Login() {
           </div>
 
           {error && (
-            <p className="text-red-400 text-sm">{error}</p>
+            <p role="alert" className="text-red-400 text-sm">{error}</p>
           )}
 
           <button

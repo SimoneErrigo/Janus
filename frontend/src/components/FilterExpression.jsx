@@ -12,6 +12,7 @@ import {
   listPresets,
   savePreset,
   deletePreset,
+	configureFieldSchema,
 } from '../utils/filterAst'
 
 // FilterExpression — unified filter/rule expression editor.
@@ -27,7 +28,7 @@ import {
 //   onChange(str)  fired with serialized expression on edits
 //   placeholder    optional placeholder text
 //   compact        smaller spacing for tight panels
-export default function FilterExpression({ value = '', onChange, placeholder, compact = false }) {
+export default function FilterExpression({ value = '', onChange, placeholder, compact = false, schema = null }) {
   const [mode, setMode] = useState('builder')
   const [tree, setTree] = useState(() => {
     const r = parse(value)
@@ -41,6 +42,10 @@ export default function FilterExpression({ value = '', onChange, placeholder, co
   const [presetName, setPresetName] = useState('')
 
   const lastEmittedRef = useRef(value)
+	const fieldGroups = useMemo(() => {
+		configureFieldSchema(schema)
+		return mergeFieldSchema(schema)
+	}, [schema])
 
   // Sync incoming `value` prop (e.g. preset application from outside).
   // The ref guard makes this idempotent across re-renders.
@@ -227,7 +232,7 @@ export default function FilterExpression({ value = '', onChange, placeholder, co
       )}
 
       {mode === 'builder' ? (
-        <GroupNode node={tree} onChange={setBuilderTree} isRoot />
+        <GroupNode node={tree} onChange={setBuilderTree} isRoot fieldGroups={fieldGroups} />
       ) : (
         <TextEditor
           text={text}
@@ -246,7 +251,7 @@ export default function FilterExpression({ value = '', onChange, placeholder, co
 
 // ----- Group node renderer -----
 
-function GroupNode({ node, onChange, isRoot = false, depth = 0 }) {
+function GroupNode({ node, onChange, isRoot = false, depth = 0, fieldGroups = FIELD_GROUPS }) {
   function update(patch) { onChange({ ...node, ...patch }) }
   function updateChild(idx, child) {
     const next = node.children.slice()
@@ -300,9 +305,10 @@ function GroupNode({ node, onChange, isRoot = false, depth = 0 }) {
                 <PredicateRow
                   node={child}
                   onChange={(c) => updateChild(idx, c)}
+				  fieldGroups={fieldGroups}
                 />
               ) : (
-                <GroupNode node={child} onChange={(c) => updateChild(idx, c)} depth={depth + 1} />
+                <GroupNode node={child} onChange={(c) => updateChild(idx, c)} depth={depth + 1} fieldGroups={fieldGroups} />
               )}
             </div>
             <button
@@ -336,21 +342,28 @@ function GroupNode({ node, onChange, isRoot = false, depth = 0 }) {
 
 // ----- Predicate row renderer -----
 
-function PredicateRow({ node, onChange }) {
-  const t = fieldType(node.field)
-  const ops = useMemo(() => opsForType(t), [t])
+function PredicateRow({ node, onChange, fieldGroups }) {
+	const meta = fieldGroups.flatMap((group) => group.fields).find((field) => field.name === node.field)
+	const baseType = normalizeSchemaType(meta?.type || fieldType(node.field))
+	const t = node.length ? 'int' : baseType
+	const ops = useMemo(() => node.length
+		? opsForType('int')
+		: (meta?.operators?.length ? meta.operators : opsForType(baseType)), [node.length, meta, baseType])
   const isHeader = node.field === 'header'
 
   function update(patch) {
     const next = { ...node, ...patch }
     // If the field type changed and the current op isn't valid, reset to first valid op.
-    if (patch.field !== undefined) {
-      const newOps = opsForType(fieldType(next.field))
+    if (patch.field !== undefined || patch.length !== undefined) {
+	  const nextMeta = fieldGroups.flatMap((group) => group.fields).find((field) => field.name === next.field)
+	  const nextBaseType = normalizeSchemaType(nextMeta?.type || fieldType(next.field))
+	  const nextType = next.length ? 'int' : nextBaseType
+	  const newOps = next.length ? opsForType('int') : (nextMeta?.operators?.length ? nextMeta.operators : opsForType(nextType))
       if (!newOps.includes(next.op)) next.op = newOps[0]
-      if (fieldType(next.field) === 'bool' && (next.value === '' || next.value === undefined)) {
+	  if (nextType === 'bool' && (next.value === '' || next.value === undefined)) {
         next.value = true
       }
-      if (fieldType(next.field) !== 'header') next.headerName = ''
+	  if (nextBaseType !== 'header') next.headerName = ''
     }
     onChange(next)
   }
@@ -370,7 +383,7 @@ function PredicateRow({ node, onChange }) {
         onChange={e => update({ field: e.target.value })}
         className="bg-gray-800 border border-gray-700 rounded px-1.5 py-0.5 text-xs text-gray-100 cursor-pointer focus:outline-none focus:border-cyan-500"
       >
-        {FIELD_GROUPS.map(g => (
+		{fieldGroups.map(g => (
           <optgroup key={g.label} label={g.label}>
             {g.fields.map(f => <option key={f.name} value={f.name} title={f.desc}>{f.name}</option>)}
           </optgroup>
@@ -396,8 +409,11 @@ function PredicateRow({ node, onChange }) {
       >
         {ops.map(o => <option key={o} value={o}>{o}</option>)}
       </select>
+	  {(baseType === 'string' || baseType === 'header') && (
+		<button type="button" onClick={() => update({ length: !node.length })} className={`px-1.5 py-0.5 rounded text-[10px] cursor-pointer ${node.length ? 'bg-teal-900/60 text-teal-300' : 'bg-gray-800 text-gray-500'}`} title="Compare byte length">len</button>
+	  )}
 
-      {t === 'bool' ? (
+	  {(node.op === 'exists' || node.op === 'missing') ? null : t === 'bool' ? (
         <select
           value={(node.value === true || node.value === 'true') ? 'true' : 'false'}
           onChange={e => update({ value: e.target.value === 'true' })}
@@ -417,6 +433,31 @@ function PredicateRow({ node, onChange }) {
       )}
     </div>
   )
+}
+
+function normalizeSchemaType(type) {
+	if (type === 'headers') return 'header'
+	if (type === 'bytes') return 'string'
+	return type || 'string'
+}
+
+function mergeFieldSchema(schema) {
+	if (!schema?.fields?.length) return FIELD_GROUPS
+	const backend = new Map(schema.fields.map((field) => [field.name, field]))
+	const known = new Set()
+	const groups = FIELD_GROUPS.map((group) => ({
+		...group,
+		fields: group.fields.map((field) => {
+			known.add(field.name)
+			const live = backend.get(field.name)
+			return live ? { ...field, type: normalizeSchemaType(live.type), operators: live.operators || [] } : field
+		}),
+	}))
+	const extra = schema.fields
+		.filter((field) => !known.has(field.name))
+		.map((field) => ({ name: field.name, type: normalizeSchemaType(field.type), operators: field.operators || [], desc: 'Backend field' }))
+	if (extra.length) groups.push({ label: 'Other', fields: extra })
+	return groups
 }
 
 // ----- Text editor -----

@@ -1,6 +1,6 @@
 // Package pcap writes captured packets as standard .pcap files (libpcap format).
-// It wraps each stored packet with synthetic Ethernet + IPv4 + TCP headers so
-// the result opens correctly in Wireshark and other pcap-aware tools.
+// It wraps each stored packet with synthetic Ethernet + IPv4 + TCP/UDP headers
+// so the result opens correctly in Wireshark and other pcap-aware tools.
 // No external dependencies are required — the pcap file format is simple enough
 // to implement in ~120 lines of pure Go.
 package pcap
@@ -24,6 +24,8 @@ const (
 	pcapMinor   uint16 = 4
 	pcapSnapLen uint32 = 65535
 	pcapEthLink uint32 = 1 // LINKTYPE_ETHERNET
+	maxTCPChunk        = int(pcapSnapLen) - 14 - 20 - 20
+	maxUDPChunk        = int(pcapSnapLen) - 14 - 20 - 8
 )
 
 // seqState tracks TCP sequence numbers per session to produce a valid bidirectional stream.
@@ -95,6 +97,11 @@ func buildHTTPPayload(pkt *sniffer.Packet) []byte {
 	}
 
 	for k, v := range pkt.Headers {
+		// Stored bodies have already been de-chunked by net/http. Emit one
+		// authoritative length instead of producing contradictory framing.
+		if strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "Transfer-Encoding") {
+			continue
+		}
 		fmt.Fprintf(&sb, "%s: %s\r\n", k, v)
 	}
 	if len(body) > 0 {
@@ -104,6 +111,28 @@ func buildHTTPPayload(pkt *sniffer.Packet) []byte {
 
 	result := []byte(sb.String())
 	return append(result, body...)
+}
+
+func packetPayload(pkt *sniffer.Packet) []byte {
+	protocol := strings.ToLower(pkt.Protocol)
+	switch protocol {
+	case "http", "https", "h2", "h2c", "grpc", "grpc-h2c":
+		return buildHTTPPayload(pkt)
+	default:
+		if len(pkt.Body) > 0 {
+			return pkt.Body
+		}
+		return []byte(pkt.BodyString)
+	}
+}
+
+func isUDP(pkt *sniffer.Packet) bool {
+	switch strings.ToLower(pkt.Protocol) {
+	case "udp", "dns":
+		return true
+	default:
+		return false
+	}
 }
 
 // toIPv4 parses an IP string and returns its 4-byte IPv4 form.
@@ -128,31 +157,40 @@ func WriteGlobalHeader(w io.Writer) error {
 	return err
 }
 
-// writeFrame writes one captured packet as a pcap record with synthetic
-// Ethernet + IPv4 + TCP framing.
-func writeFrame(w io.Writer, pkt *sniffer.Packet, state *seqState) error {
-	payload := buildHTTPPayload(pkt)
-
-	isReq := pkt.Direction == sniffer.DirectionRequest
-	srcIP := toIPv4(pkt.SrcIP)
-	dstIP := toIPv4(pkt.DstIP)
-	srcPort := uint16(pkt.SrcPort)
-	dstPort := uint16(pkt.DstPort)
-
-	var seq, ack uint32
-	if isReq {
-		seq = state.clientSeq
-		ack = state.serverSeq
-		state.clientSeq += uint32(len(payload))
-	} else {
-		seq = state.serverSeq
-		ack = state.clientSeq
-		state.serverSeq += uint32(len(payload))
+// writePacket emits one or more valid frames. Large TCP payloads are segmented
+// and large synthetic UDP payloads are represented as multiple datagrams, so
+// IPv4 lengths and PCAP captured lengths never wrap or exceed snaplen.
+func writePacket(w io.Writer, pkt *sniffer.Packet, state *seqState) error {
+	payload := packetPayload(pkt)
+	chunkSize := maxTCPChunk
+	if isUDP(pkt) {
+		chunkSize = maxUDPChunk
 	}
+	if len(payload) == 0 {
+		return writeTransportFrame(w, pkt, state, nil, 0)
+	}
+	for offset, index := 0, 0; offset < len(payload); index++ {
+		end := offset + chunkSize
+		if end > len(payload) {
+			end = len(payload)
+		}
+		if err := writeTransportFrame(w, pkt, state, payload[offset:end], index); err != nil {
+			return err
+		}
+		offset = end
+	}
+	return nil
+}
 
-	// Frame layout: Ethernet(14) + IPv4(20) + TCP(20) + payload
-	ipPayloadLen := 20 + len(payload)
-	totalIPLen := 20 + ipPayloadLen
+func writeTransportFrame(w io.Writer, pkt *sniffer.Packet, state *seqState, payload []byte, index int) error {
+	udp := isUDP(pkt)
+	transportLen := 20
+	protocol := byte(6)
+	if udp {
+		transportLen = 8
+		protocol = 17
+	}
+	totalIPLen := 20 + transportLen + len(payload)
 	frame := make([]byte, 14+totalIPLen)
 
 	// Ethernet header
@@ -164,33 +202,46 @@ func writeFrame(w io.Writer, pkt *sniffer.Packet, state *seqState) error {
 
 	// IPv4 header (offset 14, 20 bytes)
 	ip := frame[14:]
-	ip[0] = 0x45                                         // version=4, IHL=5
+	ip[0] = 0x45 // version=4, IHL=5
 	binary.BigEndian.PutUint16(ip[2:], uint16(totalIPLen))
-	binary.BigEndian.PutUint16(ip[6:], 0x4000)          // don't fragment
-	ip[8] = 64                                           // TTL
-	ip[9] = 6                                            // TCP
+	binary.BigEndian.PutUint16(ip[6:], 0x4000) // don't fragment
+	ip[8] = 64                                 // TTL
+	ip[9] = protocol
 	// ip[10:12] = checksum — left as 0 (Wireshark handles unchecked checksums)
-	copy(ip[12:16], srcIP)
-	copy(ip[16:20], dstIP)
+	copy(ip[12:16], toIPv4(pkt.SrcIP))
+	copy(ip[16:20], toIPv4(pkt.DstIP))
 
-	// TCP header (offset 34, 20 bytes)
-	tcp := frame[34:]
-	binary.BigEndian.PutUint16(tcp[0:], srcPort)
-	binary.BigEndian.PutUint16(tcp[2:], dstPort)
-	binary.BigEndian.PutUint32(tcp[4:], seq)
-	binary.BigEndian.PutUint32(tcp[8:], ack)
-	tcp[12] = 0x50 // data offset = 5 (20 bytes header, no options)
-	tcp[13] = 0x18 // PSH + ACK
-	binary.BigEndian.PutUint16(tcp[14:], 65535) // window
-	// tcp[16:18] = checksum (0), tcp[18:20] = urgent (0)
-
-	// Payload
-	copy(frame[54:], payload)
+	transport := frame[34:]
+	binary.BigEndian.PutUint16(transport[0:], uint16(pkt.SrcPort))
+	binary.BigEndian.PutUint16(transport[2:], uint16(pkt.DstPort))
+	if udp {
+		binary.BigEndian.PutUint16(transport[4:], uint16(8+len(payload)))
+		copy(transport[8:], payload)
+	} else {
+		isReq := pkt.Direction == sniffer.DirectionRequest
+		var seq, ack uint32
+		if isReq {
+			seq, ack = state.clientSeq, state.serverSeq
+			state.clientSeq += uint32(len(payload))
+		} else {
+			seq, ack = state.serverSeq, state.clientSeq
+			state.serverSeq += uint32(len(payload))
+		}
+		binary.BigEndian.PutUint32(transport[4:], seq)
+		binary.BigEndian.PutUint32(transport[8:], ack)
+		transport[12] = 0x50
+		transport[13] = 0x18
+		binary.BigEndian.PutUint16(transport[14:], 65535)
+		copy(transport[20:], payload)
+	}
 
 	// PCAP packet record (16-byte header)
 	ts := pkt.Timestamp
 	if ts.IsZero() {
 		ts = time.Now()
+	}
+	if index > 0 {
+		ts = ts.Add(time.Duration(index) * time.Microsecond)
 	}
 	recHdr := make([]byte, 16)
 	binary.LittleEndian.PutUint32(recHdr[0:], uint32(ts.Unix()))
@@ -214,7 +265,7 @@ func WritePcap(w io.Writer, packets []*sniffer.Packet) error {
 	// Sort ascending so Wireshark sees the conversation in order
 	sorted := make([]*sniffer.Packet, len(packets))
 	copy(sorted, packets)
-	sort.Slice(sorted, func(i, j int) bool {
+	sort.SliceStable(sorted, func(i, j int) bool {
 		return sorted[i].Timestamp.Before(sorted[j].Timestamp)
 	})
 
@@ -227,7 +278,7 @@ func WritePcap(w io.Writer, packets []*sniffer.Packet) error {
 		if _, ok := seqMap[sid]; !ok {
 			seqMap[sid] = &seqState{clientSeq: 1000, serverSeq: 2000}
 		}
-		if err := writeFrame(w, pkt, seqMap[sid]); err != nil {
+		if err := writePacket(w, pkt, seqMap[sid]); err != nil {
 			return err
 		}
 	}

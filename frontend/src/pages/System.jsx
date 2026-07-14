@@ -52,6 +52,29 @@ function StatCard({ label, value, unit, sub }) {
   )
 }
 
+function CaptureHealth({ capture }) {
+  const dropped = Number(capture?.queue_dropped || 0)
+  const writerErrors = Number(capture?.writer_errors || 0)
+  const healthy = dropped === 0 && writerErrors === 0
+  return (
+    <div className={`mb-6 flex flex-col items-start justify-between gap-2 rounded-lg border px-4 py-3 sm:flex-row sm:items-center sm:gap-4 ${
+      healthy
+        ? 'border-emerald-900/60 bg-emerald-950/20'
+        : 'border-amber-800/60 bg-amber-950/30'
+    }`}>
+      <div className="flex items-center gap-2 min-w-0">
+        <span className={`h-2 w-2 rounded-full flex-shrink-0 ${healthy ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+        <span className={`text-sm font-medium ${healthy ? 'text-emerald-300' : 'text-amber-300'}`}>
+          Capture pipeline {healthy ? 'healthy' : 'needs attention'}
+        </span>
+      </div>
+      <span className="text-xs text-gray-500 whitespace-nowrap">
+        {dropped} queue dropped · {writerErrors} writer errors
+      </span>
+    </div>
+  )
+}
+
 export default function System() {
   const [stats, setStats] = useState(null)
   const [error, setError] = useState(null)
@@ -59,6 +82,7 @@ export default function System() {
 
   useEffect(() => {
     let mounted = true
+    let refreshTimer
 
     async function fetchStats() {
       try {
@@ -70,18 +94,19 @@ export default function System() {
         }
       } catch (err) {
         if (mounted) setError(err.message)
+      } finally {
+        if (mounted) refreshTimer = setTimeout(fetchStats, 10000)
       }
     }
 
     fetchStats()
-    const interval = setInterval(fetchStats, 10000)
     const tick = setInterval(() => {
       if (mounted) setCountdown(c => Math.max(0, c - 1))
     }, 1000)
 
     return () => {
       mounted = false
-      clearInterval(interval)
+      clearTimeout(refreshTimer)
       clearInterval(tick)
     }
   }, [])
@@ -154,6 +179,8 @@ export default function System() {
           value={formatUptime(stats.uptime_secs)}
         />
       </div>
+
+      <CaptureHealth capture={stats.capture} />
 
       {/* Redis (conditional) */}
       {stats.redis_mem_mb != null && (

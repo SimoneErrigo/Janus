@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useCallback, useState, useEffect, useRef } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import ErrorBanner from '../components/ErrorBanner'
@@ -24,6 +24,7 @@ export default function Rules() {
   const [selectedIds, setSelectedIds] = useState(new Set())
   const [actionFilter, setActionFilter] = useState('all') // 'all' | 'drop' | 'alert' | 'both'
   const ruleFormAnchorRef = useRef(null)
+  const rulesRequestRef = useRef(0)
   // Anchor for Shift+click range selection, set by any single checkbox toggle.
   const selectionAnchorRef = useRef(null)
   const location = useLocation()
@@ -33,7 +34,7 @@ export default function Rules() {
     api.listServices().then((data) => {
       const svcs = data || []
       setServices(svcs)
-      if (svcs.length > 0 && !selectedService) setSelectedService('_all')
+      if (svcs.length > 0) setSelectedService((current) => current || '_all')
     })
   }, [])
 
@@ -43,34 +44,45 @@ export default function Rules() {
   useEffect(() => {
     const preset = location.state?.presetRule
     if (!preset) return
-    setEditing({
-      _isNew: true,
-      service_id: preset.service_id || (services[0]?.id || ''),
-      name: preset.name || '',
-      expression: preset.expression || '',
-      priority: 10,
-      enabled: true,
-      action: preset.action || 'drop',
-    })
-    if (preset.service_id) setSelectedService(preset.service_id)
-    navigate(location.pathname, { replace: true, state: null })
-    setTimeout(() => ruleFormAnchorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
+    let scrollTimer
+    const timer = setTimeout(() => {
+      setEditing({
+        _isNew: true,
+        service_id: preset.service_id || (services[0]?.id || ''),
+        name: preset.name || '',
+        expression: preset.expression || '',
+        priority: 10,
+        enabled: true,
+        action: preset.action || 'drop',
+      })
+      if (preset.service_id) setSelectedService(preset.service_id)
+      navigate(location.pathname, { replace: true, state: null })
+      scrollTimer = setTimeout(() => ruleFormAnchorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
+    }, 0)
+    return () => { clearTimeout(timer); clearTimeout(scrollTimer) }
   }, [location.state, location.pathname, navigate, services])
 
-  useEffect(() => {
-    loadRules()
-  }, [selectedService])
-
-  async function loadRules() {
+  const loadRules = useCallback(async () => {
+    const request = ++rulesRequestRef.current
     try {
       const serviceId = selectedService === '_all' ? '' : selectedService
       const data = await api.listRules(serviceId)
+      if (request !== rulesRequestRef.current) return
       setRules(data || [])
       setSelectedIds(new Set())
     } catch (err) {
-      setError(err.message)
+      if (request === rulesRequestRef.current) setError(err.message)
     }
-  }
+  }, [selectedService])
+  const invalidateRulesLoad = useCallback(() => { rulesRequestRef.current++ }, [])
+
+  useEffect(() => {
+    const timer = setTimeout(loadRules, 0)
+    return () => {
+      clearTimeout(timer)
+      invalidateRulesLoad()
+    }
+  }, [invalidateRulesLoad, loadRules])
 
   const { serviceName } = useServiceMap(services)
 

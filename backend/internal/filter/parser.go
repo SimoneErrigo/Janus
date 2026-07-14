@@ -9,12 +9,18 @@ import (
 // Parse turns an expression source string into an AST.
 // An empty (or whitespace-only) source parses to nil — callers treat nil as "match all".
 func Parse(src string) (Node, error) {
+	if len(src) > 4096 {
+		return nil, &SyntaxError{Pos: 4096, Message: "expression is too long"}
+	}
 	if strings.TrimSpace(src) == "" {
 		return nil, nil
 	}
 	toks, err := tokenize(src)
 	if err != nil {
 		return nil, err
+	}
+	if len(toks) > 1024 {
+		return nil, &SyntaxError{Pos: len(src), Message: "expression has too many tokens"}
 	}
 	p := &parser{toks: toks}
 	node, err := p.parseOr()
@@ -137,31 +143,29 @@ func (p *parser) parseAtom() (Node, error) {
 }
 
 // parsePredicate handles:
-//   <field> <op> <value>
-//   <field>                                  (bool field shortcut: equivalent to <field> == true)
-//   header.<name> <op> <value>
+//
+//	<field> <op> <value>
+//	<field>                                  (bool field shortcut: equivalent to <field> == true)
+//	header.<name> <op> <value>
 func (p *parser) parsePredicate() (Node, error) {
 	field := p.advance()
 	pred := Predicate{Field: strings.ToLower(field.val)}
 
-	// Dotted suffixes: `header.<name>`, `<field>.length`, and the combination
+	// Dotted suffixes: `header.<name>`, structured paths such as
+	// `decoded.dns.qname` / `json.user.id`, and `<field>.length`.
 	// `header.<name>.length`. `.length` (aliases `.len`, `.size`) turns any
 	// string/bytes/header field into an integer byte-length comparison.
 	if p.peek().kind == tkDot {
 		p.advance() // consume dot
 		nm := p.peek()
-		if nm.kind != tkIdent {
+		if nm.kind != tkIdent && nm.kind != tkKwOp {
 			return nil, &SyntaxError{Pos: nm.pos, Message: "expected a name after `.`"}
 		}
 		if isLengthWord(nm.val) {
 			// <field>.length
 			p.advance()
 			pred.Length = true
-		} else {
-			// header.<name>[.length]
-			if pred.Field != "header" && pred.Field != "headers" {
-				return nil, &SyntaxError{Pos: nm.pos, Message: "only `header.` accepts a sub-name (use `.length` for byte length)"}
-			}
+		} else if pred.Field == "header" || pred.Field == "headers" {
 			p.advance()
 			pred.Field = "header"
 			pred.HeaderName = nm.val
@@ -174,6 +178,25 @@ func (p *parser) parsePredicate() (Node, error) {
 				p.advance()
 				pred.Length = true
 			}
+		} else {
+			parts := []string{pred.Field}
+			for {
+				part := p.peek()
+				if part.kind != tkIdent && part.kind != tkKwOp {
+					return nil, &SyntaxError{Pos: part.pos, Message: "expected a field segment after `.`"}
+				}
+				p.advance()
+				if isLengthWord(part.val) && p.peek().kind != tkDot {
+					pred.Length = true
+					break
+				}
+				parts = append(parts, strings.ToLower(part.val))
+				if p.peek().kind != tkDot {
+					break
+				}
+				p.advance()
+			}
+			pred.Field = strings.Join(parts, ".")
 		}
 	}
 
@@ -183,6 +206,10 @@ func (p *parser) parsePredicate() (Node, error) {
 	// bare-field bool shortcut (e.g. `flagged`)
 	switch p.peek().kind {
 	case tkAnd, tkOr, tkRParen, tkEOF:
+		fieldDef, ok := LookupField(pred.Field)
+		if !ok || pred.Length || fieldDef.Type != TypeBool {
+			return nil, &SyntaxError{Pos: p.peek().pos, Message: fmt.Sprintf("expected operator after field `%s`", field.val)}
+		}
 		pred.Op = OpEq
 		pred.Value = Value{Kind: ValBool, Bool: true}
 		return &pred, nil
@@ -212,6 +239,10 @@ func (p *parser) parsePredicate() (Node, error) {
 		pred.Op = Op(opTok.val)
 	default:
 		return nil, &SyntaxError{Pos: opTok.pos, Message: fmt.Sprintf("expected operator after field `%s`", field.val)}
+	}
+	if pred.Op == OpExists || pred.Op == OpMissing {
+		pred.Value = Value{Kind: ValBool, Bool: true}
+		return &pred, nil
 	}
 
 	// value
@@ -244,6 +275,9 @@ func (p *parser) parseValue(inList bool) (Value, error) {
 				return Value{}, err
 			}
 			items = append(items, item)
+			if len(items) > 256 {
+				return Value{}, &SyntaxError{Pos: p.peek().pos, Message: "list has more than 256 items"}
+			}
 			if p.peek().kind == tkComma {
 				p.advance()
 				continue

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { createElement, Suspense, useEffect, useState } from 'react'
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { api, clearToken, getDisplayName } from '../api'
 import ShortcutsLegend from './ShortcutsLegend'
@@ -57,37 +57,46 @@ export default function Layout() {
   }, [])
 
   useEffect(() => {
-    let mounted = true
-    api.getConfig().then((cfg) => {
-      if (!mounted) return
-      setTrafficMode(cfg?.traffic_mode || 'live')
-    }).catch(() => {})
-    const t = setInterval(async () => {
+    let cancelled = false
+    let timer
+    async function poll() {
       try {
         const cfg = await api.getConfig()
-        if (mounted) setTrafficMode(cfg?.traffic_mode || 'live')
-      } catch {}
-    }, 30000)
+        if (!cancelled) setTrafficMode(cfg?.traffic_mode || 'live')
+      } catch {
+        // Keep the last known mode; the next poll retries.
+      } finally {
+        if (!cancelled) timer = setTimeout(poll, 30000)
+      }
+    }
+    poll()
     return () => {
-      mounted = false
-      clearInterval(t)
+      cancelled = true
+      clearTimeout(timer)
     }
   }, [])
 
   useEffect(() => {
-    let mounted = true
-    const poll = async () => {
+    let cancelled = false
+    let timer
+    async function poll() {
       try {
         const data = await api.getSessionActive()
-        if (mounted) setActiveSessions(data?.sessions || [])
-      } catch {}
+        if (!cancelled) setActiveSessions(data?.sessions || [])
+      } catch {
+        // Presence is informational; retain the last successful snapshot.
+      } finally {
+        if (!cancelled) timer = setTimeout(poll, 10000)
+      }
     }
     poll()
-    const t = setInterval(poll, 10000)
-    return () => { mounted = false; clearInterval(t) }
+    return () => { cancelled = true; clearTimeout(timer) }
   }, [])
 
   function handleLogout() {
+    // Start cookie invalidation while the bearer token is still available.
+    // Navigation is intentionally not blocked by a slow/offline backend.
+    api.logout().catch(() => { /* local logout still succeeds */ })
     clearToken()
     navigate('/login')
   }
@@ -158,7 +167,7 @@ export default function Layout() {
                     }`
                   }
                 >
-                  <Icon className="w-4 h-4 flex-shrink-0" />
+                  {createElement(Icon, { className: 'w-4 h-4 flex-shrink-0' })}
                   {!collapsed && label}
                 </NavLink>
               ))}
@@ -197,7 +206,9 @@ export default function Layout() {
 
       {/* Main content */}
       <main className="flex-1 overflow-auto">
-        <Outlet />
+        <Suspense fallback={<div className="p-6 text-sm text-gray-600">Loading…</div>}>
+          <Outlet />
+        </Suspense>
       </main>
 
       {showShortcuts && <ShortcutsLegend onClose={() => setShowShortcuts(false)} />}

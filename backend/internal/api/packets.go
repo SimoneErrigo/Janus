@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -14,10 +15,18 @@ import (
 )
 
 type paginatedPackets struct {
-	Packets []*sniffer.Packet `json:"packets"`
-	Total   int               `json:"total"`
-	Limit   int               `json:"limit"`
-	Offset  int               `json:"offset"`
+	Packets    []*sniffer.Packet `json:"packets"`
+	Total      int               `json:"total"`
+	Limit      int               `json:"limit"`
+	Offset     int               `json:"offset"`
+	TotalExact bool              `json:"total_exact"`
+	Partial    bool              `json:"partial,omitempty"`
+	NextCursor string            `json:"next_cursor,omitempty"`
+}
+
+type packetCursor struct {
+	Timestamp string `json:"t"`
+	ID        int64  `json:"id"`
 }
 
 func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
@@ -25,9 +34,21 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if len(r.URL.RawQuery) > 64<<10 {
+		http.Error(w, "query string is too long", http.StatusRequestURITooLong)
+		return
+	}
 
 	q := sniffer.PacketQuery{}
 	params := r.URL.Query()
+	if raw := params.Get("cursor"); raw != "" {
+		cursor, err := decodePacketCursor(raw)
+		if err != nil {
+			http.Error(w, "invalid cursor", http.StatusBadRequest)
+			return
+		}
+		q.CursorTimestamp, q.CursorID = cursor.Timestamp, cursor.ID
+	}
 
 	q.ServiceID = params.Get("service_id")
 
@@ -79,6 +100,10 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 	q.ContainsHeaders = params.Get("contains_headers")
 	q.Regex = params.Get("regex")
 	q.Q = params.Get("q")
+	if len(q.Q) > 4096 {
+		http.Error(w, "q expression is too long", http.StatusBadRequest)
+		return
+	}
 	if q.Q != "" {
 		// Parse-validate up front so syntax errors come back as 400, not 500.
 		if _, err := filter.Compile(q.Q); err != nil {
@@ -99,6 +124,19 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 	q.NotContainsBody = params.Get("not_contains_body")
 	q.NotContainsHeaders = params.Get("not_contains_headers")
 	q.NotRegex = params.Get("not_regex")
+	for name, value := range map[string]string{
+		"service_id": q.ServiceID, "session_id": q.SessionID, "src_ip": q.SrcIP, "dst_ip": q.DstIP,
+		"peer_ip": q.PeerIP, "url": q.URL, "contains": q.Contains, "contains_body": q.ContainsBody,
+		"contains_headers": q.ContainsHeaders, "regex": q.Regex, "not_service_id": q.NotServiceID,
+		"not_src_ip": q.NotSrcIP, "not_dst_ip": q.NotDstIP, "not_peer_ip": q.NotPeerIP,
+		"not_url": q.NotURL, "not_contains": q.NotContains, "not_contains_body": q.NotContainsBody,
+		"not_contains_headers": q.NotContainsHeaders, "not_regex": q.NotRegex,
+	} {
+		if len(value) > 4096 {
+			http.Error(w, name+" is too long", http.StatusBadRequest)
+			return
+		}
+	}
 	if v := params.Get("not_direction"); v != "" {
 		dir := strings.ToLower(strings.TrimSpace(v))
 		switch dir {
@@ -106,11 +144,18 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 			q.NotDirection = "request"
 		case "res", "response":
 			q.NotDirection = "response"
+		default:
+			http.Error(w, "invalid not_direction: use 'req', 'res', 'request', or 'response'", http.StatusBadRequest)
+			return
 		}
 	}
 
 	if v := params.Get("flagged"); v != "" {
-		flagged := v == "true" || v == "1"
+		flagged, ok := parseBoolQuery(v)
+		if !ok {
+			http.Error(w, "invalid flagged boolean", http.StatusBadRequest)
+			return
+		}
 		q.Flagged = &flagged
 	}
 
@@ -147,6 +192,9 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		q.Limit = n
+		if q.Limit > 500 {
+			q.Limit = 500
+		}
 	}
 
 	if v := params.Get("offset"); v != "" {
@@ -155,21 +203,45 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid offset", http.StatusBadRequest)
 			return
 		}
+		if n > 10_000_000 {
+			http.Error(w, "offset is too large", http.StatusBadRequest)
+			return
+		}
 		q.Offset = n
 	}
 
 	if v := params.Get("contains_flagid"); v != "" {
-		b := v == "true" || v == "1"
+		b, ok := parseBoolQuery(v)
+		if !ok {
+			http.Error(w, "invalid contains_flagid boolean", http.StatusBadRequest)
+			return
+		}
 		q.ContainsFlagID = &b
+	}
+	if v := params.Get("flagid_round"); v != "" {
+		round, err := strconv.Atoi(v)
+		if err != nil || round < 0 {
+			http.Error(w, "invalid flagid_round", http.StatusBadRequest)
+			return
+		}
+		q.FlagIDRound = &round
 	}
 
 	if v := params.Get("has_matched_rules"); v != "" {
-		b := v == "true" || v == "1"
+		b, ok := parseBoolQuery(v)
+		if !ok {
+			http.Error(w, "invalid has_matched_rules boolean", http.StatusBadRequest)
+			return
+		}
 		q.HasMatchedRules = &b
 	}
 
 	if v := params.Get("dropped"); v != "" {
-		b := v == "true" || v == "1"
+		b, ok := parseBoolQuery(v)
+		if !ok {
+			http.Error(w, "invalid dropped boolean", http.StatusBadRequest)
+			return
+		}
 		q.Dropped = &b
 	}
 
@@ -180,8 +252,8 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 	// Per-user hide filters (client-sent): exclude_ids=comma,separated and hidden_before=RFC3339.
 	if v := params.Get("exclude_ids"); v != "" {
 		parts := strings.Split(v, ",")
-		if len(parts) > 2000 {
-			parts = parts[:2000]
+		if len(parts) > 500 {
+			parts = parts[:500]
 		}
 		ids := make([]int64, 0, len(parts))
 		for _, p := range parts {
@@ -200,7 +272,7 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 		q.HiddenBefore = &t
 	}
 
-	packets, total, err := s.packetStore.Query(q)
+	packets, total, meta, err := s.packetStore.QueryPage(q)
 	if err != nil {
 		http.Error(w, "query error: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -217,13 +289,47 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result := paginatedPackets{
-		Packets: packets,
-		Total:   total,
-		Limit:   limit,
-		Offset:  q.Offset,
+		Packets:    packets,
+		Total:      total,
+		Limit:      limit,
+		Offset:     q.Offset,
+		TotalExact: meta.TotalExact,
+		Partial:    meta.Partial,
+		NextCursor: encodePacketCursor(meta.NextTimestamp, meta.NextID),
 	}
 
 	writeJSON(w, http.StatusOK, result)
+}
+
+func decodePacketCursor(raw string) (packetCursor, error) {
+	if len(raw) > 512 {
+		return packetCursor{}, fmt.Errorf("cursor too long")
+	}
+	data, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return packetCursor{}, err
+	}
+	var cursor packetCursor
+	if err := json.Unmarshal(data, &cursor); err != nil {
+		return packetCursor{}, err
+	}
+	timestamp, err := time.Parse(time.RFC3339Nano, cursor.Timestamp)
+	if err != nil || cursor.ID <= 0 {
+		return packetCursor{}, fmt.Errorf("invalid cursor payload")
+	}
+	cursor.Timestamp = sniffer.CanonicalTimestamp(timestamp)
+	return cursor, nil
+}
+
+func encodePacketCursor(timestamp time.Time, id int64) string {
+	if timestamp.IsZero() || id <= 0 {
+		return ""
+	}
+	data, err := json.Marshal(packetCursor{Timestamp: sniffer.CanonicalTimestamp(timestamp), ID: id})
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(data)
 }
 
 func (s *Server) handlePacketByID(w http.ResponseWriter, r *http.Request) {
@@ -234,7 +340,7 @@ func (s *Server) handlePacketByID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
+	if err != nil || id <= 0 {
 		http.Error(w, "invalid packet ID", http.StatusBadRequest)
 		return
 	}
@@ -283,6 +389,16 @@ func (s *Server) handlePacketsBulkDelete(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusOK, map[string]int64{"deleted": 0})
 		return
 	}
+	if len(body.IDs) > 500 {
+		http.Error(w, "ids must contain at most 500 packets", http.StatusBadRequest)
+		return
+	}
+	for _, id := range body.IDs {
+		if id <= 0 {
+			http.Error(w, "ids must contain only positive packet IDs", http.StatusBadRequest)
+			return
+		}
+	}
 
 	n, err := s.packetStore.DeletePacketIDs(body.IDs)
 	if err != nil {
@@ -291,6 +407,36 @@ func (s *Server) handlePacketsBulkDelete(w http.ResponseWriter, r *http.Request)
 	}
 	log.Printf("[user=%s] action=bulk-delete-packets count=%d", DisplayNameFromRequest(r), n)
 	writeJSON(w, http.StatusOK, map[string]int64{"deleted": n})
+}
+
+func (s *Server) handlePacketsLabel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		IDs   []int64 `json:"ids"`
+		Label string  `json:"label"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10)).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if len(req.IDs) == 0 || len(req.IDs) > 500 {
+		http.Error(w, "ids must contain 1 to 500 packets", http.StatusBadRequest)
+		return
+	}
+	switch req.Label {
+	case "", "exploit", "checker", "normal":
+	default:
+		http.Error(w, "label must be exploit, checker, normal, or empty", http.StatusBadRequest)
+		return
+	}
+	if err := s.packetStore.SetAnalystLabel(req.IDs, req.Label); err != nil {
+		http.Error(w, "failed to set label", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"updated": len(req.IDs), "label": req.Label})
 }
 
 func (s *Server) handlePacketFlow(w http.ResponseWriter, r *http.Request) {
@@ -306,7 +452,7 @@ func (s *Server) handlePacketFlow(w http.ResponseWriter, r *http.Request) {
 	}
 
 	packetID, err := strconv.ParseInt(packetIDStr, 10, 64)
-	if err != nil {
+	if err != nil || packetID <= 0 {
 		http.Error(w, fmt.Sprintf("invalid packet_id: %v", err), http.StatusBadRequest)
 		return
 	}
@@ -328,4 +474,15 @@ func (s *Server) handlePacketFlow(w http.ResponseWriter, r *http.Request) {
 		Limit:   len(packets),
 		Offset:  0,
 	})
+}
+
+func parseBoolQuery(value string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true", "1":
+		return true, true
+	case "false", "0":
+		return false, true
+	default:
+		return false, false
+	}
 }

@@ -1,7 +1,7 @@
 # Python filters — advanced examples
 
 Worked `match(flow)` filters, from one-liners to stateful attack detectors, for
-HTTP, TCP, and WebSocket services. Most are modelled on **real A/D vulnerabilities**, and each
+HTTP, TCP, UDP, and WebSocket services. Most are modelled on **real A/D vulnerabilities**, and each
 is written **ad-hoc so it drops the exploit without ever matching the checker's
 normal traffic** — the note under each one says exactly why the checker slips
 through. For the full API see [PYFILTERS.md](PYFILTERS.md).
@@ -11,19 +11,24 @@ If this is your first filter, begin with the smaller examples in
 [PYFILTERS_QUICKSTART.md](PYFILTERS_QUICKSTART.md), then test the adapted script
 against a captured packet or a whole flow before enabling it.
 
-Tags: **Alert** returns a reason string (works on any filter). **Blocking** drops
-or rewrites the current message and needs the *Blocking* checkbox (inline on TCP
-and WebSocket requests + responses, and HTTP requests).
+Tags: **Alert** returns a reason string (works in either mode). **Inline** drops
+or rewrites the current message before forwarding. Inline execution
+works in both directions for TCP, UDP, and WebSocket, plus ordinary buffered
+HTTP/HTTPS responses up to 1 MiB; streaming/oversized HTTP and HTTP/2 or gRPC
+responses are observe-only. For body-based HTTP request decisions, require
+`flow.body_complete`: chunked/unknown-length bodies are streamed without
+pre-reading and bodies over 1 MiB expose only a bounded prefix inline.
 
 Return values: `False`/`None` ignore · `"reason"` alert · `{"drop": True, "reason": …}`
 drop now · assign `flow.body` / `flow.content` rewrite. `DIRECTION = "request"`/`"response"`
-at module level restricts the side. Module globals persist; `flow.conn` is
-per-TCP-connection state (private to each filter).
+at module level restricts the side. Module globals persist; `flow.state` is
+bounded per-connection/session state private to each filter (`flow.conn` is its
+legacy alias).
 
-The test panel accepts a single packet or an ordered request/response flow. Use
-**Repeat** to exercise counters and other stateful logic. A successful test only
-becomes an inline block or rewrite on live traffic when the script is also marked
-**Blocking**.
+The test panel accepts a manual sample, a server-loaded packet, or an ordered
+request/response flow. It applies the selected mode and scope; **Repeat**
+exercises counters and other stateful logic. A successful test only changes live
+traffic after the script is saved, enabled, and set to Inline.
 
 ## `util.*` — payload analysis helpers
 
@@ -58,32 +63,32 @@ and drop immediately without pulling the whole thing apart by hand.
 ## Table of contents
 
 **Level 1 — stateless pattern**
-1. [Mass assignment on registration](#1-mass-assignment-on-registration) · Blocking
-2. [Curl option injection / SSRF](#2-curl-option-injection--ssrf) · Blocking
-3. [Control chars in a username](#3-control-chars-in-a-username) · Blocking
-4. [Strict date format (buffer overflow)](#4-strict-date-format-buffer-overflow) · Blocking
-5. [Bounded numeric timestamp](#5-bounded-numeric-timestamp) · Blocking
+1. [Mass assignment on registration](#1-mass-assignment-on-registration) · Inline
+2. [Curl option injection / SSRF](#2-curl-option-injection--ssrf) · Inline
+3. [Control chars in a username](#3-control-chars-in-a-username) · Inline
+4. [Strict date format (buffer overflow)](#4-strict-date-format-buffer-overflow) · Inline
+5. [Bounded numeric timestamp](#5-bounded-numeric-timestamp) · Inline
 
 **Level 2 — body / file parsing**
-6. [Reject malformed JSON (error-leak)](#6-reject-malformed-json-error-leak) · Blocking
-7. [A file field must be canonical base64](#7-a-file-field-must-be-canonical-base64) · Blocking
-8. [Content-Type must match the bytes](#8-content-type-must-match-the-bytes) · Blocking
-9. [Malicious content inside an uploaded image (polyglot / QR / metadata)](#9-malicious-content-inside-an-uploaded-image-polyglot--qr--metadata) · Blocking
-10. [Static path traversal / SSRF](#10-static-path-traversal--ssrf) · Blocking
-11. [Algorithm allowlist](#11-algorithm-allowlist) · Blocking
+6. [Reject malformed JSON (error-leak)](#6-reject-malformed-json-error-leak) · Inline
+7. [A file field must be canonical base64](#7-a-file-field-must-be-canonical-base64) · Inline
+8. [Content-Type must match the bytes](#8-content-type-must-match-the-bytes) · Inline
+9. [Malicious content inside an uploaded image (polyglot / QR / metadata)](#9-malicious-content-inside-an-uploaded-image-polyglot--qr--metadata) · Inline
+10. [Static path traversal / SSRF](#10-static-path-traversal--ssrf) · Inline
+11. [Algorithm allowlist](#11-algorithm-allowlist) · Inline
 
 **Level 3 — semantic payload**
-12. [JOIN result-length overflow](#12-join-result-length-overflow) · Blocking
-13. [Marker that appears only after sanitization](#13-marker-that-appears-only-after-sanitization) · Blocking
-14. [Crypto-oracle input (uniform blocks)](#14-crypto-oracle-input-uniform-blocks) · Blocking
-15. [Parameter pollution + shell metacharacters](#15-parameter-pollution--shell-metacharacters) · Blocking
+12. [JOIN result-length overflow](#12-join-result-length-overflow) · Inline
+13. [Marker that appears only after sanitization](#13-marker-that-appears-only-after-sanitization) · Inline
+14. [Crypto-oracle input (uniform blocks)](#14-crypto-oracle-input-uniform-blocks) · Inline
+15. [Parameter pollution + shell metacharacters](#15-parameter-pollution--shell-metacharacters) · Inline
 
 **Level 4 — stateful flow**
-16. [Empty-password login flood](#16-empty-password-login-flood) · Blocking
-17. [Repeated protocol INIT (challenge reuse)](#17-repeated-protocol-init-challenge-reuse) · Blocking
-18. [Byte-at-a-time compare oracle](#18-byte-at-a-time-compare-oracle) · Blocking
-19. [Author overwrite between open and answer](#19-author-overwrite-between-open-and-answer) · Blocking
-20. [IDOR: object never created in this session](#20-idor-object-never-created-in-this-session) · Alert
+16. [Login flood against one victim](#16-login-flood-against-one-victim) · Inline
+17. [Repeated protocol INIT (challenge reuse)](#17-repeated-protocol-init-challenge-reuse) · Inline
+18. [Byte-at-a-time compare oracle](#18-byte-at-a-time-compare-oracle) · Inline
+19. [Author overwrite between open and answer](#19-author-overwrite-between-open-and-answer) · Inline
+20. [IDOR: object never created in this session](#20-idor-object-never-created-in-this-session) · Inline
 
 **Level 5 — [when a traffic filter can't be trusted](#level-5--when-a-traffic-filter-cant-be-trusted)**
 
@@ -404,8 +409,10 @@ def match(flow):
 
 ## Level 4 — stateful flow
 
-These key on `flow.conn` (per TCP connection). For HTTP, prefer a module-level
-dict keyed by a **session cookie** (SNAT-safe — never by IP).
+These use `flow.state`, which is bounded and private to the current filter and
+Janus connection/session. If an HTTP detector must span transport connections,
+use a bounded module-level dictionary keyed by a **session cookie** or
+credential (SNAT-safe—never only by IP).
 
 ### 16. Login flood against one victim
 *CookingNonna — the exploit opens ~253 failed logins against the victim's
@@ -420,16 +427,16 @@ def match(flow):
     for cmd in flow.commands(CMDS):
         if cmd.name == "login":
             k = "u:" + cmd.user.decode("latin1", "ignore")
-            n = flow.conn.get(k, 0) + 1
-            flow.conn[k] = n
+            n = flow.state.get(k, 0) + 1
+            flow.state[k] = n
             if n >= 30:
                 return {"drop": True, "reason": "login flood: %d attempts on one user" % n}
     return False
 ```
 *The checker does a single correct login, so the per-user counter never
-approaches 30. (Note: an empty password sent as a blank line isn't visible here —
-`flow.commands` skips blank lines — so key on the attempt count, not the password.
-The long vault names the checker uses are deliberately not what we match.)*
+approaches 30. Empty argument lines are preserved by `flow.commands`, so field
+positions do not shift across an empty password. The long vault names the
+checker uses are deliberately not what we match.*
 
 ### 17. Repeated protocol INIT (challenge reuse)
 *Fonograph — the Schnorr challenge isn't regenerated; two `INIT`s before `FINISH`
@@ -442,11 +449,11 @@ CMDS = {b"INIT": ("init", 0), b"FINISH": ("finish", 0)}
 def match(flow):
     for cmd in flow.commands(CMDS):
         if cmd.name == "init":
-            if flow.conn.get("state") == "challenged":
+            if flow.state.get("state") == "challenged":
                 return {"drop": True, "reason": "second INIT without FINISH (challenge reuse)"}
-            flow.conn["state"] = "challenged"
+            flow.state["state"] = "challenged"
         elif cmd.name == "finish":
-            flow.conn["state"] = "idle"
+            flow.state["state"] = "idle"
     return False
 ```
 *The checker runs `INIT` → `FINISH`, so a second `INIT` never arrives while a
@@ -465,8 +472,8 @@ def match(flow):
     for cmd in flow.commands(CMDS):
         if cmd.name == "chk":
             k = "n:" + cmd.uid.decode("latin1", "ignore")
-            n = flow.conn.get(k, 0) + 1
-            flow.conn[k] = n
+            n = flow.state.get(k, 0) + 1
+            flow.state[k] = n
             if n >= 16:
                 return {"drop": True, "reason": "%d CHK_KEY on the same UID (compare oracle)" % n}
     return False
@@ -483,7 +490,7 @@ opening a question and answering it is the tell.
 DIRECTION = "request"
 
 def match(flow):
-    c = flow.conn
+    c = flow.state
     p = flow.path
     if p.endswith("/challenge/open"):
         c["open"], c["listed"] = True, False
@@ -500,15 +507,16 @@ open, so `listed` is reset to False by the open and the answer is clean.*
 
 ### 20. IDOR: object never created in this session
 *CCForms — `/form/:id/answers` (and embedded forms) don't check ownership.* Learn
-the ids this session created from the **responses**, then flag reads of an id it
-never made. This needs response visibility, so it **alerts** (run it non-Blocking).
+the ids this session created from the **responses**, then block reads of an id it
+never made. Select both directions and use Inline mode for ordinary HTTP/1.1 or
+HTTPS responses that fit in Janus's response buffer.
 
 ```python
 import re
 ANSWERS = re.compile(r"/form/([^/]+)/answers")
 
 def match(flow):
-    c = flow.conn
+    c = flow.state
     if flow.is_response:
         data = flow.json() or {}
         fid = data.get("id") or data.get("form_id")
@@ -517,13 +525,13 @@ def match(flow):
         return False
     m = ANSWERS.search(flow.path)
     if m and m.group(1) not in c.get("owned", set()):
-        return "reading answers of form %s never created in this session" % m.group(1)
+        return flow.drop("reading answers of form %s never created in this session" % m.group(1))
     return False
 ```
 *The checker creates a form (its response teaches us the id), then reads that same
-id — which is in `owned`. The exploit reads the victim's id without ever creating
-it. Because it correlates a request with an earlier response, keep it **async**
-(alert): inline blocking on HTTP doesn't see responses.*
+id—which is in `owned`. The exploit reads the victim's id without ever creating
+it. On streaming/oversized HTTP responses, HTTP/2, or gRPC, response evaluation
+is observe-only, so validate the exact service path before relying on this block.*
 
 ---
 
@@ -561,16 +569,18 @@ def match(flow):
             return "bearer token that was never issued by the server (possible forgery)"
     return False
 ```
-*Alert-only, and it needs to see the issuing responses — so run it async and be
-aware it will false-positive on tokens minted before the filter started.*
+*Start in Observe because it needs to see issuing responses and will
+false-positive on tokens minted before the filter started. It can become a
+Block filter on ordinary buffered HTTP/HTTPS after the state has warmed up.*
 
 ---
 
 ## Testing your filters
 
 Use the **Test** panel on the Python Filters page: build a Request/Response
-sample, or load a real captured packet (or a whole request+response **flow**) from
-traffic. Whole-flow tests replay `match()` over the packets in order, so stateful
-and `flow.commands` filters see the real sequence. Always test the **checker's**
+sample, or load a real captured packet (or a whole request+response **flow**)
+server-side by packet ID. The selected mode and scope are enforced. Whole-flow
+tests replay `match()` over the packets in order, so stateful and
+`flow.commands` filters see the real sequence. Always test the **checker's**
 happy path too and confirm it shows *no match* — that's what keeps a filter from
 costing you SLA.

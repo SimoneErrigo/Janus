@@ -216,6 +216,10 @@ func tryPushBool(col string, pr *Predicate) (string, []any, bool) {
 		bit = 1
 	}
 	switch pr.Op {
+	case OpExists:
+		return col + " != ''", nil, true
+	case OpMissing:
+		return col + " = ''", nil, true
 	case OpEq:
 		return fmt.Sprintf("%s = %d", col, bit), nil, true
 	case OpNeq:

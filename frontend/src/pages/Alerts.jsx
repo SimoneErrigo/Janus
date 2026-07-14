@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useInfiniteList } from '../hooks/useInfiniteList'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { api, subscribePacketStream } from '../api'
-import { addHiddenIds, getHiddenIds, getClearCursor, getHiddenAlertIds, addHiddenAlertIds } from '../userHidden'
+import { addHiddenIds, getHiddenIds, getEffectiveClearCursor, getHiddenAlertIds, setViewClearCursor } from '../userHidden'
 import HighlightedBody from '../components/HighlightedBody'
 import FilterExpression from '../components/FilterExpression'
 import { tryFormatJSON } from '../utils/formatting'
@@ -85,9 +85,18 @@ export default function Alerts() {
   const [filterNegated, setFilterNegated] = useState({ service_id: false, src_ip: false })
   const [paused, setPaused] = useState(false)
   const pausedRef = useRef(false)
+  const selectionRequestRef = useRef(0)
+
+  const clearSelection = useCallback(() => {
+    selectionRequestRef.current++
+    setSelectedAlert(null)
+    setLinkedPacket(null)
+  }, [])
 
   const fetchPage = useCallback(async (offset, limit) => {
     const params = { limit, offset }
+    const clearCursor = getEffectiveClearCursor('alerts')
+    if (clearCursor) params.time_from = clearCursor
     if (expression.trim()) params.q = expression
     if (filters.service_id) {
       if (filterNegated.service_id) params.not_service_id = filters.service_id
@@ -112,19 +121,17 @@ export default function Alerts() {
 
   // Filter out alerts whose linked packet this user has hidden, plus any alerts
   // the user dismissed from their own view via "Clear All".
-  const [hideVersion, setHideVersion] = useState(0)
   const alerts = useMemo(() => {
     const hiddenPkts = new Set(getHiddenIds())
     const hiddenAlerts = new Set(getHiddenAlertIds())
-    const cursor = getClearCursor()
+    const cursor = getEffectiveClearCursor('alerts')
     return alertsRaw.filter((a) => {
       if (hiddenAlerts.has(Number(a.id))) return false
       if (hiddenPkts.has(Number(a.packet_id))) return false
       if (cursor && a.timestamp && a.timestamp < cursor) return false
       return true
     })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [alertsRaw, hideVersion])
+  }, [alertsRaw])
   const hiddenCount = alertsRaw.length - alerts.length
   const total = Math.max(0, totalRaw - hiddenCount)
 
@@ -153,11 +160,12 @@ export default function Alerts() {
   useEffect(() => {
     const id = location.state?.restoreAlertId
     if (id == null) return
+    const request = ++selectionRequestRef.current
     navigate(location.pathname, { replace: true, state: {} })
     ;(async () => {
       try {
         const data = await api.getAlert(id)
-        if (data?.alert) {
+        if (request === selectionRequestRef.current && data?.alert) {
           setSelectedAlert(data.alert)
           setLinkedPacket(data.packet ?? null)
         }
@@ -179,25 +187,27 @@ export default function Alerts() {
         )
         if (shouldReload) refreshAlerts()
       },
-      () => { if (!pausedRef.current) refreshAlerts() },
+      () => pausedRef.current ? undefined : refreshAlerts(),
     )
     return () => unsub()
   }, [refreshAlerts])
 
   function handleClearAll() {
     if (!confirm('Hide all alerts from your view? (Teammates still see them.)')) return
-    if (alertsRaw.length > 0) addHiddenAlertIds(alertsRaw.map((a) => a.id))
-    setSelectedAlert(null)
-    setLinkedPacket(null)
-    setHideVersion((v) => v + 1)
+    setViewClearCursor('alerts', new Date().toISOString())
+    clearSelection()
+    resetAlerts()
   }
 
   async function viewAlert(alert) {
+    const request = ++selectionRequestRef.current
     setSelectedAlert(alert)
+    setLinkedPacket(null)
     try {
       const data = await api.getAlert(alert.id)
-      setLinkedPacket(data.packet)
+      if (request === selectionRequestRef.current) setLinkedPacket(data.packet ?? null)
     } catch (err) {
+      if (request !== selectionRequestRef.current) return
       console.error(err)
       setLinkedPacket(null)
     }
@@ -349,8 +359,7 @@ export default function Alerts() {
                       onClick={() => {
                         if (!confirm('Hide this packet from your view? (Teammates still see it.)')) return
                         addHiddenIds([linkedPacket.id])
-                        setLinkedPacket(null)
-                        setSelectedAlert(null)
+                        clearSelection()
                         refreshAlerts()
                       }}
                       className="text-xs text-red-500 hover:text-red-400 cursor-pointer"
@@ -359,7 +368,7 @@ export default function Alerts() {
                       Hide
                     </button>
                   )}
-                  <button type="button" onClick={() => { setSelectedAlert(null); setLinkedPacket(null) }} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
+                  <button type="button" onClick={clearSelection} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
                 </div>
               </div>
               <div className="p-3 space-y-3 text-sm">

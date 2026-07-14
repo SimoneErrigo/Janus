@@ -4,18 +4,27 @@ package storage
 type Protocol string
 
 const (
-	ProtocolHTTP  Protocol = "http"
-	ProtocolHTTPS Protocol = "https"
-	ProtocolWS    Protocol = "ws"
-	ProtocolWSS   Protocol = "wss"
-	ProtocolHTTP2 Protocol = "h2"
-	ProtocolGRPC  Protocol = "grpc"
-	ProtocolTCP   Protocol = "tcp"
+	ProtocolHTTP    Protocol = "http"
+	ProtocolHTTPS   Protocol = "https"
+	ProtocolWS      Protocol = "ws"
+	ProtocolWSS     Protocol = "wss"
+	ProtocolHTTP2   Protocol = "h2"
+	ProtocolH2C     Protocol = "h2c"
+	ProtocolGRPC    Protocol = "grpc"
+	ProtocolGRPCH2C Protocol = "grpc-h2c"
+	ProtocolTCP     Protocol = "tcp"
+	ProtocolTCPLine Protocol = "tcp-line"
+	ProtocolTLS     Protocol = "tls"
+	ProtocolUDP     Protocol = "udp"
+	ProtocolDNS     Protocol = "dns"
+	ProtocolDNSTCP  Protocol = "dns-tcp"
+	ProtocolRESP    Protocol = "resp"
+	ProtocolMQTT    Protocol = "mqtt"
 )
 
 // ServiceModelVersion is the current persisted service schema. Protocol stays
 // as the beginner-facing preset while Spec is the normalized runtime model.
-const ServiceModelVersion = 2
+const ServiceModelVersion = 3
 
 // Transport identifies the network transport used by a service listener.
 type Transport string
@@ -34,6 +43,9 @@ const (
 	ApplicationWebSocket ApplicationProfile = "websocket"
 	ApplicationHTTP2     ApplicationProfile = "http2"
 	ApplicationGRPC      ApplicationProfile = "grpc"
+	ApplicationDNS       ApplicationProfile = "dns"
+	ApplicationRESP      ApplicationProfile = "resp"
+	ApplicationMQTT      ApplicationProfile = "mqtt"
 )
 
 // ClientTLSMode describes TLS on the client-facing side. Passthrough is part
@@ -58,6 +70,8 @@ const (
 	FramingDelimiter    FramingMode = "delimiter"
 	FramingFixed        FramingMode = "fixed"
 	FramingLengthPrefix FramingMode = "length-prefix"
+	FramingRESP         FramingMode = "resp"
+	FramingMQTT         FramingMode = "mqtt"
 	FramingCustom       FramingMode = "custom"
 )
 
@@ -106,21 +120,22 @@ const (
 
 // Service represents a proxied CTF challenge service.
 type Service struct {
-	ID           string      `json:"id"`
-	Name         string      `json:"name"`
-	ModelVersion int         `json:"model_version"`
-	Protocol     Protocol    `json:"protocol"`    // beginner-facing preset
-	Spec         ServiceSpec `json:"spec"`        // normalized runtime model
-	ListenAddr   string      `json:"listen_addr"` // legacy/API compatibility
-	ListenPort   int         `json:"listen_port"`
-	TargetAddr   string      `json:"target_addr"` // legacy/API compatibility
-	TLSMode      TLSMode     `json:"tls_mode,omitempty"`
-	CertFile     string      `json:"cert_file,omitempty"`   // path for challenge mode
-	KeyFile      string      `json:"key_file,omitempty"`    // path for challenge mode
-	TargetTLS    bool        `json:"target_tls,omitempty"`  // connect to backend with TLS
-	ProtoPaths   []string    `json:"proto_paths,omitempty"` // gRPC: paths to .proto files for body decoding
-	ProtocolID   string      `json:"protocol_id,omitempty"` // custom protocol decoder (Step 14)
-	Enabled      bool        `json:"enabled"`
+	ID             string      `json:"id"`
+	Name           string      `json:"name"`
+	ModelVersion   int         `json:"model_version"`
+	Protocol       Protocol    `json:"protocol"` // beginner-facing preset
+	PresetRevision int         `json:"preset_revision,omitempty"`
+	Spec           ServiceSpec `json:"spec"`        // normalized runtime model
+	ListenAddr     string      `json:"listen_addr"` // legacy/API compatibility
+	ListenPort     int         `json:"listen_port"`
+	TargetAddr     string      `json:"target_addr"` // legacy/API compatibility
+	TLSMode        TLSMode     `json:"tls_mode,omitempty"`
+	CertFile       string      `json:"cert_file,omitempty"`   // path for challenge mode
+	KeyFile        string      `json:"key_file,omitempty"`    // path for challenge mode
+	TargetTLS      bool        `json:"target_tls,omitempty"`  // connect to backend with TLS
+	ProtoPaths     []string    `json:"proto_paths,omitempty"` // gRPC: paths to .proto files for body decoding
+	ProtocolID     string      `json:"protocol_id,omitempty"` // custom protocol decoder (Step 14)
+	Enabled        bool        `json:"enabled"`
 }
 
 // FieldType enumerates the wire-level types supported by the custom protocol

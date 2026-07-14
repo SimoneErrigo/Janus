@@ -6,7 +6,12 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     proxy: {
-      '/api': 'http://localhost:9090',
+      '/api': {
+        target: 'http://127.0.0.1:9090',
+        // Keep the browser-facing Host/Origin pair intact so development uses
+        // the same exact-origin check as the production frontend proxy.
+        changeOrigin: false,
+      },
     },
   },
 })

@@ -1,8 +1,11 @@
 package api
 
 import (
+	"crypto/tls"
 	"fmt"
+	"net"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/config"
@@ -28,16 +31,12 @@ func applyServiceDefaults(svc *storage.Service) {
 		svc.ListenAddr = teamIP
 	}
 
-	// TLS-capable presets should work after selecting the protocol alone.
+	// TLS-terminating presets should work after selecting the protocol alone.
 	// Self-signed is the safe CTF default; challenge certificates remain an
 	// optional advanced override.
-	switch svc.Protocol {
-	case storage.ProtocolHTTPS, storage.ProtocolWSS, storage.ProtocolHTTP2, storage.ProtocolGRPC:
-		if svc.TLSMode == storage.TLSModeNone {
-			svc.TLSMode = storage.TLSModeSelfSigned
-		}
+	if preset, ok := storage.LookupProtocolPreset(svc.Protocol); ok && preset.Spec.Listener.TLS == storage.ClientTLSTerminate && svc.TLSMode == storage.TLSModeNone {
+		svc.TLSMode = storage.TLSModeSelfSigned
 	}
-	svc.ApplyProtocolPreset()
 }
 
 // serviceIDPattern restricts service IDs to characters that survive URL paths
@@ -82,11 +81,26 @@ func validateService(svc *storage.Service) error {
 	if svc.ID == "" {
 		return fmt.Errorf("id is required")
 	}
-	if !serviceIDPattern.MatchString(svc.ID) {
+	if len(svc.ID) > 128 || !serviceIDPattern.MatchString(svc.ID) {
 		return fmt.Errorf("id must match %s", serviceIDPattern.String())
 	}
+	svc.Name = strings.TrimSpace(svc.Name)
 	if svc.Name == "" {
 		return fmt.Errorf("name is required")
+	}
+	if len(svc.Name) > 256 || len(svc.ListenAddr) > 512 || len(svc.TargetAddr) > 2048 {
+		return fmt.Errorf("service name or address is too long")
+	}
+	if len(svc.CertFile) > 4096 || len(svc.KeyFile) > 4096 || len(svc.ProtocolID) > 128 {
+		return fmt.Errorf("service path or protocol id is too long")
+	}
+	if len(svc.ProtoPaths) > 128 {
+		return fmt.Errorf("at most 128 proto paths are supported")
+	}
+	for _, path := range svc.ProtoPaths {
+		if len(path) > 4096 {
+			return fmt.Errorf("proto path is too long")
+		}
 	}
 
 	// Proxy fields are required only when the service is enabled (the proxy
@@ -104,21 +118,23 @@ func validateService(svc *storage.Service) error {
 		if svc.TargetAddr == "" {
 			return fmt.Errorf("target_addr is required when service is enabled")
 		}
+		host, portText, err := net.SplitHostPort(svc.TargetAddr)
+		port, portErr := strconv.Atoi(portText)
+		if err != nil || portErr != nil || strings.TrimSpace(host) == "" || port < 1 || port > 65535 {
+			return fmt.Errorf("target_addr must be a host:port address")
+		}
 	} else if svc.ListenPort < 0 || svc.ListenPort > 65535 {
 		// Partial config is fine on disabled services, but reject obviously
 		// out-of-range port numbers so we don't store garbage.
 		return fmt.Errorf("listen_port must be between 0 and 65535")
 	}
 
-	switch svc.Protocol {
-	case storage.ProtocolHTTP, storage.ProtocolHTTPS, storage.ProtocolWS, storage.ProtocolWSS, storage.ProtocolHTTP2, storage.ProtocolGRPC, storage.ProtocolTCP:
-		// valid
-	default:
-		return fmt.Errorf("protocol must be one of: http, https, ws, wss, h2, grpc, tcp")
+	if _, ok := storage.LookupProtocolPreset(svc.Protocol); !ok {
+		return fmt.Errorf("unknown protocol preset %q", svc.Protocol)
 	}
 
 	// TLS validation also only matters if the proxy will actually start.
-	if svc.Enabled && (svc.Protocol == storage.ProtocolHTTPS || svc.Protocol == storage.ProtocolWSS || svc.Protocol == storage.ProtocolHTTP2 || svc.Protocol == storage.ProtocolGRPC) {
+	if svc.Enabled && svc.RuntimeSpec().Listener.TLS == storage.ClientTLSTerminate {
 		switch svc.TLSMode {
 		case storage.TLSModeSelfSigned, storage.TLSModeChallenge:
 			// valid
@@ -128,6 +144,9 @@ func validateService(svc *storage.Service) error {
 		if svc.TLSMode == storage.TLSModeChallenge {
 			if svc.CertFile == "" || svc.KeyFile == "" {
 				return fmt.Errorf("cert_file and key_file are required for challenge TLS mode")
+			}
+			if _, err := tls.LoadX509KeyPair(svc.CertFile, svc.KeyFile); err != nil {
+				return fmt.Errorf("invalid challenge TLS certificate or key: %w", err)
 			}
 		}
 	}

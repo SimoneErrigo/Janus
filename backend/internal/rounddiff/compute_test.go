@@ -35,9 +35,9 @@ func fixtureRounds() (a, b []*sniffer.Packet) {
 	}
 	b = []*sniffer.Packet{
 		pkt(11, sniffer.DirectionRequest, "POST", "/login", 0, `{"user":"alice","pass":"x"}`), // identical -> skip
-		pkt(12, sniffer.DirectionRequest, "POST", "/search", 0, `{"q":"' OR 1=1 --"}`),         // changed body + sqli
-		pkt(13, sniffer.DirectionRequest, "POST", "/admin", 0, `{"cmd":"whoami"}`),             // new route
-		pkt(14, sniffer.DirectionResponse, "", "", 200, "OK"),                                  // identical -> skip
+		pkt(12, sniffer.DirectionRequest, "POST", "/search", 0, `{"q":"' OR 1=1 --"}`),        // changed body + sqli
+		pkt(13, sniffer.DirectionRequest, "POST", "/admin", 0, `{"cmd":"whoami"}`),            // new route
+		pkt(14, sniffer.DirectionResponse, "", "", 200, "OK"),                                 // identical -> skip
 	}
 	return a, b
 }
@@ -134,8 +134,8 @@ func genChattyRound(routes, perRoute int, seed int64, mutate bool) []*sniffer.Pa
 }
 
 func BenchmarkCompute(b *testing.B) {
-	a := genChattyRound(40, 50, 0, false)        // 2000 packets
-	bb := genChattyRound(40, 50, 100000, true)   // 2000 packets, some mutated
+	a := genChattyRound(40, 50, 0, false)      // 2000 packets
+	bb := genChattyRound(40, 50, 100000, true) // 2000 packets, some mutated
 	opts := Options{TopK: 24, IncludeDiff: true}
 	b.ReportAllocs()
 	b.ResetTimer()

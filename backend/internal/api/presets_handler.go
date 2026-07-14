@@ -1,8 +1,6 @@
 package api
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -46,9 +44,27 @@ func (s *Server) handlePresetsApply(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "service_ids is required", http.StatusBadRequest)
 		return
 	}
+	if len(req.ServiceIDs) > 64 || len(req.Selected) > 64 {
+		http.Error(w, "too many services or preset categories", http.StatusBadRequest)
+		return
+	}
 	if len(req.Selected) == 0 {
 		http.Error(w, "selected is required", http.StatusBadRequest)
 		return
+	}
+	selectedCount := 0
+	for _, indices := range req.Selected {
+		selectedCount += len(indices)
+	}
+	if selectedCount == 0 || selectedCount*len(req.ServiceIDs) > 500 {
+		http.Error(w, "preset selection must create at most 500 rules", http.StatusBadRequest)
+		return
+	}
+	for _, serviceID := range req.ServiceIDs {
+		if _, ok := s.store.GetService(serviceID); !ok {
+			http.Error(w, "service not found: "+serviceID, http.StatusBadRequest)
+			return
+		}
 	}
 
 	// Build a lookup map: category name -> PresetCategory
@@ -59,6 +75,8 @@ func (s *Server) handlePresetsApply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var created, errors int
+	s.ruleMu.Lock()
+	defer s.ruleMu.Unlock()
 
 	for catName, indices := range req.Selected {
 		cat, ok := presetMap[catName]
@@ -72,11 +90,15 @@ func (s *Server) handlePresetsApply(w http.ResponseWriter, r *http.Request) {
 			preset := cat.Rules[idx]
 
 			for _, svcID := range req.ServiceIDs {
-				b := make([]byte, 8)
-				rand.Read(b)
+				id, err := newRuleID()
+				if err != nil {
+					log.Printf("Preset rule ID generation failed: %v", err)
+					errors++
+					continue
+				}
 
 				rule := &dropper.Rule{
-					ID:        hex.EncodeToString(b),
+					ID:        id,
 					ServiceID: svcID,
 					Name:      preset.Name,
 					Type:      preset.Type,
@@ -85,6 +107,7 @@ func (s *Server) handlePresetsApply(w http.ResponseWriter, r *http.Request) {
 					Priority:  10,
 					Enabled:   true,
 					Action:    preset.Action,
+					CreatedBy: DisplayNameFromRequest(r),
 				}
 
 				if err := s.ruleStore.CreateRule(rule); err != nil {

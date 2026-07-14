@@ -2,11 +2,15 @@ package api
 
 import (
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 )
 
-const sessionTTL = 2 * time.Minute
+const (
+	sessionTTL        = 2 * time.Minute
+	maxActiveSessions = 4096
+)
 
 // SessionEntry represents one active session (token holder).
 type SessionEntry struct {
@@ -31,20 +35,37 @@ func (h *SessionHub) Heartbeat(tokenID, name string) {
 	if tokenID == "" {
 		return
 	}
+	now := time.Now()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if e, ok := h.entries[tokenID]; ok {
-		e.LastSeen = time.Now()
+		e.LastSeen = now
 		if name != "" {
 			e.Name = name
 		}
 	} else {
+		if len(h.entries) >= maxActiveSessions {
+			for id := range h.entries {
+				delete(h.entries, id)
+				break
+			}
+		}
 		h.entries[tokenID] = &SessionEntry{
 			Name:     name,
 			TokenID:  tokenID,
-			LastSeen: time.Now(),
+			LastSeen: now,
 		}
 	}
+}
+
+// Remove immediately hides a logged-out session instead of waiting for its TTL.
+func (h *SessionHub) Remove(tokenID string) {
+	if tokenID == "" {
+		return
+	}
+	h.mu.Lock()
+	delete(h.entries, tokenID)
+	h.mu.Unlock()
 }
 
 // Active returns all sessions seen within the last sessionTTL.
@@ -60,6 +81,12 @@ func (h *SessionHub) Active() []SessionEntry {
 		}
 		out = append(out, *e)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].LastSeen.Equal(out[j].LastSeen) {
+			return out[i].LastSeen.After(out[j].LastSeen)
+		}
+		return out[i].Name < out[j].Name
+	})
 	return out
 }
 

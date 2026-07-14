@@ -22,6 +22,7 @@ type validateFilterResponse struct {
 	Position       int      `json:"position,omitempty"`
 	Fields         []string `json:"fields,omitempty"`
 	ServerRequired bool     `json:"server_required,omitempty"`
+	ClientSafe     bool     `json:"client_safe"`
 }
 
 // handleFilterValidate parses the supplied expression and reports any syntax
@@ -51,7 +52,14 @@ func (s *Server) handleFilterValidate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	writeJSON(w, http.StatusOK, validateFilterResponse{
-		OK: true, Fields: filter.FieldsUsed(ast), ServerRequired: filter.NeedsServerEvaluation(ast),
-	})
+	serverRequired := filter.NeedsServerEvaluation(ast)
+	writeJSON(w, http.StatusOK, validateFilterResponse{OK: true, Fields: filter.FieldsUsed(ast), ServerRequired: serverRequired, ClientSafe: !serverRequired})
+}
+
+func (s *Server) handleFilterSchema(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, filter.PublicSchema())
 }

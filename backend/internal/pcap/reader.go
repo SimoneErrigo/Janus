@@ -28,6 +28,10 @@ const (
 	linkRaw      uint32 = 101
 	linkLinuxSLL uint32 = 113
 	linkIPv4     uint32 = 228
+
+	maxPCAPRecordSize  = 16 << 20
+	maxRetainedPayload = 64 << 20
+	maxPCAPRecords     = 500_000
 )
 
 // ---- TCP segment and stream types ----
@@ -35,6 +39,17 @@ const (
 type segment struct {
 	seq     uint32
 	flags   uint8
+	payload []byte
+	ts      time.Time
+}
+
+type streamMark struct {
+	offset int
+	ts     time.Time
+}
+
+type datagram struct {
+	dir     dirKey
 	payload []byte
 	ts      time.Time
 }
@@ -56,24 +71,29 @@ func normalizeConn(srcIP, dstIP string, srcPort, dstPort uint16) (connKey, bool)
 
 // dirKey uniquely identifies one directional half of a connection.
 type dirKey struct {
-	srcIP, dstIP string
+	srcIP, dstIP     string
 	srcPort, dstPort uint16
 }
 
 // ---- Reader state ----
 
 type pcapReader struct {
-	swap   bool // byte-order swap needed
-	nano   bool // timestamps in nanoseconds
-	link   uint32
-	segs   map[dirKey][]segment
-	synDir map[connKey]dirKey // which direction sent SYN
+	swap     bool // byte-order swap needed
+	nano     bool // timestamps in nanoseconds
+	link     uint32
+	snaplen  uint32
+	segs     map[dirKey][]segment
+	synDir   map[connKey]dirKey // which direction sent SYN
+	udp      []datagram
+	udpFirst map[connKey]dirKey
+	retained int64
 }
 
 func newPcapReader() *pcapReader {
 	return &pcapReader{
-		segs:   make(map[dirKey][]segment),
-		synDir: make(map[connKey]dirKey),
+		segs:     make(map[dirKey][]segment),
+		synDir:   make(map[connKey]dirKey),
+		udpFirst: make(map[connKey]dirKey),
 	}
 }
 
@@ -112,7 +132,13 @@ func readGlobal(r io.Reader) (*pcapReader, error) {
 	default:
 		return nil, fmt.Errorf("unrecognised pcap magic: 0x%x", magic)
 	}
+	pr.snaplen = pr.u32(hdr[16:])
 	pr.link = pr.u32(hdr[20:])
+	switch pr.link {
+	case linkEthernet, linkNull, linkRaw, linkLinuxSLL, linkIPv4:
+	default:
+		return nil, fmt.Errorf("unsupported pcap link type %d", pr.link)
+	}
 	return pr, nil
 }
 
@@ -177,13 +203,19 @@ func parseTCP(ipPkt []byte) (string, string, uint16, uint16, uint32, uint8, []by
 	if proto != 6 { // TCP
 		return "", "", 0, 0, 0, 0, nil, false
 	}
+	if binary.BigEndian.Uint16(ipPkt[6:8])&0x3fff != 0 {
+		return "", "", 0, 0, 0, 0, nil, false
+	}
 	totalLen := int(binary.BigEndian.Uint16(ipPkt[2:]))
+	if totalLen < ihl {
+		return "", "", 0, 0, 0, 0, nil, false
+	}
 	if totalLen > len(ipPkt) {
 		totalLen = len(ipPkt)
 	}
 	srcIP := fmt.Sprintf("%d.%d.%d.%d", ipPkt[12], ipPkt[13], ipPkt[14], ipPkt[15])
 	dstIP := fmt.Sprintf("%d.%d.%d.%d", ipPkt[16], ipPkt[17], ipPkt[18], ipPkt[19])
-	tcp := ipPkt[ihl:]
+	tcp := ipPkt[ihl:totalLen]
 	if len(tcp) < 20 {
 		return "", "", 0, 0, 0, 0, nil, false
 	}
@@ -195,24 +227,71 @@ func parseTCP(ipPkt []byte) (string, string, uint16, uint16, uint32, uint8, []by
 		return "", "", 0, 0, 0, 0, nil, false
 	}
 	flags := tcp[13]
-	payload := tcp[dataOffset : totalLen-ihl]
+	payload := tcp[dataOffset:]
 	return srcIP, dstIP, srcPort, dstPort, seq, flags, payload, true
+}
+
+func parseUDP(ipPkt []byte) (string, string, uint16, uint16, []byte, bool) {
+	if len(ipPkt) < 20 || ipPkt[0]>>4 != 4 || ipPkt[9] != 17 {
+		return "", "", 0, 0, nil, false
+	}
+	ihl := int(ipPkt[0]&0x0f) * 4
+	if ihl < 20 || len(ipPkt) < ihl || binary.BigEndian.Uint16(ipPkt[6:8])&0x3fff != 0 {
+		return "", "", 0, 0, nil, false
+	}
+	totalLen := int(binary.BigEndian.Uint16(ipPkt[2:]))
+	if totalLen < ihl+8 {
+		return "", "", 0, 0, nil, false
+	}
+	if totalLen > len(ipPkt) {
+		totalLen = len(ipPkt)
+	}
+	udp := ipPkt[ihl:totalLen]
+	if len(udp) < 8 {
+		return "", "", 0, 0, nil, false
+	}
+	udpLen := int(binary.BigEndian.Uint16(udp[4:6]))
+	if udpLen < 8 {
+		return "", "", 0, 0, nil, false
+	}
+	if udpLen > len(udp) {
+		udpLen = len(udp)
+	}
+	srcIP := fmt.Sprintf("%d.%d.%d.%d", ipPkt[12], ipPkt[13], ipPkt[14], ipPkt[15])
+	dstIP := fmt.Sprintf("%d.%d.%d.%d", ipPkt[16], ipPkt[17], ipPkt[18], ipPkt[19])
+	return srcIP, dstIP, binary.BigEndian.Uint16(udp[0:2]), binary.BigEndian.Uint16(udp[2:4]), udp[8:udpLen], true
+}
+
+func (p *pcapReader) retain(payload []byte) ([]byte, error) {
+	if p.retained+int64(len(payload)) > maxRetainedPayload {
+		return nil, fmt.Errorf("pcap payload exceeds %d MiB import safety limit", maxRetainedPayload>>20)
+	}
+	p.retained += int64(len(payload))
+	return append([]byte(nil), payload...), nil
 }
 
 func (p *pcapReader) readRecords(r io.Reader) error {
 	rechdr := make([]byte, 16)
+	records := 0
 	for {
 		if _, err := io.ReadFull(r, rechdr); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
+			if err == io.EOF {
 				return nil
 			}
-			return err
+			return fmt.Errorf("reading pcap record header: %w", err)
+		}
+		records++
+		if records > maxPCAPRecords {
+			return fmt.Errorf("pcap exceeds %d-record import safety limit", maxPCAPRecords)
 		}
 		tsSec := p.u32(rechdr[0:])
 		tsFrac := p.u32(rechdr[4:])
 		inclLen := p.u32(rechdr[8:])
+		if inclLen > maxPCAPRecordSize || (p.snaplen > 0 && inclLen > p.snaplen) {
+			return fmt.Errorf("pcap record length %d exceeds safety limit", inclLen)
+		}
 
-		data := make([]byte, inclLen)
+		data := make([]byte, int(inclLen))
 		if _, err := io.ReadFull(r, data); err != nil {
 			return err
 		}
@@ -231,6 +310,20 @@ func (p *pcapReader) readRecords(r io.Reader) error {
 
 		srcIP, dstIP, srcPort, dstPort, seq, flags, payload, ok := parseTCP(ipPkt)
 		if !ok {
+			udpSrcIP, udpDstIP, udpSrcPort, udpDstPort, udpPayload, udpOK := parseUDP(ipPkt)
+			if !udpOK {
+				continue
+			}
+			retained, err := p.retain(udpPayload)
+			if err != nil {
+				return err
+			}
+			dk := dirKey{srcIP: udpSrcIP, dstIP: udpDstIP, srcPort: udpSrcPort, dstPort: udpDstPort}
+			ck, _ := normalizeConn(udpSrcIP, udpDstIP, udpSrcPort, udpDstPort)
+			if _, seen := p.udpFirst[ck]; !seen {
+				p.udpFirst[ck] = dk
+			}
+			p.udp = append(p.udp, datagram{dir: dk, payload: retained, ts: ts})
 			continue
 		}
 
@@ -245,22 +338,26 @@ func (p *pcapReader) readRecords(r io.Reader) error {
 		}
 
 		if len(payload) > 0 {
-			p.segs[dk] = append(p.segs[dk], segment{seq: seq, flags: flags, payload: payload, ts: ts})
+			retained, err := p.retain(payload)
+			if err != nil {
+				return err
+			}
+			p.segs[dk] = append(p.segs[dk], segment{seq: seq, flags: flags, payload: retained, ts: ts})
 		}
 	}
 }
 
 // assembleDir concatenates payloads from one direction, sorted by seq.
-func assembleDir(segs []segment) ([]byte, []time.Time) {
+func assembleDir(segs []segment) ([]byte, []streamMark) {
 	if len(segs) == 0 {
 		return nil, nil
 	}
-	sort.Slice(segs, func(i, j int) bool {
+	sort.SliceStable(segs, func(i, j int) bool {
 		return segs[i].seq < segs[j].seq
 	})
 
 	var result []byte
-	var ts []time.Time
+	var marks []streamMark
 	lastEnd := uint32(0)
 	for _, s := range segs {
 		end := s.seq + uint32(len(s.payload))
@@ -270,34 +367,34 @@ func assembleDir(segs []segment) ([]byte, []time.Time) {
 			if skip >= len(s.payload) {
 				continue
 			}
+			marks = append(marks, streamMark{offset: len(result), ts: s.ts})
 			result = append(result, s.payload[skip:]...)
 		} else {
+			marks = append(marks, streamMark{offset: len(result), ts: s.ts})
 			result = append(result, s.payload...)
 		}
-		ts = append(ts, s.ts)
 		lastEnd = end
 	}
-	return result, ts
+	return result, marks
 }
 
 // ---- HTTP parsing ----
 
-func parseHTTPPairs(reqData, respData []byte, sessionID, serviceID, srcIP, dstIP string, srcPort, dstPort uint16) []*sniffer.Packet {
-	var packets []*sniffer.Packet
+func parseHTTPPairs(reqData, respData []byte, reqMarks, respMarks []streamMark, sessionID, serviceID, srcIP, dstIP string, srcPort, dstPort uint16) (packets []*sniffer.Packet, reqConsumed, respConsumed int) {
+	reqSource := bytes.NewReader(reqData)
+	respSource := bytes.NewReader(respData)
+	reqReader := bufio.NewReader(reqSource)
+	respReader := bufio.NewReader(respSource)
 
-	reqReader := bufio.NewReader(bytes.NewReader(reqData))
-	respReader := bufio.NewReader(bytes.NewReader(respData))
-
-	reqTimestamp := time.Now()
-	respTimestamp := time.Now()
-
-	for i := 0; ; i++ {
+	for {
+		reqOffset := streamConsumed(len(reqData), reqSource, reqReader)
 		req, err := http.ReadRequest(reqReader)
 		if err != nil {
 			break
 		}
 		body, _ := io.ReadAll(req.Body)
 		req.Body.Close()
+		reqConsumed = streamConsumed(len(reqData), reqSource, reqReader)
 
 		headers := make(map[string]string)
 		for k, vs := range req.Header {
@@ -307,7 +404,7 @@ func parseHTTPPairs(reqData, respData []byte, sessionID, serviceID, srcIP, dstIP
 		pkt := &sniffer.Packet{
 			ServiceID:    serviceID,
 			SessionID:    sessionID,
-			Timestamp:    reqTimestamp,
+			Timestamp:    timestampAtOffset(reqMarks, reqOffset),
 			SrcIP:        srcIP,
 			SrcPort:      int(srcPort),
 			DstIP:        dstIP,
@@ -326,12 +423,14 @@ func parseHTTPPairs(reqData, respData []byte, sessionID, serviceID, srcIP, dstIP
 		packets = append(packets, pkt)
 
 		// Try to read matching response
+		respOffset := streamConsumed(len(respData), respSource, respReader)
 		resp, rerr := http.ReadResponse(respReader, nil)
 		if rerr != nil {
 			break
 		}
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		respConsumed = streamConsumed(len(respData), respSource, respReader)
 
 		respHeaders := make(map[string]string)
 		for k, vs := range resp.Header {
@@ -341,7 +440,7 @@ func parseHTTPPairs(reqData, respData []byte, sessionID, serviceID, srcIP, dstIP
 		rpkt := &sniffer.Packet{
 			ServiceID:    serviceID,
 			SessionID:    sessionID,
-			Timestamp:    respTimestamp,
+			Timestamp:    timestampAtOffset(respMarks, respOffset),
 			SrcIP:        dstIP,
 			SrcPort:      int(dstPort),
 			DstIP:        srcIP,
@@ -358,7 +457,37 @@ func parseHTTPPairs(reqData, respData []byte, sessionID, serviceID, srcIP, dstIP
 		}
 		packets = append(packets, rpkt)
 	}
-	return packets
+	return packets, reqConsumed, respConsumed
+}
+
+func streamConsumed(total int, source *bytes.Reader, buffered *bufio.Reader) int {
+	return total - source.Len() - buffered.Buffered()
+}
+
+func timestampAtOffset(marks []streamMark, offset int) time.Time {
+	if len(marks) == 0 {
+		return time.Now()
+	}
+	selected := marks[0].ts
+	for _, mark := range marks[1:] {
+		if mark.offset > offset {
+			break
+		}
+		selected = mark.ts
+	}
+	return selected
+}
+
+func rawTCPPacket(data []byte, marks []streamMark, offset int, sessionID, serviceID, srcIP, dstIP string, srcPort, dstPort uint16, direction sniffer.Direction) *sniffer.Packet {
+	pkt := &sniffer.Packet{
+		ServiceID: serviceID, SessionID: sessionID, Timestamp: timestampAtOffset(marks, offset),
+		SrcIP: srcIP, SrcPort: int(srcPort), DstIP: dstIP, DstPort: int(dstPort),
+		Protocol: "tcp", Direction: direction, Body: data, MatchedRules: []sniffer.MatchedRuleInfo{},
+	}
+	if len(data) <= 512*1024 {
+		pkt.BodyString = string(data)
+	}
+	return pkt
 }
 
 // ---- Top-level API ----
@@ -401,8 +530,8 @@ func ParsePCAPAsPackets(r io.Reader, serviceID string, flagRegex *regexp.Regexp,
 		clientSegs := pr.segs[clientDK]
 		serverSegs := pr.segs[serverDK]
 
-		clientData, clientTS := assembleDir(clientSegs)
-		serverData, serverTS := assembleDir(serverSegs)
+		clientData, clientMarks := assembleDir(clientSegs)
+		serverData, serverMarks := assembleDir(serverSegs)
 
 		if len(clientData) == 0 && len(serverData) == 0 {
 			continue
@@ -412,69 +541,46 @@ func ParsePCAPAsPackets(r io.Reader, serviceID string, flagRegex *regexp.Regexp,
 			clientDK.srcIP, clientDK.srcPort, clientDK.dstIP, clientDK.dstPort)
 
 		// Try HTTP parsing
-		httpPackets := parseHTTPPairs(clientData, serverData, sessionID, serviceID,
+		httpPackets, clientConsumed, serverConsumed := parseHTTPPairs(clientData, serverData, clientMarks, serverMarks, sessionID, serviceID,
 			clientDK.srcIP, clientDK.dstIP, clientDK.srcPort, clientDK.dstPort)
-
-		if len(httpPackets) > 0 {
-			// HTTP parsed successfully: use those packets
-			// Set timestamps from segment timestamps
-			for i, pkt := range httpPackets {
-				if i < len(clientTS) && pkt.Direction == sniffer.DirectionRequest {
-					pkt.Timestamp = clientTS[0]
-				} else if len(serverTS) > 0 && pkt.Direction == sniffer.DirectionResponse {
-					pkt.Timestamp = serverTS[0]
-				}
-			}
-			allPackets = append(allPackets, httpPackets...)
-		} else {
-			// Fallback: emit raw TCP chunks per direction
-			if len(clientData) > 0 {
-				ts := time.Now()
-				if len(clientTS) > 0 {
-					ts = clientTS[0]
-				}
-				pkt := &sniffer.Packet{
-					ServiceID:    serviceID,
-					SessionID:    sessionID,
-					Timestamp:    ts,
-					SrcIP:        clientDK.srcIP,
-					SrcPort:      int(clientDK.srcPort),
-					DstIP:        clientDK.dstIP,
-					DstPort:      int(clientDK.dstPort),
-					Protocol:     "tcp",
-					Direction:    sniffer.DirectionRequest,
-					Body:         clientData,
-					MatchedRules: []sniffer.MatchedRuleInfo{},
-				}
-				if len(clientData) <= 512*1024 {
-					pkt.BodyString = string(clientData)
-				}
-				allPackets = append(allPackets, pkt)
-			}
-			if len(serverData) > 0 {
-				ts := time.Now()
-				if len(serverTS) > 0 {
-					ts = serverTS[0]
-				}
-				pkt := &sniffer.Packet{
-					ServiceID:    serviceID,
-					SessionID:    sessionID,
-					Timestamp:    ts,
-					SrcIP:        clientDK.dstIP,
-					SrcPort:      int(clientDK.dstPort),
-					DstIP:        clientDK.srcIP,
-					DstPort:      int(clientDK.srcPort),
-					Protocol:     "tcp",
-					Direction:    sniffer.DirectionResponse,
-					Body:         serverData,
-					MatchedRules: []sniffer.MatchedRuleInfo{},
-				}
-				if len(serverData) <= 512*1024 {
-					pkt.BodyString = string(serverData)
-				}
-				allPackets = append(allPackets, pkt)
-			}
+		// Preserve everything the HTTP parser did not consume. This covers mixed
+		// HTTP/binary streams, incomplete responses and pipelined trailing data
+		// without duplicating bytes already represented by structured packets.
+		allPackets = append(allPackets, httpPackets...)
+		if clientConsumed < len(clientData) {
+			allPackets = append(allPackets, rawTCPPacket(clientData[clientConsumed:], clientMarks, clientConsumed, sessionID, serviceID,
+				clientDK.srcIP, clientDK.dstIP, clientDK.srcPort, clientDK.dstPort, sniffer.DirectionRequest))
 		}
+		if serverConsumed < len(serverData) {
+			allPackets = append(allPackets, rawTCPPacket(serverData[serverConsumed:], serverMarks, serverConsumed, sessionID, serviceID,
+				clientDK.dstIP, clientDK.srcIP, clientDK.dstPort, clientDK.srcPort, sniffer.DirectionResponse))
+		}
+	}
+
+	for _, dgram := range pr.udp {
+		ck, _ := normalizeConn(dgram.dir.srcIP, dgram.dir.dstIP, dgram.dir.srcPort, dgram.dir.dstPort)
+		first := pr.udpFirst[ck]
+		direction := sniffer.DirectionResponse
+		if dgram.dir == first {
+			direction = sniffer.DirectionRequest
+		}
+		protocol := "udp"
+		if dgram.dir.srcPort == 53 || dgram.dir.dstPort == 53 {
+			protocol = "dns"
+		}
+		pkt := &sniffer.Packet{
+			ServiceID: serviceID,
+			SessionID: fmt.Sprintf("imported-udp-%s:%d-%s:%d", first.srcIP, first.srcPort, first.dstIP, first.dstPort),
+			Timestamp: dgram.ts,
+			SrcIP:     dgram.dir.srcIP, SrcPort: int(dgram.dir.srcPort),
+			DstIP: dgram.dir.dstIP, DstPort: int(dgram.dir.dstPort),
+			Protocol: protocol, Direction: direction,
+			Body: dgram.payload, MatchedRules: []sniffer.MatchedRuleInfo{},
+		}
+		if len(dgram.payload) <= 512*1024 {
+			pkt.BodyString = string(dgram.payload)
+		}
+		allPackets = append(allPackets, pkt)
 	}
 
 	// Apply flag/flagID checks
@@ -490,7 +596,7 @@ func ParsePCAPAsPackets(r io.Reader, serviceID string, flagRegex *regexp.Regexp,
 	}
 
 	// Sort by timestamp
-	sort.Slice(allPackets, func(i, j int) bool {
+	sort.SliceStable(allPackets, func(i, j int) bool {
 		return allPackets[i].Timestamp.Before(allPackets[j].Timestamp)
 	})
 

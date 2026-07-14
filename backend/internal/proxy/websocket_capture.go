@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
@@ -13,6 +14,8 @@ import (
 	"net/http/httputil"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -34,8 +37,8 @@ const (
 // changing their wire semantics. The standard ReverseProxy owns the tunnel;
 // wrapping its upgraded backend connection lets us see bytes in both
 // directions while still forwarding them unchanged.
-func (m *Manager) configureWebSocketReverseProxy(reverseProxy *httputil.ReverseProxy, svc *storage.Service) {
-	if svc.Protocol != storage.ProtocolWS && svc.Protocol != storage.ProtocolWSS {
+func (m *Manager) configureWebSocketReverseProxy(ctx context.Context, reverseProxy *httputil.ReverseProxy, svc *storage.Service) {
+	if svc.RuntimeSpec().Application.Profile != storage.ApplicationWebSocket {
 		return
 	}
 
@@ -76,27 +79,46 @@ func (m *Manager) configureWebSocketReverseProxy(reverseProxy *httputil.ReverseP
 				meta.url = resp.Request.URL.RequestURI()
 			}
 		}
-		meta.sessionID = sniffer.MakeSessionID(svc.ID, meta.clientIP, meta.clientPort)
-
-		resp.Body = &websocketCaptureConn{
-			ReadWriteCloser: backendConn,
-			toBackend: newWebSocketFrameParser(true,
-				func(opcode byte, payload []byte) websocketMessageDecision {
-					return m.processWebSocketMessage(svc, meta, sniffer.DirectionRequest, opcode, payload)
-				},
-				func(opcode byte, size uint64) {
-					m.dropOversizedWebSocketMessage(svc, meta, sniffer.DirectionRequest, opcode, size)
-				},
-			),
-			fromBackend: newWebSocketFrameParser(false,
-				func(opcode byte, payload []byte) websocketMessageDecision {
-					return m.processWebSocketMessage(svc, meta, sniffer.DirectionResponse, opcode, payload)
-				},
-				func(opcode byte, size uint64) {
-					m.dropOversizedWebSocketMessage(svc, meta, sniffer.DirectionResponse, opcode, size)
-				},
-			),
+		if resp.Request != nil {
+			meta.sessionID, _ = sniffer.ConnectionSessionFromContext(resp.Request.Context())
 		}
+		if meta.sessionID == "" {
+			meta.sessionID = sniffer.MakeConnectionSessionID(svc.ID, meta.clientIP, meta.clientPort)
+		}
+
+		captured := &websocketCaptureConn{ReadWriteCloser: backendConn, done: make(chan struct{})}
+		captured.toBackend = newWebSocketFrameParser(true,
+			func(opcode byte, payload []byte) websocketMessageDecision {
+				decision := m.processWebSocketMessage(svc, meta, sniffer.DirectionRequest, opcode, payload)
+				if decision.Close {
+					captured.terminate.Store(true)
+				}
+				return decision
+			},
+			func(opcode byte, size uint64) {
+				m.recordOversizedWebSocketMessage(svc, meta, sniffer.DirectionRequest, opcode, size)
+			},
+		)
+		captured.fromBackend = newWebSocketFrameParser(false,
+			func(opcode byte, payload []byte) websocketMessageDecision {
+				decision := m.processWebSocketMessage(svc, meta, sniffer.DirectionResponse, opcode, payload)
+				if decision.Close {
+					captured.terminate.Store(true)
+				}
+				return decision
+			},
+			func(opcode byte, size uint64) {
+				m.recordOversizedWebSocketMessage(svc, meta, sniffer.DirectionResponse, opcode, size)
+			},
+		)
+		resp.Body = captured
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = captured.Close()
+			case <-captured.done:
+			}
+		}()
 		return nil
 	}
 }
@@ -122,6 +144,18 @@ type websocketCaptureConn struct {
 	readOutput  bytes.Buffer
 	readScratch [32 * 1024]byte
 	readErr     error
+	closeOnce   sync.Once
+	terminate   atomic.Bool
+	done        chan struct{}
+}
+
+func (c *websocketCaptureConn) Close() error {
+	var err error
+	c.closeOnce.Do(func() {
+		err = c.ReadWriteCloser.Close()
+		close(c.done)
+	})
+	return err
 }
 
 func (c *websocketCaptureConn) Read(p []byte) (int, error) {
@@ -138,6 +172,10 @@ func (c *websocketCaptureConn) Read(p []byte) (int, error) {
 		n, err := c.ReadWriteCloser.Read(c.readScratch[:])
 		if n > 0 {
 			c.readOutput.Write(c.fromBackend.Feed(c.readScratch[:n]))
+			if c.terminate.Load() {
+				_ = c.Close()
+				return 0, net.ErrClosed
+			}
 		}
 		if err != nil {
 			c.readErr = err
@@ -147,6 +185,10 @@ func (c *websocketCaptureConn) Read(p []byte) (int, error) {
 
 func (c *websocketCaptureConn) Write(p []byte) (int, error) {
 	output := c.toBackend.Feed(p)
+	if c.terminate.Load() {
+		_ = c.Close()
+		return 0, net.ErrClosed
+	}
 	for len(output) > 0 {
 		n, err := c.ReadWriteCloser.Write(output)
 		if n > 0 {
@@ -167,6 +209,7 @@ func (c *websocketCaptureConn) Write(p []byte) (int, error) {
 type websocketMessageDecision struct {
 	Payload   []byte
 	Drop      bool
+	Close     bool
 	Rewritten bool
 }
 
@@ -194,14 +237,19 @@ func websocketMessageHeaders(opcode byte) (string, map[string]string) {
 // proxies, but at WebSocket message boundaries and on the unmasked payload.
 // The returned decision is applied before bytes reach the opposite peer.
 func (m *Manager) processWebSocketMessage(svc *storage.Service, meta websocketCaptureMeta, dir sniffer.Direction, opcode byte, payload []byte) websocketMessageDecision {
+	observedAt := time.Now()
+	pyEventID := sniffer.MakePyFilterEventID(meta.sessionID, dir, observedAt)
 	body := append([]byte(nil), payload...)
 	opcodeName, headers := websocketMessageHeaders(opcode)
 	srcIP, srcPort, dstIP, dstPort := websocketEndpoints(meta, dir)
-	pyFlagged := sniffer.CheckFlagged(m.flagRegex, m.flagScanner, "", "", body)
-	pyContainsFlagID, _, _ := sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", body)
+	flagRegex, flagScanner := m.currentFlagMatchers()
+	pyFlagged := sniffer.CheckFlagged(flagRegex, flagScanner, "", "", body)
+	_, _, pyFlagCount := sniffer.CountFlags(flagRegex, flagScanner, "", "", body)
+	pyContainsFlagID, pyMatchedFlagIDs, _ := sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", body)
 
 	var matchedRules []sniffer.MatchedRuleInfo
 	shouldDrop := false
+	shouldClose := false
 	var alertRules []dropper.Rule
 	if engine := m.engineFor(svc); engine != nil && dir == sniffer.DirectionRequest {
 		view := flowmodel.PacketView{
@@ -230,10 +278,14 @@ func (m *Manager) processWebSocketMessage(svc *storage.Service, meta websocketCa
 	// Calculate the original-message tags for inline Python filters. Persisted
 	// flag metadata is recalculated below after any rewrite.
 	var pyBlockAlerts []*sniffer.Alert
+	var pyFlow map[string]any
+	var pyResult sniffer.PyResult
 	rewritten := false
 	if pyBlock := m.currentPyBlockFn(); pyBlock != nil {
-		flow := map[string]any{
+		pyFlow = map[string]any{
 			"service":          svc.ID,
+			"session":          meta.sessionID,
+			"event_id":         pyEventID,
 			"direction":        string(dir),
 			"method":           "WS",
 			"url":              meta.url,
@@ -248,11 +300,20 @@ func (m *Manager) processWebSocketMessage(svc *storage.Service, meta websocketCa
 			"body_b64":         base64.StdEncoding.EncodeToString(body),
 			"flagged":          pyFlagged,
 			"contains_flagid":  pyContainsFlagID,
-			"timestamp":        time.Now().Unix(),
+			"matched_flagids":  pyMatchedFlagIDs,
+			"flag_count_body":  pyFlagCount,
+			"admitted":         !shouldDrop,
+			"timestamp":        float64(observedAt.UnixNano()) / float64(time.Second),
 			"websocket_opcode": opcodeName,
 		}
-		result := pyBlock(flow)
+		result := pyBlock(pyFlow)
+		pyResult = result
+		for _, alert := range result.Alerts {
+			matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{ID: "pyfilter:" + alert.Script, Name: "Python alert (" + alert.Script + ")", Action: "alert", Pattern: alert.Reason, Scope: "python"})
+			pyBlockAlerts = append(pyBlockAlerts, &sniffer.Alert{RuleID: "pyfilter:" + alert.Script, ServiceID: svc.ID, SrcIP: srcIP, Timestamp: time.Now(), PatternMatched: alert.Reason})
+		}
 		for _, block := range result.Blocks {
+			shouldClose = shouldClose || block.Close
 			matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{
 				ID:      "pyfilter:" + block.Script,
 				Name:    "Python block (" + block.Script + ")",
@@ -279,11 +340,15 @@ func (m *Manager) processWebSocketMessage(svc *storage.Service, meta websocketCa
 		}
 	}
 
-	flagged := sniffer.CheckFlagged(m.flagRegex, m.flagScanner, "", "", body)
+	flagRegex, flagScanner = m.currentFlagMatchers()
+	flagged := sniffer.CheckFlagged(flagRegex, flagScanner, "", "", body)
+	_, _, flagCountBody := sniffer.CountFlags(flagRegex, flagScanner, "", "", body)
 	containsFlagID, matchedFlagIDs, flagIDRound := false, []string(nil), 0
 	if m.shouldApplyFlagIDsOnIngest() {
 		containsFlagID, matchedFlagIDs, flagIDRound = sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", body)
 	}
+	pyResult.Reconcile(pyFlow, body, !shouldDrop, false, flagged, containsFlagID,
+		matchedFlagIDs, flagCountBody, 0, 0)
 
 	captureEnabled := m.packetStore != nil && m.shouldCapture()
 	mustPersist := captureEnabled || shouldDrop || len(alertRules) > 0 || len(pyBlockAlerts) > 0
@@ -291,27 +356,29 @@ func (m *Manager) processWebSocketMessage(svc *storage.Service, meta websocketCa
 		if matchedRules == nil {
 			matchedRules = []sniffer.MatchedRuleInfo{}
 		}
-		now := time.Now()
+		now := observedAt
 		pkt := &sniffer.Packet{
-			ServiceID:      svc.ID,
-			SessionID:      meta.sessionID,
-			Timestamp:      now,
-			SrcIP:          srcIP,
-			SrcPort:        srcPort,
-			DstIP:          dstIP,
-			DstPort:        dstPort,
-			Protocol:       string(svc.Protocol),
-			Direction:      dir,
-			Method:         "WS",
-			URL:            meta.url,
-			Headers:        headers,
-			Body:           body,
-			MatchedRules:   matchedRules,
-			Flagged:        flagged,
-			ContainsFlagID: containsFlagID,
-			MatchedFlagIDs: matchedFlagIDs,
-			FlagIDRound:    flagIDRound,
-			Verdict:        sniffer.VerdictFor(dir, matchedRules, shouldDrop, rewritten, true),
+			ServiceID:       svc.ID,
+			SessionID:       meta.sessionID,
+			Timestamp:       now,
+			SrcIP:           srcIP,
+			SrcPort:         srcPort,
+			DstIP:           dstIP,
+			DstPort:         dstPort,
+			Protocol:        string(svc.Protocol),
+			Direction:       dir,
+			Method:          "WS",
+			URL:             meta.url,
+			Headers:         headers,
+			Body:            body,
+			MatchedRules:    matchedRules,
+			Flagged:         flagged,
+			ContainsFlagID:  containsFlagID,
+			MatchedFlagIDs:  matchedFlagIDs,
+			FlagIDRound:     flagIDRound,
+			FlagCountBody:   flagCountBody,
+			PyFilterEventID: pyEventID,
+			Verdict:         sniffer.VerdictFor(dir, matchedRules, shouldDrop, rewritten, true),
 		}
 		alerts := make([]*sniffer.Alert, 0, len(alertRules)+len(pyBlockAlerts))
 		for _, rule := range alertRules {
@@ -332,7 +399,7 @@ func (m *Manager) processWebSocketMessage(svc *storage.Service, meta websocketCa
 	if shouldDrop {
 		log.Printf("[%s] WebSocket DROP: %d filter(s) matched %s %s message", svc.Name, len(matchedRules), dir, opcodeName)
 	}
-	return websocketMessageDecision{Payload: body, Drop: shouldDrop, Rewritten: rewritten}
+	return websocketMessageDecision{Payload: body, Drop: shouldDrop, Close: shouldClose, Rewritten: rewritten}
 }
 
 func splitWebSocketRemoteAddr(remoteAddr string) (string, int) {
@@ -344,27 +411,24 @@ func splitWebSocketRemoteAddr(remoteAddr string) (string, int) {
 	return host, port
 }
 
-func (m *Manager) dropOversizedWebSocketMessage(svc *storage.Service, meta websocketCaptureMeta, dir sniffer.Direction, opcode byte, size uint64) {
+func (m *Manager) recordOversizedWebSocketMessage(svc *storage.Service, meta websocketCaptureMeta, dir sniffer.Direction, opcode byte, size uint64) {
 	opcodeName, headers := websocketMessageHeaders(opcode)
-	headers["X-Janus-WebSocket-Error"] = fmt.Sprintf("message exceeds %d-byte filtering limit", maxWebSocketMessageCapture)
+	headers["X-Janus-WebSocket-Capture"] = "truncated"
 	srcIP, srcPort, dstIP, dstPort := websocketEndpoints(meta, dir)
-	message := fmt.Sprintf("WebSocket %s message dropped: %d bytes exceeds %d-byte filtering limit", opcodeName, size, maxWebSocketMessageCapture)
+	message := fmt.Sprintf("WebSocket %s message forwarded without filtering: %d bytes exceeds %d-byte capture limit", opcodeName, size, maxWebSocketMessageCapture)
 
-	if m.packetStore != nil {
-		limitMatches := []sniffer.MatchedRuleInfo{{
-			ID: "janus:websocket-message-limit", Name: "WebSocket message size limit",
-			Action: "drop", Pattern: fmt.Sprintf("size > %d", maxWebSocketMessageCapture), Scope: "body",
-		}}
+	if m.packetStore != nil && m.shouldCapture() {
 		pkt := &sniffer.Packet{
 			ServiceID: svc.ID, SessionID: meta.sessionID, Timestamp: time.Now(),
 			SrcIP: srcIP, SrcPort: srcPort, DstIP: dstIP, DstPort: dstPort,
 			Protocol: string(svc.Protocol), Direction: dir, Method: "WS", URL: meta.url,
 			Headers: headers, BodyString: message,
-			MatchedRules: limitMatches,
-			Verdict:      sniffer.VerdictFor(dir, limitMatches, true, false, true),
+			MatchedRules:     []sniffer.MatchedRuleInfo{},
+			CaptureTruncated: true,
+			Verdict:          sniffer.VerdictFor(dir, nil, false, false, true),
 		}
 		if err := m.packetStore.Enqueue(pkt, nil); err != nil {
-			log.Printf("[%s] sniffer: failed to log oversized WebSocket message: %v", svc.Name, err)
+			log.Printf("[%s] sniffer: failed to log oversized WebSocket metadata: %v", svc.Name, err)
 		}
 	}
 	log.Printf("[%s] %s", svc.Name, message)
@@ -373,12 +437,12 @@ func (m *Manager) dropOversizedWebSocketMessage(svc *storage.Service, meta webso
 type websocketFrameParser struct {
 	buffer []byte
 
-	skipPayload uint64
+	passPayload uint64
 
 	fragmentOpcode  byte
 	fragmentPayload []byte
 	fragmentWire    []byte
-	fragmentDropped bool
+	fragmentBypass  bool
 
 	maskRewrites bool
 	onMessage    func(opcode byte, payload []byte) websocketMessageDecision
@@ -402,13 +466,14 @@ func (p *websocketFrameParser) Feed(data []byte) []byte {
 		return output
 	}
 
-	if p.skipPayload > 0 {
+	if p.passPayload > 0 {
 		consumed := uint64(len(data))
-		if consumed > p.skipPayload {
-			consumed = p.skipPayload
+		if consumed > p.passPayload {
+			consumed = p.passPayload
 		}
+		output = append(output, data[:int(consumed)]...)
 		data = data[int(consumed):]
-		p.skipPayload -= consumed
+		p.passPayload -= consumed
 		if len(data) == 0 {
 			return output
 		}
@@ -416,18 +481,6 @@ func (p *websocketFrameParser) Feed(data []byte) []byte {
 
 	p.buffer = append(p.buffer, data...)
 	for {
-		if p.skipPayload > 0 {
-			consumed := uint64(len(p.buffer))
-			if consumed > p.skipPayload {
-				consumed = p.skipPayload
-			}
-			p.buffer = p.buffer[int(consumed):]
-			p.skipPayload -= consumed
-			if p.skipPayload > 0 || len(p.buffer) == 0 {
-				return output
-			}
-		}
-
 		if len(p.buffer) < 2 {
 			return output
 		}
@@ -463,20 +516,27 @@ func (p *websocketFrameParser) Feed(data []byte) []byte {
 
 		if payloadLen > maxWebSocketMessageCapture {
 			reportedOpcode := opcode
+			reportedSize := payloadLen
 			if opcode == webSocketOpcodeContinuation && p.fragmentOpcode != 0 {
 				reportedOpcode = p.fragmentOpcode
+				reportedSize += uint64(len(p.fragmentPayload))
 			}
 			if p.onOversized != nil {
-				p.onOversized(reportedOpcode, payloadLen)
+				p.onOversized(reportedOpcode, reportedSize)
 			}
-			p.handleDroppedFrame(opcode, fin)
+			output = append(output, p.beginOversizedFrame(opcode, fin)...)
+			output = append(output, p.buffer[:headerLen]...)
 			p.buffer = p.buffer[headerLen:]
 			available := uint64(len(p.buffer))
 			if available > payloadLen {
 				available = payloadLen
 			}
+			output = append(output, p.buffer[:int(available)]...)
 			p.buffer = p.buffer[int(available):]
-			p.skipPayload = payloadLen - available
+			p.passPayload = payloadLen - available
+			if p.passPayload > 0 {
+				return output
+			}
 			continue
 		}
 
@@ -512,7 +572,7 @@ func (p *websocketFrameParser) handleFrame(opcode byte, fin bool, payload, rawFr
 		// A new data message before the previous fragmented message completed is
 		// invalid. Fail open for the incomplete bytes so the peers, not Janus,
 		// decide how to handle the protocol error.
-		if p.fragmentOpcode != 0 && !p.fragmentDropped {
+		if p.fragmentOpcode != 0 && !p.fragmentBypass {
 			output = append(output, p.fragmentWire...)
 		}
 		p.resetFragment()
@@ -529,23 +589,25 @@ func (p *websocketFrameParser) handleFrame(opcode byte, fin bool, payload, rawFr
 			// Stray continuation is invalid but should remain transparent.
 			return rawFrame
 		}
-		if p.fragmentDropped {
+		if p.fragmentBypass {
 			if fin {
 				p.resetFragment()
 			}
-			return nil
+			return rawFrame
 		}
 		if len(payload) > maxWebSocketMessageCapture-len(p.fragmentPayload) {
+			total := uint64(len(p.fragmentPayload) + len(payload))
 			if p.onOversized != nil {
-				p.onOversized(p.fragmentOpcode, uint64(len(p.fragmentPayload)+len(payload)))
+				p.onOversized(p.fragmentOpcode, total)
 			}
-			p.fragmentPayload = nil
-			p.fragmentWire = nil
-			p.fragmentDropped = true
-			if fin {
-				p.resetFragment()
+			opcode := p.fragmentOpcode
+			output := append(append([]byte(nil), p.fragmentWire...), rawFrame...)
+			p.resetFragment()
+			if !fin {
+				p.fragmentOpcode = opcode
+				p.fragmentBypass = true
 			}
-			return nil
+			return output
 		}
 		p.fragmentPayload = append(p.fragmentPayload, payload...)
 		p.fragmentWire = append(p.fragmentWire, rawFrame...)
@@ -576,30 +638,39 @@ func (p *websocketFrameParser) applyDecision(opcode byte, payload, originalWire 
 	return encodeWebSocketMessage(opcode, decision.Payload, p.maskRewrites)
 }
 
-func (p *websocketFrameParser) handleDroppedFrame(opcode byte, fin bool) {
+// beginOversizedFrame switches the current message to transparent pass-through
+// and returns any fragments that had been held while waiting for filtering.
+func (p *websocketFrameParser) beginOversizedFrame(opcode byte, fin bool) []byte {
+	var held []byte
 	switch opcode {
 	case webSocketOpcodeText, webSocketOpcodeBinary:
+		if p.fragmentOpcode != 0 && !p.fragmentBypass {
+			held = append(held, p.fragmentWire...)
+		}
 		p.resetFragment()
 		if !fin {
 			p.fragmentOpcode = opcode
-			p.fragmentDropped = true
+			p.fragmentBypass = true
 		}
 	case webSocketOpcodeContinuation:
-		if fin {
-			p.resetFragment()
-		} else if p.fragmentOpcode != 0 {
-			p.fragmentPayload = nil
-			p.fragmentWire = nil
-			p.fragmentDropped = true
+		if p.fragmentOpcode != 0 && !p.fragmentBypass {
+			held = append(held, p.fragmentWire...)
+		}
+		opcode := p.fragmentOpcode
+		p.resetFragment()
+		if !fin && opcode != 0 {
+			p.fragmentOpcode = opcode
+			p.fragmentBypass = true
 		}
 	}
+	return held
 }
 
 func (p *websocketFrameParser) resetFragment() {
 	p.fragmentOpcode = 0
 	p.fragmentPayload = nil
 	p.fragmentWire = nil
-	p.fragmentDropped = false
+	p.fragmentBypass = false
 }
 
 func encodeWebSocketMessage(opcode byte, payload []byte, masked bool) []byte {

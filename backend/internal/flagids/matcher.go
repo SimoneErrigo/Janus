@@ -16,10 +16,10 @@ type FlagMatch struct {
 
 // Matcher wraps an Aho-Corasick automaton for O(text_length) multi-pattern matching.
 type Matcher struct {
-	patterns []FlagMatch          // ordered list matching automaton pattern indices
+	patterns []FlagMatch // ordered list matching automaton pattern indices
 	ac       ahocorasick.AhoCorasick
 	empty    bool
-	byValue  map[string]int       // flagID value -> index in patterns (for dedup)
+	byValue  map[string]int // flagID value -> index in patterns (for dedup)
 }
 
 // BuildMatcher constructs an Aho-Corasick automaton from round-aware flagId data.
@@ -108,7 +108,8 @@ type FlagScanner struct {
 	scanBytes  func(data []byte) bool
 	scanString func(s string) bool
 	// fallback regex for unsupported patterns
-	regex *regexp.Regexp
+	regex      *regexp.Regexp
+	countRegex *regexp.Regexp
 	// decodeURL also scans a percent-decoded copy of the input, so
 	// URL-encoded flags are caught even when the raw bytes don't match.
 	decodeURL bool
@@ -136,7 +137,15 @@ func NewFlagScanner(flagRegex string, caseInsensitive, decodeURL bool) *FlagScan
 		pat = pat[len("(?i)"):]
 	}
 
-	fs := &FlagScanner{decodeURL: decodeURL}
+	compilePat := pat
+	if ci && !strings.HasPrefix(compilePat, "(?i)") {
+		compilePat = "(?i)" + compilePat
+	}
+	countRegex, err := regexp.Compile(compilePat)
+	if err != nil {
+		return nil
+	}
+	fs := &FlagScanner{decodeURL: decodeURL, countRegex: countRegex}
 
 	// Try to parse known CTF flag patterns and build optimized scanners
 	if spec := parseSuffixPattern(pat, ci); spec != nil {
@@ -165,17 +174,9 @@ func NewFlagScanner(flagRegex string, caseInsensitive, decodeURL bool) *FlagScan
 	}
 
 	// Unknown pattern: fall back to compiled regexp
-	compilePat := pat
-	if ci && !strings.HasPrefix(compilePat, "(?i)") {
-		compilePat = "(?i)" + compilePat
-	}
-	re, err := regexp.Compile(compilePat)
-	if err != nil {
-		return nil
-	}
-	fs.regex = re
-	fs.scanBytes = func(data []byte) bool { return re.Match(data) }
-	fs.scanString = func(s string) bool { return re.MatchString(s) }
+	fs.regex = countRegex
+	fs.scanBytes = func(data []byte) bool { return countRegex.Match(data) }
+	fs.scanString = func(s string) bool { return countRegex.MatchString(s) }
 	return fs
 }
 
@@ -209,6 +210,26 @@ func (fs *FlagScanner) MatchString(s string) bool {
 		}
 	}
 	return false
+}
+
+// CountBytes returns the number of non-overlapping flag matches. When URL
+// decoding is enabled it scans the decoded representation only, so the same raw
+// match is never counted twice while encoded flags are still included.
+func (fs *FlagScanner) CountBytes(data []byte) int {
+	if fs == nil || fs.countRegex == nil || len(data) == 0 {
+		return 0
+	}
+	if fs.decodeURL {
+		if decoded, changed := lenientPercentDecode(data); changed {
+			data = decoded
+		}
+	}
+	return len(fs.countRegex.FindAll(data, -1))
+}
+
+// CountString is the string counterpart of CountBytes.
+func (fs *FlagScanner) CountString(value string) int {
+	return fs.CountBytes([]byte(value))
 }
 
 // lenientPercentDecode decodes "%HH" escapes in-place, leaving any invalid or

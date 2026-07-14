@@ -19,7 +19,10 @@ func (p *Packet) View() flowmodel.PacketView {
 		HeaderValues: p.Headers, Payload: p.Body, BodyText: p.BodyString,
 		RoundNumber: p.Round, FlaggedValue: p.Flagged,
 		ContainsFlagIDValue: p.ContainsFlagID, DroppedValue: dropped,
-		Truncated: p.CaptureTruncated,
+		Truncated: p.CaptureTruncated, Decoded: p.Decoded,
+		AttackScoreValue: p.AttackScore, NormalScoreValue: p.NormalScore,
+		ScoreCoverageValue: p.ScoreCoverage, ScoreConfidenceValue: p.ScoreConfidence,
+		ClassificationValue: p.Classification, AnalystLabelValue: p.AnalystLabel,
 	}
 }
 

@@ -4,7 +4,7 @@
 export default function ErrorBanner({ error, className = '' }) {
   if (!error) return null
   return (
-    <div className={`bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded ${className}`.trim()}>
+    <div role="alert" className={`bg-red-900/30 border border-red-800 text-red-400 text-sm px-4 py-2 rounded ${className}`.trim()}>
       {error}
     </div>
   )

@@ -10,12 +10,17 @@ import (
 
 // Manager handles background cleanup of old packets and DB size management.
 type Manager struct {
-	mu           sync.RWMutex
-	packetStore  *sniffer.PacketStore
-	maxAgeMins   int
-	maxDBSizeMB  int
-	stopCh       chan struct{}
-	runNowCh     chan chan Result
+	mu          sync.RWMutex
+	runMu       sync.Mutex
+	lifecycleMu sync.Mutex
+	started     bool
+	stopped     bool
+	packetStore *sniffer.PacketStore
+	maxAgeMins  int
+	maxDBSizeMB int
+	stopCh      chan struct{}
+	doneCh      chan struct{}
+	runNowCh    chan chan Result
 }
 
 // Result holds the outcome of a cleanup run.
@@ -24,6 +29,7 @@ type Result struct {
 	AlertsDeleted  int64   `json:"alerts_deleted"`
 	DurationMs     int64   `json:"duration_ms"`
 	DBSizeMB       float64 `json:"db_size_mb"`
+	DBUsedMB       float64 `json:"db_used_mb"`
 	Error          string  `json:"error,omitempty"`
 }
 
@@ -40,19 +46,47 @@ func NewManager(packetStore *sniffer.PacketStore, maxAgeMins, maxDBSizeMB int) *
 		maxAgeMins:  maxAgeMins,
 		maxDBSizeMB: maxDBSizeMB,
 		stopCh:      make(chan struct{}),
+		doneCh:      make(chan struct{}),
 		runNowCh:    make(chan chan Result),
 	}
 }
 
-// Start launches the background cleanup goroutine (runs every 1 minute).
+const (
+	cleanupInterval  = 15 * time.Second
+	cleanupBatchSize = 500
+	maxBatchesPerRun = 4
+)
+
+// Start launches the background cleanup goroutine. Cleanup is frequent and
+// incremental so no single run monopolizes SQLite's writer connection.
 func (m *Manager) Start() {
+	m.lifecycleMu.Lock()
+	if m.started || m.stopped {
+		m.lifecycleMu.Unlock()
+		return
+	}
+	m.started = true
+	m.lifecycleMu.Unlock()
 	go m.loop()
 	log.Printf("Cleanup goroutine started (max_age=%dm, max_db_size=%dMB)", m.maxAgeMins, m.maxDBSizeMB)
 }
 
 // Stop signals the background goroutine to exit.
 func (m *Manager) Stop() {
-	close(m.stopCh)
+	m.lifecycleMu.Lock()
+	if !m.stopped {
+		m.stopped = true
+		close(m.stopCh)
+	}
+	started := m.started
+	m.lifecycleMu.Unlock()
+	if started {
+		<-m.doneCh
+	}
+	// A direct RunNow/Purge call can run outside the background loop. Wait for
+	// it as well so callers may safely close the packet store after Stop.
+	m.runMu.Lock()
+	m.runMu.Unlock()
 }
 
 // GetSettings returns the current cleanup policy.
@@ -75,15 +109,40 @@ func (m *Manager) UpdateSettings(s Settings) {
 }
 
 // RunNow triggers an immediate cleanup run and returns the result.
-// Non-blocking: if the loop is busy running a cleanup, it runs directly.
+// Concurrent manual/automatic runs are serialized to avoid competing DELETEs.
 func (m *Manager) RunNow() Result {
+	m.lifecycleMu.Lock()
+	stopped := m.stopped
+	m.lifecycleMu.Unlock()
+	if stopped {
+		return Result{Error: "cleanup manager is stopped"}
+	}
 	resultCh := make(chan Result, 1)
 	select {
+	case <-m.stopCh:
+		return Result{Error: "cleanup manager is stopped"}
 	case m.runNowCh <- resultCh:
-		return <-resultCh
+		select {
+		case result := <-resultCh:
+			return result
+		case <-m.stopCh:
+			return Result{Error: "cleanup manager is stopped"}
+		}
 	default:
-		// Loop is busy — run directly instead of blocking
-		return m.run()
+		// Do not queue behind an automatic cleanup while SQLite is already doing
+		// bounded DELETE batches. Returning promptly keeps the control plane and
+		// packet UI responsive; the active run is already enforcing the policy.
+		if !m.runMu.TryLock() {
+			return Result{Error: "cleanup already in progress", DBSizeMB: m.DBSizeMB()}
+		}
+		defer m.runMu.Unlock()
+		m.lifecycleMu.Lock()
+		stopped = m.stopped
+		m.lifecycleMu.Unlock()
+		if stopped {
+			return Result{Error: "cleanup manager is stopped"}
+		}
+		return m.runLocked()
 	}
 }
 
@@ -96,8 +155,18 @@ func (m *Manager) DBSizeMB() float64 {
 	return float64(size) / (1024 * 1024)
 }
 
+// DBUsedMB is the logical SQLite space in use, excluding reusable free pages.
+func (m *Manager) DBUsedMB() float64 {
+	size, err := m.packetStore.DBUsedSize()
+	if err != nil {
+		return 0
+	}
+	return float64(size) / (1024 * 1024)
+}
+
 func (m *Manager) loop() {
-	ticker := time.NewTicker(1 * time.Minute)
+	defer close(m.doneCh)
+	ticker := time.NewTicker(cleanupInterval)
 	defer ticker.Stop()
 
 	for {
@@ -114,6 +183,8 @@ func (m *Manager) loop() {
 
 // PurgeAll deletes all packets and alerts regardless of policies.
 func (m *Manager) PurgeAll() Result {
+	m.runMu.Lock()
+	defer m.runMu.Unlock()
 	start := time.Now()
 	pkts, alerts, err := m.packetStore.PurgeAll()
 	if err != nil {
@@ -121,6 +192,9 @@ func (m *Manager) PurgeAll() Result {
 		return Result{Error: err.Error()}
 	}
 	duration := time.Since(start)
+	if pkts > 0 || alerts > 0 {
+		m.packetStore.NotifyMetadataChange()
+	}
 	dbSize := m.DBSizeMB()
 	log.Printf("PurgeAll: deleted %d packets, %d alerts in %dms (DB: %.1f MB)",
 		pkts, alerts, duration.Milliseconds(), dbSize)
@@ -129,11 +203,14 @@ func (m *Manager) PurgeAll() Result {
 		AlertsDeleted:  alerts,
 		DurationMs:     duration.Milliseconds(),
 		DBSizeMB:       dbSize,
+		DBUsedMB:       m.DBUsedMB(),
 	}
 }
 
 // PurgePackets deletes all packets (and their linked alerts) but no other data.
 func (m *Manager) PurgePackets() Result {
+	m.runMu.Lock()
+	defer m.runMu.Unlock()
 	start := time.Now()
 	pkts, err := m.packetStore.PurgePackets()
 	if err != nil {
@@ -141,6 +218,9 @@ func (m *Manager) PurgePackets() Result {
 		return Result{Error: err.Error()}
 	}
 	duration := time.Since(start)
+	if pkts > 0 {
+		m.packetStore.NotifyMetadataChange()
+	}
 	dbSize := m.DBSizeMB()
 	log.Printf("PurgePackets: deleted %d packets in %dms (DB: %.1f MB)",
 		pkts, duration.Milliseconds(), dbSize)
@@ -148,11 +228,14 @@ func (m *Manager) PurgePackets() Result {
 		PacketsDeleted: pkts,
 		DurationMs:     duration.Milliseconds(),
 		DBSizeMB:       dbSize,
+		DBUsedMB:       m.DBUsedMB(),
 	}
 }
 
 // PurgeDroppedPackets deletes all packets that were dropped by a rule.
 func (m *Manager) PurgeDroppedPackets() Result {
+	m.runMu.Lock()
+	defer m.runMu.Unlock()
 	start := time.Now()
 	pkts, err := m.packetStore.PurgeDroppedPackets()
 	if err != nil {
@@ -160,6 +243,9 @@ func (m *Manager) PurgeDroppedPackets() Result {
 		return Result{Error: err.Error()}
 	}
 	duration := time.Since(start)
+	if pkts > 0 {
+		m.packetStore.NotifyMetadataChange()
+	}
 	dbSize := m.DBSizeMB()
 	log.Printf("PurgeDroppedPackets: deleted %d packets in %dms (DB: %.1f MB)",
 		pkts, duration.Milliseconds(), dbSize)
@@ -167,10 +253,17 @@ func (m *Manager) PurgeDroppedPackets() Result {
 		PacketsDeleted: pkts,
 		DurationMs:     duration.Milliseconds(),
 		DBSizeMB:       dbSize,
+		DBUsedMB:       m.DBUsedMB(),
 	}
 }
 
 func (m *Manager) run() Result {
+	m.runMu.Lock()
+	defer m.runMu.Unlock()
+	return m.runLocked()
+}
+
+func (m *Manager) runLocked() Result {
 	start := time.Now()
 	var totalPkts, totalAlerts int64
 
@@ -182,37 +275,59 @@ func (m *Manager) run() Result {
 	// Policy 1: age-based cleanup
 	if maxAge > 0 {
 		cutoff := time.Now().Add(-time.Duration(maxAge) * time.Minute)
-		pkts, alerts, err := m.packetStore.DeleteOlderThan(cutoff)
-		if err != nil {
-			log.Printf("Cleanup error (age policy): %v", err)
-			return Result{Error: err.Error()}
+		for batch := 0; batch < maxBatchesPerRun; batch++ {
+			pkts, alerts, err := m.packetStore.DeleteOlderThanBatch(cutoff, cleanupBatchSize)
+			if err != nil {
+				log.Printf("Cleanup error (age policy): %v", err)
+				return Result{PacketsDeleted: totalPkts, AlertsDeleted: totalAlerts, Error: err.Error()}
+			}
+			totalPkts += pkts
+			totalAlerts += alerts
+			if pkts < cleanupBatchSize {
+				break
+			}
+			time.Sleep(2 * time.Millisecond)
 		}
-		totalPkts += pkts
-		totalAlerts += alerts
 	}
 
 	// Policy 2: size-based cleanup
 	if maxSize > 0 {
 		maxBytes := int64(maxSize) * 1024 * 1024
-		pkts, alerts, err := m.packetStore.DeleteOldestUntilSize(maxBytes)
-		if err != nil {
-			log.Printf("Cleanup error (size policy): %v", err)
-			return Result{
-				PacketsDeleted: totalPkts,
-				AlertsDeleted:  totalAlerts,
-				Error:          err.Error(),
+		// Aim below the threshold so cleanup does not oscillate on every insert.
+		targetBytes := maxBytes * 9 / 10
+		for batch := 0; batch < maxBatchesPerRun; batch++ {
+			usedBytes, err := m.packetStore.DBUsedSize()
+			if err != nil {
+				return Result{PacketsDeleted: totalPkts, AlertsDeleted: totalAlerts, Error: err.Error()}
 			}
+			if usedBytes <= targetBytes || (batch == 0 && usedBytes <= maxBytes) {
+				break
+			}
+			pkts, alerts, err := m.packetStore.DeleteOldestBatch(cleanupBatchSize)
+			if err != nil {
+				log.Printf("Cleanup error (size policy): %v", err)
+				return Result{PacketsDeleted: totalPkts, AlertsDeleted: totalAlerts, Error: err.Error()}
+			}
+			totalPkts += pkts
+			totalAlerts += alerts
+			if pkts == 0 {
+				break
+			}
+			time.Sleep(2 * time.Millisecond)
 		}
-		totalPkts += pkts
-		totalAlerts += alerts
 	}
 
 	duration := time.Since(start)
+	if totalPkts > 0 || totalAlerts > 0 {
+		m.packetStore.CheckpointWAL()
+		m.packetStore.NotifyMetadataChange()
+	}
 	dbSize := m.DBSizeMB()
+	dbUsed := m.DBUsedMB()
 
 	if totalPkts > 0 || totalAlerts > 0 {
-		log.Printf("Cleanup: deleted %d packets, %d alerts in %dms (DB: %.1f MB)",
-			totalPkts, totalAlerts, duration.Milliseconds(), dbSize)
+		log.Printf("Cleanup: deleted %d packets, %d alerts in %dms (DB: %.1f MB physical, %.1f MB used)",
+			totalPkts, totalAlerts, duration.Milliseconds(), dbSize, dbUsed)
 	}
 
 	return Result{
@@ -220,5 +335,6 @@ func (m *Manager) run() Result {
 		AlertsDeleted:  totalAlerts,
 		DurationMs:     duration.Milliseconds(),
 		DBSizeMB:       dbSize,
+		DBUsedMB:       dbUsed,
 	}
 }

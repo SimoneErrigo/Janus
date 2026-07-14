@@ -2,19 +2,20 @@
 // the packet query API and the drop/alert rules engine.
 //
 // Grammar (informal):
-//   expr      := orExpr
-//   orExpr    := andExpr (("OR"|"||") andExpr)*
-//   andExpr   := notExpr (("AND"|"&&") notExpr)*
-//   notExpr   := ("NOT"|"!"|"~") notExpr | atom
-//   atom      := "(" orExpr ")" | predicate | bool
-//   predicate := field op value
-//                | field                             (bool-field shortcut: == true)
-//   field     := body | url | method | status | proto | service
-//              | src | dst | peer | sport | dport
-//              | header | header.<name> | raw | direction
-//              | flagged | contains_flagid | dropped
-//   op        := contains | icontains | == | != | matches
-//              | startswith | endswith | in | > | < | >= | <=
+//
+//	expr      := orExpr
+//	orExpr    := andExpr (("OR"|"||") andExpr)*
+//	andExpr   := notExpr (("AND"|"&&") notExpr)*
+//	notExpr   := ("NOT"|"!"|"~") notExpr | atom
+//	atom      := "(" orExpr ")" | predicate | bool
+//	predicate := field op value
+//	             | field                             (bool-field shortcut: == true)
+//	field     := body | url | method | status | proto | service
+//	           | src | dst | peer | sport | dport
+//	           | header | header.<name> | raw | direction
+//	           | flagged | contains_flagid | dropped
+//	op        := contains | icontains | == | != | matches
+//	           | startswith | endswith | in | > | < | >= | <=
 //
 // The package exposes:
 //   - Parse:       source string -> AST

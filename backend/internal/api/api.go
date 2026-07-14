@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/cache"
@@ -15,6 +17,7 @@ import (
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
 	"github.com/SimoneErrigo/Janus/backend/internal/pyfilter"
 	"github.com/SimoneErrigo/Janus/backend/internal/rounddiff"
+	"github.com/SimoneErrigo/Janus/backend/internal/scoring"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 	"github.com/SimoneErrigo/Janus/backend/internal/sysstat"
@@ -37,7 +40,19 @@ type Server struct {
 	protoDir       string
 	roundDiffCache *rounddiff.Cache
 	pyfilter       *pyfilter.Manager
+	scoring        scoringProvider
+	loginLimiter   loginLimiter
+	configMu       sync.Mutex
+	serviceMu      sync.Mutex
+	ruleMu         sync.Mutex
+	protocolMu     sync.Mutex
 	mux            *http.ServeMux
+}
+
+type scoringProvider interface {
+	Status() scoring.Status
+	ConfigureBaseline(scoring.BaselineConfig) error
+	RebuildBaseline() error
 }
 
 // NewServer creates a new API server.
@@ -66,7 +81,19 @@ func NewServer(store storage.Repository, proxyMgr *proxy.Manager, packetStore *s
 
 // Handler returns the HTTP handler for this server.
 func (s *Server) Handler() http.Handler {
-	return corsMiddleware(s.mux)
+	return corsMiddleware(requestBodyLimitMiddleware(s.mux))
+}
+
+func (s *Server) SetScoringStatusProvider(provider scoringProvider) {
+	s.scoring = provider
+}
+
+func (s *Server) prewarmPyFilters(serviceID string) {
+	if s.pyfilter != nil {
+		if err := s.pyfilter.PrewarmServices([]string{serviceID}); err != nil {
+			log.Printf("Warning: failed to prewarm Python filters for %s: %v", serviceID, err)
+		}
+	}
 }
 
 // annotateRound fills the `Round` field on a packet from competition timing,
@@ -100,6 +127,7 @@ func (s *Server) routes() {
 	protected := http.NewServeMux()
 	protected.HandleFunc("/api/services", s.handleServices)
 	protected.HandleFunc("/api/services/", s.handleServiceByID)
+	protected.HandleFunc("/api/protocol-presets", s.handleProtocolPresets)
 	// Proxy listener health / retry controls. Kept under /api/proxy/ rather
 	// than /api/services/ so the path can't ever be shadowed by a service
 	// whose ID happens to be "status" or "retry-all" (validateService allows
@@ -118,6 +146,7 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/protocols", s.handleProtocols)
 	protected.HandleFunc("/api/protocols/", s.handleProtocolByID)
 	protected.HandleFunc("/api/packets/bulk-delete", s.handlePacketsBulkDelete)
+	protected.HandleFunc("/api/packets/label", s.handlePacketsLabel)
 	protected.HandleFunc("/api/packets/", s.handlePacketByID)
 	protected.HandleFunc("/api/packets", s.handlePackets)
 	protected.HandleFunc("/api/rules/presets/apply", s.handlePresetsApply)
@@ -142,7 +171,11 @@ func (s *Server) routes() {
 	protected.HandleFunc("/api/traffic/capture/apply-flagids", s.handleTrafficCaptureApplyFlagIDs)
 	protected.HandleFunc("/api/system/stats", s.handleSystemStats)
 	protected.HandleFunc("/api/filter/validate", s.handleFilterValidate)
+	protected.HandleFunc("/api/filter/schema", s.handleFilterSchema)
+	protected.HandleFunc("/api/scoring/status", s.handleScoringStatus)
+	protected.HandleFunc("/api/scoring/baseline/rebuild", s.handleScoringBaselineRebuild)
 	protected.HandleFunc("/api/session/active", s.handleSessionActive)
+	protected.HandleFunc("/api/logout", s.handleLogout)
 	protected.HandleFunc("/api/flows/saved/", s.handleSavedFlowByID)
 	protected.HandleFunc("/api/flows/saved", s.handleSavedFlows)
 	protected.HandleFunc("/api/pcap/export", s.handlePcapExport)
@@ -167,7 +200,17 @@ func (s *Server) routes() {
 // corsMiddleware adds CORS headers for the frontend.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			if !sameHostOrigin(origin, r.Host) {
+				http.Error(w, "origin not allowed", http.StatusForbidden)
+				return
+			} else {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+				w.Header().Add("Vary", "Origin")
+			}
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
@@ -176,6 +219,32 @@ func corsMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		next.ServeHTTP(w, r)
+	})
+}
+
+func sameHostOrigin(origin, requestHost string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil {
+		return false
+	}
+	// SameSite cookies do not isolate ports. Compare the complete authority so
+	// an unrelated web service on another port of the team host cannot make
+	// credentialed Janus calls and read their responses through CORS.
+	return strings.EqualFold(strings.TrimSpace(requestHost), u.Host)
+}
+
+func requestBodyLimitMiddleware(next http.Handler) http.Handler {
+	const maxRequestBytes = 16 << 20
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// PCAP imports enforce their own larger multipart/file limits.
+		if r.Body != nil && r.URL.Path != "/api/pcap/import" {
+			if r.ContentLength > maxRequestBytes {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -278,6 +347,14 @@ func (s *Server) listServices(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, services)
 }
 
+func (s *Server) handleProtocolPresets(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, storage.ProtocolPresets())
+}
+
 func (s *Server) getService(w http.ResponseWriter, r *http.Request, id string) {
 	svc, ok := s.store.GetService(id)
 	if !ok {
@@ -293,6 +370,10 @@ func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.protocolMu.Lock()
+	defer s.protocolMu.Unlock()
+	s.serviceMu.Lock()
+	defer s.serviceMu.Unlock()
 
 	// The ID is an internal key; users only provide a name. Auto-generate a
 	// unique slug from the name when the client didn't supply one.
@@ -304,10 +385,17 @@ func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 	}
 
 	applyServiceDefaults(&svc)
+	svc.ApplyProtocolPreset()
 
 	if err := validateService(&svc); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+	if svc.ProtocolID != "" {
+		if _, ok := s.store.GetProtocol(svc.ProtocolID); !ok {
+			http.Error(w, "protocol_id not found", http.StatusBadRequest)
+			return
+		}
 	}
 
 	if err := s.store.CreateService(&svc); err != nil {
@@ -316,6 +404,7 @@ func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if svc.Enabled {
+		s.prewarmPyFilters(svc.ID)
 		if err := s.proxy.StartService(&svc); err != nil {
 			log.Printf("Warning: service created but proxy failed to start: %v", err)
 		}
@@ -331,18 +420,38 @@ func (s *Server) updateService(w http.ResponseWriter, r *http.Request, id string
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.protocolMu.Lock()
+	defer s.protocolMu.Unlock()
+	s.serviceMu.Lock()
+	defer s.serviceMu.Unlock()
+	previous, ok := s.store.GetService(id)
+	if !ok {
+		http.Error(w, "service not found", http.StatusNotFound)
+		return
+	}
 
 	svc.ID = id
 
 	applyServiceDefaults(&svc)
+	if svc.Protocol != previous.Protocol || svc.Spec.Listener.Transport == "" {
+		svc.ApplyProtocolPreset()
+	} else {
+		svc.NormalizeSpec()
+	}
 
 	if err := validateService(&svc); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if svc.ProtocolID != "" {
+		if _, ok := s.store.GetProtocol(svc.ProtocolID); !ok {
+			http.Error(w, "protocol_id not found", http.StatusBadRequest)
+			return
+		}
+	}
 
 	if err := s.store.UpdateService(&svc); err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -351,6 +460,7 @@ func (s *Server) updateService(w http.ResponseWriter, r *http.Request, id string
 
 	// Restart proxy if enabled, stop if disabled
 	if svc.Enabled {
+		s.prewarmPyFilters(svc.ID)
 		if err := s.proxy.RestartService(&svc); err != nil {
 			log.Printf("Warning: service updated but proxy failed to restart: %v", err)
 		}
@@ -363,12 +473,18 @@ func (s *Server) updateService(w http.ResponseWriter, r *http.Request, id string
 }
 
 func (s *Server) deleteService(w http.ResponseWriter, r *http.Request, id string) {
-	s.proxy.StopService(id)
-
-	if err := s.store.DeleteService(id); err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+	s.serviceMu.Lock()
+	defer s.serviceMu.Unlock()
+	if _, ok := s.store.GetService(id); !ok {
+		http.Error(w, "service not found", http.StatusNotFound)
 		return
 	}
+
+	if err := s.store.DeleteService(id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.proxy.StopService(id)
 
 	s.protoCache.Invalidate(id)
 

@@ -3,38 +3,10 @@ package storage
 // ProtocolPreset derives the normalized runtime model from the single
 // protocol choice exposed by the beginner service setup.
 func ProtocolPreset(protocol Protocol) ServiceSpec {
-	spec := ServiceSpec{
-		Listener: ListenerSpec{Transport: TransportTCP, TLS: ClientTLSOff},
-		Upstream: UpstreamSpec{},
-		Framing:  FramingSpec{Mode: FramingRaw},
+	if p, ok := LookupProtocolPreset(protocol); ok {
+		return p.Spec
 	}
-	switch protocol {
-	case ProtocolHTTP:
-		spec.Application.Profile = ApplicationHTTP
-		spec.Framing.Mode = FramingHTTP
-	case ProtocolHTTPS:
-		spec.Application.Profile = ApplicationHTTP
-		spec.Listener.TLS = ClientTLSTerminate
-		spec.Framing.Mode = FramingHTTP
-	case ProtocolWS:
-		spec.Application.Profile = ApplicationWebSocket
-		spec.Framing.Mode = FramingHTTP
-	case ProtocolWSS:
-		spec.Application.Profile = ApplicationWebSocket
-		spec.Listener.TLS = ClientTLSTerminate
-		spec.Framing.Mode = FramingHTTP
-	case ProtocolHTTP2:
-		spec.Application.Profile = ApplicationHTTP2
-		spec.Listener.TLS = ClientTLSTerminate
-		spec.Framing.Mode = FramingHTTP
-	case ProtocolGRPC:
-		spec.Application.Profile = ApplicationGRPC
-		spec.Listener.TLS = ClientTLSTerminate
-		spec.Framing.Mode = FramingHTTP
-	case ProtocolTCP:
-		spec.Application.Profile = ApplicationRaw
-	}
-	return spec
+	return ServiceSpec{Listener: ListenerSpec{Transport: TransportTCP, TLS: ClientTLSOff}, Application: ApplicationSpec{Profile: ApplicationRaw}, Framing: FramingSpec{Mode: FramingRaw}}
 }
 
 // ApplyProtocolPreset materializes the selected protocol into Spec. Existing
@@ -47,6 +19,25 @@ func (s *Service) ApplyProtocolPreset() {
 	spec.Upstream.TLS = s.TargetTLS
 	s.Spec = spec
 	s.ModelVersion = ServiceModelVersion
+	s.PresetRevision = ProtocolPresetRevision
+}
+
+// NormalizeSpec preserves advanced framing/decoder choices while keeping the
+// addresses mirrored from the beginner-facing fields. Selecting a different
+// protocol explicitly calls ApplyProtocolPreset instead.
+func (s *Service) NormalizeSpec() {
+	if s.Spec.Listener.Transport == "" || s.Spec.Application.Profile == "" || s.Spec.Framing.Mode == "" {
+		s.ApplyProtocolPreset()
+		return
+	}
+	s.Spec.Listener.Address = s.ListenAddr
+	s.Spec.Listener.Port = s.ListenPort
+	s.Spec.Upstream.Address = s.TargetAddr
+	s.Spec.Upstream.TLS = s.TargetTLS
+	s.ModelVersion = ServiceModelVersion
+	if s.PresetRevision == 0 {
+		s.PresetRevision = ProtocolPresetRevision
+	}
 }
 
 // Migrate upgrades a legacy service record in memory. It returns true when
@@ -62,7 +53,7 @@ func (s *Service) Migrate() bool {
 // RuntimeSpec returns a complete spec even for a Service constructed directly
 // by older tests or integrations that have not passed through Store migration.
 func (s *Service) RuntimeSpec() ServiceSpec {
-	if s.ModelVersion >= ServiceModelVersion && s.Spec.Listener.Transport != "" {
+	if s.Spec.Listener.Transport != "" {
 		return s.Spec
 	}
 	clone := *s

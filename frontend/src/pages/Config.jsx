@@ -4,6 +4,31 @@ import { api } from '../api'
 import { SHORTCUT_ACTIONS, getBindings, saveBindings, defaultBindings, keysToInputString, parseKeyList } from '../trafficNavKeys'
 import ErrorBanner from '../components/ErrorBanner'
 
+function configForForm(data) {
+  return {
+    ...(data || {}),
+    team_password_set: data?.team_password_set ?? !!data?.team_password,
+    team_password: '',
+  }
+}
+
+const GENERAL_CONFIG_FIELDS = [
+  'team_password', 'team_password_set', 'flag_regex', 'traffic_mode',
+  'flow_correlation_window_seconds',
+]
+
+const FLAGID_CONFIG_FIELDS = [
+  'flagid_enabled', 'flagid_api_url', 'flagid_team_id', 'flagid_poll_interval',
+  'flagid_format', 'round_duration_seconds', 'competition_start', 'keep_rounds',
+  'baseline_start_round', 'baseline_end_round',
+]
+
+function mergeConfigFields(current, server, fields) {
+  const merged = { ...current }
+  for (const field of fields) merged[field] = server[field]
+  return merged
+}
+
 export default function Config() {
   const [config, setConfig] = useState(null)
   const [form, setForm] = useState({})
@@ -15,9 +40,16 @@ export default function Config() {
   const [flagIDCountdown, setFlagIDCountdown] = useState('')
   const [flagIDSaved, setFlagIDSaved] = useState(false)
   const [flagIDError, setFlagIDError] = useState('')
+  const [scoringStatus, setScoringStatus] = useState(null)
+  const [baselineRebuilding, setBaselineRebuilding] = useState(false)
+	const baselineDirty = config != null && (
+		Number(form.baseline_start_round ?? 1) !== Number(config.baseline_start_round ?? 1) ||
+		Number(form.baseline_end_round ?? 5) !== Number(config.baseline_end_round ?? 5) ||
+		Number(form.round_duration_seconds ?? 120) !== Number(config.round_duration_seconds ?? 120) ||
+		String(form.competition_start || '') !== String(config.competition_start || '')
+	)
 
   // Cleanup state
-  const [cleanupConfig, setCleanupConfig] = useState(null)
   const [cleanupForm, setCleanupForm] = useState({})
   const [cleanupSaved, setCleanupSaved] = useState(false)
   const [cleanupError, setCleanupError] = useState('')
@@ -26,6 +58,7 @@ export default function Config() {
   const [purgeRunning, setPurgeRunning] = useState(false)
   const [purgePacketsRunning, setPurgePacketsRunning] = useState(false)
   const [dbSizeMB, setDbSizeMB] = useState(0)
+	const [dbUsedMB, setDbUsedMB] = useState(0)
 
   // Per-action shortcut inputs (action id -> comma-separated key string).
   const [shortcutInputs, setShortcutInputs] = useState({})
@@ -46,15 +79,7 @@ export default function Config() {
   const [services, setServices] = useState([])
   const [protocols, setProtocols] = useState([])
   const importFileRef = useRef(null)
-
-  useEffect(() => {
-    loadConfig()
-    loadCleanupConfig()
-    loadFlagIDData()
-    api.listPcapFiles().then(d => setPcapFiles(d?.files || [])).catch(() => {})
-    api.listServices().then(d => setServices(d || [])).catch(() => {})
-    api.listProtocols().then(d => setProtocols(d || [])).catch(() => {})
-  }, [])
+  const importPollRef = useRef(0)
 
   async function startPcapImport(e) {
     e.preventDefault()
@@ -63,12 +88,16 @@ export default function Config() {
       setImportError('Select a .pcap file first.')
       return
     }
+    const generation = ++importPollRef.current
     try {
       const { import_id, service_id } = await api.pcapImport(importFile, importServiceID, importProtocolID)
+      if (generation !== importPollRef.current) return
       setImportStatus({ state: 'running', packets_imported: 0, service_id })
       const poll = async () => {
+        if (generation !== importPollRef.current) return
         try {
           const st = await api.getPcapImportStatus(import_id)
+          if (generation !== importPollRef.current) return
           setImportStatus(st)
           if (st.state === 'running') {
             setTimeout(poll, 800)
@@ -76,14 +105,16 @@ export default function Config() {
             api.listServices().then(d => setServices(d || [])).catch(() => {})
           }
         } catch (err) {
-          setImportError(err.message)
+          if (generation === importPollRef.current) setImportError(err.message)
         }
       }
       poll()
     } catch (err) {
-      setImportError(err.message)
+      if (generation === importPollRef.current) setImportError(err.message)
     }
   }
+
+  useEffect(() => () => { importPollRef.current++ }, [])
 
   useEffect(() => {
     setShortcutInputs(bindingsToInputs(getBindings()))
@@ -120,23 +151,30 @@ export default function Config() {
     setTimeout(() => setTrafficNavSaved(false), 2500)
   }
 
-  async function loadFlagIDData() {
+  const loadFlagIDData = useCallback(async () => {
     try {
       const status = await api.getFlagIDStatus()
       setFlagIDStatus(status)
-    } catch {}
-  }
+	} catch { /* status is optional and retried */ }
+  }, [])
+
+  const loadScoringStatus = useCallback(async () => {
+    try {
+      setScoringStatus(await api.getScoringStatus())
+    } catch { /* optional status; settings still remain editable */ }
+  }, [])
 
   // Refresh flag ID status every 10 seconds for countdown
   useEffect(() => {
-    const interval = setInterval(async () => {
-      try {
-        const status = await api.getFlagIDStatus()
-        setFlagIDStatus(status)
-      } catch {}
-    }, 10000)
-    return () => clearInterval(interval)
-  }, [])
+    let cancelled = false
+    let timer
+    async function poll() {
+      await loadFlagIDData()
+      if (!cancelled) timer = setTimeout(poll, 10000)
+    }
+    timer = setTimeout(poll, 10000)
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [loadFlagIDData])
 
   // Update countdown timer every second
   useEffect(() => {
@@ -154,34 +192,51 @@ export default function Config() {
   const loadCleanupConfig = useCallback(async () => {
     try {
       const data = await api.getCleanupConfig()
-      setCleanupConfig(data)
       setCleanupForm({ max_age_minutes: data.max_age_minutes, max_db_size_mb: data.max_db_size_mb })
       setDbSizeMB(data.db_size_mb)
+	  setDbUsedMB(data.db_used_mb ?? data.db_size_mb)
     } catch (err) {
       setCleanupError(err.message)
     }
   }, [])
 
-  // Refresh DB size every 30 seconds
-  useEffect(() => {
-    const interval = setInterval(async () => {
-      try {
-        const data = await api.getCleanupConfig()
-        setDbSizeMB(data.db_size_mb)
-      } catch {}
-    }, 30000)
-    return () => clearInterval(interval)
-  }, [])
-
-  async function loadConfig() {
+  const loadConfig = useCallback(async () => {
     try {
-      const data = await api.getConfig()
-      setConfig(data)
-      setForm(data)
+      const next = configForForm(await api.getConfig())
+      setConfig(next)
+      setForm(next)
     } catch (err) {
       setError(err.message)
     }
-  }
+  }, [])
+
+	useEffect(() => {
+		loadConfig()
+		loadCleanupConfig()
+		loadFlagIDData()
+		loadScoringStatus()
+		api.listPcapFiles().then(d => setPcapFiles(d?.files || [])).catch(() => {})
+		api.listServices().then(d => setServices(d || [])).catch(() => {})
+		api.listProtocols().then(d => setProtocols(d || [])).catch(() => {})
+		}, [loadCleanupConfig, loadConfig, loadFlagIDData, loadScoringStatus])
+
+  // Refresh DB size every 30 seconds
+  useEffect(() => {
+    let cancelled = false
+    let timer
+    async function poll() {
+      try {
+        const data = await api.getCleanupConfig()
+        if (!cancelled) {
+          setDbSizeMB(data.db_size_mb)
+		  setDbUsedMB(data.db_used_mb ?? data.db_size_mb)
+        }
+	  } catch { /* next poll retries */ }
+      if (!cancelled) timer = setTimeout(poll, 30000)
+    }
+    timer = setTimeout(poll, 30000)
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [])
 
   function set(field, value) {
     setForm((f) => ({ ...f, [field]: value }))
@@ -199,8 +254,9 @@ export default function Config() {
         traffic_mode: form.traffic_mode || 'live',
         flow_correlation_window_seconds: parseInt(form.flow_correlation_window_seconds, 10) || 120,
       })
-      setConfig(data)
-      setForm(data)
+      const next = configForForm(data)
+      setConfig(next)
+      setForm((current) => mergeConfigFields(current, next, GENERAL_CONFIG_FIELDS))
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
     } catch (err) {
@@ -222,15 +278,34 @@ export default function Config() {
         round_duration_seconds: parseInt(form.round_duration_seconds, 10) || 120,
         competition_start: form.competition_start || '',
         keep_rounds: parseInt(form.keep_rounds, 10) || 5,
+        baseline_start_round: parseInt(form.baseline_start_round, 10) || 1,
+        baseline_end_round: parseInt(form.baseline_end_round, 10) || 5,
       })
-      setConfig(data)
-      setForm(data)
+      const next = configForForm(data)
+      setConfig(next)
+      setForm((current) => mergeConfigFields(current, next, FLAGID_CONFIG_FIELDS))
       setFlagIDSaved(true)
       setTimeout(() => setFlagIDSaved(false), 3000)
       // Refresh status after config change
       setTimeout(loadFlagIDData, 500)
+      setTimeout(loadScoringStatus, 500)
     } catch (err) {
       setFlagIDError(err.message)
+      loadScoringStatus()
+    }
+  }
+
+  async function rebuildBaseline() {
+    setFlagIDError('')
+    setBaselineRebuilding(true)
+    try {
+      const status = await api.rebuildScoringBaseline()
+      setScoringStatus((current) => ({ ...current, ...status, available: true }))
+    } catch (err) {
+      setFlagIDError(err.message)
+      loadScoringStatus()
+    } finally {
+      setBaselineRebuilding(false)
     }
   }
 
@@ -243,8 +318,8 @@ export default function Config() {
         max_age_minutes: parseInt(cleanupForm.max_age_minutes, 10) || 0,
         max_db_size_mb: parseInt(cleanupForm.max_db_size_mb, 10) || 0,
       })
-      setCleanupConfig(data)
       setDbSizeMB(data.db_size_mb)
+	  setDbUsedMB(data.db_used_mb ?? data.db_size_mb)
       setCleanupSaved(true)
       setTimeout(() => setCleanupSaved(false), 3000)
     } catch (err) {
@@ -259,6 +334,7 @@ export default function Config() {
       const result = await api.runCleanup()
       setCleanupResult(result)
       setDbSizeMB(result.db_size_mb)
+	  setDbUsedMB(result.db_used_mb ?? result.db_size_mb)
     } catch (err) {
       setCleanupError(err.message)
     } finally {
@@ -274,6 +350,7 @@ export default function Config() {
       const result = await api.purgeAll()
       setCleanupResult(result)
       setDbSizeMB(result.db_size_mb)
+	  setDbUsedMB(result.db_used_mb ?? result.db_size_mb)
     } catch (err) {
       setCleanupError(err.message)
     } finally {
@@ -289,6 +366,7 @@ export default function Config() {
       const result = await api.purgePackets()
       setCleanupResult(result)
       setDbSizeMB(result.db_size_mb)
+	  setDbUsedMB(result.db_used_mb ?? result.db_size_mb)
     } catch (err) {
       setCleanupError(err.message)
     } finally {
@@ -296,7 +374,13 @@ export default function Config() {
     }
   }
 
-  if (!config) return <div className="p-6 text-gray-500">Loading...</div>
+  if (!config) {
+    return (
+      <div className="p-6 text-gray-500">
+        {error ? <ErrorBanner error={error} /> : 'Loading...'}
+      </div>
+    )
+  }
 
   return (
     <div className="p-6 space-y-6">
@@ -310,9 +394,12 @@ export default function Config() {
             value={form.team_password || ''}
             onChange={(e) => set('team_password', e.target.value)}
             className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 transition-colors"
-            placeholder="Password for frontend access"
+            placeholder={form.team_password_set ? 'Leave blank to keep the current password' : 'Set the team password'}
+            autoComplete="new-password"
           />
-          <p className="text-xs text-gray-600 mt-1">Changing this will require re-login with the new password</p>
+          <p className="text-xs text-gray-600 mt-1">
+            {form.team_password_set ? 'Password is configured. Leave this blank to keep it unchanged.' : 'Set the password used to access Janus.'}
+          </p>
         </div>
 
         <div>
@@ -531,6 +618,83 @@ export default function Config() {
             </div>
           </div>
 
+          <div className="border-t border-gray-800 pt-3 space-y-3">
+            <div>
+              <h4 className="text-sm font-medium text-gray-300">Static checker baseline</h4>
+              <p className="text-xs text-gray-500 mt-1">
+                Janus trusts a clean fingerprint only when it repeats in every selected round. The selected range defines the opening baseline window.
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label htmlFor="baseline-start-round" className="block text-sm text-gray-400 mb-1">First round</label>
+                <input
+                  id="baseline-start-round"
+                  type="number"
+                  min="1"
+                  max="9999"
+                  value={form.baseline_start_round ?? 1}
+                  onChange={(e) => set('baseline_start_round', e.target.value)}
+                  className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
+                />
+              </div>
+              <div>
+                <label htmlFor="baseline-end-round" className="block text-sm text-gray-400 mb-1">Last round</label>
+                <input
+                  id="baseline-end-round"
+                  type="number"
+                  min="2"
+                  max="10000"
+                  value={form.baseline_end_round ?? 5}
+                  onChange={(e) => set('baseline_end_round', e.target.value)}
+                  className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
+                />
+              </div>
+            </div>
+            <div className="rounded border border-amber-900/60 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80">
+              A distinct exploit fingerprint seen in only one round remains a candidate and is never trusted. Static checks also exclude rule matches, suspicious payloads, request flags, truncated captures and flows labeled <span className="font-mono">exploit</span>. An exploit structurally identical to recurring checker traffic, or the same safe-looking exploit repeated in every selected round, cannot be distinguished with certainty without external ground truth.
+            </div>
+            <div className="flex items-center gap-2 flex-wrap text-xs">
+              <button
+                type="button"
+                onClick={rebuildBaseline}
+                disabled={baselineRebuilding || scoringStatus?.rebuilding || baselineDirty || !scoringStatus?.available}
+                className="bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-gray-300 px-3 py-1.5 rounded border border-gray-700 cursor-pointer"
+              >
+                {baselineRebuilding || scoringStatus?.rebuilding ? 'Rebuilding…' : 'Rebuild from captured traffic'}
+              </button>
+              <span className="text-gray-500">
+                {baselineDirty ? 'Save competition timing and the round range before rebuilding.' : 'Use after labeling a contaminated flow as exploit.'}
+                {Number.isFinite(scoringStatus?.replayed_packets) && ` Last replay: ${scoringStatus.replayed_packets} packets.`}
+              </span>
+            </div>
+            {(scoringStatus?.last_error || scoringStatus?.store_errors > 0 || scoringStatus?.queue_dropped > 0) && (
+              <div role="alert" className="rounded border border-red-900/60 bg-red-950/20 px-3 py-2 text-xs text-red-300">
+                {scoringStatus.last_error && <span>{scoringStatus.last_error}. </span>}
+                {scoringStatus.store_errors > 0 && <span>{scoringStatus.store_errors} storage errors. </span>}
+                {scoringStatus.queue_dropped > 0 && <span>{scoringStatus.queue_dropped} scoring events skipped under load.</span>}
+              </div>
+            )}
+            {(scoringStatus?.services || []).length > 0 && (
+              <div className="space-y-1 text-xs">
+                {(scoringStatus.services || []).map((status) => {
+                  const observed = status.rounds_observed?.length || 0
+                  const required = scoringStatus.baseline_required_rounds || 5
+                  return (
+                    <div key={status.service_id} className="flex flex-wrap gap-x-2 rounded border border-gray-800 bg-gray-950/40 px-2.5 py-1.5 text-gray-400">
+                      <span className="font-mono text-gray-300">{status.service_id}</span>
+                      <span>rounds {observed}/{required}</span>
+                      <span className={status.trusted_signatures > 0 ? 'text-emerald-400' : 'text-gray-500'}>{status.trusted_signatures || 0} trusted</span>
+                      <span>{status.candidate_signatures || 0} candidates</span>
+                      <span>{status.scored_flows || 0} scored</span>
+                      {status.excluded_opening_flows > 0 && <span className="text-amber-400">{status.excluded_opening_flows} excluded</span>}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+
           <ErrorBanner error={flagIDError} />
           {flagIDSaved && <div className="bg-green-900/30 border border-green-800 text-green-400 text-sm px-4 py-2 rounded">Flag ID settings saved</div>}
 
@@ -594,17 +758,18 @@ export default function Config() {
         <div className="flex items-center justify-between">
           <h3 className="text-lg font-medium text-gray-100">Database Cleanup</h3>
           <div className="text-sm">
-            <span className="text-gray-500">DB Size: </span>
+            <span className="text-gray-500">Used: </span>
             <span className={`font-mono font-medium ${
-              cleanupForm.max_db_size_mb > 0 && dbSizeMB >= cleanupForm.max_db_size_mb * 0.85 ? 'text-red-400' :
-              cleanupForm.max_db_size_mb > 0 && dbSizeMB >= cleanupForm.max_db_size_mb * 0.7 ? 'text-yellow-400' :
+			  cleanupForm.max_db_size_mb > 0 && dbUsedMB >= cleanupForm.max_db_size_mb * 0.85 ? 'text-red-400' :
+			  cleanupForm.max_db_size_mb > 0 && dbUsedMB >= cleanupForm.max_db_size_mb * 0.7 ? 'text-yellow-400' :
               'text-cyan-400'
             }`}>
-              {dbSizeMB.toFixed(1)} MB
+			  {dbUsedMB.toFixed(1)} MB
             </span>
             {cleanupForm.max_db_size_mb > 0 && (
               <span className="text-gray-600"> / {cleanupForm.max_db_size_mb} MB</span>
             )}
+			<span className="ml-2 text-[10px] text-gray-600" title="Physical SQLite + WAL files may stay allocated and are reused without blocking VACUUM">physical {dbSizeMB.toFixed(1)} MB</span>
           </div>
         </div>
 
@@ -640,7 +805,7 @@ export default function Config() {
           {cleanupResult && (
             <div className="bg-cyan-900/20 border border-cyan-800/50 text-cyan-300 text-sm px-4 py-2 rounded">
               Deleted {cleanupResult.packets_deleted} packets, {cleanupResult.alerts_deleted} alerts in {cleanupResult.duration_ms}ms.
-              DB now {cleanupResult.db_size_mb.toFixed(1)} MB.
+			  Used now {(cleanupResult.db_used_mb ?? cleanupResult.db_size_mb).toFixed(1)} MB; physical files {cleanupResult.db_size_mb.toFixed(1)} MB.
             </div>
           )}
 
@@ -692,7 +857,7 @@ export default function Config() {
               })
               setPcapSaved(true)
               setTimeout(() => setPcapSaved(false), 2000)
-            } catch {}
+			} catch (err) { setError(err.message) }
           }}
           className="space-y-4"
         >
@@ -750,7 +915,7 @@ export default function Config() {
                         try {
                           await api.deletePcapFile(f.name)
                           setPcapFiles(prev => prev.filter(p => p.name !== f.name))
-                        } catch {}
+						} catch (err) { setError(err.message) }
                       }}
                       className="text-xs text-red-500 hover:text-red-400 cursor-pointer"
                     >

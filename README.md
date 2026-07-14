@@ -9,8 +9,9 @@ without changing the checker-facing endpoint.
 checker / opponents -> Janus (original service port) -> service (new local port)
 ```
 
-It supports HTTP/1.1, HTTPS/TLS, WebSocket (WS/WSS), HTTP/2, gRPC, and raw TCP.
-Traffic can be decoded with `.proto` files or custom binary protocol definitions.
+It supports HTTP/1.1, HTTPS/TLS, WebSocket (WS/WSS), HTTP/2 (TLS or h2c),
+gRPC, raw/line/TLS TCP, UDP, DNS, Redis RESP2, and MQTT. Traffic can be
+decoded with built-in decoders, `.proto` files, or custom binary definitions.
 
 ## Documentation
 
@@ -48,6 +49,7 @@ Useful settings:
 | `FLAG_REGEX_CASE_INSENSITIVE` | Make flag matching ASCII case-insensitive |
 | `FLAG_DECODE_URL` | Also scan a percent-decoded copy of traffic |
 | `PYFILTER_ENABLED` | Enable the Python-filter engine (default `true`) |
+| `BASELINE_START_ROUND` / `BASELINE_END_ROUND` | Inclusive rounds used by the deterministic checker baseline (default `1`–`5`) |
 | `TRAFFIC_MODE` | `live` (normal operation) or `static` (manual capture) |
 
 ### 2. Start Janus
@@ -118,13 +120,15 @@ bypass generic filtering. Messages larger than 1 MiB are dropped and audited.
 
 ## What Janus provides
 
-- **Traffic** — live SSE updates, packet/flow inspection, unified filters,
-  flag and Flag ID highlighting, PCAP import/export, and exploit skeletons.
+- **Traffic** — live SSE updates, packet/flow inspection, simple search plus
+  filter DSL, deterministic exploit/checker confidence, flag and Flag ID
+  highlighting, PCAP import/export, and exploit skeletons.
 - **Rules** — drop, alert, or both using the filter language. Attack presets
   can create a selected set of rules for multiple services.
 - **PyFilters** — stateful Python scripts for detections that cannot be
-  expressed in the DSL. Async scripts alert; blocking scripts can stop or
-  rewrite the current request (and TCP/WebSocket response). Start with
+  expressed in the DSL. Observe scripts alert; inline scripts can stop,
+  close, or rewrite HTTP/HTTPS, TCP, UDP, and WebSocket traffic within the
+  protocol limits described in the [reference](PYFILTERS.md). Start with
   [PYFILTERS_QUICKSTART.md](PYFILTERS_QUICKSTART.md).
 - **Protocols** — gRPC decoding from `.proto` files and editable custom binary
   decoders. Definitions support fixed, length-prefixed, computed-length, enum,
@@ -163,10 +167,26 @@ bypass generic filtering. Messages larger than 1 MiB are dropped and audited.
 3. For state or protocol-aware logic, write a PyFilter and run it against a
    saved packet or a whole reconstructed flow before enabling it.
 
+### Choose a safe opening baseline
+
+Janus estimates exploit/checker confidence with deterministic signatures and
+rules only—there is no AI or learned model. In **Config**, choose an inclusive
+opening range (default rounds 1–5). A signature becomes trusted checker traffic
+only after it appears in every selected round; a distinct exploit fingerprint
+seen in one round therefore remains untrusted. Truncated flows, request flags,
+rule/suspicion matches, and flows labelled `exploit` are excluded.
+
+No static method can separate an exploit that is structurally identical to a
+recurring checker flow, or prove that a safe-looking exploit repeated unchanged
+in every selected round is legitimate. If the opening window was contaminated,
+label the captured flow as `exploit`, adjust the range if needed, then use
+**Rebuild from captured traffic**. Changing the range also rebuilds from the
+retained packets, so the setting remains useful after the competition starts.
+
 ### Decode a non-HTTP service
 
-1. Bind a `.proto` file to a gRPC service, or create a custom protocol in
-   **Protocols**.
+1. Select DNS, RESP, or MQTT directly in **Services** for built-in decoding;
+   bind a `.proto` to gRPC, or create a custom definition in **Protocols**.
 2. For a Python challenge client, use **Import Python** to obtain a draft.
 3. Review field lengths, computed lengths, enums, dispatches, and warnings;
    save the decoder and bind it to the TCP service.
@@ -177,6 +197,12 @@ Janus uses SQLite WAL with separate read/write pools, per-service compiled rule
 bundles, Aho-Corasick matching for Flag IDs, optimized flag scanning, and
 batched SSE delivery. Redis is an optional cache adapter: traffic and
 configuration remain correct when it is disabled or unavailable.
+
+Automatic cleanup runs in bounded batches and uses SQLite's logical used space
+rather than allocated database/WAL file size. Freed pages are reused and WAL
+pages are passively checkpointed, avoiding long automatic `VACUUM` pauses.
+Traffic clients receive one refresh after cleanup and targeted SSE patches when
+deterministic flow scores change.
 
 Runtime data, saved PyFilters, SQLite data, and exported PCAPs live beneath
 `DATA_DIR` (mounted as `./data` by Compose). Treat this directory as operational

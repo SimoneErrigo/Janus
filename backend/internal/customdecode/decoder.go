@@ -44,10 +44,28 @@ type DecodedField struct {
 	Name  string         `json:"name"`
 	Type  string         `json:"type"`
 	Value interface{}    `json:"value,omitempty"`
-	Hex   string         `json:"hex,omitempty"`   // raw bytes for byte-shaped fields
-	Enum  string         `json:"enum,omitempty"`  // resolved enum label for numeric fields
-	Sub   []DecodedField `json:"sub,omitempty"`   // nested struct fields (dispatch)
+	Hex   string         `json:"hex,omitempty"`  // raw bytes for byte-shaped fields
+	Enum  string         `json:"enum,omitempty"` // resolved enum label for numeric fields
+	Sub   []DecodedField `json:"sub,omitempty"`  // nested struct fields (dispatch)
 	Error string         `json:"error,omitempty"`
+}
+
+const (
+	maxDecodedMessages = 4 * 1024
+	maxDecodedFields   = 16 * 1024
+	maxDispatchDepth   = 32
+	maxDecodedInput    = 1 << 20
+)
+
+type decodeBudget struct {
+	fields int
+	err    error
+}
+
+func (b *decodeBudget) stop(err error) {
+	if b.err == nil {
+		b.err = err
+	}
 }
 
 // cursor walks the body buffer, returning typed reads or an error if the
@@ -135,12 +153,21 @@ func Decode(p *storage.CustomProtocol, direction string, body []byte) *DecodeRes
 	if direction == "response" {
 		fields = p.ResponseFields
 	}
+	omitted := 0
+	if len(body) > maxDecodedInput {
+		omitted = len(body) - maxDecodedInput
+		body = body[:maxDecodedInput]
+	}
 	c := &cursor{buf: body, endi: p.Endian}
 
 	out := &DecodeResult{
 		Protocol:  p.Name,
 		Direction: direction,
 	}
+	if omitted > 0 {
+		out.Error = fmt.Sprintf("decode input limited to %d bytes (%d omitted)", maxDecodedInput, omitted)
+	}
+	budget := &decodeBudget{}
 	if len(fields) == 0 {
 		// Nothing configured for this direction — surface the body as a
 		// single trailing-hex blob so the user sees what's there.
@@ -151,9 +178,18 @@ func Decode(p *storage.CustomProtocol, direction string, body []byte) *DecodeRes
 	}
 
 	for c.pos < len(c.buf) {
+		if len(out.Messages) >= maxDecodedMessages {
+			budget.stop(fmt.Errorf("decoded message count exceeds %d", maxDecodedMessages))
+			break
+		}
 		startPos := c.pos
-		msg := decodeFields(c, fields, p, nil)
-		out.Messages = append(out.Messages, msg)
+		msg := decodeFields(c, fields, p, budget, 0)
+		if len(msg) > 0 {
+			out.Messages = append(out.Messages, msg)
+		}
+		if budget.err != nil {
+			break
+		}
 		// Decoded a message that consumed zero bytes (e.g. an empty field
 		// list, or every field hit a truncation error on the very first
 		// byte). Stop instead of looping forever.
@@ -166,6 +202,12 @@ func Decode(p *storage.CustomProtocol, direction string, body []byte) *DecodeRes
 		if len(msg) > 0 && msg[len(msg)-1].Error != "" {
 			break
 		}
+	}
+	if budget.err != nil {
+		if out.Error != "" {
+			out.Error += "; "
+		}
+		out.Error += budget.err.Error()
 	}
 	if len(out.Messages) == 0 {
 		// Body was empty: still return one empty message rather than nil so
@@ -181,14 +223,20 @@ func Decode(p *storage.CustomProtocol, direction string, body []byte) *DecodeRes
 // decodeFields walks an ordered field list. `siblings` carries the values
 // already decoded *at this level* so dispatch fields can resolve their
 // enum-typed source by name.
-func decodeFields(c *cursor, fields []storage.ProtocolField, p *storage.CustomProtocol, _ map[string]interface{}) []DecodedField {
+func decodeFields(c *cursor, fields []storage.ProtocolField, p *storage.CustomProtocol, budget *decodeBudget, depth int) []DecodedField {
 	siblings := make(map[string]interface{}, len(fields))
 	siblingEnumLabel := make(map[string]string, len(fields))
 	out := make([]DecodedField, 0, len(fields))
 
 	for _, f := range fields {
+		if budget.fields >= maxDecodedFields {
+			budget.stop(fmt.Errorf("decoded field count exceeds %d", maxDecodedFields))
+			return out
+		}
+		budget.fields++
 		df := DecodedField{Name: f.Name, Type: string(f.Type)}
-		val, label, sub, hexs, err := readField(c, f, p, siblings, siblingEnumLabel)
+		val, label, sub, hexs, err := readField(c, f, p, siblings, siblingEnumLabel, budget, depth)
+		df.Value, df.Enum, df.Sub, df.Hex = val, label, sub, hexs
 		if err != nil {
 			df.Error = err.Error()
 			out = append(out, df)
@@ -198,10 +246,6 @@ func decodeFields(c *cursor, fields []storage.ProtocolField, p *storage.CustomPr
 			// what we have.
 			return out
 		}
-		df.Value = val
-		df.Enum = label
-		df.Sub = sub
-		df.Hex = hexs
 		// Track sibling values for later dispatch / future cross-field uses.
 		siblings[f.Name] = val
 		siblingEnumLabel[f.Name] = label
@@ -212,7 +256,7 @@ func decodeFields(c *cursor, fields []storage.ProtocolField, p *storage.CustomPr
 
 // readField executes one field's read against the cursor. The return tuple
 // is (value, enumLabel, subFields, hex, error).
-func readField(c *cursor, f storage.ProtocolField, p *storage.CustomProtocol, siblings map[string]interface{}, siblingLabels map[string]string) (interface{}, string, []DecodedField, string, error) {
+func readField(c *cursor, f storage.ProtocolField, p *storage.CustomProtocol, siblings map[string]interface{}, siblingLabels map[string]string, budget *decodeBudget, depth int) (interface{}, string, []DecodedField, string, error) {
 	switch f.Type {
 	case storage.FieldU8:
 		v, err := c.readU8()
@@ -398,7 +442,15 @@ func readField(c *cursor, f storage.ProtocolField, p *storage.CustomProtocol, si
 			c.pos = len(c.buf)
 			return nil, label, nil, hex.EncodeToString(b), nil
 		}
-		sub := decodeFields(c, strct, p, nil)
+		if depth >= maxDispatchDepth {
+			err := fmt.Errorf("dispatch nesting exceeds %d", maxDispatchDepth)
+			budget.stop(err)
+			return nil, label, nil, "", err
+		}
+		sub := decodeFields(c, strct, p, budget, depth+1)
+		if budget.err != nil {
+			return nil, label, sub, "", budget.err
+		}
 		return nil, label, sub, "", nil
 	}
 	return nil, "", nil, "", fmt.Errorf("unsupported field type %q", f.Type)

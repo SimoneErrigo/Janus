@@ -96,7 +96,7 @@ func NeedsServerEvaluation(node Node) bool {
 			walk(v.Child)
 		case *Predicate:
 			field := canonicalField(v.Field)
-			if field == "body" || field == "raw" || field == "header" || v.Length || v.Op == OpMatches {
+			if field == "body" || field == "raw" || field == "header" || strings.HasPrefix(field, "decoded.") || strings.HasPrefix(field, "json.") || strings.HasPrefix(field, "form.") || strings.HasPrefix(field, "cookie.") || strings.HasPrefix(field, "dns.") || strings.HasPrefix(field, "resp.") || strings.HasPrefix(field, "mqtt.") || v.Length || v.Op == OpMatches {
 				needs = true
 				return
 			}
@@ -130,6 +130,8 @@ const (
 	OpStartsWith Op = "startswith"
 	OpEndsWith   Op = "endswith"
 	OpIn         Op = "in"
+	OpExists     Op = "exists"
+	OpMissing    Op = "missing"
 	OpGT         Op = ">"
 	OpLT         Op = "<"
 	OpGTE        Op = ">="

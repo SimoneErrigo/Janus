@@ -2,6 +2,9 @@
 
 Same expression language for: Traffic / Alerts page filters, drop & alert rules, QuickRulePanel.
 Empty expression matches everything. Keywords case-insensitive (`AND` = `and`).
+The visual builder loads fields and valid operators from `/api/filter/schema`.
+For expensive searches the Traffic page explicitly distinguishes an estimated
+total from a result truncated at the bounded scan limit.
 
 ---
 
@@ -11,7 +14,7 @@ Empty expression matches everything. Keywords case-insensitive (`AND` = `and`).
 service == "minecclicker"
 service in ("web", "api", "auth")
 proto == "tcp"
-proto in ("http", "https", "ws", "wss", "h2")
+proto in ("http", "https", "ws", "wss", "h2", "h2c", "grpc", "tcp", "udp", "dns", "resp", "mqtt")
 src == "10.10.0.1"
 src in (10.0.0.0/8)
 src in (10.0.0.0/8, 192.168.0.0/16)
@@ -23,6 +26,22 @@ dport in (8080, 8443, 9999)
 direction == "request"
 direction == "response"
 ```
+
+Built-in decoded fields use dotted paths:
+
+```text
+dns.qname == "target.example"
+resp.command in ("GET", "SET")
+mqtt.topic startswith "team/"
+decoded.dns.rcode == "0"
+json.user.role == "admin"
+query.debug exists
+cookie.session missing
+```
+
+Use any deeper `decoded.<path>`, `json.<path>`, `query.<name>`,
+`form.<name>`, or `cookie.<name>` path. `exists` and `missing` do not take a
+value.
 
 ---
 
@@ -133,6 +152,22 @@ NOT dropped
 flagged AND NOT dropped                  # leaked flag, slipped through
 contains_flagid AND direction == "response"
 ```
+
+---
+
+## Deterministic Janus score
+
+```text
+classification == "likely_exploit"
+classification == "review" AND score_confidence >= 40
+attack_score >= 60
+normal_score >= 65
+score_coverage < 50
+analyst_label == "exploit"
+```
+
+The score is explainable shadow metadata only: no AI, no automatic blocking.
+Manual analyst labels are stored separately and never train or alter it.
 
 ---
 

@@ -59,8 +59,9 @@ func (v httpRequestView) Header(name string) string {
 	return ""
 }
 
-func (v httpRequestView) HeadersText() string  { return v.req.Headers }
-func (v httpRequestView) RawBytes() []byte     { return v.req.RawBytes }
-func (v httpRequestView) Flagged() bool        { return v.req.Flagged }
-func (v httpRequestView) ContainsFlagID() bool { return v.req.ContainsFlagID }
-func (v httpRequestView) Dropped() bool        { return false }
+func (v httpRequestView) HeadersText() string           { return v.req.Headers }
+func (v httpRequestView) RawBytes() []byte              { return v.req.RawBytes }
+func (v httpRequestView) Flagged() bool                 { return v.req.Flagged }
+func (v httpRequestView) ContainsFlagID() bool          { return v.req.ContainsFlagID }
+func (v httpRequestView) Dropped() bool                 { return false }
+func (v httpRequestView) DecodedFields() map[string]any { return nil }

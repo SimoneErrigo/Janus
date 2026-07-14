@@ -188,12 +188,12 @@ func peelGRPCFrames(body []byte) ([][]byte, bool, error) {
 
 // DecodeResult is the JSON-serializable output of a successful decode.
 type DecodeResult struct {
-	Method        string   `json:"method"`         // e.g. "cheesycheats.Manager/Register"
-	MessageType   string   `json:"message_type"`   // e.g. "cheesycheats.RegisterRequest"
-	Direction     string   `json:"direction"`      // "request" or "response"
-	Frames        []Frame  `json:"frames"`         // one entry per gRPC frame
-	Compressed    bool     `json:"compressed,omitempty"`
-	Notes         []string `json:"notes,omitempty"`
+	Method      string   `json:"method"`       // e.g. "cheesycheats.Manager/Register"
+	MessageType string   `json:"message_type"` // e.g. "cheesycheats.RegisterRequest"
+	Direction   string   `json:"direction"`    // "request" or "response"
+	Frames      []Frame  `json:"frames"`       // one entry per gRPC frame
+	Compressed  bool     `json:"compressed,omitempty"`
+	Notes       []string `json:"notes,omitempty"`
 }
 
 type Frame struct {

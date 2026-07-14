@@ -65,8 +65,11 @@ func (s *RuleStore) SetOnChange(fn OnChangeFunc) {
 }
 
 func (s *RuleStore) notifyChange(serviceID string) {
-	if s.onChange != nil {
-		s.onChange(serviceID)
+	s.mu.RLock()
+	fn := s.onChange
+	s.mu.RUnlock()
+	if fn != nil {
+		fn(serviceID)
 	}
 }
 
@@ -122,14 +125,17 @@ func (s *RuleStore) CreateRule(r *Rule) error {
 	}
 	cp.Revision = 1
 	cp.UpdatedAt = time.Now().Unix()
-	if err := s.appendRevisionLocked(cp); err != nil {
-		s.mu.Unlock()
-		return err
-	}
 	s.rules[r.ID] = &cp
 	err := s.save()
 	if err != nil {
 		delete(s.rules, r.ID)
+	} else if err = s.replaceRevisionHistoryLocked(cp); err != nil {
+		// History is published only after rules.json is durable. If history
+		// cannot be saved, restore the previous active set as well.
+		delete(s.rules, r.ID)
+		if rollbackErr := s.save(); rollbackErr != nil {
+			err = fmt.Errorf("%v; restoring rules: %w", err, rollbackErr)
+		}
 	}
 	if err == nil {
 		s.version++
@@ -164,14 +170,16 @@ func (s *RuleStore) UpdateRule(r *Rule) error {
 		cp.Revision = 2
 	}
 	cp.UpdatedAt = time.Now().Unix()
-	if err := s.appendRevisionLocked(cp); err != nil {
-		s.mu.Unlock()
-		return err
-	}
 	s.rules[r.ID] = &cp
 	err := s.save()
 	if err != nil {
 		s.rules[r.ID] = previous
+	} else if err = s.appendRevisionLocked(cp); err != nil {
+		// Do not leave rule_revisions.json ahead of the active rules file.
+		s.rules[r.ID] = previous
+		if rollbackErr := s.save(); rollbackErr != nil {
+			err = fmt.Errorf("%v; restoring rules: %w", err, rollbackErr)
+		}
 	}
 	if err == nil {
 		s.version++
@@ -214,10 +222,12 @@ func (s *RuleStore) DeleteRules(ids []string) (int, error) {
 	s.mu.Lock()
 
 	affectedServices := map[string]bool{}
+	removed := make(map[string]*Rule)
 	deleted := 0
 	for _, id := range ids {
 		if r, exists := s.rules[id]; exists {
 			affectedServices[r.ServiceID] = true
+			removed[id] = r
 			delete(s.rules, id)
 			deleted++
 		}
@@ -228,9 +238,9 @@ func (s *RuleStore) DeleteRules(ids []string) (int, error) {
 	}
 	err := s.save()
 	if err != nil {
-		// Reloading restores the last atomically persisted state.
-		s.rules = make(map[string]*Rule)
-		_ = s.load()
+		for id, rule := range removed {
+			s.rules[id] = rule
+		}
 	}
 	if err == nil {
 		s.version++
@@ -258,7 +268,16 @@ func (s *RuleStore) load() error {
 		return fmt.Errorf("parsing rules file: %w", err)
 	}
 	migrated := false
-	for _, r := range list {
+	for i, r := range list {
+		if r == nil {
+			return fmt.Errorf("parsing rules file: entry %d is null", i)
+		}
+		if r.ID == "" {
+			return fmt.Errorf("parsing rules file: entry %d has an empty ID", i)
+		}
+		if _, exists := s.rules[r.ID]; exists {
+			return fmt.Errorf("parsing rules file: duplicate ID %q", r.ID)
+		}
 		// Migration: existing rules without action default to "drop"
 		if r.Action == "" {
 			r.Action = ActionDrop
@@ -336,6 +355,9 @@ func (s *RuleStore) loadRevisions() error {
 	if err := json.Unmarshal(data, &s.revisions); err != nil {
 		return fmt.Errorf("parsing rule revisions: %w", err)
 	}
+	if s.revisions == nil {
+		s.revisions = make(map[string][]RuleRevision)
+	}
 	return nil
 }
 
@@ -360,13 +382,35 @@ func (s *RuleStore) appendRevisionLocked(rule Rule) error {
 	return nil
 }
 
+// replaceRevisionHistoryLocked starts a fresh history for a newly-created
+// rule. IDs can be reused after deletion; old snapshots must not then collide
+// with the new rule's revision 1.
+func (s *RuleStore) replaceRevisionHistoryLocked(rule Rule) error {
+	history, existed := s.revisions[rule.ID]
+	s.revisions[rule.ID] = []RuleRevision{{Rule: rule, RecordedAt: time.Now().Unix()}}
+	if err := s.saveRevisionsLocked(); err != nil {
+		if existed {
+			s.revisions[rule.ID] = history
+		} else {
+			delete(s.revisions, rule.ID)
+		}
+		return err
+	}
+	return nil
+}
+
 func (s *RuleStore) ensureCurrentRevisions() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	changed := false
 	for id, rule := range s.rules {
 		history := s.revisions[id]
-		if len(history) == 0 || history[len(history)-1].Rule.Revision < rule.Revision {
+		// Revision 1 denotes a fresh incarnation. This also repairs a crash
+		// between publishing rules.json and replacing stale history on recreate.
+		if rule.Revision == 1 && (len(history) != 1 || history[0].Rule != *rule) {
+			s.revisions[id] = []RuleRevision{{Rule: *rule, RecordedAt: time.Now().Unix()}}
+			changed = true
+		} else if len(history) == 0 || history[len(history)-1].Rule.Revision < rule.Revision {
 			s.revisions[id] = append(history, RuleRevision{Rule: *rule, RecordedAt: time.Now().Unix()})
 			changed = true
 		}

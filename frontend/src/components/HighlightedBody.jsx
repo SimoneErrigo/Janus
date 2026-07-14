@@ -4,7 +4,7 @@ import { toJSRegex } from '../utils/formatting'
 // Single-pattern highlighter used by Alerts (orange) and Blocks (red).
 // Traffic uses its own multi-pattern variant — keep them separate by design.
 const HighlightedBody = memo(function HighlightedBody({ text, pattern, colorClass = 'bg-orange-500/40 text-orange-200' }) {
-  const result = useMemo(() => {
+  const ranges = useMemo(() => {
     if (!text || !pattern) return null
     try {
       const re = toJSRegex(pattern)
@@ -16,22 +16,24 @@ const HighlightedBody = memo(function HighlightedBody({ text, pattern, colorClas
         if (m[0].length === 0) re.lastIndex++
       }
       if (ranges.length === 0) return null
-      const parts = []
-      let pos = 0
-      for (const r of ranges) {
-        if (r.start > pos) parts.push(<span key={`t${pos}`}>{text.slice(pos, r.start)}</span>)
-        parts.push(<mark key={`m${r.start}`} className={`${colorClass} rounded px-0.5`}>{r.text}</mark>)
-        pos = r.end
-      }
-      if (pos < text.length) parts.push(<span key={`t${pos}`}>{text.slice(pos)}</span>)
-      return parts
+      return ranges
     } catch {
       return null
     }
-  }, [text, pattern, colorClass])
+  }, [text, pattern])
 
   if (!text) return <>{text}</>
-  return <>{result ?? text}</>
+  if (!ranges) return <>{text}</>
+
+  const parts = []
+  let pos = 0
+  for (const range of ranges) {
+    if (range.start > pos) parts.push(<span key={`t${pos}`}>{text.slice(pos, range.start)}</span>)
+    parts.push(<mark key={`m${range.start}`} className={`${colorClass} rounded px-0.5`}>{range.text}</mark>)
+    pos = range.end
+  }
+  if (pos < text.length) parts.push(<span key={`t${pos}`}>{text.slice(pos)}</span>)
+  return <>{parts}</>
 })
 
 export default HighlightedBody

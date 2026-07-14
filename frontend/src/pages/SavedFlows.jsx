@@ -40,22 +40,14 @@ function flowPcapUrl(anchorPacketId) {
 
 const PacketDetail = memo(function PacketDetail({ packet, services, customProtocols, onClose }) {
   const [showQuickRule, setShowQuickRule] = useState(false)
-  // Server-side decoded gRPC frames (resolved via the service's .proto files).
-  const [decodedNamed, setDecodedNamed] = useState(null)
-  const [decodedNamedError, setDecodedNamedError] = useState('')
-  // Server-side decoded custom binary protocol frames.
-  const [decodedCustom, setDecodedCustom] = useState(null)
-  const [decodedCustomError, setDecodedCustomError] = useState('')
+  const [namedDecode, setNamedDecode] = useState({ key: '', data: null, error: '' })
+  const [customDecode, setCustomDecode] = useState({ key: '', data: null, error: '' })
   // Manual override for the custom-protocol decoder. Resets when the user
   // switches packets so we don't carry an override across selections.
   const [customProtocolOverride, setCustomProtocolOverride] = useState('')
   // Opt-in picker for services with no bound protocol — keeps the panel
   // hidden until the user explicitly asks for a custom decode.
   const [customPickerOpen, setCustomPickerOpen] = useState(false)
-
-  // Close the rule panel when switching to a different packet.
-  useEffect(() => { setShowQuickRule(false) }, [packet?.id])
-  useEffect(() => { setCustomProtocolOverride(''); setCustomPickerOpen(false) }, [packet?.id])
 
   const formattedBody = useMemo(() => tryFormatJSON(packet?.body_string || ''), [packet?.body_string])
 
@@ -69,7 +61,7 @@ const PacketDetail = memo(function PacketDetail({ packet, services, customProtoc
     const result = decodeProtobuf(bytes)
     if (!result.ok) return null
     return result
-  }, [packet?.body, formattedBody.isJSON])
+  }, [packet, formattedBody.isJSON])
 
   // Permissive predicate: trigger server-side decode for any body that has
   // gRPC framing or a gRPC-shaped URL, even when the local walk gave up.
@@ -82,41 +74,52 @@ const PacketDetail = memo(function PacketDetail({ packet, services, customProtoc
     const url = packet?.url || ''
     if (url && /^\/[A-Za-z_][\w.]*\/[A-Za-z_]\w*(?:\?|$)/.test(url)) return true
     return false
-  }, [packet?.body, packet?.url, formattedBody.isJSON, decodedProto])
+  }, [packet, formattedBody.isJSON, decodedProto])
 
   // Server-side gRPC decode.
+  const packetID = packet?.id
+  const namedDecodeKey = packetID && mayBeGRPC ? String(packetID) : ''
+  const decodedNamed = namedDecode.key === namedDecodeKey ? namedDecode.data : null
+  const decodedNamedError = namedDecode.key === namedDecodeKey ? namedDecode.error : ''
   useEffect(() => {
-    setDecodedNamed(null)
-    setDecodedNamedError('')
-    if (!packet?.id) return
-    if (!mayBeGRPC) return
+    if (!namedDecodeKey) return
     let cancelled = false
-    api.decodePacket(packet.id)
-      .then((res) => { if (!cancelled) setDecodedNamed(res) })
-      .catch((err) => { if (!cancelled) setDecodedNamedError(err.message || String(err)) })
+    api.decodePacket(packetID)
+      .then((data) => {
+        if (!cancelled) setNamedDecode({ key: namedDecodeKey, data, error: '' })
+      })
+      .catch((err) => {
+        if (!cancelled) setNamedDecode({ key: namedDecodeKey, data: null, error: err.message || String(err) })
+      })
     return () => { cancelled = true }
-  }, [packet?.id, packet?.body, mayBeGRPC])
+  }, [packetID, namedDecodeKey])
 
   // Bound custom protocol from the owning service, plus any override.
   const boundCustomProtocolID = useMemo(() => {
     if (!packet?.service_id || !services) return ''
     const svc = services.find((s) => s.id === packet.service_id)
     return svc?.protocol_id || ''
-  }, [packet?.service_id, services])
+  }, [packet, services])
 
   const effectiveCustomProtocolID = customProtocolOverride || boundCustomProtocolID
+  const customDecodeKey = packetID && packet?.body && effectiveCustomProtocolID
+    ? `${packetID}:${effectiveCustomProtocolID}`
+    : ''
+  const decodedCustom = customDecode.key === customDecodeKey ? customDecode.data : null
+  const decodedCustomError = customDecode.key === customDecodeKey ? customDecode.error : ''
 
   useEffect(() => {
-    setDecodedCustom(null)
-    setDecodedCustomError('')
-    if (!packet?.id || !effectiveCustomProtocolID) return
-    if (!packet?.body) return
+    if (!customDecodeKey) return
     let cancelled = false
-    api.decodePacketCustom(packet.id, effectiveCustomProtocolID)
-      .then((res) => { if (!cancelled) setDecodedCustom(res) })
-      .catch((err) => { if (!cancelled) setDecodedCustomError(err.message || String(err)) })
+    api.decodePacketCustom(packetID, effectiveCustomProtocolID)
+      .then((data) => {
+        if (!cancelled) setCustomDecode({ key: customDecodeKey, data, error: '' })
+      })
+      .catch((err) => {
+        if (!cancelled) setCustomDecode({ key: customDecodeKey, data: null, error: err.message || String(err) })
+      })
     return () => { cancelled = true }
-  }, [packet?.id, packet?.body, effectiveCustomProtocolID])
+  }, [packetID, effectiveCustomProtocolID, customDecodeKey])
 
   if (!packet) return null
   return (
@@ -390,7 +393,7 @@ function FlowInspector({ flowData, services, customProtocols, diffSet, onNavigat
   useEffect(() => {
     if (selectedId == null || !tableRef.current) return
     const row = tableRef.current.querySelector(`tr[data-packet-id="${selectedId}"]`)
-    row?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+    row?.scrollIntoView({ block: 'nearest', behavior: 'auto' })
   }, [selectedId])
 
   return (
@@ -469,6 +472,7 @@ function FlowInspector({ flowData, services, customProtocols, diffSet, onNavigat
         </div>
         {selected && (
           <PacketDetail
+            key={selected.id}
             packet={selected}
             services={services}
             customProtocols={customProtocols}
@@ -494,6 +498,7 @@ export default function SavedFlows() {
   const [services, setServices] = useState([])
   const [customProtocols, setCustomProtocols] = useState([])
   const [focusedFlowId, setFocusedFlowId] = useState(null)
+  const detailRequestsRef = useRef(0)
 
   useEffect(() => { api.listServices().then((d) => setServices(d || [])).catch(() => {}) }, [])
   useEffect(() => { api.listProtocols().then((d) => setCustomProtocols(d || [])).catch(() => {}) }, [])
@@ -518,12 +523,16 @@ export default function SavedFlows() {
     // Cap at 2 selections to keep comparison usable; newest replaces oldest.
     setSelectedIds((prev) => (prev.length >= 2 ? [prev[1], id] : [...prev, id]))
     if (!flowData[id]) {
+      detailRequestsRef.current++
       setLoadingDetail(true)
       try {
         const data = await api.getSavedFlow(id)
         setFlowData((prev) => ({ ...prev, [id]: data }))
       } catch (err) { setError(err.message) }
-      finally { setLoadingDetail(false) }
+      finally {
+        detailRequestsRef.current = Math.max(0, detailRequestsRef.current - 1)
+        if (detailRequestsRef.current === 0) setLoadingDetail(false)
+      }
     }
   }, [selectedIds, flowData])
 

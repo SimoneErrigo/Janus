@@ -1,8 +1,11 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { api } from '../api'
 import ErrorBanner from '../components/ErrorBanner'
 
-const protocols = ['http', 'https', 'ws', 'wss', 'h2', 'grpc', 'tcp']
+const fallbackPresets = [
+  { id: 'http', label: 'HTTP', group: 'Web', description: 'HTTP/1.1 reverse proxy', spec: { listener: { transport: 'tcp', tls: 'off' }, application: { profile: 'http' }, framing: { mode: 'http' } } },
+  { id: 'tcp', label: 'TCP raw', group: 'Generic', description: 'Raw TCP chunks', spec: { listener: { transport: 'tcp', tls: 'off' }, application: { profile: 'raw' }, framing: { mode: 'raw' } } },
+]
 const tlsModes = ['', 'selfsigned', 'challenge']
 
 const emptyService = {
@@ -24,6 +27,7 @@ export default function Services() {
   const [editing, setEditing] = useState(null) // null or service object
   const [error, setError] = useState('')
   const [retrying, setRetrying] = useState({}) // serviceId -> bool (button busy)
+  const statusRequestRef = useRef(0)
 
   useEffect(() => { loadServices() }, [])
 
@@ -32,17 +36,20 @@ export default function Services() {
   // intermittent status fetch error doesn't blow away the service list.
   useEffect(() => {
     let cancelled = false
+    let timer
     async function tick() {
+      const request = ++statusRequestRef.current
       try {
         const data = await api.getServicesStatus()
-        if (!cancelled) setStatuses(data || {})
+        if (!cancelled && request === statusRequestRef.current) setStatuses(data || {})
       } catch {
         // network blips are fine — next tick will recover
+      } finally {
+        if (!cancelled) timer = setTimeout(tick, STATUS_POLL_MS)
       }
     }
     tick()
-    const id = setInterval(tick, STATUS_POLL_MS)
-    return () => { cancelled = true; clearInterval(id) }
+    return () => { cancelled = true; clearTimeout(timer) }
   }, [])
 
   async function loadServices() {
@@ -55,9 +62,10 @@ export default function Services() {
   }
 
   async function refreshStatuses() {
+    const request = ++statusRequestRef.current
     try {
       const data = await api.getServicesStatus()
-      setStatuses(data || {})
+      if (request === statusRequestRef.current) setStatuses(data || {})
     } catch {
       // see comment in the poll effect
     }
@@ -101,7 +109,8 @@ export default function Services() {
     setRetrying((r) => ({ ...r, [id]: true }))
     try {
       const st = await api.retryService(id)
-      // Optimistically merge — the next poll will sync the rest.
+      // Invalidate a status poll that may have captured the pre-retry state.
+      statusRequestRef.current++
       if (st && st.service_id) setStatuses((s) => ({ ...s, [st.service_id]: st }))
     } catch (err) {
       setError(err.message)
@@ -229,12 +238,15 @@ function ServiceForm({ service, onSave, onCancel }) {
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [discoveredProtos, setDiscoveredProtos] = useState({ dir: '', files: [] })
   const [customProtocols, setCustomProtocols] = useState([])
+	const [protocolPresets, setProtocolPresets] = useState(fallbackPresets)
 
   useEffect(() => {
     let cancelled = false
-    api.listProtocols()
-      .then((list) => { if (!cancelled) setCustomProtocols(list || []) })
-      .catch(() => { /* picker is optional */ })
+	Promise.allSettled([api.listProtocols(), api.listProtocolPresets()]).then(([custom, presets]) => {
+	  if (cancelled) return
+	  if (custom.status === 'fulfilled') setCustomProtocols(custom.value || [])
+	  if (presets.status === 'fulfilled' && presets.value?.length) setProtocolPresets(presets.value)
+	})
     return () => { cancelled = true }
   }, [])
 
@@ -242,10 +254,29 @@ function ServiceForm({ service, onSave, onCancel }) {
     setForm((f) => ({ ...f, [field]: value }))
   }
 
-  const needsTLS = ['https', 'wss', 'h2', 'grpc'].includes(form.protocol)
+	const selectedPreset = protocolPresets.find((p) => p.id === form.protocol)
+	const needsTLS = selectedPreset?.spec?.listener?.tls === 'terminate'
   // gRPC is HTTP/2 with protobuf bodies; allow proto_paths for both since users
   // sometimes configure their service as `h2` even when carrying gRPC traffic.
-  const supportsProtos = form.protocol === 'grpc' || form.protocol === 'h2'
+	const supportsProtos = selectedPreset?.spec?.application?.profile === 'grpc' || selectedPreset?.spec?.application?.profile === 'http2'
+	const selectorValue = form.protocol_id ? `custom:${form.protocol_id}` : form.protocol
+	const presetGroups = protocolPresets.reduce((groups, p) => {
+	  const key = p.group || 'Other'
+	  ;(groups[key] ||= []).push(p)
+	  return groups
+	}, {})
+	const orderedGroups = Object.entries(presetGroups).sort(([a], [b]) => {
+	  const order = { Web: 0, Generic: 1, Decoded: 2 }
+	  return (order[a] ?? 99) - (order[b] ?? 99) || a.localeCompare(b)
+	})
+
+	function selectProtocol(value) {
+	  if (value.startsWith('custom:')) {
+		setForm((f) => ({ ...f, protocol: 'tcp', protocol_id: value.slice(7) }))
+	  } else {
+		setForm((f) => ({ ...f, protocol: value, protocol_id: '' }))
+	  }
+	}
   const protoPathsText = Array.isArray(form.proto_paths) ? form.proto_paths.join('\n') : (form.proto_paths || '')
   const selectedProtoSet = new Set(
     Array.isArray(form.proto_paths)
@@ -285,10 +316,25 @@ function ServiceForm({ service, onSave, onCancel }) {
         <Field label="Target Address" value={form.target_addr} onChange={(v) => set('target_addr', v)} placeholder="e.g. 127.0.0.1:9080" />
         <div>
           <label className="block text-sm text-gray-400 mb-1">Protocol</label>
-          <select value={form.protocol} onChange={(e) => set('protocol', e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500">
-            {protocols.map((p) => <option key={p} value={p}>{p.toUpperCase()}</option>)}
+		  <select value={selectorValue} onChange={(e) => selectProtocol(e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500">
+			{orderedGroups.map(([group, items]) => (
+			  <optgroup key={group} label={group}>
+				{items.map((p) => <option key={p.id} value={p.id}>{p.label}{p.stability === 'experimental' ? ' (experimental)' : ''}</option>)}
+			  </optgroup>
+			))}
+			{customProtocols.length > 0 && (
+			  <optgroup label="Custom">
+				{customProtocols.map((p) => <option key={p.id} value={`custom:${p.id}`}>{p.name}</option>)}
+			  </optgroup>
+			)}
           </select>
-          <p className="text-xs text-gray-600 mt-1">Transport, application mode, client TLS and framing are configured automatically.</p>
+		  <p className="text-xs text-gray-500 mt-1">
+			{form.protocol_id
+			  ? 'Janus will use TCP with the selected custom decoder.'
+			  : selectedPreset
+				? `${selectedPreset.description}. ${selectedPreset.spec.listener.transport.toUpperCase()} · ${selectedPreset.spec.framing.mode}.`
+				: 'Transport, TLS and framing are configured automatically.'}
+		  </p>
         </div>
         <div className="col-span-2 border-t border-gray-800 pt-3">
           <button
@@ -371,22 +417,6 @@ function ServiceForm({ service, onSave, onCancel }) {
             )}
               </div>
             )}
-            <div className="col-span-2">
-          <label className="block text-sm text-gray-400 mb-1">
-            Custom Protocol (decoder)
-            <span className="text-gray-600 ml-2 text-xs">
-              binds a user-defined protocol so packets are rendered as a structured tree instead of hex
-            </span>
-          </label>
-          <select
-            value={form.protocol_id || ''}
-            onChange={(e) => set('protocol_id', e.target.value)}
-            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500"
-          >
-            <option value="">— None —</option>
-            {customProtocols.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-          </select>
-            </div>
           </>
         )}
         <div className="flex items-center gap-2 col-span-2">

@@ -53,7 +53,10 @@ func (s *Server) handleRuleByID(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "a positive revision is required", http.StatusBadRequest)
 				return
 			}
-			if err := s.ruleStore.RollbackRule(id, body.Revision); err != nil {
+			s.ruleMu.Lock()
+			err := s.ruleStore.RollbackRule(id, body.Revision)
+			s.ruleMu.Unlock()
+			if err != nil {
 				http.Error(w, err.Error(), http.StatusNotFound)
 				return
 			}
@@ -106,9 +109,12 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 
 	// Auto-generate ID if not provided
 	if rule.ID == "" {
-		b := make([]byte, 8)
-		rand.Read(b)
-		rule.ID = hex.EncodeToString(b)
+		var err error
+		rule.ID, err = newRuleID()
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	// Default action to drop if not specified
@@ -120,8 +126,14 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if _, ok := s.store.GetService(rule.ServiceID); !ok {
+		http.Error(w, "service not found", http.StatusBadRequest)
+		return
+	}
 
 	// Reject duplicate rules — same service + expression + action.
+	s.ruleMu.Lock()
+	defer s.ruleMu.Unlock()
 	existing := s.ruleStore.ListRules(rule.ServiceID)
 	for _, e := range existing {
 		if e.Action == rule.Action && e.Expression == rule.Expression {
@@ -141,6 +153,14 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 	user := rule.CreatedBy
 	log.Printf("[user=%s] Rule created: %s (%s) for service %s", user, rule.Name, rule.ID, rule.ServiceID)
 	writeJSON(w, http.StatusCreated, rule)
+}
+
+func newRuleID() (string, error) {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func (s *Server) updateRule(w http.ResponseWriter, r *http.Request, id string) {
@@ -166,7 +186,19 @@ func (s *Server) updateRule(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if _, ok := s.store.GetService(rule.ServiceID); !ok {
+		http.Error(w, "service not found", http.StatusBadRequest)
+		return
+	}
 
+	s.ruleMu.Lock()
+	defer s.ruleMu.Unlock()
+	for _, existing := range s.ruleStore.ListRules(rule.ServiceID) {
+		if existing.ID != id && existing.Action == rule.Action && existing.Expression == rule.Expression {
+			http.Error(w, fmt.Sprintf("duplicate rule: identical to %s", existing.ID), http.StatusConflict)
+			return
+		}
+	}
 	if err := s.ruleStore.UpdateRule(&rule); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -177,6 +209,8 @@ func (s *Server) updateRule(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request, id string) {
+	s.ruleMu.Lock()
+	defer s.ruleMu.Unlock()
 	if err := s.ruleStore.DeleteRule(id); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -203,7 +237,19 @@ func (s *Server) handleRulesBulkDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "ids array is required", http.StatusBadRequest)
 		return
 	}
+	if len(body.IDs) > 500 {
+		http.Error(w, "ids must contain at most 500 rules", http.StatusBadRequest)
+		return
+	}
+	for _, id := range body.IDs {
+		if !serviceIDPattern.MatchString(id) {
+			http.Error(w, "invalid rule id", http.StatusBadRequest)
+			return
+		}
+	}
 
+	s.ruleMu.Lock()
+	defer s.ruleMu.Unlock()
 	deleted, err := s.ruleStore.DeleteRules(body.IDs)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -218,14 +264,26 @@ func validateRule(r *dropper.Rule) error {
 	if r.ID == "" {
 		return fmt.Errorf("id is required")
 	}
+	if len(r.ID) > 128 || !serviceIDPattern.MatchString(r.ID) {
+		return fmt.Errorf("id must be at most 128 characters and match %s", serviceIDPattern.String())
+	}
 	if r.ServiceID == "" {
 		return fmt.Errorf("service_id is required")
+	}
+	if len(r.ServiceID) > 128 || !serviceIDPattern.MatchString(r.ServiceID) {
+		return fmt.Errorf("invalid service_id")
 	}
 	if r.Name == "" {
 		return fmt.Errorf("name is required")
 	}
+	if len(r.Name) > 256 {
+		return fmt.Errorf("name is too long")
+	}
 	if strings.TrimSpace(r.Expression) == "" {
 		return fmt.Errorf("expression is required")
+	}
+	if len(r.Expression) > 64<<10 || len(r.Pattern) > 64<<10 {
+		return fmt.Errorf("rule expression is too long")
 	}
 	if _, err := filter.Compile(r.Expression); err != nil {
 		return fmt.Errorf("invalid expression: %v", err)
