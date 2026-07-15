@@ -179,6 +179,23 @@ type BaselineSignature struct {
 	Rounds               []int
 }
 
+// BaselineSnapshot describes one persisted scoring configuration. Definition
+// is owned by the scoring package; the packet store keeps it opaque so the
+// storage layer does not need to understand competition timing.
+type BaselineSnapshot struct {
+	Epoch          string
+	Definition     string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	SignatureCount int
+	Active         bool
+}
+
+type BaselineWindow struct {
+	From time.Time
+	To   time.Time
+}
+
 // FlagIDChecker checks if text contains any current flag ID value.
 type FlagIDChecker interface {
 	ContainsFlagID(text string) bool

@@ -367,7 +367,7 @@ function RawSelectionActionButton({ disabled, onAction }) {
           </button>
           <button type="button" onMouseDown={(e) => { e.preventDefault(); setOpen(false); onAction('rule') }}
             className="block w-full text-left px-2 py-1.5 hover:bg-gray-800 text-red-200 cursor-pointer">
-            New drop rule
+            New rule
           </button>
         </div>
       )}
@@ -379,7 +379,7 @@ function RawSelectionActionButton({ disabled, onAction }) {
 // as an interactive tree where each leaf field exposes an action menu:
 //   - Copy raw filter   → puts `raw contains "\xHH..."` on the clipboard
 //   - Add to filter     → appends the predicate to the Traffic expression
-//   - New drop rule     → navigates to /rules with the form pre-filled
+//   - New rule          → navigates to /rules with the form pre-filled
 // Nested objects/arrays are rendered without action buttons because the
 // backend encoder needs a top-level field of the request message; clicking
 // a leaf nested inside a sub-message would require encoding a parent path
@@ -510,7 +510,7 @@ function DecodedFieldActionButton({ field, value, onAction }) {
             onMouseDown={(e) => { e.preventDefault(); setOpen(false); onAction('rule', field, value) }}
             className="block w-full text-left px-2 py-1.5 hover:bg-gray-800 text-red-200 cursor-pointer"
           >
-            New drop rule
+            New rule
           </button>
         </div>
       )}
@@ -659,6 +659,16 @@ export default function Traffic() {
 	const [filterSchema, setFilterSchema] = useState(null)
 	const [expressionFields, setExpressionFields] = useState([])
 	const [scoringStatus, setScoringStatus] = useState(null)
+	const baselineByService = useMemo(() => Object.fromEntries(
+		(scoringStatus?.services || []).map((status) => [status.service_id, status]),
+	), [scoringStatus])
+	const baselineForService = useCallback((serviceID) => {
+		const status = baselineByService[serviceID]
+		return {
+			start: status?.baseline_start_round || scoringStatus?.baseline_start_round || 1,
+			end: status?.baseline_end_round || scoringStatus?.baseline_end_round || 5,
+		}
+	}, [baselineByService, scoringStatus?.baseline_start_round, scoringStatus?.baseline_end_round])
 	const scoringRefreshTimerRef = useRef(null)
 	const scoringRequestRef = useRef(0)
 	const [searchDraft, setSearchDraft] = useState('')
@@ -1643,7 +1653,7 @@ export default function Traffic() {
             service_id: svcId || '',
             expression,
             name: ruleNameSuffix || 'custom-rule',
-            action: 'drop',
+            action: 'alert',
           },
         },
       })
@@ -1663,7 +1673,7 @@ export default function Traffic() {
       const escaped = res?.escaped ?? ''
       if (!escaped) throw new Error('encoder returned empty bytes')
       const rawPredicate = `raw contains "${escaped}"`
-      // For "New drop rule" we want a more selective predicate scoped to the
+      // For "New rule" we want a more selective predicate scoped to the
       // gRPC method, so we override the generic applyFilterPredicate path.
       if (kind === 'rule') {
         const urlPredicate = `url endswith "/${decodedNamed.method.split('/').pop()}"`
@@ -1674,7 +1684,7 @@ export default function Traffic() {
               service_id: selected.service_id,
               expression: `${svcPredicate} AND ${urlPredicate} AND ${rawPredicate}`,
               name: `${decodedNamed.message_type}.${field}=${typeof value === 'string' ? value : JSON.stringify(value)}`,
-              action: 'drop',
+              action: 'alert',
             },
           },
         })
@@ -2091,15 +2101,15 @@ export default function Traffic() {
 		  {(scoringStatus.services || []).length > 0 && (
 			<div className="mt-1.5 flex items-center gap-1.5 overflow-x-auto text-[10px]">
 			  <span className="text-gray-600 flex-shrink-0">
-				Baseline r{scoringStatus.baseline_start_round || 1}–{scoringStatus.baseline_end_round || 5}:
+				Default r{scoringStatus.baseline_start_round || 1}–{scoringStatus.baseline_end_round || 5}:
 			  </span>
 			  {scoringStatus.rebuilding && <span className="text-amber-400 flex-shrink-0">rebuilding…</span>}
 			  {scoringStatus.services.map((status) => {
 				const observed = status.rounds_observed?.length || 0
-				const target = scoringStatus.baseline_required_rounds || scoringStatus.opening_rounds || 5
+				const target = status.baseline_required_rounds || scoringStatus.baseline_required_rounds || scoringStatus.opening_rounds || 5
 				const complete = status.complete === true
 				return <span key={status.service_id} className="flex-shrink-0 rounded border border-gray-800 bg-gray-950/50 px-1.5 py-0.5 text-gray-400" title={`${status.candidate_signatures || 0} clean candidates; trusted means repeated in every configured round; ${status.excluded_opening_flows || 0} suspicious, labeled, truncated or mixed-round flows excluded`}>
-				  {serviceName(status.service_id)}: <span className={complete ? 'text-emerald-400' : 'text-cyan-400'}>{observed}/{target}</span> · {status.trusted_signatures || 0} trusted
+				  {serviceName(status.service_id)} r{status.baseline_start_round || scoringStatus.baseline_start_round || 1}–{status.baseline_end_round || scoringStatus.baseline_end_round || 5}: <span className={complete ? 'text-emerald-400' : 'text-cyan-400'}>{observed}/{target}</span> · {status.trusted_signatures || 0} trusted
 				  {status.excluded_opening_flows > 0 && <span className="text-amber-500"> · {status.excluded_opening_flows} excluded</span>}
 				</span>
 			  })}
@@ -2210,7 +2220,7 @@ export default function Traffic() {
                     <td className="px-3 py-1.5 text-xs">
                       {pkt.status > 0 && <span className={`${pkt.status < 400 ? 'text-green-400' : 'text-red-400'}`}>{pkt.status}</span>}
                     </td>
-					<td className="px-3 py-1.5 text-xs"><ScoreBadge packet={pkt} baselineStart={scoringStatus?.baseline_start_round || 1} baselineEnd={scoringStatus?.baseline_end_round || 5} /></td>
+					<td className="px-3 py-1.5 text-xs">{(() => { const range = baselineForService(pkt.service_id); return <ScoreBadge packet={pkt} baselineStart={range.start} baselineEnd={range.end} /> })()}</td>
                     <td className="px-3 py-1.5">
                       <div className="flex items-center gap-1">
                         {pkt.flagged && <span className="text-yellow-400 text-xs" title="Contains flag">&#9873;</span>}
@@ -2497,7 +2507,7 @@ export default function Traffic() {
 					<div className="flex items-center justify-between gap-2">
 					  <div className="flex items-center gap-2">
 						<span className="text-gray-400">Deterministic flow score</span>
-						<ScoreBadge packet={selected} detailed baselineStart={scoringStatus?.baseline_start_round || 1} baselineEnd={scoringStatus?.baseline_end_round || 5} />
+						{(() => { const range = baselineForService(selected.service_id); return <ScoreBadge packet={selected} detailed baselineStart={range.start} baselineEnd={range.end} /> })()}
 					  </div>
 					  <span className="text-gray-600" title="Informational score; it does not block traffic">advisory only</span>
 					</div>

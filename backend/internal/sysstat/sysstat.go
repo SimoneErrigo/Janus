@@ -79,7 +79,9 @@ func (c *Collector) Collect() (*Stats, error) {
 	}
 
 	// CPU
-	cpuPercent, err := cpu.Percent(500*time.Millisecond, false)
+	// interval=0 uses the delta maintained by gopsutil and returns immediately;
+	// the stats endpoint must not pause the control plane on every refresh.
+	cpuPercent, err := cpu.Percent(0, false)
 	if err == nil && len(cpuPercent) > 0 {
 		s.CPU.UsagePercent = cpuPercent[0]
 	}

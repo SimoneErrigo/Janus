@@ -7,7 +7,7 @@ import FilterExpression from './FilterExpression'
 // contains, multi-scope OR) so users don't have to type the DSL by hand.
 export default function QuickRulePanel({ packet, services, onCreated, onCancel }) {
   const [expression, setExpression] = useState('')
-  const [action, setAction] = useState('drop')
+  const [action, setAction] = useState('alert')
   const [creating, setCreating] = useState(false)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState(false)

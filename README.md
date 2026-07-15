@@ -49,7 +49,7 @@ Useful settings:
 | `FLAG_REGEX_CASE_INSENSITIVE` | Make flag matching ASCII case-insensitive |
 | `FLAG_DECODE_URL` | Also scan a percent-decoded copy of traffic |
 | `PYFILTER_ENABLED` | Enable the Python-filter engine (default `true`) |
-| `BASELINE_START_ROUND` / `BASELINE_END_ROUND` | Inclusive rounds used by the deterministic checker baseline (default `1`–`5`) |
+| `BASELINE_START_ROUND` / `BASELINE_END_ROUND` | Default inclusive rounds used by the deterministic checker baseline (`1`–`5`); Config can override them per service |
 | `TRAFFIC_MODE` | `live` (normal operation) or `static` (manual capture) |
 
 ### 2. Start Janus
@@ -67,7 +67,8 @@ in `docker-compose.yml` when Docker cannot use host networking.
 
 Redis is optional. The default single-process setup uses SQLite plus in-memory
 compiled rule bundles. To enable the cache adapter, set `REDIS_ADDR=redis:6379`
-and start Compose with `--profile cache`.
+and start Compose with `--profile cache`. Otherwise leave `REDIS_ADDR` empty:
+the Redis container stays off and this is the recommended competition setup.
 
 For a Linux competition VM, host networking lets Janus bind arbitrary original
 service ports:
@@ -77,7 +78,8 @@ docker compose -f docker-compose.yml -f docker-compose-competition.yml up --buil
 ```
 
 Review the exposure and bind settings in both Compose files before using this
-on a competition network.
+on a competition network. `docker compose ps` should report both `janus` and
+`frontend` as healthy before challenge ports are moved.
 
 ### 3. Add a service
 
@@ -100,6 +102,20 @@ application profile, client-side TLS, upstream TLS and framing into the
 versioned service model. Existing `services.json` records are migrated on first
 load. No manual conversion is required; advanced certificate/decoder settings
 remain available under **Advanced settings**.
+
+To migrate a challenge Compose file, run the included interactive helper first
+with `--dry-run`, then without it after reviewing every service:
+
+```bash
+./scripts/janus_compose_ports.py --dry-run /path/to/challenge
+./scripts/janus_compose_ports.py /path/to/challenge
+```
+
+It supports the same TCP/UDP protocol presets as the UI, preserves `/udp`
+Compose mappings and switches the challenge ports only after Janus service,
+certificate and `.proto` files have been written atomically. Unknown encrypted
+protocols default to raw TCP passthrough; choose TLS termination only when the
+original certificate behaviour is known.
 
 The standard bridge Compose profile binds listeners inside the container on
 the wildcard address while preserving the configured checker-facing IP. The
@@ -124,7 +140,8 @@ bypass generic filtering. Messages larger than 1 MiB are dropped and audited.
   filter DSL, deterministic exploit/checker confidence, flag and Flag ID
   highlighting, PCAP import/export, and exploit skeletons.
 - **Rules** — drop, alert, or both using the filter language. Attack presets
-  can create a selected set of rules for multiple services.
+  can create a selected set of alert rules for multiple services. New rules
+  start as alerts and require an explicit operator choice before they block.
 - **PyFilters** — stateful Python scripts for detections that cannot be
   expressed in the DSL. Observe scripts alert; inline scripts can stop,
   close, or rewrite HTTP/HTTPS, TCP, UDP, and WebSocket traffic within the
@@ -167,11 +184,23 @@ bypass generic filtering. Messages larger than 1 MiB are dropped and audited.
 3. For state or protocol-aware logic, write a PyFilter and run it against a
    saved packet or a whole reconstructed flow before enabling it.
 
+For a conservative initial rule set, validate and seed only the categories
+needed by each service:
+
+```bash
+./scripts/seed_rules.py --password "$TEAM_PASSWORD" --validate-only
+./scripts/seed_rules.py --password "$TEAM_PASSWORD" --service web --category sqli --category path
+```
+
+The curated seed is idempotent and alert-only. Observe real checker traffic
+before manually promoting a narrow service-specific rule to `drop` or `both`;
+do not seed every category blindly on every service.
+
 ### Choose a safe opening baseline
 
 Janus estimates exploit/checker confidence with deterministic signatures and
-rules only—there is no AI or learned model. In **Config**, choose an inclusive
-opening range (default rounds 1–5). A signature becomes trusted checker traffic
+rules only—there is no AI or learned model. In **Config**, choose a default
+inclusive opening range and optional service-specific ranges. A signature becomes trusted checker traffic
 only after it appears in every selected round; a distinct exploit fingerprint
 seen in one round therefore remains untrusted. Truncated flows, request flags,
 rule/suspicion matches, and flows labelled `exploit` are excluded.
@@ -180,8 +209,12 @@ No static method can separate an exploit that is structurally identical to a
 recurring checker flow, or prove that a safe-looking exploit repeated unchanged
 in every selected round is legitimate. If the opening window was contaminated,
 label the captured flow as `exploit`, adjust the range if needed, then use
-**Rebuild from captured traffic**. Changing the range also rebuilds from the
-retained packets, so the setting remains useful after the competition starts.
+**Rebuild from captured traffic**. Baselines are versioned by timing and round
+selection, independently from captured packets: autoclean cannot remove them,
+and reselecting an old range restores its fingerprint snapshot even when its
+raw traffic is gone. A manual rebuild replaces the active snapshot only after
+retained safe traffic covers all required rounds; otherwise Janus keeps the
+previous snapshot unchanged.
 
 ### Decode a non-HTTP service
 
@@ -198,7 +231,7 @@ bundles, Aho-Corasick matching for Flag IDs, optimized flag scanning, and
 batched SSE delivery. Redis is an optional cache adapter: traffic and
 configuration remain correct when it is disabled or unavailable.
 
-Automatic cleanup runs in bounded batches and uses SQLite's logical used space
+Automatic cleanup runs in short time-budgeted batches and uses SQLite's logical used space
 rather than allocated database/WAL file size. Freed pages are reused and WAL
 pages are passively checkpointed, avoiding long automatic `VACUUM` pauses.
 Traffic clients receive one refresh after cleanup and targeted SSE patches when

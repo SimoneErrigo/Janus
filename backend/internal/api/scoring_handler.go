@@ -38,6 +38,7 @@ func (s *Server) handleScoringStatus(w http.ResponseWriter, r *http.Request) {
 		result["store_errors"] = status.StoreErrors
 		result["last_error"] = status.LastError
 		result["services"] = status.Services
+		result["snapshots"] = status.Snapshots
 	}
 	writeJSON(w, http.StatusOK, result)
 }

@@ -2,6 +2,25 @@ package flagids
 
 import "testing"
 
+func TestFlagIDMatcherShortBoundaryAndNewestRound(t *testing.T) {
+	matcher := BuildMatcher(map[int]map[string][]string{
+		7: {"service": {"user5"}},
+		8: {"service": {"user5", "user314"}},
+	})
+	matches := matcher.FindMatches("account=user5&other=user314")
+	if len(matches) != 2 {
+		t.Fatalf("matches=%v, want two", matches)
+	}
+	for _, match := range matches {
+		if match.Round != 8 {
+			t.Fatalf("match %q attributed to round %d, want newest round 8", match.FlagID, match.Round)
+		}
+	}
+	if matcher.ContainsAny("account=user50") {
+		t.Fatal("five-byte attack-info must require a word boundary")
+	}
+}
+
 // a valid CyberChallenge-style flag: 31 uppercase alnum chars + '='
 const upperFlag = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345="
 

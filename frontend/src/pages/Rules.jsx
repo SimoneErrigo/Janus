@@ -38,7 +38,7 @@ export default function Rules() {
     })
   }, [])
 
-  // Receive a pre-filled rule from another page (e.g. Traffic "New drop rule").
+  // Receive a pre-filled rule from another page (e.g. Traffic "New rule").
   // We consume location.state and clear it so a back-navigation doesn't re-open
   // the form. The form is opened immediately so the user only confirms + saves.
   useEffect(() => {
@@ -53,7 +53,7 @@ export default function Rules() {
         expression: preset.expression || '',
         priority: 10,
         enabled: true,
-        action: preset.action || 'drop',
+        action: preset.action || 'alert',
       })
       if (preset.service_id) setSelectedService(preset.service_id)
       navigate(location.pathname, { replace: true, state: null })
@@ -149,7 +149,7 @@ export default function Rules() {
     selectionAnchorRef.current = id
   }
 
-  const filteredRules = actionFilter === 'all' ? rules : rules.filter(r => (r.action || 'drop') === actionFilter)
+  const filteredRules = actionFilter === 'all' ? rules : rules.filter(r => (r.action || 'alert') === actionFilter)
 
   // Extend (or start) a selection from the anchor row to the clicked row, over
   // the currently filtered list. Mirrors the Traffic table behaviour. Returns
@@ -227,7 +227,7 @@ export default function Rules() {
             </button>
           )}
           <button
-            onClick={() => setEditing({ _isNew: true, service_id: selectedService === '_all' ? (services[0]?.id || '') : selectedService, name: '', expression: '', priority: 10, enabled: true, action: 'drop' })}
+            onClick={() => setEditing({ _isNew: true, service_id: selectedService === '_all' ? (services[0]?.id || '') : selectedService, name: '', expression: '', priority: 10, enabled: true, action: 'alert' })}
             disabled={!selectedService || services.length === 0}
             className="bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
           >
@@ -309,7 +309,7 @@ export default function Rules() {
                       rule.action === 'alert' ? 'bg-orange-900/40 text-orange-400' :
                       rule.action === 'both' ? 'bg-purple-900/40 text-purple-400' :
                       'bg-gray-800 text-gray-400'
-                    }`}>{rule.action || 'drop'}</span>
+                    }`}>{rule.action || 'alert'}</span>
                     <span className="text-gray-300">{ruleSummary(rule)}</span>
                     <span className="ml-2 text-gray-600">priority: {rule.priority}</span>
                     {rule.created_by && (
@@ -533,7 +533,7 @@ function PresetPanel({ services, defaultServiceId, onCreated, onCancel }) {
 function RuleForm({ rule, services, onSave, onCancel }) {
   const [form, setForm] = useState({
     ...rule,
-    action: rule.action || 'drop',
+    action: rule.action || 'alert',
     expression: rule.expression || '',
   })
   const [targetServices, setTargetServices] = useState([rule.service_id])

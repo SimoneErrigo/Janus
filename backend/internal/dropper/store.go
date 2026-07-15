@@ -30,7 +30,7 @@ type RuleStore struct {
 }
 
 // Version returns the current rule-store version. Bumped after every
-// successful CreateRule/UpdateRule/DeleteRule call.
+// successful create batch, update, or delete mutation.
 func (s *RuleStore) Version() int64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -107,45 +107,93 @@ func (s *RuleStore) GetRule(id string) (*Rule, bool) {
 	return &cp, true
 }
 
-// CreateRule adds a new rule and persists the change.
+// CreateRule adds one rule and persists the change.
 func (s *RuleStore) CreateRule(r *Rule) error {
-	s.mu.Lock()
+	return s.CreateRules([]*Rule{r})
+}
 
-	if _, exists := s.rules[r.ID]; exists {
-		s.mu.Unlock()
-		return fmt.Errorf("rule with ID %q already exists", r.ID)
+// CreateRules validates and publishes a batch with one rules/revisions write.
+// Invalid input or a persistence error leaves the active set unchanged.
+func (s *RuleStore) CreateRules(rules []*Rule) error {
+	if len(rules) == 0 {
+		return nil
 	}
-	cp := *r
-	if cp.Expression == "" {
-		cp.Expression = DeriveExpression(&cp)
+	s.mu.Lock()
+	prepared := make([]Rule, len(rules))
+	ids := make(map[string]struct{}, len(rules))
+	updatedAt := time.Now().Unix()
+	for i, rule := range rules {
+		if rule == nil {
+			s.mu.Unlock()
+			return fmt.Errorf("rule %d is nil", i)
+		}
+		if _, exists := s.rules[rule.ID]; exists {
+			s.mu.Unlock()
+			return fmt.Errorf("rule with ID %q already exists", rule.ID)
+		}
+		if _, duplicate := ids[rule.ID]; duplicate {
+			s.mu.Unlock()
+			return fmt.Errorf("duplicate rule ID %q in batch", rule.ID)
+		}
+		ids[rule.ID] = struct{}{}
+		prepared[i] = *rule
+		if prepared[i].Expression == "" {
+			prepared[i].Expression = DeriveExpression(&prepared[i])
+		}
+		if _, err := filter.Compile(prepared[i].Expression); err != nil {
+			s.mu.Unlock()
+			return fmt.Errorf("invalid rule expression for %q: %w", rule.ID, err)
+		}
+		prepared[i].Revision = 1
+		prepared[i].UpdatedAt = updatedAt
 	}
-	if _, err := filter.Compile(cp.Expression); err != nil {
-		s.mu.Unlock()
-		return fmt.Errorf("invalid rule expression: %w", err)
+
+	for i := range prepared {
+		rule := prepared[i]
+		s.rules[rule.ID] = &prepared[i]
 	}
-	cp.Revision = 1
-	cp.UpdatedAt = time.Now().Unix()
-	s.rules[r.ID] = &cp
 	err := s.save()
 	if err != nil {
-		delete(s.rules, r.ID)
-	} else if err = s.replaceRevisionHistoryLocked(cp); err != nil {
-		// History is published only after rules.json is durable. If history
-		// cannot be saved, restore the previous active set as well.
-		delete(s.rules, r.ID)
+		for _, rule := range prepared {
+			delete(s.rules, rule.ID)
+		}
+		s.mu.Unlock()
+		return err
+	}
+
+	previousHistory := make(map[string][]RuleRevision, len(prepared))
+	previousHistoryExists := make(map[string]bool, len(prepared))
+	for _, rule := range prepared {
+		previousHistory[rule.ID], previousHistoryExists[rule.ID] = s.revisions[rule.ID]
+		s.revisions[rule.ID] = []RuleRevision{{Rule: rule, RecordedAt: updatedAt}}
+	}
+	if err = s.saveRevisionsLocked(); err != nil {
+		for _, rule := range prepared {
+			delete(s.rules, rule.ID)
+			if previousHistoryExists[rule.ID] {
+				s.revisions[rule.ID] = previousHistory[rule.ID]
+			} else {
+				delete(s.revisions, rule.ID)
+			}
+		}
 		if rollbackErr := s.save(); rollbackErr != nil {
 			err = fmt.Errorf("%v; restoring rules: %w", err, rollbackErr)
 		}
+		s.mu.Unlock()
+		return err
 	}
-	if err == nil {
-		s.version++
-		*r = cp
+
+	s.version++
+	affectedServices := make(map[string]struct{})
+	for i, rule := range rules {
+		*rule = prepared[i]
+		affectedServices[rule.ServiceID] = struct{}{}
 	}
 	s.mu.Unlock()
-	if err == nil {
-		s.notifyChange(r.ServiceID)
+	for serviceID := range affectedServices {
+		s.notifyChange(serviceID)
 	}
-	return err
+	return nil
 }
 
 // UpdateRule replaces an existing rule and persists the change.
@@ -377,23 +425,6 @@ func (s *RuleStore) appendRevisionLocked(rule Rule) error {
 	s.revisions[rule.ID] = append(history, RuleRevision{Rule: rule, RecordedAt: time.Now().Unix()})
 	if err := s.saveRevisionsLocked(); err != nil {
 		s.revisions[rule.ID] = history
-		return err
-	}
-	return nil
-}
-
-// replaceRevisionHistoryLocked starts a fresh history for a newly-created
-// rule. IDs can be reused after deletion; old snapshots must not then collide
-// with the new rule's revision 1.
-func (s *RuleStore) replaceRevisionHistoryLocked(rule Rule) error {
-	history, existed := s.revisions[rule.ID]
-	s.revisions[rule.ID] = []RuleRevision{{Rule: rule, RecordedAt: time.Now().Unix()}}
-	if err := s.saveRevisionsLocked(); err != nil {
-		if existed {
-			s.revisions[rule.ID] = history
-		} else {
-			delete(s.revisions, rule.ID)
-		}
 		return err
 	}
 	return nil

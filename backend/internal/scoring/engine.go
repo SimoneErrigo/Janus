@@ -6,7 +6,7 @@ package scoring
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
@@ -37,12 +37,18 @@ type BaselineConfig struct {
 	RoundDurationSec int
 	StartRound       int
 	EndRound         int
+	ServiceRanges    map[string]BaselineRange
 }
 
-func NewBaselineConfig(start time.Time, roundDurationSec, startRound, endRound int) BaselineConfig {
+type BaselineRange struct {
+	StartRound int `json:"start_round"`
+	EndRound   int `json:"end_round"`
+}
+
+func NewBaselineConfig(start time.Time, roundDurationSec, startRound, endRound int, serviceRanges map[string]BaselineRange) BaselineConfig {
 	cfg := BaselineConfig{
 		CompetitionStart: start, RoundDurationSec: roundDurationSec,
-		StartRound: startRound, EndRound: endRound,
+		StartRound: startRound, EndRound: endRound, ServiceRanges: serviceRanges,
 	}
 	return cfg.normalized()
 }
@@ -57,6 +63,13 @@ func (c BaselineConfig) normalized() BaselineConfig {
 	if c.EndRound < c.StartRound+1 {
 		c.EndRound = c.StartRound + (DefaultBaselineEndRound - DefaultBaselineStartRound)
 	}
+	ranges := make(map[string]BaselineRange, len(c.ServiceRanges))
+	for serviceID, rounds := range c.ServiceRanges {
+		if serviceID != "" && rounds.StartRound > 0 && rounds.EndRound >= rounds.StartRound+1 {
+			ranges[serviceID] = rounds
+		}
+	}
+	c.ServiceRanges = ranges
 	c.CompetitionStart = c.CompetitionStart.UTC()
 	return c
 }
@@ -66,9 +79,23 @@ func (c BaselineConfig) RequiredRounds() int {
 	return c.EndRound - c.StartRound + 1
 }
 
-func (c BaselineConfig) contains(round int) bool {
-	c = c.normalized()
-	return round >= c.StartRound && round <= c.EndRound
+func (c BaselineConfig) RangeFor(serviceID string) BaselineRange {
+	if rounds, ok := c.ServiceRanges[serviceID]; ok && rounds.StartRound > 0 && rounds.EndRound >= rounds.StartRound+1 {
+		return rounds
+	}
+	start, end := c.StartRound, c.EndRound
+	if start <= 0 {
+		start = DefaultBaselineStartRound
+	}
+	if end < start+1 {
+		end = start + (DefaultBaselineEndRound - DefaultBaselineStartRound)
+	}
+	return BaselineRange{StartRound: start, EndRound: end}
+}
+
+func (c BaselineConfig) contains(serviceID string, round int) bool {
+	rounds := c.RangeFor(serviceID)
+	return round >= rounds.StartRound && round <= rounds.EndRound
 }
 
 func (c BaselineConfig) roundForTime(at time.Time) int {
@@ -79,15 +106,23 @@ func (c BaselineConfig) roundForTime(at time.Time) int {
 	return int(at.Sub(c.CompetitionStart)/(time.Duration(c.RoundDurationSec)*time.Second)) + 1
 }
 
-func (c BaselineConfig) window() (time.Time, time.Time, bool) {
+func (c BaselineConfig) windows() (sniffer.BaselineWindow, map[string]sniffer.BaselineWindow, bool) {
 	c = c.normalized()
 	if c.CompetitionStart.IsZero() {
-		return time.Time{}, time.Time{}, false
+		return sniffer.BaselineWindow{}, nil, false
 	}
 	duration := time.Duration(c.RoundDurationSec) * time.Second
-	start := c.CompetitionStart.Add(time.Duration(c.StartRound-1) * duration)
-	end := c.CompetitionStart.Add(time.Duration(c.EndRound) * duration)
-	return start, end, true
+	window := func(rounds BaselineRange) sniffer.BaselineWindow {
+		return sniffer.BaselineWindow{
+			From: c.CompetitionStart.Add(time.Duration(rounds.StartRound-1) * duration),
+			To:   c.CompetitionStart.Add(time.Duration(rounds.EndRound) * duration),
+		}
+	}
+	serviceWindows := make(map[string]sniffer.BaselineWindow, len(c.ServiceRanges))
+	for serviceID, rounds := range c.ServiceRanges {
+		serviceWindows[serviceID] = window(rounds)
+	}
+	return window(BaselineRange{StartRound: c.StartRound, EndRound: c.EndRound}), serviceWindows, true
 }
 
 // BaselineEpoch includes both timing and the selected round range, preventing
@@ -98,19 +133,64 @@ func BaselineEpoch(c BaselineConfig) string {
 	if !c.CompetitionStart.IsZero() {
 		start = c.CompetitionStart.Format(time.RFC3339Nano)
 	}
-	return fmt.Sprintf("%s/%ds/r%d-%d", start, c.RoundDurationSec, c.StartRound, c.EndRound)
+	epoch := fmt.Sprintf("%s/%ds/r%d-%d", start, c.RoundDurationSec, c.StartRound, c.EndRound)
+	if len(c.ServiceRanges) == 0 {
+		return epoch
+	}
+	serviceIDs := make([]string, 0, len(c.ServiceRanges))
+	for serviceID := range c.ServiceRanges {
+		serviceIDs = append(serviceIDs, serviceID)
+	}
+	sort.Strings(serviceIDs)
+	var overrides strings.Builder
+	for _, serviceID := range serviceIDs {
+		rounds := c.ServiceRanges[serviceID]
+		fmt.Fprintf(&overrides, "/%q:r%d-%d", serviceID, rounds.StartRound, rounds.EndRound)
+	}
+	return epoch + overrides.String()
+}
+
+type baselineDefinition struct {
+	CompetitionStart time.Time                `json:"competition_start"`
+	RoundDurationSec int                      `json:"round_duration_seconds"`
+	StartRound       int                      `json:"baseline_start_round"`
+	EndRound         int                      `json:"baseline_end_round"`
+	ServiceRanges    map[string]BaselineRange `json:"baseline_service_rounds"`
+}
+
+func encodeBaselineDefinition(config BaselineConfig) (string, error) {
+	config = config.normalized()
+	encoded, err := json.Marshal(baselineDefinition{
+		CompetitionStart: config.CompetitionStart, RoundDurationSec: config.RoundDurationSec,
+		StartRound: config.StartRound, EndRound: config.EndRound, ServiceRanges: config.ServiceRanges,
+	})
+	if err != nil {
+		return "", fmt.Errorf("encoding baseline definition: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func decodeBaselineDefinition(encoded string) (BaselineConfig, error) {
+	var definition baselineDefinition
+	if err := json.Unmarshal([]byte(encoded), &definition); err != nil {
+		return BaselineConfig{}, err
+	}
+	return NewBaselineConfig(
+		definition.CompetitionStart, definition.RoundDurationSec,
+		definition.StartRound, definition.EndRound, definition.ServiceRanges,
+	), nil
 }
 
 type Store interface {
 	UpdateFlowScore([]int64, sniffer.FlowScore) error
-	PrepareBaseline(epoch string) error
-	ClearBaseline(epoch string) error
+	PrepareBaseline(epoch, definition string) error
 	LoadBaselineSignatures() ([]sniffer.BaselineSignature, error)
 	UpsertBaselineSignature(serviceID, signature string, rounds []int) error
 	DeleteBaselineSignature(serviceID, signature string) error
 	ReplaceBaselineSignatures([]sniffer.BaselineSignature) error
-	CountBaselinePackets(from, to time.Time) (int, error)
-	ReplayBaselinePackets(from, to time.Time, limit int, visit func(*sniffer.Packet) error) (int, error)
+	ListBaselineSnapshots() ([]sniffer.BaselineSnapshot, error)
+	CountBaselinePackets(defaultWindow sniffer.BaselineWindow, serviceWindows map[string]sniffer.BaselineWindow) (int, error)
+	ReplayBaselinePackets(defaultWindow sniffer.BaselineWindow, serviceWindows map[string]sniffer.BaselineWindow, limit int, visit func(*sniffer.Packet) error) (int, error)
 }
 
 type flowRun struct {
@@ -155,21 +235,40 @@ type resetRequest struct {
 }
 
 type Status struct {
-	Epoch           string          `json:"epoch,omitempty"`
-	OpeningRounds   int             `json:"opening_rounds"`
-	StartRound      int             `json:"baseline_start_round"`
-	EndRound        int             `json:"baseline_end_round"`
-	RequiredRounds  int             `json:"baseline_required_rounds"`
-	Rebuilding      bool            `json:"rebuilding"`
-	ReplayedPackets int             `json:"replayed_packets"`
-	QueueDropped    uint64          `json:"queue_dropped"`
-	StoreErrors     uint64          `json:"store_errors"`
-	LastError       string          `json:"last_error,omitempty"`
-	Services        []ServiceStatus `json:"services"`
+	Epoch           string           `json:"epoch,omitempty"`
+	OpeningRounds   int              `json:"opening_rounds"`
+	StartRound      int              `json:"baseline_start_round"`
+	EndRound        int              `json:"baseline_end_round"`
+	RequiredRounds  int              `json:"baseline_required_rounds"`
+	Rebuilding      bool             `json:"rebuilding"`
+	ReplayedPackets int              `json:"replayed_packets"`
+	QueueDropped    uint64           `json:"queue_dropped"`
+	StoreErrors     uint64           `json:"store_errors"`
+	LastError       string           `json:"last_error,omitempty"`
+	Services        []ServiceStatus  `json:"services"`
+	Snapshots       []SnapshotStatus `json:"snapshots"`
+}
+
+type SnapshotStatus struct {
+	Epoch            string                   `json:"epoch"`
+	Active           bool                     `json:"active"`
+	Compatible       bool                     `json:"compatible"`
+	CompetitionStart time.Time                `json:"competition_start"`
+	RoundDurationSec int                      `json:"round_duration_seconds"`
+	StartRound       int                      `json:"baseline_start_round"`
+	EndRound         int                      `json:"baseline_end_round"`
+	ServiceRanges    map[string]BaselineRange `json:"baseline_service_rounds"`
+	SignatureCount   int                      `json:"signature_count"`
+	CreatedAt        time.Time                `json:"created_at"`
+	UpdatedAt        time.Time                `json:"updated_at"`
 }
 
 type ServiceStatus struct {
 	ServiceID            string `json:"service_id"`
+	BaselineStartRound   int    `json:"baseline_start_round"`
+	BaselineEndRound     int    `json:"baseline_end_round"`
+	BaselineRequired     int    `json:"baseline_required_rounds"`
+	UsesDefaultBaseline  bool   `json:"uses_default_baseline"`
 	RoundsObserved       []int  `json:"rounds_observed"`
 	CandidateSignatures  int    `json:"candidate_signatures"`
 	TrustedSignatures    int    `json:"trusted_signatures"`
@@ -230,14 +329,14 @@ func (e *Engine) Close() {
 }
 
 // ConfigureBaseline switches timing/range on the engine goroutine after
-// finishing pending flows. It also replays retained packets from the selected
-// window, so changing the range mid-competition does not discard history.
+// finishing pending flows. A preserved snapshot is restored when available;
+// otherwise retained packets seed a new version without deleting old ones.
 func (e *Engine) ConfigureBaseline(config BaselineConfig) error {
 	return e.requestBaseline(resetRequest{config: config.normalized(), done: make(chan error, 1)})
 }
 
-// RebuildBaseline discards persisted candidates and relearns the current
-// range. It is the recovery path after labeling a captured flow as exploit.
+// RebuildBaseline relearns the current range in isolation and publishes it
+// only after retained traffic passes coverage checks.
 func (e *Engine) RebuildBaseline() error {
 	e.stateMu.RLock()
 	config := e.config
@@ -263,6 +362,11 @@ func (e *Engine) requestBaseline(req resetRequest) error {
 
 // Status returns a stable, read-only snapshot for the operator UI.
 func (e *Engine) Status() Status {
+	var storedSnapshots []sniffer.BaselineSnapshot
+	var snapshotErr error
+	if e.store != nil {
+		storedSnapshots, snapshotErr = e.store.ListBaselineSnapshots()
+	}
 	e.stateMu.RLock()
 	defer e.stateMu.RUnlock()
 	config := e.config.normalized()
@@ -276,38 +380,74 @@ func (e *Engine) Status() Status {
 	for id := range e.excluded {
 		ids[id] = struct{}{}
 	}
+	for id := range config.ServiceRanges {
+		ids[id] = struct{}{}
+	}
 	services := make([]ServiceStatus, 0, len(ids))
 	for serviceID := range ids {
-		seen := make(map[int]struct{}, config.RequiredRounds())
+		rounds := config.RangeFor(serviceID)
+		required := rounds.EndRound - rounds.StartRound + 1
+		seen := make(map[int]struct{}, required)
 		trusted := 0
-		for _, rounds := range e.baseline[serviceID] {
+		for _, observedRounds := range e.baseline[serviceID] {
 			complete := true
-			for round := config.StartRound; round <= config.EndRound; round++ {
-				if _, ok := rounds[round]; !ok {
+			for round := rounds.StartRound; round <= rounds.EndRound; round++ {
+				if _, ok := observedRounds[round]; !ok {
 					complete = false
 				}
 			}
 			if complete {
 				trusted++
 			}
-			for round := range rounds {
+			for round := range observedRounds {
 				seen[round] = struct{}{}
 			}
 		}
 		services = append(services, ServiceStatus{
-			ServiceID: serviceID, RoundsObserved: sortedRounds(seen),
+			ServiceID: serviceID, BaselineStartRound: rounds.StartRound, BaselineEndRound: rounds.EndRound,
+			BaselineRequired: required, UsesDefaultBaseline: serviceUsesDefault(config, serviceID),
+			RoundsObserved:      sortedRounds(seen),
 			CandidateSignatures: len(e.baseline[serviceID]), TrustedSignatures: trusted, Complete: trusted > 0,
 			ExcludedOpeningFlows: e.excluded[serviceID], ScoredFlows: e.scored[serviceID],
 		})
 	}
 	sort.Slice(services, func(i, j int) bool { return services[i].ServiceID < services[j].ServiceID })
+	snapshots := make([]SnapshotStatus, 0, len(storedSnapshots))
+	activeSignatures := 0
+	for _, signatures := range e.baseline {
+		activeSignatures += len(signatures)
+	}
+	for _, stored := range storedSnapshots {
+		definition, err := decodeBaselineDefinition(stored.Definition)
+		if err != nil {
+			continue
+		}
+		count := stored.SignatureCount
+		if stored.Active && stored.Epoch == e.epoch {
+			count = activeSignatures
+		}
+		snapshots = append(snapshots, SnapshotStatus{
+			Epoch: stored.Epoch, Active: stored.Active, Compatible: sameCompetition(definition, config),
+			CompetitionStart: definition.CompetitionStart, RoundDurationSec: definition.RoundDurationSec,
+			StartRound: definition.StartRound, EndRound: definition.EndRound, ServiceRanges: definition.ServiceRanges,
+			SignatureCount: count, CreatedAt: stored.CreatedAt, UpdatedAt: stored.UpdatedAt,
+		})
+	}
+	lastError := e.lastError
+	if snapshotErr != nil {
+		lastError = snapshotErr.Error()
+	}
 	return Status{
 		Epoch: e.epoch, OpeningRounds: config.RequiredRounds(),
 		StartRound: config.StartRound, EndRound: config.EndRound,
 		RequiredRounds: config.RequiredRounds(), Rebuilding: e.rebuilding, ReplayedPackets: e.replayed,
-		QueueDropped: e.queueDropped, StoreErrors: e.storeErrors, LastError: e.lastError,
-		Services: services,
+		QueueDropped: e.queueDropped, StoreErrors: e.storeErrors, LastError: lastError,
+		Services: services, Snapshots: snapshots,
 	}
+}
+
+func sameCompetition(left, right BaselineConfig) bool {
+	return left.CompetitionStart.Equal(right.CompetitionStart) && left.RoundDurationSec == right.RoundDurationSec
 }
 
 func (e *Engine) run() {
@@ -337,36 +477,41 @@ func (e *Engine) run() {
 	}
 }
 
-func (e *Engine) configureBaseline(config BaselineConfig, force bool) (retErr error) {
+func (e *Engine) configureBaseline(config BaselineConfig, force bool) error {
 	config = config.normalized()
-	prepared := false
+	definition, err := encodeBaselineDefinition(config)
+	if err != nil {
+		return err
+	}
 	e.stateMu.Lock()
 	e.rebuilding = true
+	previous := e.captureBaselineStateLocked()
 	e.stateMu.Unlock()
 	defer func() {
-		if retErr != nil && prepared {
-			clearErr := e.store.ClearBaseline(BaselineEpoch(config))
-			e.stateMu.Lock()
-			e.baseline = make(map[string]map[string]map[int]struct{})
-			e.overflow = make(map[string]map[string]map[int]struct{})
-			e.excluded = make(map[string]uint64)
-			e.replayed = 0
-			if clearErr != nil {
-				retErr = errors.Join(retErr, fmt.Errorf("clearing incomplete baseline: %w", clearErr))
-			}
-			e.rebuilding = false
-			e.stateMu.Unlock()
-			return
-		}
 		e.stateMu.Lock()
 		e.rebuilding = false
 		e.stateMu.Unlock()
 	}()
 
+	defaultWindow, serviceWindows, hasWindow := config.windows()
+	if force {
+		return e.rebuildBaselineAtomically(config, defaultWindow, serviceWindows, hasWindow, previous)
+	}
+
 	epoch := BaselineEpoch(config)
-	from, to, hasWindow := config.window()
-	if hasWindow {
-		count, err := e.store.CountBaselinePackets(from, to)
+	snapshots, err := e.store.ListBaselineSnapshots()
+	if err != nil {
+		return err
+	}
+	restored := false
+	for _, snapshot := range snapshots {
+		if snapshot.Epoch == epoch && snapshot.SignatureCount > 0 {
+			restored = true
+			break
+		}
+	}
+	if !restored && hasWindow {
+		count, err := e.store.CountBaselinePackets(defaultWindow, serviceWindows)
 		if err != nil {
 			return err
 		}
@@ -374,59 +519,189 @@ func (e *Engine) configureBaseline(config BaselineConfig, force bool) (retErr er
 			return fmt.Errorf("baseline window contains %d packets and exceeds the %d-packet safety limit; choose a narrower round range", count, maxBaselineReplayPackets)
 		}
 	}
-	var prepareErr error
-	if force {
-		prepareErr = e.store.ClearBaseline(epoch)
-	} else {
-		prepareErr = e.store.PrepareBaseline(epoch)
+	if err := e.store.PrepareBaseline(epoch, definition); err != nil {
+		return err
 	}
-	if prepareErr != nil {
-		return prepareErr
-	}
-	prepared = true
 	stored, err := e.store.LoadBaselineSignatures()
 	if err != nil {
+		e.restorePreviousBaseline(previous)
 		return err
 	}
-	baseline := make(map[string]map[string]map[int]struct{})
-	for _, item := range stored {
-		bySignature := baseline[item.ServiceID]
-		if bySignature == nil {
-			bySignature = make(map[string]map[int]struct{})
-			baseline[item.ServiceID] = bySignature
-		}
-		rounds := make(map[int]struct{}, len(item.Rounds))
-		for _, round := range item.Rounds {
-			if config.contains(round) {
-				rounds[round] = struct{}{}
-			}
-		}
-		bySignature[item.Signature] = rounds
-	}
-	e.stateMu.Lock()
-	e.epoch = epoch
-	e.config = config
-	e.baseline = baseline
-	e.overflow = make(map[string]map[string]map[int]struct{})
-	e.excluded = make(map[string]uint64)
-	e.scored = make(map[string]uint64)
-	e.replayed = 0
-	e.stateMu.Unlock()
-
-	if !hasWindow {
+	e.installBaseline(config, epoch, baselineFromSignatures(config, stored))
+	if restored || !hasWindow {
 		return nil
 	}
-	replayed, err := e.replayBaselineWindow(config, from, to)
-	if err != nil {
-		return err
+
+	replayed, err := e.replayBaselineWindow(config, defaultWindow, serviceWindows)
+	if err == nil {
+		err = e.store.ReplaceBaselineSignatures(e.baselineSnapshot())
 	}
-	if err := e.store.ReplaceBaselineSignatures(e.baselineSnapshot()); err != nil {
+	if err != nil {
+		e.restorePreviousBaseline(previous)
 		return err
 	}
 	e.stateMu.Lock()
 	e.replayed = replayed
 	e.stateMu.Unlock()
 	return nil
+}
+
+type baselineState struct {
+	epoch    string
+	config   BaselineConfig
+	baseline map[string]map[string]map[int]struct{}
+	overflow map[string]map[string]map[int]struct{}
+	excluded map[string]uint64
+	scored   map[string]uint64
+	replayed int
+}
+
+func (e *Engine) captureBaselineStateLocked() baselineState {
+	return baselineState{
+		epoch: e.epoch, config: e.config, baseline: cloneBaselineMap(e.baseline), overflow: cloneBaselineMap(e.overflow),
+		excluded: cloneCounters(e.excluded), scored: cloneCounters(e.scored), replayed: e.replayed,
+	}
+}
+
+func (e *Engine) restorePreviousBaseline(previous baselineState) {
+	if previous.epoch != "" {
+		if definition, err := encodeBaselineDefinition(previous.config); err == nil {
+			if err := e.store.PrepareBaseline(previous.epoch, definition); err != nil {
+				e.recordStoreError(fmt.Errorf("restoring previous baseline snapshot: %w", err))
+			}
+		}
+	}
+	e.stateMu.Lock()
+	e.epoch, e.config = previous.epoch, previous.config
+	e.baseline, e.overflow = previous.baseline, previous.overflow
+	e.excluded, e.scored, e.replayed = previous.excluded, previous.scored, previous.replayed
+	e.stateMu.Unlock()
+}
+
+func (e *Engine) installBaseline(config BaselineConfig, epoch string, baseline map[string]map[string]map[int]struct{}) {
+	e.stateMu.Lock()
+	e.epoch, e.config, e.baseline = epoch, config, baseline
+	e.overflow = make(map[string]map[string]map[int]struct{})
+	e.excluded = make(map[string]uint64)
+	e.scored = make(map[string]uint64)
+	e.replayed = 0
+	e.stateMu.Unlock()
+}
+
+func (e *Engine) rebuildBaselineAtomically(config BaselineConfig, defaultWindow sniffer.BaselineWindow, serviceWindows map[string]sniffer.BaselineWindow, hasWindow bool, previous baselineState) error {
+	if !hasWindow {
+		return fmt.Errorf("cannot rebuild baseline without a competition start; persisted snapshot was kept")
+	}
+	count, err := e.store.CountBaselinePackets(defaultWindow, serviceWindows)
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return fmt.Errorf("cannot rebuild baseline: no retained packets cover the selected rounds; persisted snapshot was kept")
+	}
+	if count > maxBaselineReplayPackets {
+		return fmt.Errorf("cannot rebuild baseline: %d retained packets exceed the %d-packet safety limit; persisted snapshot was kept", count, maxBaselineReplayPackets)
+	}
+	e.installBaseline(config, BaselineEpoch(config), make(map[string]map[string]map[int]struct{}))
+	replayed, err := e.replayBaselineWindow(config, defaultWindow, serviceWindows)
+	if err == nil {
+		err = validateRebuildCoverage(config, e.baselineSnapshot(), previous.baseline)
+	}
+	if err == nil {
+		err = e.store.ReplaceBaselineSignatures(e.baselineSnapshot())
+	}
+	if err != nil {
+		e.restorePreviousBaseline(previous)
+		return err
+	}
+	e.stateMu.Lock()
+	e.replayed = replayed
+	e.stateMu.Unlock()
+	return nil
+}
+
+func validateRebuildCoverage(config BaselineConfig, items []sniffer.BaselineSignature, previous map[string]map[string]map[int]struct{}) error {
+	seen := make(map[string]map[int]struct{})
+	for _, item := range items {
+		if seen[item.ServiceID] == nil {
+			seen[item.ServiceID] = make(map[int]struct{})
+		}
+		for _, round := range item.Rounds {
+			seen[item.ServiceID][round] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return fmt.Errorf("cannot rebuild baseline: retained traffic contains no safe fingerprints; persisted snapshot was kept")
+	}
+	expected := make(map[string]struct{}, len(previous)+len(config.ServiceRanges))
+	for serviceID := range previous {
+		expected[serviceID] = struct{}{}
+	}
+	for serviceID := range config.ServiceRanges {
+		expected[serviceID] = struct{}{}
+	}
+	if len(expected) == 0 {
+		for serviceID := range seen {
+			expected[serviceID] = struct{}{}
+		}
+	}
+	var incomplete []string
+	for serviceID := range expected {
+		rounds := config.RangeFor(serviceID)
+		var missing []string
+		for round := rounds.StartRound; round <= rounds.EndRound; round++ {
+			if _, ok := seen[serviceID][round]; !ok {
+				missing = append(missing, fmt.Sprint(round))
+			}
+		}
+		if len(missing) > 0 {
+			incomplete = append(incomplete, fmt.Sprintf("%s (missing %s)", serviceID, strings.Join(missing, ",")))
+		}
+	}
+	if len(incomplete) > 0 {
+		sort.Strings(incomplete)
+		return fmt.Errorf("cannot rebuild baseline: retained safe traffic is incomplete for %s; persisted snapshot was kept", strings.Join(incomplete, "; "))
+	}
+	return nil
+}
+
+func baselineFromSignatures(config BaselineConfig, stored []sniffer.BaselineSignature) map[string]map[string]map[int]struct{} {
+	baseline := make(map[string]map[string]map[int]struct{})
+	for _, item := range stored {
+		if baseline[item.ServiceID] == nil {
+			baseline[item.ServiceID] = make(map[string]map[int]struct{})
+		}
+		rounds := make(map[int]struct{}, len(item.Rounds))
+		for _, round := range item.Rounds {
+			if config.contains(item.ServiceID, round) {
+				rounds[round] = struct{}{}
+			}
+		}
+		baseline[item.ServiceID][item.Signature] = rounds
+	}
+	return baseline
+}
+
+func cloneBaselineMap(source map[string]map[string]map[int]struct{}) map[string]map[string]map[int]struct{} {
+	copy := make(map[string]map[string]map[int]struct{}, len(source))
+	for serviceID, signatures := range source {
+		copy[serviceID] = make(map[string]map[int]struct{}, len(signatures))
+		for signature, rounds := range signatures {
+			copy[serviceID][signature] = make(map[int]struct{}, len(rounds))
+			for round := range rounds {
+				copy[serviceID][signature][round] = struct{}{}
+			}
+		}
+	}
+	return copy
+}
+
+func cloneCounters(source map[string]uint64) map[string]uint64 {
+	copy := make(map[string]uint64, len(source))
+	for key, value := range source {
+		copy[key] = value
+	}
+	return copy
 }
 
 func (e *Engine) accept(packet *sniffer.Packet) {
@@ -524,10 +799,10 @@ func (e *Engine) learnBaseline(packets []*sniffer.Packet, signature string, pers
 	e.stateMu.RLock()
 	config := e.config
 	e.stateMu.RUnlock()
-	if !config.contains(round) {
+	serviceID := packets[0].ServiceID
+	if !config.contains(serviceID, round) {
 		return nil
 	}
-	serviceID := packets[0].ServiceID
 	if !sameRound || !baselineSafe(packets) {
 		e.stateMu.Lock()
 		e.excluded[serviceID]++
@@ -552,7 +827,7 @@ func (e *Engine) learnBaseline(packets []*sniffer.Packet, signature string, pers
 // replayBaselineWindow rebuilds only learning state and consumes storage in
 // bounded batches. Historical scores stay untouched; new flows immediately
 // use the reconstructed baseline.
-func (e *Engine) replayBaselineWindow(config BaselineConfig, from, to time.Time) (int, error) {
+func (e *Engine) replayBaselineWindow(config BaselineConfig, defaultWindow sniffer.BaselineWindow, serviceWindows map[string]sniffer.BaselineWindow) (int, error) {
 	runs := make(map[string]*flowRun)
 	var replayErr error
 	finish := func(run *flowRun) {
@@ -561,7 +836,7 @@ func (e *Engine) replayBaselineWindow(config BaselineConfig, from, to time.Time)
 		}
 		replayErr = e.learnBaseline(run.packets, flowSignature(run.packets), false)
 	}
-	replayed, err := e.store.ReplayBaselinePackets(from, to, maxBaselineReplayPackets, func(packet *sniffer.Packet) error {
+	replayed, err := e.store.ReplayBaselinePackets(defaultWindow, serviceWindows, maxBaselineReplayPackets, func(packet *sniffer.Packet) error {
 		if packet == nil {
 			return nil
 		}
@@ -622,6 +897,7 @@ func (e *Engine) score(packets []*sniffer.Packet, signature string) sniffer.Flow
 	e.stateMu.RLock()
 	config := e.config
 	e.stateMu.RUnlock()
+	baselineRounds := config.RangeFor(serviceID)
 	attack, normal := 0, 0
 	reasons := make([]sniffer.ScoreReason, 0, 8)
 	addAttack := func(code, label string, points int) {
@@ -704,10 +980,10 @@ func (e *Engine) score(packets []*sniffer.Packet, signature string) sniffer.Flow
 	baselineComplete := e.baselineComplete(serviceID)
 	trusted := e.signatureTrusted(serviceID, signature)
 	currentSafe := baselineSafe(packets)
-	if round > config.EndRound && baselineComplete {
+	if round > baselineRounds.EndRound && baselineComplete {
 		switch {
 		case trusted && currentSafe:
-			addNormal("opening_baseline", fmt.Sprintf("Flow repeated in every baseline round (%d-%d)", config.StartRound, config.EndRound), 70)
+			addNormal("opening_baseline", fmt.Sprintf("Flow repeated in every baseline round (%d-%d)", baselineRounds.StartRound, baselineRounds.EndRound), 70)
 		case trusted:
 			addAttack("unsafe_baseline_match", "Known shape carries current attack indicators", 15)
 		default:
@@ -717,7 +993,7 @@ func (e *Engine) score(packets []*sniffer.Packet, signature string) sniffer.Flow
 
 	attack, normal = clamp(attack), clamp(normal)
 	coverage := 25
-	if round > config.EndRound {
+	if round > baselineRounds.EndRound {
 		if baselineComplete {
 			coverage = 70
 		} else {
@@ -742,7 +1018,7 @@ func (e *Engine) score(packets []*sniffer.Packet, signature string) sniffer.Flow
 		classification = "likely_exploit"
 	case currentSafe && coverage >= 60 && normal >= 65 && attack < 35 && margin <= -25:
 		classification = "likely_checker"
-	case coverage < 50 || round <= config.EndRound:
+	case coverage < 50 || round <= baselineRounds.EndRound:
 		classification = "insufficient_data"
 	}
 	return sniffer.FlowScore{
@@ -755,6 +1031,7 @@ func (e *Engine) addBaselineRound(serviceID, signature string, round int) ([]int
 	e.stateMu.Lock()
 	defer e.stateMu.Unlock()
 	config := e.config
+	baselineRounds := config.RangeFor(serviceID)
 	bySignature := e.baseline[serviceID]
 	if bySignature == nil {
 		bySignature = make(map[string]map[int]struct{})
@@ -824,7 +1101,7 @@ func (e *Engine) addBaselineRound(serviceID, signature string, round int) ([]int
 		}
 		bySignature[signature] = rounds
 	}
-	if config.contains(round) {
+	if round >= baselineRounds.StartRound && round <= baselineRounds.EndRound {
 		rounds[round] = struct{}{}
 	}
 	return sortedRounds(rounds), evicted, true
@@ -834,7 +1111,8 @@ func (e *Engine) signatureTrusted(serviceID, signature string) bool {
 	e.stateMu.RLock()
 	defer e.stateMu.RUnlock()
 	rounds := e.baseline[serviceID][signature]
-	for round := e.config.StartRound; round <= e.config.EndRound; round++ {
+	baselineRounds := e.config.RangeFor(serviceID)
+	for round := baselineRounds.StartRound; round <= baselineRounds.EndRound; round++ {
 		if _, ok := rounds[round]; !ok {
 			return false
 		}
@@ -845,9 +1123,10 @@ func (e *Engine) signatureTrusted(serviceID, signature string) bool {
 func (e *Engine) baselineComplete(serviceID string) bool {
 	e.stateMu.RLock()
 	defer e.stateMu.RUnlock()
+	baselineRounds := e.config.RangeFor(serviceID)
 	for _, rounds := range e.baseline[serviceID] {
 		complete := true
-		for round := e.config.StartRound; round <= e.config.EndRound; round++ {
+		for round := baselineRounds.StartRound; round <= baselineRounds.EndRound; round++ {
 			if _, ok := rounds[round]; !ok {
 				complete = false
 				break
@@ -858,6 +1137,11 @@ func (e *Engine) baselineComplete(serviceID string) bool {
 		}
 	}
 	return false
+}
+
+func serviceUsesDefault(config BaselineConfig, serviceID string) bool {
+	_, overridden := config.ServiceRanges[serviceID]
+	return !overridden
 }
 
 func sortedRounds(set map[int]struct{}) []int {

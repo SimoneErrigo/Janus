@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -35,16 +36,17 @@ type configResponse struct {
 	FlagIDPollInterval int    `json:"flagid_poll_interval"`
 	FlagIDFormat       string `json:"flagid_format"`
 
-	RoundDurationSec         int    `json:"round_duration_seconds"`
-	CompetitionStart         string `json:"competition_start,omitempty"`
-	KeepRounds               int    `json:"keep_rounds"`
-	BaselineStartRound       int    `json:"baseline_start_round"`
-	BaselineEndRound         int    `json:"baseline_end_round"`
-	CurrentRound             int    `json:"current_round"`
-	TrafficMode              string `json:"traffic_mode"`
-	FlowCorrelationWindowSec int    `json:"flow_correlation_window_seconds"`
-	PcapExportDir            string `json:"pcap_export_dir"`
-	PcapAutoSave             bool   `json:"pcap_auto_save"`
+	RoundDurationSec         int                                  `json:"round_duration_seconds"`
+	CompetitionStart         string                               `json:"competition_start,omitempty"`
+	KeepRounds               int                                  `json:"keep_rounds"`
+	BaselineStartRound       int                                  `json:"baseline_start_round"`
+	BaselineEndRound         int                                  `json:"baseline_end_round"`
+	BaselineServiceRounds    map[string]config.BaselineRoundRange `json:"baseline_service_rounds"`
+	CurrentRound             int                                  `json:"current_round"`
+	TrafficMode              string                               `json:"traffic_mode"`
+	FlowCorrelationWindowSec int                                  `json:"flow_correlation_window_seconds"`
+	PcapExportDir            string                               `json:"pcap_export_dir"`
+	PcapAutoSave             bool                                 `json:"pcap_auto_save"`
 }
 
 type configUpdateRequest struct {
@@ -57,15 +59,16 @@ type configUpdateRequest struct {
 	FlagIDPollInterval *int    `json:"flagid_poll_interval,omitempty"`
 	FlagIDFormat       *string `json:"flagid_format,omitempty"`
 
-	RoundDurationSec         *int    `json:"round_duration_seconds,omitempty"`
-	CompetitionStart         *string `json:"competition_start,omitempty"`
-	KeepRounds               *int    `json:"keep_rounds,omitempty"`
-	BaselineStartRound       *int    `json:"baseline_start_round,omitempty"`
-	BaselineEndRound         *int    `json:"baseline_end_round,omitempty"`
-	TrafficMode              *string `json:"traffic_mode,omitempty"`
-	FlowCorrelationWindowSec *int    `json:"flow_correlation_window_seconds,omitempty"`
-	PcapExportDir            *string `json:"pcap_export_dir,omitempty"`
-	PcapAutoSave             *bool   `json:"pcap_auto_save,omitempty"`
+	RoundDurationSec         *int                                 `json:"round_duration_seconds,omitempty"`
+	CompetitionStart         *string                              `json:"competition_start,omitempty"`
+	KeepRounds               *int                                 `json:"keep_rounds,omitempty"`
+	BaselineStartRound       *int                                 `json:"baseline_start_round,omitempty"`
+	BaselineEndRound         *int                                 `json:"baseline_end_round,omitempty"`
+	BaselineServiceRounds    map[string]config.BaselineRoundRange `json:"baseline_service_rounds,omitempty"`
+	TrafficMode              *string                              `json:"traffic_mode,omitempty"`
+	FlowCorrelationWindowSec *int                                 `json:"flow_correlation_window_seconds,omitempty"`
+	PcapExportDir            *string                              `json:"pcap_export_dir,omitempty"`
+	PcapAutoSave             *bool                                `json:"pcap_auto_save,omitempty"`
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -143,7 +146,8 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	baselineChanged := previous.CompetitionStart != next.CompetitionStart || previous.RoundDurationSec != next.RoundDurationSec ||
-		previous.BaselineStartRound != next.BaselineStartRound || previous.BaselineEndRound != next.BaselineEndRound
+		previous.BaselineStartRound != next.BaselineStartRound || previous.BaselineEndRound != next.BaselineEndRound ||
+		!maps.Equal(previous.BaselineServiceRounds, next.BaselineServiceRounds)
 	if s.scoring != nil && baselineChanged {
 		if err := s.scoring.ConfigureBaseline(scoringBaselineConfig(next)); err != nil {
 			rollbackErr := s.rollbackConfig(previous)
@@ -261,7 +265,7 @@ func applyConfigUpdate(cfg *config.Config, req configUpdateRequest) error {
 		cfg.FlagIDFormat = strings.ToLower(strings.TrimSpace(*req.FlagIDFormat))
 	}
 	switch cfg.FlagIDFormat {
-	case "cyberchallenge", "saarctf", "faustctf", "forcad":
+	case "cyberchallenge", "saarctf", "faustctf", "forcad", "enowars":
 	default:
 		return fmt.Errorf("unsupported flagid_format %q", cfg.FlagIDFormat)
 	}
@@ -298,6 +302,23 @@ func applyConfigUpdate(cfg *config.Config, req configUpdateRequest) error {
 	}
 	if cfg.BaselineEndRound-cfg.BaselineStartRound+1 > 50 {
 		return fmt.Errorf("baseline range cannot exceed 50 rounds")
+	}
+	if req.BaselineServiceRounds != nil {
+		cfg.BaselineServiceRounds = make(map[string]config.BaselineRoundRange, len(req.BaselineServiceRounds))
+		for rawServiceID, rounds := range req.BaselineServiceRounds {
+			serviceID := strings.TrimSpace(rawServiceID)
+			if serviceID == "" || len(serviceID) > 256 {
+				return fmt.Errorf("baseline service IDs must contain between 1 and 256 characters")
+			}
+			if rounds.StartRound < 1 || rounds.EndRound > 10000 {
+				return fmt.Errorf("baseline rounds for %q must be between 1 and 10000", serviceID)
+			}
+			span := rounds.EndRound - rounds.StartRound + 1
+			if span < 2 || span > 50 {
+				return fmt.Errorf("baseline range for %q must include between 2 and 50 rounds", serviceID)
+			}
+			cfg.BaselineServiceRounds[serviceID] = rounds
+		}
 	}
 
 	if req.TrafficMode != nil {
@@ -347,7 +368,11 @@ func pollerConfig(cfg *config.Config) flagids.PollerConfig {
 
 func scoringBaselineConfig(cfg *config.Config) scoring.BaselineConfig {
 	start, _ := parseCompetitionStart(cfg.CompetitionStart)
-	return scoring.NewBaselineConfig(start, cfg.RoundDurationSec, cfg.BaselineStartRound, cfg.BaselineEndRound)
+	ranges := make(map[string]scoring.BaselineRange, len(cfg.BaselineServiceRounds))
+	for serviceID, rounds := range cfg.BaselineServiceRounds {
+		ranges[serviceID] = scoring.BaselineRange{StartRound: rounds.StartRound, EndRound: rounds.EndRound}
+	}
+	return scoring.NewBaselineConfig(start, cfg.RoundDurationSec, cfg.BaselineStartRound, cfg.BaselineEndRound, ranges)
 }
 
 func effectiveCleanupSettings(cfg *config.Config) cleanup.Settings {
@@ -374,7 +399,8 @@ func (s *Server) configResponse(cfg *config.Config) configResponse {
 		RoundDurationSec: cfg.RoundDurationSec, CompetitionStart: cfg.CompetitionStart,
 		KeepRounds: cfg.KeepRounds, CurrentRound: currentRound,
 		BaselineStartRound: cfg.BaselineStartRound, BaselineEndRound: cfg.BaselineEndRound,
-		TrafficMode: cfg.TrafficMode, FlowCorrelationWindowSec: cfg.FlowCorrelationWindowSec,
+		BaselineServiceRounds: cfg.BaselineServiceRounds,
+		TrafficMode:           cfg.TrafficMode, FlowCorrelationWindowSec: cfg.FlowCorrelationWindowSec,
 		PcapExportDir: cfg.PcapExportDir, PcapAutoSave: cfg.PcapAutoSave,
 	}
 }

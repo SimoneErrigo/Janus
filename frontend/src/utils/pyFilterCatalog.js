@@ -18,80 +18,6 @@ def match(flow):
     return False
 `
 
-const DURATION_BURST = `# A long-lived connection that suddenly sends a request burst.
-DIRECTION = "request"
-MIN_AGE_MS = 8_000
-MAX_REQUESTS_PER_SECOND = 20
-
-def match(flow):
-    conn = flow.connection
-    if conn.age_ms >= MIN_AGE_MS and conn.rate_in(seconds=2) > MAX_REQUESTS_PER_SECOND:
-        return flow.close("long connection with a suspicious request burst")
-    return False
-`
-
-const RATE_LIMIT = `# Sliding-window rate limit, private to this connection and filter.
-DIRECTION = "request"
-WINDOW_SECONDS = 5
-MAX_REQUESTS = 25
-
-def match(flow):
-    hits = flow.state.count("requests", key=flow.path, window=WINDOW_SECONDS)
-    if hits > MAX_REQUESTS:
-        return flow.drop("too many requests to %s" % flow.path)
-    return False
-`
-
-const TCP_SEQUENCE = `# Parse a line-based TCP service without writing a buffering state machine.
-import hashlib
-
-DIRECTION = "request"
-COMMANDS = {
-    b"1": ("register", ("user", "password")),
-    b"2": ("login", ("user", "password")),
-}
-
-def password_key(value):
-    # Fixed-size keys let Janus bound this state even with attacker-controlled input.
-    return ("registered-password", hashlib.sha256(value).digest())
-
-def match(flow):
-    for command in flow.commands(COMMANDS):
-        if command.name == "register":
-            flow.state[password_key(command.password)] = True
-        elif command.name == "login":
-            reused = bool(flow.state.get(password_key(command.password)))
-            if command.flagid and reused:
-                return flow.close("flag-ID login reused a registration password")
-    return False
-`
-
-const STATIC_FINGERPRINT = `# Deterministic connection fingerprint with explicit thresholds.
-# Tune the thresholds for the service, test in Observe, then promote to Inline.
-MIN_MESSAGES = 4
-
-def match(flow):
-    conn = flow.connection
-    if conn.messages < MIN_MESSAGES:
-        return False
-
-    fingerprint = flow.connection.fingerprint()
-
-    signals = []
-    if conn.age_ms > 10_000:
-        signals.append("long-lived")
-    if conn.rate_in(seconds=2) > 20:
-        signals.append("request-burst")
-    if conn.bytes_in > 4 * max(conn.bytes_out, 1):
-        signals.append("upload-heavy")
-    if conn.known_flags_out + flow.flags.known_count > 0:
-        signals.append("known-flag-out")
-
-    if len(signals) >= 2:
-        return flow.alert("suspicious fingerprint %s: %s" % (fingerprint, ", ".join(signals)))
-    return False
-`
-
 const HEADER_LENGTH = `# Block a request when one selected header is too long.
 DIRECTION = "request"
 HEADER_NAME = "X-Input"
@@ -189,47 +115,6 @@ export const PY_FILTER_TEMPLATES = [
     difficulty: 'medium',
     directions: ['response'],
     accent: 'rose',
-  },
-  {
-    key: 'duration-burst',
-    title: 'Duration + burst',
-    description: 'Combines connection age and recent request rate to reduce false positives.',
-    code: DURATION_BURST,
-    mode: 'block',
-    difficulty: 'medium',
-    directions: ['request'],
-    accent: 'amber',
-  },
-  {
-    key: 'rate-limit',
-    title: 'Sliding rate limit',
-    description: 'Counts repeated actions in a bounded time window; no global dictionaries.',
-    code: RATE_LIMIT,
-    mode: 'block',
-    difficulty: 'easy',
-    directions: ['request'],
-    accent: 'cyan',
-  },
-  {
-    key: 'tcp-sequence',
-    title: 'TCP command sequence',
-    description: 'Reassembles lines and detects a suspicious multi-command sequence.',
-    code: TCP_SEQUENCE,
-    mode: 'block',
-    difficulty: 'hard',
-    directions: ['request'],
-    protocols: ['tcp', 'tcp-line', 'tls'],
-    accent: 'violet',
-  },
-  {
-    key: 'fingerprint',
-    title: 'Static fingerprint',
-    description: 'Combines deterministic timing, rate, byte-ratio and flag signals.',
-    code: STATIC_FINGERPRINT,
-    mode: 'observe',
-    difficulty: 'hard',
-    directions: [],
-    accent: 'emerald',
   },
   {
     key: 'header-length',

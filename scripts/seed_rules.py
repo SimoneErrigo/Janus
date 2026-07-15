@@ -18,10 +18,10 @@ Environment fallbacks:
 
 Rules are scoped to services *before* they are created:
 
-* HTTP/HTTPS/h2/gRPC templates use only body, URL, and headers, the fields the
-  live HTTP rule path actually provides.
-* TCP templates use only raw bytes. Janus evaluates them on request chunks, so
-  a multi-chunk protocol needs a PyFilter for stateful or reassembled checks.
+* HTTP-family templates use only body, URL, and headers, the fields the live
+  HTTP/HTTPS/h2(c)/gRPC rule path actually provides.
+* Stream templates use only raw bytes and cover the built-in TCP framers.
+  Multi-message state still belongs in a PyFilter.
 
 The catalogue deliberately does not seed scanner User-Agent rules, broad size
 heuristics, generic admin-path probes, or standalone template delimiters. Those
@@ -49,8 +49,8 @@ from typing import Any, Iterable
 
 ALERT = "alert"
 SEED_PREFIX = "[janus-seed]"
-HTTP_PROTOCOLS = frozenset({"http", "https", "h2", "grpc"})
-TCP_PROTOCOLS = frozenset({"tcp"})
+HTTP_PROTOCOLS = frozenset({"http", "https", "h2", "h2c", "grpc", "grpc-h2c"})
+TCP_PROTOCOLS = frozenset({"tcp", "tcp-line", "tls", "dns-tcp", "resp", "mqtt"})
 
 
 def _rule(

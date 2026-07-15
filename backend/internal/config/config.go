@@ -21,6 +21,11 @@ type DataPlaneConfig struct {
 	BindMode    string
 }
 
+type BaselineRoundRange struct {
+	StartRound int `json:"start_round"`
+	EndRound   int `json:"end_round"`
+}
+
 // Config holds the global configuration loaded from .env.
 type Config struct {
 	TeamPassword string
@@ -55,11 +60,12 @@ type Config struct {
 	FlagIDFormat       string
 
 	// Competition timing
-	RoundDurationSec   int    // duration of a single round in seconds (default 120)
-	CompetitionStart   string // when the competition started (RFC3339, optional)
-	KeepRounds         int    // how many rounds of flagIds to keep (default 5)
-	BaselineStartRound int    // first round used by deterministic scoring baseline (inclusive)
-	BaselineEndRound   int    // last round used by deterministic scoring baseline (inclusive)
+	RoundDurationSec      int                           // duration of a single round in seconds (default 120)
+	CompetitionStart      string                        // when the competition started (RFC3339, optional)
+	KeepRounds            int                           // how many rounds of flagIds to keep (default 5)
+	BaselineStartRound    int                           // default first baseline round (inclusive)
+	BaselineEndRound      int                           // default last baseline round (inclusive)
+	BaselineServiceRounds map[string]BaselineRoundRange // optional service-specific overrides
 
 	// Redis settings
 	RedisAddr     string
@@ -96,24 +102,25 @@ const runtimeConfigName = "runtime_config.json"
 // Infrastructure-only values (bind addresses, Redis credentials, data path,
 // interpreter path, ...) remain controlled by the environment.
 type runtimeConfig struct {
-	TeamPassword             *string `json:"team_password,omitempty"`
-	FlagRegex                *string `json:"flag_regex,omitempty"`
-	CleanupMaxAgeMinutes     *int    `json:"cleanup_max_age_minutes,omitempty"`
-	CleanupMaxDBSizeMB       *int    `json:"cleanup_max_db_size_mb,omitempty"`
-	FlagIDEnabled            *bool   `json:"flagid_enabled,omitempty"`
-	OurTeamID                *string `json:"our_team_id,omitempty"`
-	FlagIDAPIURL             *string `json:"flagid_api_url,omitempty"`
-	FlagIDPollInterval       *int    `json:"flagid_poll_interval,omitempty"`
-	FlagIDFormat             *string `json:"flagid_format,omitempty"`
-	RoundDurationSec         *int    `json:"round_duration_seconds,omitempty"`
-	CompetitionStart         *string `json:"competition_start,omitempty"`
-	KeepRounds               *int    `json:"keep_rounds,omitempty"`
-	BaselineStartRound       *int    `json:"baseline_start_round,omitempty"`
-	BaselineEndRound         *int    `json:"baseline_end_round,omitempty"`
-	TrafficMode              *string `json:"traffic_mode,omitempty"`
-	FlowCorrelationWindowSec *int    `json:"flow_correlation_window_seconds,omitempty"`
-	PcapExportDir            *string `json:"pcap_export_dir,omitempty"`
-	PcapAutoSave             *bool   `json:"pcap_auto_save,omitempty"`
+	TeamPassword             *string                       `json:"team_password,omitempty"`
+	FlagRegex                *string                       `json:"flag_regex,omitempty"`
+	CleanupMaxAgeMinutes     *int                          `json:"cleanup_max_age_minutes,omitempty"`
+	CleanupMaxDBSizeMB       *int                          `json:"cleanup_max_db_size_mb,omitempty"`
+	FlagIDEnabled            *bool                         `json:"flagid_enabled,omitempty"`
+	OurTeamID                *string                       `json:"our_team_id,omitempty"`
+	FlagIDAPIURL             *string                       `json:"flagid_api_url,omitempty"`
+	FlagIDPollInterval       *int                          `json:"flagid_poll_interval,omitempty"`
+	FlagIDFormat             *string                       `json:"flagid_format,omitempty"`
+	RoundDurationSec         *int                          `json:"round_duration_seconds,omitempty"`
+	CompetitionStart         *string                       `json:"competition_start,omitempty"`
+	KeepRounds               *int                          `json:"keep_rounds,omitempty"`
+	BaselineStartRound       *int                          `json:"baseline_start_round,omitempty"`
+	BaselineEndRound         *int                          `json:"baseline_end_round,omitempty"`
+	BaselineServiceRounds    map[string]BaselineRoundRange `json:"baseline_service_rounds,omitempty"`
+	TrafficMode              *string                       `json:"traffic_mode,omitempty"`
+	FlowCorrelationWindowSec *int                          `json:"flow_correlation_window_seconds,omitempty"`
+	PcapExportDir            *string                       `json:"pcap_export_dir,omitempty"`
+	PcapAutoSave             *bool                         `json:"pcap_auto_save,omitempty"`
 }
 
 // Load reads the .env file and returns the Config singleton.
@@ -135,6 +142,7 @@ func Load(envPath string) (*Config, error) {
 			KeepRounds:               5,
 			BaselineStartRound:       1,
 			BaselineEndRound:         5,
+			BaselineServiceRounds:    make(map[string]BaselineRoundRange),
 			ProtoDir:                 "/protos",
 			PyFilterEnabled:          true,
 			DataBindMode:             "configured",
@@ -369,6 +377,7 @@ func Get() *Config {
 		panic("config.Load() must be called before config.Get()")
 	}
 	copy := *instance
+	copy.BaselineServiceRounds = cloneBaselineServiceRounds(instance.BaselineServiceRounds)
 	return &copy
 }
 
@@ -385,6 +394,7 @@ func Update(mutate func(*Config) error) (*Config, error) {
 		return nil, fmt.Errorf("config.Load() must be called before config.Update()")
 	}
 	next := *instance
+	next.BaselineServiceRounds = cloneBaselineServiceRounds(instance.BaselineServiceRounds)
 	if err := mutate(&next); err != nil {
 		return nil, err
 	}
@@ -392,8 +402,10 @@ func Update(mutate func(*Config) error) (*Config, error) {
 	if err := saveRuntimeConfig(&next); err != nil {
 		return nil, err
 	}
+	next.BaselineServiceRounds = cloneBaselineServiceRounds(next.BaselineServiceRounds)
 	instance = &next
 	copy := next
+	copy.BaselineServiceRounds = cloneBaselineServiceRounds(next.BaselineServiceRounds)
 	return &copy, nil
 }
 
@@ -428,6 +440,12 @@ func normalizeDefaults(cfg *Config) {
 			cfg.BaselineEndRound = cfg.BaselineStartRound + 1
 		}
 	}
+	for serviceID, rounds := range cfg.BaselineServiceRounds {
+		span := rounds.EndRound - rounds.StartRound + 1
+		if serviceID == "" || rounds.StartRound < 1 || rounds.EndRound > 10000 || span < 2 || span > 50 {
+			delete(cfg.BaselineServiceRounds, serviceID)
+		}
+	}
 	if cfg.FlowCorrelationWindowSec <= 0 {
 		cfg.FlowCorrelationWindowSec = 120
 	}
@@ -438,7 +456,7 @@ func normalizeDefaults(cfg *Config) {
 		cfg.CleanupMaxDBSizeMB = 0
 	}
 	switch cfg.FlagIDFormat {
-	case "cyberchallenge", "saarctf", "faustctf", "forcad":
+	case "cyberchallenge", "saarctf", "faustctf", "forcad", "enowars":
 	default:
 		cfg.FlagIDFormat = "cyberchallenge"
 	}
@@ -510,6 +528,9 @@ func applyRuntimeConfig(cfg *Config, saved runtimeConfig) {
 	if saved.BaselineEndRound != nil {
 		cfg.BaselineEndRound = *saved.BaselineEndRound
 	}
+	if saved.BaselineServiceRounds != nil {
+		cfg.BaselineServiceRounds = cloneBaselineServiceRounds(saved.BaselineServiceRounds)
+	}
 	if saved.TrafficMode != nil {
 		cfg.TrafficMode = *saved.TrafficMode
 	}
@@ -533,7 +554,8 @@ func saveRuntimeConfig(cfg *Config) error {
 		FlagIDFormat: &cfg.FlagIDFormat, RoundDurationSec: &cfg.RoundDurationSec,
 		CompetitionStart: &cfg.CompetitionStart, KeepRounds: &cfg.KeepRounds,
 		BaselineStartRound: &cfg.BaselineStartRound, BaselineEndRound: &cfg.BaselineEndRound,
-		TrafficMode: &cfg.TrafficMode, FlowCorrelationWindowSec: &cfg.FlowCorrelationWindowSec,
+		BaselineServiceRounds: cloneBaselineServiceRounds(cfg.BaselineServiceRounds),
+		TrafficMode:           &cfg.TrafficMode, FlowCorrelationWindowSec: &cfg.FlowCorrelationWindowSec,
 		PcapExportDir: &cfg.PcapExportDir, PcapAutoSave: &cfg.PcapAutoSave,
 	}
 	data, err := json.MarshalIndent(saved, "", "  ")
@@ -578,6 +600,14 @@ func saveRuntimeConfig(cfg *Config) error {
 		_ = dir.Close()
 	}
 	return nil
+}
+
+func cloneBaselineServiceRounds(source map[string]BaselineRoundRange) map[string]BaselineRoundRange {
+	copy := make(map[string]BaselineRoundRange, len(source))
+	for serviceID, rounds := range source {
+		copy[serviceID] = rounds
+	}
+	return copy
 }
 
 // boolVal parses a truthy env value ("true"/"1"/"yes"/"on", case-insensitive).

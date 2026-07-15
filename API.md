@@ -62,11 +62,11 @@ presence indicator in the dashboard.
 |  | POST | `/api/rules/{id}/rollback` | Activate an old snapshot as a new revision |
 |  | POST | `/api/rules/bulk-delete` | Remove rules by ID |
 |  | GET | `/api/rules/presets` | List attack-preset categories |
-|  | POST | `/api/rules/presets/apply` | Apply selected presets to services |
+|  | POST | `/api/rules/presets/apply` | Validate and apply selected alert presets to services |
 |  | POST | `/api/filter/validate` | Validate a filter expression |
 |  | GET | `/api/filter/schema` | Queryable fields, patterns, and valid operators |
 | Scoring | GET | `/api/scoring/status` | Opening-baseline progress and classification counts |
-|  | POST | `/api/scoring/baseline/rebuild` | Rebuild the selected opening baseline from retained traffic |
+|  | POST | `/api/scoring/baseline/rebuild` | Transactionally rebuild the selected baseline from retained traffic |
 | Alerts | GET, DELETE | `/api/alerts` | List or clear alerts |
 |  | GET | `/api/alerts/{id}` | Read alert detail |
 | PyFilters | GET, POST | `/api/pyfilters` | List scripts and engine status, or create a script |
@@ -155,6 +155,10 @@ method == "POST" AND url contains "/login" AND body matches "(?i)union"
 See [FILTERS.md](FILTERS.md) for the complete language. Legacy packet search
 parameters (`contains`, `regex`, `src_ip`, ...) remain available.
 
+`POST /api/rules` defaults a missing `action` to `alert`. Built-in presets are
+also alert-only, prevalidated and rejected atomically before creation when the
+selection is invalid or duplicates an existing service/expression/action.
+
 Successful `POST /api/filter/validate` responses also include `fields` and
 `server_required`. The latter is true when browser-side evaluation cannot be
 guaranteed equivalent to the backend.
@@ -238,26 +242,37 @@ drop/rewrite logic; metadata remains available without delaying the service. See
 ### Deterministic opening baseline
 
 `GET /api/config` includes `baseline_start_round` and
-`baseline_end_round`; `PUT /api/config` accepts either field. Both are
-inclusive, must describe at least two and at most 50 rounds, and default to
-rounds `1`–`5`:
+`baseline_end_round` as the default service range, plus optional
+`baseline_service_rounds` overrides keyed by service ID. Every range is
+inclusive and must describe at least two and at most 50 rounds:
 
 ```json
 {
   "baseline_start_round": 1,
-  "baseline_end_round": 5
+  "baseline_end_round": 5,
+  "baseline_service_rounds": {
+    "web": { "start_round": 2, "end_round": 6 },
+    "database": { "start_round": 4, "end_round": 8 }
+  }
 }
 ```
 
-Changing the range, competition start, or round duration rebuilds the baseline
-from retained packets in that window. `POST /api/scoring/baseline/rebuild`
-takes no body and forces the same replay for the current range; use it after
-labelling contaminated flows as `exploit`.
+Services without an override use the default `1`–`5` range. Sending an empty
+`baseline_service_rounds` object clears all overrides. Each distinct timing and
+range configuration has a persistent fingerprint snapshot. Selecting a new
+configuration builds it from retained packets in the exact windows; selecting
+one used previously restores it even if autoclean removed those packets.
+`POST /api/scoring/baseline/rebuild` takes no body and relearns the current
+snapshot in isolation. The replacement is committed only when retained safe
+traffic covers every required round; on missing data or errors, the existing
+snapshot remains active.
 
 `GET /api/scoring/status` returns `baseline_start_round`,
 `baseline_end_round`, `baseline_required_rounds`, `rebuilding`,
-`replayed_packets`, queue/storage errors, and per-service
+`replayed_packets`, queue/storage errors, and per-service range,
 observed/candidate/trusted counts plus the exact `complete` state. A
+`snapshots` array lists preserved configurations, signature counts, active and
+timing-compatible state so clients can offer one-click range restoration. A
 signature is trusted only if the same safe deterministic shape occurs in every
 selected round. Truncated flows, rule/drop matches, suspicious payloads,
 request flags/Flag IDs, and exploit-labelled flows are excluded. Thus an

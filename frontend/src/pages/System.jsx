@@ -8,6 +8,13 @@ function formatUptime(secs) {
   return `${h}h ${m}m ${s}s`
 }
 
+function formatMegabytes(value) {
+  const mb = Number(value || 0)
+  if (mb >= 1024 * 1024) return `${(mb / 1024 / 1024).toFixed(1)} TB`
+  if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`
+  return `${mb.toFixed(0)} MB`
+}
+
 function barColor(percent) {
   if (percent >= 85) return 'bg-red-500'
   if (percent >= 70) return 'bg-yellow-500'
@@ -149,12 +156,12 @@ export default function System() {
         <PercentBar
           label="RAM"
           percent={stats.ram.usage_percent}
-          detail={`${stats.ram.used_mb.toFixed(0)} / ${stats.ram.total_mb.toFixed(0)} MB (${stats.ram.available_mb.toFixed(0)} MB available)`}
+          detail={`${formatMegabytes(stats.ram.used_mb)} / ${formatMegabytes(stats.ram.total_mb)} (${formatMegabytes(stats.ram.available_mb)} available)`}
         />
         <PercentBar
           label="Disk"
           percent={stats.disk.usage_percent}
-          detail={`${stats.disk.used_mb.toFixed(0)} / ${stats.disk.total_mb.toFixed(0)} MB (${stats.disk.available_mb.toFixed(0)} MB free)`}
+          detail={`${formatMegabytes(stats.disk.used_mb)} / ${formatMegabytes(stats.disk.total_mb)} (${formatMegabytes(stats.disk.available_mb)} free in data filesystem)`}
         />
       </div>
 
@@ -195,7 +202,7 @@ export default function System() {
 
       {stats.redis_mem_mb == null && (
         <div className="bg-gray-900 border border-gray-800 rounded-lg p-3 text-xs text-gray-500">
-          Redis is unavailable — stats not shown
+          Redis cache is disabled — optional for the default in-process rules engine
         </div>
       )}
     </div>

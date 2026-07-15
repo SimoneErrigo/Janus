@@ -114,8 +114,12 @@ func main() {
 		cfg.RoundDurationSec, competitionStart, cfg.KeepRounds,
 	)
 	packetStore.SetRoundResolver(flagIDPoller.RoundForTime)
+	serviceBaselineRanges := make(map[string]scoring.BaselineRange, len(cfg.BaselineServiceRounds))
+	for serviceID, rounds := range cfg.BaselineServiceRounds {
+		serviceBaselineRanges[serviceID] = scoring.BaselineRange{StartRound: rounds.StartRound, EndRound: rounds.EndRound}
+	}
 	baselineConfig := scoring.NewBaselineConfig(
-		competitionStart, cfg.RoundDurationSec, cfg.BaselineStartRound, cfg.BaselineEndRound,
+		competitionStart, cfg.RoundDurationSec, cfg.BaselineStartRound, cfg.BaselineEndRound, serviceBaselineRanges,
 	)
 	scoreEngine := scoring.New(packetStore, baselineConfig)
 	defer scoreEngine.Close()

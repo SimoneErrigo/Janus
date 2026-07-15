@@ -27,7 +27,7 @@ KEEP_ROUNDS=5
 | `FLAGID_ENABLED` | Enables polling in `live` traffic mode. |
 | `FLAGID_API_URL` | Scoreboard endpoint returning the selected JSON shape. |
 | `OUR_TEAM_ID` | Team identifier. Interpretation depends on the format. |
-| `FLAGID_FORMAT` | `cyberchallenge`, `saarctf`, `faustctf`, or `forcad`. |
+| `FLAGID_FORMAT` | `cyberchallenge`, `saarctf`, `faustctf`, `forcad`, or `enowars`. |
 | `FLAGID_POLL_INTERVAL` | Normal fetch interval in seconds. |
 | `ROUND_DURATION` | Scoreboard round length in seconds. Defaults to 120 when unset. |
 | `COMPETITION_START` | Optional RFC3339 start time used to calculate the current round. |
@@ -49,10 +49,13 @@ fetch. The API route list is in [API.md](API.md).
 - For round-aware formats, the matcher contains the latest `KEEP_ROUNDS`.
   Each Flag ID hit keeps its source round so Round Diff and Traffic can retain
   useful round information.
+- Fetch/parse errors and incomplete ENOWARS responses keep the last valid
+  matcher active. Repeated failures back off up to one minute and remain
+  visible through `last_error` instead of flooding the runtime log.
 
-Except for ForcAD, Janus appends `?team=<OUR_TEAM_ID>` (or `&team=...`) to the
-configured endpoint. Make the endpoint accept that query parameter or return
-the local team's data after applying it.
+Except for ForcAD and ENOWARS, Janus appends `?team=<OUR_TEAM_ID>` (or
+`&team=...`) to the configured endpoint. Make the endpoint accept that query
+parameter or return the local team's data after applying it.
 
 ## Supported formats
 
@@ -180,6 +183,49 @@ Values have no embedded round and are assigned to the computed current round
 values to their leaves, and splits `label: value` pairs into the bare value and
 useful URL/JSON forms. This makes identifiers match when services send them as
 request fields rather than in the scoreboard's display format.
+
+### ENOWARS (`enowars`)
+
+ENOWARS Attack Info responses contain all teams and retain round numbers in
+the payload. Janus selects the local team client-side and does not append a
+`team` query parameter.
+
+For ENOWARS 10, configure:
+
+```dotenv
+FLAGID_API_URL=https://10.enowars.com/scoreboard/attack.json
+FLAGID_FORMAT=enowars
+OUR_TEAM_ID=52
+```
+
+```json
+{
+  "availableTeams": ["10.1.52.1"],
+  "services": {
+    "service_1": {
+      "10.1.52.1": {
+        "7": [["user73"], ["user5"]],
+        "8": [["user96"], ["user314"]]
+      }
+    }
+  }
+}
+```
+
+Shape:
+
+```text
+services -> service -> team IP -> round -> nested Flag ID values
+```
+
+Set `OUR_TEAM_ID` to the full IP (`10.1.52.1`) or the team number (`52`) used
+by the standard `10.1.<team>.1` address. Nested arrays and objects are flattened
+to their usable leaf values, including JSON serialized inside a string, with
+duplicates removed within each service and round. Five-character values such
+as `user5` are accepted only on word boundaries to avoid substring matches;
+shorter generic values are ignored. Partial service responses are merged with
+the retained rounds, while a missing team or stale response leaves the last
+valid snapshot untouched.
 
 ## Troubleshooting
 

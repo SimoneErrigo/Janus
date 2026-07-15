@@ -52,9 +52,11 @@ func NewManager(packetStore *sniffer.PacketStore, maxAgeMins, maxDBSizeMB int) *
 }
 
 const (
-	cleanupInterval  = 15 * time.Second
-	cleanupBatchSize = 500
-	maxBatchesPerRun = 4
+	cleanupInterval   = 15 * time.Second
+	cleanupBatchSize  = 500
+	cleanupRunBudget  = 1500 * time.Millisecond
+	maxCleanupBatches = 128
+	cleanupYield      = 3 * time.Millisecond
 )
 
 // Start launches the background cleanup goroutine. Cleanup is frequent and
@@ -266,6 +268,7 @@ func (m *Manager) run() Result {
 func (m *Manager) runLocked() Result {
 	start := time.Now()
 	var totalPkts, totalAlerts int64
+	batches := 0
 
 	m.mu.RLock()
 	maxAge := m.maxAgeMins
@@ -275,8 +278,9 @@ func (m *Manager) runLocked() Result {
 	// Policy 1: age-based cleanup
 	if maxAge > 0 {
 		cutoff := time.Now().Add(-time.Duration(maxAge) * time.Minute)
-		for batch := 0; batch < maxBatchesPerRun; batch++ {
+		for cleanupBudgetAvailable(start, batches) {
 			pkts, alerts, err := m.packetStore.DeleteOlderThanBatch(cutoff, cleanupBatchSize)
+			batches++
 			if err != nil {
 				log.Printf("Cleanup error (age policy): %v", err)
 				return Result{PacketsDeleted: totalPkts, AlertsDeleted: totalAlerts, Error: err.Error()}
@@ -286,7 +290,7 @@ func (m *Manager) runLocked() Result {
 			if pkts < cleanupBatchSize {
 				break
 			}
-			time.Sleep(2 * time.Millisecond)
+			time.Sleep(cleanupYield)
 		}
 	}
 
@@ -295,15 +299,18 @@ func (m *Manager) runLocked() Result {
 		maxBytes := int64(maxSize) * 1024 * 1024
 		// Aim below the threshold so cleanup does not oscillate on every insert.
 		targetBytes := maxBytes * 9 / 10
-		for batch := 0; batch < maxBatchesPerRun; batch++ {
+		sizeBatches := 0
+		for cleanupBudgetAvailable(start, batches) {
 			usedBytes, err := m.packetStore.DBUsedSize()
 			if err != nil {
 				return Result{PacketsDeleted: totalPkts, AlertsDeleted: totalAlerts, Error: err.Error()}
 			}
-			if usedBytes <= targetBytes || (batch == 0 && usedBytes <= maxBytes) {
+			if usedBytes <= targetBytes || (sizeBatches == 0 && usedBytes <= maxBytes) {
 				break
 			}
 			pkts, alerts, err := m.packetStore.DeleteOldestBatch(cleanupBatchSize)
+			batches++
+			sizeBatches++
 			if err != nil {
 				log.Printf("Cleanup error (size policy): %v", err)
 				return Result{PacketsDeleted: totalPkts, AlertsDeleted: totalAlerts, Error: err.Error()}
@@ -313,7 +320,7 @@ func (m *Manager) runLocked() Result {
 			if pkts == 0 {
 				break
 			}
-			time.Sleep(2 * time.Millisecond)
+			time.Sleep(cleanupYield)
 		}
 	}
 
@@ -337,4 +344,8 @@ func (m *Manager) runLocked() Result {
 		DBSizeMB:       dbSize,
 		DBUsedMB:       dbUsed,
 	}
+}
+
+func cleanupBudgetAvailable(start time.Time, batches int) bool {
+	return batches < maxCleanupBatches && (batches == 0 || time.Since(start) < cleanupRunBudget)
 }

@@ -10,6 +10,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/appdecode"
@@ -20,7 +21,49 @@ import (
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
 
-const maxTCPCapture = 1 << 20 // 1 MB per direction per connection
+const (
+	maxTCPCapture               = 1 << 20 // 1 MB per direction per connection
+	maxTCPConnectionsPerService = 1024
+	tcpIdleTimeout              = 2 * time.Minute
+	tcpIdleCheckInterval        = 10 * time.Second
+)
+
+type tcpActivity struct{ last atomic.Int64 }
+
+func newTCPActivity() *tcpActivity {
+	activity := &tcpActivity{}
+	activity.touch()
+	return activity
+}
+
+func (a *tcpActivity) touch() { a.last.Store(time.Now().UnixNano()) }
+
+func (a *tcpActivity) idleFor(now time.Time) time.Duration {
+	return now.Sub(time.Unix(0, a.last.Load()))
+}
+
+type activeConn struct {
+	net.Conn
+	activity *tcpActivity
+}
+
+func (c *activeConn) Read(buffer []byte) (int, error) {
+	c.activity.touch()
+	n, err := c.Conn.Read(buffer)
+	if n > 0 {
+		c.activity.touch()
+	}
+	return n, err
+}
+
+func (c *activeConn) Write(buffer []byte) (int, error) {
+	c.activity.touch()
+	n, err := c.Conn.Write(buffer)
+	if n > 0 {
+		c.activity.touch()
+	}
+	return n, err
+}
 
 func (m *Manager) startTCPProxy(ctx context.Context, cancel context.CancelFunc, svc *storage.Service) (*runningProxy, error) {
 	spec := svc.RuntimeSpec()
@@ -47,6 +90,8 @@ func (m *Manager) startTCPProxy(ctx context.Context, cancel context.CancelFunc, 
 		listener: listener,
 		cancel:   cancel,
 	}
+	connections := make(chan struct{}, maxTCPConnectionsPerService)
+	var rejected atomic.Uint64
 
 	go func() {
 		for {
@@ -60,7 +105,18 @@ func (m *Manager) startTCPProxy(ctx context.Context, cancel context.CancelFunc, 
 					continue
 				}
 			}
-			go m.handleTCPConn(ctx, svc, conn)
+			select {
+			case connections <- struct{}{}:
+				go func() {
+					defer func() { <-connections }()
+					m.handleTCPConn(ctx, svc, conn)
+				}()
+			default:
+				_ = conn.Close()
+				if count := rejected.Add(1); count == 1 || count%256 == 0 {
+					log.Printf("[%s] TCP connection limit reached (%d active, %d rejected)", svc.Name, cap(connections), count)
+				}
+			}
 		}
 	}()
 
@@ -101,6 +157,9 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 		return
 	}
 	defer backendConn.Close()
+	activity := newTCPActivity()
+	clientIO := &activeConn{Conn: clientConn, activity: activity}
+	backendIO := &activeConn{Conn: backendConn, activity: activity}
 
 	// closeBoth tears down both connections immediately. Used for drop rules,
 	// ctx cancellation, and when the response side finishes.
@@ -124,12 +183,12 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	requestFrames, err := framing.NewReader(clientConn, spec.Framing)
+	requestFrames, err := framing.NewReader(clientIO, spec.Framing)
 	if err != nil {
 		log.Printf("[%s] TCP request framing error: %v", svc.Name, err)
 		return
 	}
-	responseFrames, err := framing.NewReader(backendConn, spec.Framing)
+	responseFrames, err := framing.NewReader(backendIO, spec.Framing)
 	if err != nil {
 		log.Printf("[%s] TCP response framing error: %v", svc.Name, err)
 		return
@@ -140,7 +199,7 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 	// down both sides, so the response goroutine can drain any late data.
 	go func() {
 		defer wg.Done()
-		m.sniffCopyWithRules(backendConn, requestFrames, svc, sessionID, srcIP, srcPort, dstIP, dstPort, sniffer.DirectionRequest, closeBoth)
+		m.sniffCopyWithRules(backendIO, requestFrames, svc, sessionID, srcIP, srcPort, dstIP, dstPort, sniffer.DirectionRequest, closeBoth)
 		// Request side is done (natural EOF, write error, or drop).
 		// Half-close the write side so the backend knows the client is done,
 		// then arm a linger deadline so the response goroutine drains any
@@ -158,7 +217,7 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 	go func() {
 		defer wg.Done()
 		defer closeBoth()
-		m.sniffCopyWithRules(clientConn, responseFrames, svc, sessionID, dstIP, dstPort, srcIP, srcPort, sniffer.DirectionResponse, closeBoth)
+		m.sniffCopyWithRules(clientIO, responseFrames, svc, sessionID, dstIP, dstPort, srcIP, srcPort, sniffer.DirectionResponse, closeBoth)
 	}()
 
 	done := make(chan struct{})
@@ -167,10 +226,21 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 		close(done)
 	}()
 
-	select {
-	case <-done:
-	case <-ctx.Done():
-		closeBoth()
+	idleTicker := time.NewTicker(tcpIdleCheckInterval)
+	defer idleTicker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			closeBoth()
+			return
+		case now := <-idleTicker.C:
+			if activity.idleFor(now) >= tcpIdleTimeout {
+				log.Printf("[%s] TCP idle timeout: closing connection", svc.Name)
+				closeBoth()
+			}
+		}
 	}
 }
 

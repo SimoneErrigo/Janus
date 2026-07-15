@@ -20,8 +20,23 @@ const GENERAL_CONFIG_FIELDS = [
 const FLAGID_CONFIG_FIELDS = [
   'flagid_enabled', 'flagid_api_url', 'flagid_team_id', 'flagid_poll_interval',
   'flagid_format', 'round_duration_seconds', 'competition_start', 'keep_rounds',
-  'baseline_start_round', 'baseline_end_round',
+  'baseline_start_round', 'baseline_end_round', 'baseline_service_rounds',
 ]
+
+function baselineOverridesForAPI(ranges) {
+  const normalized = {}
+  for (const serviceID of Object.keys(ranges || {}).sort()) {
+    normalized[serviceID] = {
+      start_round: parseInt(ranges[serviceID]?.start_round, 10) || 0,
+      end_round: parseInt(ranges[serviceID]?.end_round, 10) || 0,
+    }
+  }
+  return normalized
+}
+
+function sameBaselineOverrides(left, right) {
+  return JSON.stringify(baselineOverridesForAPI(left)) === JSON.stringify(baselineOverridesForAPI(right))
+}
 
 function mergeConfigFields(current, server, fields) {
   const merged = { ...current }
@@ -45,6 +60,7 @@ export default function Config() {
 	const baselineDirty = config != null && (
 		Number(form.baseline_start_round ?? 1) !== Number(config.baseline_start_round ?? 1) ||
 		Number(form.baseline_end_round ?? 5) !== Number(config.baseline_end_round ?? 5) ||
+		!sameBaselineOverrides(form.baseline_service_rounds, config.baseline_service_rounds) ||
 		Number(form.round_duration_seconds ?? 120) !== Number(config.round_duration_seconds ?? 120) ||
 		String(form.competition_start || '') !== String(config.competition_start || '')
 	)
@@ -243,6 +259,56 @@ export default function Config() {
     setSaved(false)
   }
 
+  function toggleServiceBaseline(serviceID, enabled) {
+    setForm((current) => {
+      const ranges = { ...(current.baseline_service_rounds || {}) }
+      if (enabled) {
+        ranges[serviceID] = {
+          start_round: parseInt(current.baseline_start_round, 10) || 1,
+          end_round: parseInt(current.baseline_end_round, 10) || 5,
+        }
+      } else {
+        delete ranges[serviceID]
+      }
+      return { ...current, baseline_service_rounds: ranges }
+    })
+    setFlagIDSaved(false)
+  }
+
+  function setServiceBaselineRound(serviceID, field, value) {
+    setForm((current) => ({
+      ...current,
+      baseline_service_rounds: {
+        ...(current.baseline_service_rounds || {}),
+        [serviceID]: { ...(current.baseline_service_rounds?.[serviceID] || {}), [field]: value },
+      },
+    }))
+    setFlagIDSaved(false)
+  }
+
+  const baselineServices = (() => {
+    const byID = new Map((services || []).map((service) => [service.id, service]))
+    for (const serviceID of Object.keys(form.baseline_service_rounds || {})) {
+      if (!byID.has(serviceID)) byID.set(serviceID, { id: serviceID, name: serviceID, missing: true })
+    }
+    return Array.from(byID.values()).sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)))
+  })()
+
+  const savedBaselines = (scoringStatus?.snapshots || []).filter((snapshot) => (
+    !snapshot.active && snapshot.compatible && snapshot.signature_count > 0
+  ))
+
+  function restoreBaselineSnapshot(snapshot) {
+    setForm((current) => ({
+      ...current,
+      baseline_start_round: snapshot.baseline_start_round,
+      baseline_end_round: snapshot.baseline_end_round,
+      baseline_service_rounds: baselineOverridesForAPI(snapshot.baseline_service_rounds),
+    }))
+    setFlagIDError('')
+    setFlagIDSaved(false)
+  }
+
   async function handleSave(e) {
     e.preventDefault()
     setError('')
@@ -280,6 +346,7 @@ export default function Config() {
         keep_rounds: parseInt(form.keep_rounds, 10) || 5,
         baseline_start_round: parseInt(form.baseline_start_round, 10) || 1,
         baseline_end_round: parseInt(form.baseline_end_round, 10) || 5,
+        baseline_service_rounds: baselineOverridesForAPI(form.baseline_service_rounds),
       })
       const next = configForForm(data)
       setConfig(next)
@@ -532,6 +599,8 @@ export default function Config() {
               className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm font-mono focus:outline-none focus:border-cyan-500 transition-colors"
               placeholder={form.flagid_format === 'forcad'
                 ? 'e.g. http://10.0.0.1/api/client/attack_data/'
+                : form.flagid_format === 'enowars'
+                  ? 'e.g. https://10.enowars.com/scoreboard/attack.json'
                 : 'e.g. http://10.10.0.1:8080/api/flagids'}
             />
             <p className="text-xs text-gray-600 mt-1">URL of the competition flag ID API endpoint</p>
@@ -551,6 +620,12 @@ export default function Config() {
                   ForcAD: team number (e.g. <span className="font-mono">3</span>) or full IP
                   (e.g. <span className="font-mono">10.0.0.3</span>). Janus auto-resolves
                   the matching IP key in the response.
+                </p>
+              )}
+              {form.flagid_format === 'enowars' && (
+                <p className="text-xs text-gray-600 mt-1">
+                  ENOWARS: full team IP (e.g. <span className="font-mono">10.1.52.1</span>)
+                  {' '}or team number (e.g. <span className="font-mono">52</span>).
                 </p>
               )}
             </div>
@@ -577,6 +652,7 @@ export default function Config() {
               <option value="saarctf">saarCTF</option>
               <option value="faustctf">FaustCTF</option>
               <option value="forcad">ForcAD</option>
+              <option value="enowars">ENOWARS</option>
             </select>
             <p className="text-xs text-gray-600 mt-1">Response format of the flag ID API</p>
           </div>
@@ -622,12 +698,12 @@ export default function Config() {
             <div>
               <h4 className="text-sm font-medium text-gray-300">Static checker baseline</h4>
               <p className="text-xs text-gray-500 mt-1">
-                Janus trusts a clean fingerprint only when it repeats in every selected round. The selected range defines the opening baseline window.
+                Janus trusts a clean fingerprint only when it repeats in every selected round. Services use the default range unless you give them an override.
               </p>
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label htmlFor="baseline-start-round" className="block text-sm text-gray-400 mb-1">First round</label>
+                <label htmlFor="baseline-start-round" className="block text-sm text-gray-400 mb-1">Default first round</label>
                 <input
                   id="baseline-start-round"
                   type="number"
@@ -639,7 +715,7 @@ export default function Config() {
                 />
               </div>
               <div>
-                <label htmlFor="baseline-end-round" className="block text-sm text-gray-400 mb-1">Last round</label>
+                <label htmlFor="baseline-end-round" className="block text-sm text-gray-400 mb-1">Default last round</label>
                 <input
                   id="baseline-end-round"
                   type="number"
@@ -651,6 +727,89 @@ export default function Config() {
                 />
               </div>
             </div>
+            {savedBaselines.length > 0 && (
+              <div className="space-y-2">
+                <div>
+                  <div className="text-xs font-medium text-gray-400">Saved baselines</div>
+                  <p className="mt-0.5 text-[11px] text-gray-600">Fingerprint snapshots survive packet cleanup. Restore their ranges and save to reactivate them.</p>
+                </div>
+                {savedBaselines.map((snapshot) => {
+                  const overrides = Object.entries(snapshot.baseline_service_rounds || {})
+                    .sort(([left], [right]) => left.localeCompare(right))
+                    .map(([serviceID, rounds]) => `${serviceID} r${rounds.start_round}–${rounds.end_round}`)
+                  return (
+                    <div key={snapshot.epoch} className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded border border-emerald-950 bg-emerald-950/10 px-3 py-2 text-xs">
+                      <span className="font-medium text-gray-300">Default r{snapshot.baseline_start_round}–{snapshot.baseline_end_round}</span>
+                      {overrides.length > 0 && <span className="font-mono text-[10px] text-gray-500">{overrides.join(' · ')}</span>}
+                      <span className="text-gray-600">{snapshot.signature_count} fingerprints</span>
+                      <button
+                        type="button"
+                        onClick={() => restoreBaselineSnapshot(snapshot)}
+                        className="ml-auto rounded border border-emerald-900/70 bg-emerald-950/30 px-2.5 py-1 text-emerald-400 hover:bg-emerald-950/60"
+                      >
+                        Restore ranges
+                      </button>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+            {baselineServices.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-xs font-medium text-gray-400">Service ranges</div>
+                {baselineServices.map((service) => {
+                  const override = form.baseline_service_rounds?.[service.id]
+                  return (
+                    <div key={service.id} className="grid gap-2 rounded border border-gray-800 bg-gray-950/40 px-3 py-2 sm:grid-cols-[minmax(0,1fr)_8rem_8rem_auto] sm:items-end">
+                      <div className="min-w-0 self-center">
+                        <div className="truncate text-sm text-gray-300" title={service.id}>{service.name || service.id}</div>
+                        <div className="truncate font-mono text-[10px] text-gray-600">{service.id}{service.missing ? ' · service not configured' : ''}</div>
+                      </div>
+                      {override ? (
+                        <>
+                          <label className="text-[10px] text-gray-500">
+                            First round
+                            <input
+                              type="number"
+                              min="1"
+                              max="9999"
+                              required
+                              value={override.start_round}
+                              onChange={(e) => setServiceBaselineRound(service.id, 'start_round', e.target.value)}
+                              className="mt-1 w-full rounded border border-gray-700 bg-gray-800 px-2 py-1.5 text-sm text-gray-100 focus:border-cyan-500 focus:outline-none"
+                            />
+                          </label>
+                          <label className="text-[10px] text-gray-500">
+                            Last round
+                            <input
+                              type="number"
+                              min="2"
+                              max="10000"
+                              required
+                              value={override.end_round}
+                              onChange={(e) => setServiceBaselineRound(service.id, 'end_round', e.target.value)}
+                              className="mt-1 w-full rounded border border-gray-700 bg-gray-800 px-2 py-1.5 text-sm text-gray-100 focus:border-cyan-500 focus:outline-none"
+                            />
+                          </label>
+                          <button type="button" onClick={() => toggleServiceBaseline(service.id, false)} className="rounded border border-gray-700 bg-gray-800 px-2.5 py-1.5 text-xs text-gray-400 hover:text-gray-200">
+                            Use default
+                          </button>
+                        </>
+                      ) : (
+                        <div className="sm:col-span-2 self-center text-xs text-gray-600">
+                          Default r{form.baseline_start_round || 1}–{form.baseline_end_round || 5}
+                        </div>
+                      )}
+                      {!override && (
+                        <button type="button" onClick={() => toggleServiceBaseline(service.id, true)} className="rounded border border-cyan-900/70 bg-cyan-950/20 px-2.5 py-1.5 text-xs text-cyan-400 hover:bg-cyan-950/40">
+                          Customize
+                        </button>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
             <div className="rounded border border-amber-900/60 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/80">
               A distinct exploit fingerprint seen in only one round remains a candidate and is never trusted. Static checks also exclude rule matches, suspicious payloads, request flags, truncated captures and flows labeled <span className="font-mono">exploit</span>. An exploit structurally identical to recurring checker traffic, or the same safe-looking exploit repeated in every selected round, cannot be distinguished with certainty without external ground truth.
             </div>
@@ -664,10 +823,13 @@ export default function Config() {
                 {baselineRebuilding || scoringStatus?.rebuilding ? 'Rebuilding…' : 'Rebuild from captured traffic'}
               </button>
               <span className="text-gray-500">
-                {baselineDirty ? 'Save competition timing and the round range before rebuilding.' : 'Use after labeling a contaminated flow as exploit.'}
+                {baselineDirty ? 'Save competition timing and baseline ranges before rebuilding.' : 'Use after labeling a contaminated flow as exploit.'}
                 {Number.isFinite(scoringStatus?.replayed_packets) && ` Last replay: ${scoringStatus.replayed_packets} packets.`}
               </span>
             </div>
+            <p className="text-[11px] text-gray-600">
+              Rebuild is transactional: if retained safe traffic does not cover the selected rounds, the persisted snapshot remains active.
+            </p>
             {(scoringStatus?.last_error || scoringStatus?.store_errors > 0 || scoringStatus?.queue_dropped > 0) && (
               <div role="alert" className="rounded border border-red-900/60 bg-red-950/20 px-3 py-2 text-xs text-red-300">
                 {scoringStatus.last_error && <span>{scoringStatus.last_error}. </span>}
@@ -679,10 +841,11 @@ export default function Config() {
               <div className="space-y-1 text-xs">
                 {(scoringStatus.services || []).map((status) => {
                   const observed = status.rounds_observed?.length || 0
-                  const required = scoringStatus.baseline_required_rounds || 5
+                  const required = status.baseline_required_rounds || scoringStatus.baseline_required_rounds || 5
                   return (
                     <div key={status.service_id} className="flex flex-wrap gap-x-2 rounded border border-gray-800 bg-gray-950/40 px-2.5 py-1.5 text-gray-400">
                       <span className="font-mono text-gray-300">{status.service_id}</span>
+                      <span>r{status.baseline_start_round || scoringStatus.baseline_start_round || 1}–{status.baseline_end_round || scoringStatus.baseline_end_round || 5}</span>
                       <span>rounds {observed}/{required}</span>
                       <span className={status.trusted_signatures > 0 ? 'text-emerald-400' : 'text-gray-500'}>{status.trusted_signatures || 0} trusted</span>
                       <span>{status.candidate_signatures || 0} candidates</span>

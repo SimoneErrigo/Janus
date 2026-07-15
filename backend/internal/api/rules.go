@@ -117,9 +117,9 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Default action to drop if not specified
+	// New rules start in observe mode; blocking requires an explicit choice.
 	if rule.Action == "" {
-		rule.Action = dropper.ActionDrop
+		rule.Action = dropper.ActionAlert
 	}
 
 	if err := validateRule(&rule); err != nil {
@@ -171,15 +171,20 @@ func (s *Server) updateRule(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	rule.ID = id
+	existingRule, exists := s.ruleStore.GetRule(id)
+	if !exists {
+		http.Error(w, "rule not found", http.StatusNotFound)
+		return
+	}
 
 	// Flag rules must always remain action=alert
 	if rule.IsFlagRule() && rule.Action != dropper.ActionAlert {
 		rule.Action = dropper.ActionAlert
 	}
 
-	// Default action to drop if not specified
+	// Partial/older API clients must not silently change an existing verdict.
 	if rule.Action == "" {
-		rule.Action = dropper.ActionDrop
+		rule.Action = existingRule.Action
 	}
 
 	if err := validateRule(&rule); err != nil {

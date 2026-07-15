@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -310,9 +311,34 @@ func migrate(db *sql.DB) error {
 	);
 	CREATE TABLE IF NOT EXISTS baseline_meta (
 		key TEXT PRIMARY KEY, value TEXT NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS baseline_snapshot_meta (
+		epoch TEXT PRIMARY KEY,
+		definition TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS baseline_snapshot_signatures (
+		epoch TEXT NOT NULL,
+		service_id TEXT NOT NULL,
+		signature TEXT NOT NULL,
+		rounds TEXT NOT NULL DEFAULT '[]',
+		PRIMARY KEY(epoch, service_id, signature)
 	)`)
 	if err != nil {
 		return err
+	}
+	// Preserve the legacy single active baseline as the first versioned
+	// snapshot. The INSERTs are idempotent and make upgrades crash-safe.
+	now := CanonicalTimestamp(time.Now())
+	if _, err := db.Exec(`INSERT OR IGNORE INTO baseline_snapshot_meta(epoch, definition, created_at, updated_at)
+		SELECT value, '', ?, ? FROM baseline_meta WHERE key = 'epoch'`, now, now); err != nil {
+		return fmt.Errorf("migrating baseline snapshot metadata: %w", err)
+	}
+	if _, err := db.Exec(`INSERT OR IGNORE INTO baseline_snapshot_signatures(epoch, service_id, signature, rounds)
+		SELECT m.value, s.service_id, s.signature, s.rounds
+		FROM baseline_signatures s CROSS JOIN baseline_meta m WHERE m.key = 'epoch'`); err != nil {
+		return fmt.Errorf("migrating baseline snapshot signatures: %w", err)
 	}
 
 	// Backfill existing rows once after migration.
@@ -924,17 +950,15 @@ func (s *PacketStore) LoadBaselineSignatures() ([]BaselineSignature, error) {
 	return out, rows.Err()
 }
 
-// CountBaselinePackets preflights a rebuild before the active baseline is
-// cleared, so an oversized window cannot leave the previous policy half-reset.
-func (s *PacketStore) CountBaselinePackets(from, to time.Time) (int, error) {
-	if from.IsZero() || to.IsZero() || !to.After(from) {
+// CountBaselinePackets preflights the exact default and service-specific
+// windows before the active baseline is cleared.
+func (s *PacketStore) CountBaselinePackets(defaultWindow BaselineWindow, serviceWindows map[string]BaselineWindow) (int, error) {
+	where, args := baselineSelection(defaultWindow, serviceWindows)
+	if where == "" {
 		return 0, nil
 	}
 	var total int
-	if err := s.rdb.QueryRow(
-		"SELECT COUNT(*) FROM packets WHERE timestamp >= ? AND timestamp < ?",
-		CanonicalTimestamp(from), CanonicalTimestamp(to),
-	).Scan(&total); err != nil {
+	if err := s.rdb.QueryRow("SELECT COUNT(*) FROM packets WHERE "+where, args...).Scan(&total); err != nil {
 		return 0, fmt.Errorf("counting baseline replay: %w", err)
 	}
 	return total, nil
@@ -943,16 +967,16 @@ func (s *PacketStore) CountBaselinePackets(from, to time.Time) (int, error) {
 // ReplayBaselinePackets streams a bounded, chronological replay window in
 // small batches. This avoids retaining thousands of captured bodies when the
 // operator changes baseline rounds after traffic has already been captured.
-func (s *PacketStore) ReplayBaselinePackets(from, to time.Time, limit int, visit func(*Packet) error) (int, error) {
-	if from.IsZero() || to.IsZero() || !to.After(from) {
+func (s *PacketStore) ReplayBaselinePackets(defaultWindow BaselineWindow, serviceWindows map[string]BaselineWindow, limit int, visit func(*Packet) error) (int, error) {
+	selection, selectionArgs := baselineSelection(defaultWindow, serviceWindows)
+	if selection == "" {
 		return 0, nil
 	}
 	if limit <= 0 || visit == nil {
 		return 0, fmt.Errorf("baseline replay requires a positive limit and visitor")
 	}
 	const batchSize = 128
-	fromText, toText := CanonicalTimestamp(from), CanonicalTimestamp(to)
-	total, err := s.CountBaselinePackets(from, to)
+	total, err := s.CountBaselinePackets(defaultWindow, serviceWindows)
 	if err != nil {
 		return 0, err
 	}
@@ -967,8 +991,8 @@ func (s *PacketStore) ReplayBaselinePackets(from, to time.Time, limit int, visit
 		if remaining := limit - count + 1; remaining < fetch {
 			fetch = remaining
 		}
-		where := "timestamp >= ? AND timestamp < ?"
-		args := []interface{}{fromText, toText}
+		where := "(" + selection + ")"
+		args := append(make([]interface{}, 0, len(selectionArgs)+4), selectionArgs...)
 		if cursorTS != "" {
 			where += " AND (timestamp > ? OR (timestamp = ? AND id > ?))"
 			args = append(args, cursorTS, cursorTS, cursorID)
@@ -998,9 +1022,47 @@ func (s *PacketStore) ReplayBaselinePackets(from, to time.Time, limit int, visit
 	}
 }
 
-// PrepareBaseline resets signatures when a different competition start is
-// configured, preventing an old event from influencing the current one.
-func (s *PacketStore) PrepareBaseline(epoch string) error {
+func baselineSelection(defaultWindow BaselineWindow, serviceWindows map[string]BaselineWindow) (string, []interface{}) {
+	serviceIDs := make([]string, 0, len(serviceWindows))
+	for serviceID, window := range serviceWindows {
+		if serviceID != "" && validBaselineWindow(window) {
+			serviceIDs = append(serviceIDs, serviceID)
+		}
+	}
+	sort.Strings(serviceIDs)
+
+	clauses := make([]string, 0, len(serviceIDs)+1)
+	args := make([]interface{}, 0, 2+len(serviceIDs)*3)
+	if validBaselineWindow(defaultWindow) {
+		clause := "(timestamp >= ? AND timestamp < ?"
+		args = append(args, CanonicalTimestamp(defaultWindow.From), CanonicalTimestamp(defaultWindow.To))
+		if len(serviceIDs) > 0 {
+			clause += " AND service_id NOT IN (" + strings.TrimSuffix(strings.Repeat("?,", len(serviceIDs)), ",") + ")"
+			for _, serviceID := range serviceIDs {
+				args = append(args, serviceID)
+			}
+		}
+		clauses = append(clauses, clause+")")
+	}
+	for _, serviceID := range serviceIDs {
+		window := serviceWindows[serviceID]
+		clauses = append(clauses, "(service_id = ? AND timestamp >= ? AND timestamp < ?)")
+		args = append(args, serviceID, CanonicalTimestamp(window.From), CanonicalTimestamp(window.To))
+	}
+	return strings.Join(clauses, " OR "), args
+}
+
+func validBaselineWindow(window BaselineWindow) bool {
+	return !window.From.IsZero() && !window.To.IsZero() && window.To.After(window.From)
+}
+
+// PrepareBaseline activates a versioned snapshot. Switching configurations
+// restores its signatures instead of deleting the previously active set.
+func (s *PacketStore) PrepareBaseline(epoch, definition string) error {
+	epoch = strings.TrimSpace(epoch)
+	if epoch == "" {
+		return fmt.Errorf("baseline epoch is empty")
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -1011,29 +1073,20 @@ func (s *PacketStore) PrepareBaseline(epoch string) error {
 	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("reading baseline epoch: %w", err)
 	}
+	now := CanonicalTimestamp(time.Now())
+	if _, err := tx.Exec(`INSERT INTO baseline_snapshot_meta(epoch, definition, created_at, updated_at)
+		VALUES(?, ?, ?, ?)
+		ON CONFLICT(epoch) DO UPDATE SET definition = excluded.definition`, epoch, definition, now, now); err != nil {
+		return fmt.Errorf("saving baseline snapshot metadata: %w", err)
+	}
 	if err == sql.ErrNoRows || stored != epoch {
 		if _, err := tx.Exec(`DELETE FROM baseline_signatures`); err != nil {
-			return fmt.Errorf("resetting baseline: %w", err)
+			return fmt.Errorf("switching baseline: %w", err)
 		}
-		if _, err := tx.Exec(`INSERT INTO baseline_meta(key, value) VALUES('epoch', ?)
-			ON CONFLICT(key) DO UPDATE SET value = excluded.value`, epoch); err != nil {
-			return fmt.Errorf("saving baseline epoch: %w", err)
+		if _, err := tx.Exec(`INSERT INTO baseline_signatures(service_id, signature, rounds)
+			SELECT service_id, signature, rounds FROM baseline_snapshot_signatures WHERE epoch = ?`, epoch); err != nil {
+			return fmt.Errorf("restoring baseline snapshot: %w", err)
 		}
-	}
-	return tx.Commit()
-}
-
-// ClearBaseline force-resets candidates while keeping the current epoch. It
-// is used after the operator labels a contaminated flow and requests a
-// deterministic rebuild from retained packets.
-func (s *PacketStore) ClearBaseline(epoch string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`DELETE FROM baseline_signatures`); err != nil {
-		return fmt.Errorf("clearing baseline: %w", err)
 	}
 	if _, err := tx.Exec(`INSERT INTO baseline_meta(key, value) VALUES('epoch', ?)
 		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, epoch); err != nil {
@@ -1049,21 +1102,51 @@ func (s *PacketStore) UpsertBaselineSignature(serviceID, signature string, round
 	if err != nil {
 		return fmt.Errorf("encoding baseline rounds: %w", err)
 	}
-	_, err = s.db.Exec(`INSERT INTO baseline_signatures(service_id, signature, rounds) VALUES(?, ?, ?)
-		ON CONFLICT(service_id, signature) DO UPDATE SET rounds = excluded.rounds`, serviceID, signature, string(encoded))
+	tx, err := s.db.Begin()
 	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	epoch, err := activeBaselineEpoch(tx)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO baseline_signatures(service_id, signature, rounds) VALUES(?, ?, ?)
+		ON CONFLICT(service_id, signature) DO UPDATE SET rounds = excluded.rounds`, serviceID, signature, string(encoded)); err != nil {
 		return fmt.Errorf("saving baseline signature: %w", err)
 	}
-	return nil
+	if _, err = tx.Exec(`INSERT INTO baseline_snapshot_signatures(epoch, service_id, signature, rounds) VALUES(?, ?, ?, ?)
+		ON CONFLICT(epoch, service_id, signature) DO UPDATE SET rounds = excluded.rounds`, epoch, serviceID, signature, string(encoded)); err != nil {
+		return fmt.Errorf("saving versioned baseline signature: %w", err)
+	}
+	if err := touchBaselineSnapshot(tx, epoch); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // DeleteBaselineSignature removes a weak candidate evicted by the bounded
 // in-memory baseline. Recurring candidates are never selected for eviction.
 func (s *PacketStore) DeleteBaselineSignature(serviceID, signature string) error {
-	if _, err := s.db.Exec(`DELETE FROM baseline_signatures WHERE service_id = ? AND signature = ?`, serviceID, signature); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	epoch, err := activeBaselineEpoch(tx)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM baseline_signatures WHERE service_id = ? AND signature = ?`, serviceID, signature); err != nil {
 		return fmt.Errorf("deleting baseline signature: %w", err)
 	}
-	return nil
+	if _, err := tx.Exec(`DELETE FROM baseline_snapshot_signatures WHERE epoch = ? AND service_id = ? AND signature = ?`, epoch, serviceID, signature); err != nil {
+		return fmt.Errorf("deleting versioned baseline signature: %w", err)
+	}
+	if err := touchBaselineSnapshot(tx, epoch); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ReplaceBaselineSignatures atomically publishes a completed historical
@@ -1074,24 +1157,89 @@ func (s *PacketStore) ReplaceBaselineSignatures(items []BaselineSignature) error
 		return fmt.Errorf("starting baseline replacement: %w", err)
 	}
 	defer tx.Rollback()
+	epoch, err := activeBaselineEpoch(tx)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM baseline_signatures`); err != nil {
 		return fmt.Errorf("clearing baseline replacement: %w", err)
 	}
-	stmt, err := tx.Prepare(`INSERT INTO baseline_signatures(service_id, signature, rounds) VALUES(?, ?, ?)`)
+	if _, err := tx.Exec(`DELETE FROM baseline_snapshot_signatures WHERE epoch = ?`, epoch); err != nil {
+		return fmt.Errorf("clearing versioned baseline replacement: %w", err)
+	}
+	activeStmt, err := tx.Prepare(`INSERT INTO baseline_signatures(service_id, signature, rounds) VALUES(?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("preparing baseline replacement: %w", err)
 	}
-	defer stmt.Close()
+	defer activeStmt.Close()
+	snapshotStmt, err := tx.Prepare(`INSERT INTO baseline_snapshot_signatures(epoch, service_id, signature, rounds) VALUES(?, ?, ?, ?)`)
+	if err != nil {
+		return fmt.Errorf("preparing versioned baseline replacement: %w", err)
+	}
+	defer snapshotStmt.Close()
 	for _, item := range items {
 		encoded, err := json.Marshal(item.Rounds)
 		if err != nil {
 			return fmt.Errorf("encoding baseline rounds: %w", err)
 		}
-		if _, err := stmt.Exec(item.ServiceID, item.Signature, string(encoded)); err != nil {
+		if _, err := activeStmt.Exec(item.ServiceID, item.Signature, string(encoded)); err != nil {
 			return fmt.Errorf("replacing baseline signature: %w", err)
 		}
+		if _, err := snapshotStmt.Exec(epoch, item.ServiceID, item.Signature, string(encoded)); err != nil {
+			return fmt.Errorf("replacing versioned baseline signature: %w", err)
+		}
+	}
+	if err := touchBaselineSnapshot(tx, epoch); err != nil {
+		return err
 	}
 	return tx.Commit()
+}
+
+// ListBaselineSnapshots returns every preserved configuration, including the
+// active one. Packet cleanup never touches these tables.
+func (s *PacketStore) ListBaselineSnapshots() ([]BaselineSnapshot, error) {
+	rows, err := s.rdb.Query(`SELECT m.epoch, m.definition, m.created_at, m.updated_at,
+		COUNT(s.signature), CASE WHEN m.epoch = COALESCE((SELECT value FROM baseline_meta WHERE key = 'epoch'), '') THEN 1 ELSE 0 END
+		FROM baseline_snapshot_meta m
+		LEFT JOIN baseline_snapshot_signatures s ON s.epoch = m.epoch
+		GROUP BY m.epoch, m.definition, m.created_at, m.updated_at
+		ORDER BY m.updated_at DESC, m.epoch ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("listing baseline snapshots: %w", err)
+	}
+	defer rows.Close()
+	var out []BaselineSnapshot
+	for rows.Next() {
+		var item BaselineSnapshot
+		var createdAt, updatedAt string
+		var active int
+		if err := rows.Scan(&item.Epoch, &item.Definition, &createdAt, &updatedAt, &item.SignatureCount, &active); err != nil {
+			return nil, err
+		}
+		item.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+		item.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+		item.Active = active != 0
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func activeBaselineEpoch(tx *sql.Tx) (string, error) {
+	var epoch string
+	if err := tx.QueryRow(`SELECT value FROM baseline_meta WHERE key = 'epoch'`).Scan(&epoch); err != nil {
+		if err == sql.ErrNoRows {
+			return "", fmt.Errorf("active baseline is not prepared")
+		}
+		return "", fmt.Errorf("reading active baseline: %w", err)
+	}
+	return epoch, nil
+}
+
+func touchBaselineSnapshot(tx *sql.Tx, epoch string) error {
+	if _, err := tx.Exec(`UPDATE baseline_snapshot_meta SET updated_at = ? WHERE epoch = ?`, CanonicalTimestamp(time.Now()), epoch); err != nil {
+		return fmt.Errorf("updating baseline snapshot metadata: %w", err)
+	}
+	return nil
 }
 
 // Query retrieves packets matching the given filters.

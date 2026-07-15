@@ -13,16 +13,20 @@ import json
 import os
 import random
 import re
-import shutil
 import socket
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 PORT_MIN = 11500
 PORT_MAX = 12000
-PROTOCOLS = ("http", "https", "ws", "wss", "h2", "grpc", "tcp")
-TLS_PROTOCOLS = {"https", "wss", "h2", "grpc"}
+TCP_PROTOCOLS = (
+    "http", "https", "ws", "wss", "h2", "h2c", "grpc", "grpc-h2c",
+    "tcp", "tcp-line", "tls", "dns-tcp", "resp", "mqtt",
+)
+UDP_PROTOCOLS = ("udp", "dns")
+TLS_PROTOCOLS = {"https", "wss", "h2", "grpc", "tls"}
 COMMENT_MAPPING_KEY = "janus-original-mapping"
 COMMENT_PORT_KEY = "janus-original-port"
 COMPOSE_NAMES = {"compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml"}
@@ -100,6 +104,7 @@ class PortMapping:
     bind_ip: str | None
     host_port: str
     container_port: str
+    transport: str = "tcp"
 
 
 @dataclass(frozen=True)
@@ -111,6 +116,7 @@ class PortPlan:
     original_port: int
     target_port: int
     container_port: int
+    transport: str
     already_patched: bool
 
 
@@ -175,9 +181,10 @@ class ServicePlan:
         return value
 
 
-def is_port_free(port: int) -> bool:
+def is_port_free(port: int, transport: str = "tcp") -> bool:
     global PORT_CHECK_WARNING_SHOWN
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock_type = socket.SOCK_DGRAM if transport == "udp" else socket.SOCK_STREAM
+    with socket.socket(socket.AF_INET, sock_type) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind(("127.0.0.1", port))
@@ -210,9 +217,9 @@ class PortAllocator:
         self.next_port = start
         self.high = high
 
-    def take(self) -> int:
+    def take(self, transport: str = "tcp") -> int:
         while self.next_port <= self.high and (
-            self.next_port in self.reserved or not is_port_free(self.next_port)
+            self.next_port in self.reserved or not is_port_free(self.next_port, transport)
         ):
             print(f"  skip occupied/reserved port {self.next_port}")
             self.next_port += 1
@@ -224,9 +231,10 @@ class PortAllocator:
 
 
 def parse_mapping(raw: str) -> PortMapping | None:
-    if "/" in raw or "-" in raw:
+    mapping, separator, transport = raw.partition("/")
+    if "-" in mapping or (separator and transport.lower() not in {"tcp", "udp"}):
         return None
-    parts = raw.split(":")
+    parts = mapping.split(":")
     if len(parts) == 2:
         bind_ip, host_port, container_port = None, *parts
     elif len(parts) == 3:
@@ -235,7 +243,26 @@ def parse_mapping(raw: str) -> PortMapping | None:
         return None
     if not host_port.isdigit() or not container_port.isdigit():
         return None
-    return PortMapping(bind_ip, host_port, container_port)
+    return PortMapping(bind_ip, host_port, container_port, transport.lower() or "tcp")
+
+
+def atomic_write(path: Path, data: bytes, mode: int | None = None) -> None:
+    """Durably replace one configuration file without exposing partial data."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if mode is None:
+        mode = (path.stat().st_mode & 0o777) if path.exists() else 0o644
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_path.chmod(mode)
+        os.replace(temporary_path, path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def has_janus_comment(line: str) -> bool:
@@ -362,10 +389,13 @@ def build_port_plans(paths: list[Path], allocator: PortAllocator) -> list[PortPl
             if original is None:
                 print(f"  skip {path}: invalid Janus restore comment")
                 continue
-            target_port = int(current.host_port) if already_patched else allocator.take()
+            if current.transport != original.transport:
+                print(f"  skip {path}: transport changed since Janus patch")
+                continue
+            target_port = int(current.host_port) if already_patched else allocator.take(original.transport)
             plans.append(PortPlan(
                 path, line, service, original_raw or raw, int(original.host_port),
-                target_port, int(current.container_port), already_patched,
+                target_port, int(current.container_port), original.transport, already_patched,
             ))
     return plans
 
@@ -375,6 +405,7 @@ def patch_compose(plans: list[PortPlan]) -> None:
     for plan in plans:
         if not plan.already_patched:
             by_file.setdefault(plan.compose, []).append(plan)
+    rendered: dict[Path, bytes] = {}
     for path, changes in by_file.items():
         lines = path.read_text(encoding="utf8").splitlines(keepends=True)
         for change in changes:
@@ -389,11 +420,15 @@ def patch_compose(plans: list[PortPlan]) -> None:
             comment = f"# {COMMENT_MAPPING_KEY}: {match.group('mapping')}"
             if tail:
                 comment = f"{tail} | {COMMENT_MAPPING_KEY}: {match.group('mapping')}"
+            suffix = "/udp" if change.transport == "udp" else ""
             lines[change.line] = (
-                f"{match.group('indent')}- {quote}127.0.0.1:{change.target_port}:{change.container_port}{quote} "
+                f"{match.group('indent')}- {quote}127.0.0.1:{change.target_port}:{change.container_port}{suffix}{quote} "
                 f"{comment}{newline}"
             )
-        path.write_text("".join(lines), encoding="utf8")
+        rendered[path] = "".join(lines).encode("utf8")
+    # Every source line is validated before the first Compose file changes.
+    for path, data in rendered.items():
+        atomic_write(path, data)
 
 
 def restore_compose(path: Path, dry_run: bool) -> list[RestoreChange]:
@@ -412,7 +447,7 @@ def restore_compose(path: Path, dry_run: bool) -> list[RestoreChange]:
         lines[index] = f"{match.group('indent')}- {quote}{restored}{quote}{tail}{newline}"
         changes.append(RestoreChange(path, service, match.group("mapping"), restored))
     if changes and not dry_run:
-        path.write_text("".join(lines), encoding="utf8")
+        atomic_write(path, "".join(lines).encode("utf8"))
     return changes
 
 
@@ -537,6 +572,9 @@ def infer_service(plan: PortPlan) -> Inference:
     websocket = websocket_evidence(text)
     grpc = bool(protos) or any(hint in text for hint in ("grpc.server", "grpc_server", "grpcio", "add_insecure_port", "add_secure_port"))
     h2 = any(hint in text for hint in ("http2", "http/2", "h2c", "nextprotos"))
+    dns = plan.container_port == 53 or any(hint in text for hint in ("dns server", "dns.message", "miekg/dns", "dnslib"))
+    resp = plan.container_port == 6379 or any(hint in text for hint in ("redis-server", "redis.asyncio", "resp2"))
+    mqtt = plan.container_port in {1883, 8883} or any(hint in text for hint in ("mosquitto", "mqtt broker", "mqtt.server"))
     http = (
         plan.service.lower() in {"frontend", "web", "nginx", "apache"}
         or any(hint in text for hint in (
@@ -550,19 +588,23 @@ def infer_service(plan: PortPlan) -> Inference:
         "sslcontext", "ssl.wrap_socket", "https.createserver", "tls.createserver",
         "tls.listen(", "certfile", "keyfile", "ssl_certificate", "listen 443",
         "listen ssl", "server-cert", "server_key", "tokio_rustls", "tokio-rustls",
-    )) or plan.container_port == 443
+    )) or plan.container_port in {443, 853, 8883}
     cert, key, ca = find_tls_files(paths)
     if cert and key:
         tls = True
 
-    if explicit_ws:
+    if plan.transport == "udp":
+        protocol = "dns" if dns else "udp"
+        tls = False  # Janus does not terminate DTLS; preserve UDP datagrams.
+        evidence = ["porta/indizi DNS su UDP" if dns else "mapping Compose UDP"]
+    elif explicit_ws:
         protocol = explicit_ws
         evidence = [f"protocollo {explicit_ws} esplicito nel Compose (janus.protocol)"]
     elif grpc:
-        protocol = "grpc"
+        protocol = "grpc" if tls else "grpc-h2c"
         evidence = ["riferimenti gRPC/.proto nel build context"]
     elif h2:
-        protocol = "h2"
+        protocol = "h2" if tls else "h2c"
         evidence = ["riferimenti HTTP/2 nel build context"]
     elif websocket:
         protocol = "wss" if tls else "ws"
@@ -570,6 +612,18 @@ def infer_service(plan: PortPlan) -> Inference:
     elif http:
         protocol = "https" if tls else "http"
         evidence = ["frontend/framework o porta HTTP"]
+    elif tls:
+        protocol = "tcp"
+        evidence = ["TLS applicativo non riconosciuto: fallback TCP passthrough"]
+    elif dns:
+        protocol = "dns-tcp"
+        evidence = ["porta/indizi DNS su TCP"]
+    elif resp:
+        protocol = "resp"
+        evidence = ["porta/indizi Redis RESP"]
+    elif mqtt:
+        protocol = "mqtt"
+        evidence = ["porta/indizi MQTT"]
     else:
         protocol = "tcp"
         evidence = ["nessun protocollo applicativo riconosciuto (fallback TCP)"]
@@ -693,7 +747,7 @@ def review_services(
         rel = port.compose.relative_to(Path.cwd()) if port.compose.is_relative_to(Path.cwd()) else port.compose
         state = "già spostata" if port.already_patched else "da spostare"
         print(f"\n[{rel} / {port.service}] {port.original_port} -> 127.0.0.1:{port.target_port} ({state})")
-        print(f"  rilevamento: {inference.protocol}, backend TLS={'yes' if inference.target_tls else 'no'}; {'; '.join(inference.evidence)}")
+        print(f"  rilevamento: {inference.protocol}, TLS rilevato={'yes' if inference.target_tls else 'no'}; {'; '.join(inference.evidence)}")
         if not ask_bool("Configurare questa porta in Janus?", True):
             continue
 
@@ -702,8 +756,13 @@ def review_services(
         listen_addr = ask("Listen address", team_ip)
         listen_port = ask_port("Listen port", port.original_port)
         target_addr = ask("Target address", f"127.0.0.1:{port.target_port}")
-        protocol = ask_choice("Protocol", PROTOCOLS, inference.protocol)
-        target_tls = ask_bool("Backend uses TLS?", inference.target_tls)
+        choices = UDP_PROTOCOLS if port.transport == "udp" else TCP_PROTOCOLS
+        protocol = ask_choice("Protocol", choices, inference.protocol)
+        # Raw TCP preserves an unknown TLS stream end-to-end. Only a Janus
+        # TLS-terminating listener should establish a second TLS connection to
+        # the unchanged challenge backend.
+        target_tls_default = inference.target_tls and protocol in TLS_PROTOCOLS
+        target_tls = ask_bool("Backend uses TLS?", target_tls_default) if port.transport == "tcp" else False
         service_id = existing_ids.get(name) or unique_id(name, used)
         plan = ServicePlan(service_id, name, listen_addr, listen_port, target_addr, protocol, target_tls)
 
@@ -721,7 +780,7 @@ def review_services(
                     if source is not None and not source.is_file():
                         raise RuntimeError(f"certificate file not found: {source}")
 
-        if protocol in {"grpc", "h2"}:
+        if protocol in {"grpc", "grpc-h2c", "h2", "h2c"}:
             default_protos = ",".join(str(path) for path in inference.protos)
             raw = ask("Local .proto files to copy (comma-separated, optional)", default_protos, required=False)
             plan.proto_sources = [Path(value.strip()).expanduser().resolve() for value in raw.split(",") if value.strip()]
@@ -740,7 +799,8 @@ def print_summary(port_plans: list[PortPlan], services: list[ServicePlan], servi
     print("\nPlanned changes:")
     for port in port_plans:
         if not port.already_patched:
-            print(f"  compose  {port.compose}: {port.original_mapping} -> 127.0.0.1:{port.target_port}:{port.container_port}")
+            suffix = "/udp" if port.transport == "udp" else ""
+            print(f"  compose  {port.compose}: {port.original_mapping} -> 127.0.0.1:{port.target_port}:{port.container_port}{suffix}")
     for service in services:
         tls = f", TLS={service.tls_mode}, backend-TLS={service.target_tls}" if service.protocol in TLS_PROTOCOLS else f", backend-TLS={service.target_tls}"
         print(
@@ -763,15 +823,13 @@ def write_assets(services: list[ServicePlan], certs_dir: Path, protos_dir: Path)
                 fullchain += service.ca_source.read_bytes()
                 if not fullchain.endswith(b"\n"):
                     fullchain += b"\n"
-            (certs_dir / Path(service.cert_file).name).write_bytes(fullchain)
+            atomic_write(certs_dir / Path(service.cert_file).name, fullchain)
             key_target = certs_dir / Path(service.key_file).name
-            shutil.copyfile(service.key_source, key_target)
-            key_target.chmod(0o600)
+            atomic_write(key_target, service.key_source.read_bytes(), 0o600)
         for source in service.proto_sources:
             relative, _ = proto_destination(source, service.id)
             target = protos_dir / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, target)
+            atomic_write(target, source.read_bytes())
 
 
 def write_services(path: Path, services: list[ServicePlan]) -> None:
@@ -779,8 +837,7 @@ def write_services(path: Path, services: list[ServicePlan]) -> None:
     by_id = {str(service.get("id", "")): service for service in current}
     for service in services:
         by_id[service.id] = service.as_json()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(list(by_id.values()), indent=2) + "\n", encoding="utf8")
+    atomic_write(path, (json.dumps(list(by_id.values()), indent=2) + "\n").encode("utf8"))
 
 
 def is_janus_root(path: Path) -> bool:
@@ -930,9 +987,11 @@ def main(argv: list[str]) -> int:
         if not ask_bool("Apply all changes?", False):
             print("Cancelled: no files changed.")
             return 0
-        patch_compose(selected_ports)
+        # Keep the challenge reachable if an asset/config write fails: Compose
+        # port mappings are switched only after every Janus input is durable.
         write_assets(services, args.certs_dir, args.protos_dir)
         write_services(args.services_file, services)
+        patch_compose(selected_ports)
     except (EOFError, KeyboardInterrupt):
         print("\nCancelled: no files changed.", file=sys.stderr)
         return 130

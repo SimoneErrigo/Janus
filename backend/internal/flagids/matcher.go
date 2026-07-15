@@ -3,6 +3,7 @@ package flagids
 import (
 	"bytes"
 	"regexp"
+	"sort"
 	"strings"
 
 	ahocorasick "github.com/petar-dambovaliev/aho-corasick"
@@ -16,47 +17,75 @@ type FlagMatch struct {
 
 // Matcher wraps an Aho-Corasick automaton for O(text_length) multi-pattern matching.
 type Matcher struct {
-	patterns []FlagMatch // ordered list matching automaton pattern indices
-	ac       ahocorasick.AhoCorasick
-	empty    bool
-	byValue  map[string]int // flagID value -> index in patterns (for dedup)
+	patterns      []FlagMatch // ordered list matching automaton pattern indices
+	ac            ahocorasick.AhoCorasick
+	shortPatterns []FlagMatch // five-byte IDs, matched only on word boundaries
+	shortAC       ahocorasick.AhoCorasick
+	empty         bool
 }
 
 // BuildMatcher constructs an Aho-Corasick automaton from round-aware flagId data.
 // roundFlags: roundNum -> serviceName -> []flagIdValue
 func BuildMatcher(roundFlags map[int]map[string][]string) *Matcher {
-	m := &Matcher{byValue: make(map[string]int)}
-
-	var values []string
-	for round, services := range roundFlags {
-		for _, flagIDs := range services {
-			for _, v := range flagIDs {
-				if len(v) < 6 {
-					continue // skip short values to avoid false positives
+	m := &Matcher{}
+	seen := make(map[string]struct{})
+	var values, shortValues []string
+	rounds := make([]int, 0, len(roundFlags))
+	for round := range roundFlags {
+		rounds = append(rounds, round)
+	}
+	// A repeated value belongs to the newest retained round. Sorting rounds and
+	// service names also makes matcher metadata stable across process restarts.
+	sort.Sort(sort.Reverse(sort.IntSlice(rounds)))
+	for _, round := range rounds {
+		services := roundFlags[round]
+		names := make([]string, 0, len(services))
+		for name := range services {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			for _, value := range services[name] {
+				if len(value) < 5 {
+					continue
 				}
-				if _, exists := m.byValue[v]; exists {
-					continue // deduplicate
+				if _, exists := seen[value]; exists {
+					continue
 				}
-				m.byValue[v] = len(m.patterns)
-				m.patterns = append(m.patterns, FlagMatch{FlagID: v, Round: round})
-				values = append(values, v)
+				seen[value] = struct{}{}
+				match := FlagMatch{FlagID: value, Round: round}
+				if len(value) == 5 {
+					m.shortPatterns = append(m.shortPatterns, match)
+					shortValues = append(shortValues, value)
+				} else {
+					m.patterns = append(m.patterns, match)
+					values = append(values, value)
+				}
 			}
 		}
 	}
 
-	if len(values) == 0 {
+	if len(values) == 0 && len(shortValues) == 0 {
 		m.empty = true
 		return m
 	}
+	if len(values) > 0 {
+		m.ac = buildFlagIDAutomaton(values, false)
+	}
+	if len(shortValues) > 0 {
+		m.shortAC = buildFlagIDAutomaton(shortValues, true)
+	}
+	return m
+}
 
+func buildFlagIDAutomaton(values []string, wholeWords bool) ahocorasick.AhoCorasick {
 	builder := ahocorasick.NewAhoCorasickBuilder(ahocorasick.Opts{
 		AsciiCaseInsensitive: false,
-		MatchOnlyWholeWords:  false,
+		MatchOnlyWholeWords:  wholeWords,
 		MatchKind:            ahocorasick.StandardMatch,
-		DFA:                  true, // DFA is faster for repeated searches
+		DFA:                  true,
 	})
-	m.ac = builder.Build(values)
-	return m
+	return builder.Build(values)
 }
 
 // FindMatches returns all flag IDs found in the text, deduplicated.
@@ -64,22 +93,26 @@ func (m *Matcher) FindMatches(text string) []FlagMatch {
 	if m == nil || m.empty {
 		return nil
 	}
-	hits := m.ac.FindAll(text)
-	if len(hits) == 0 {
-		return nil
-	}
-
-	seen := make(map[int]struct{}, len(hits))
+	seen := make(map[string]struct{})
 	var result []FlagMatch
-	for _, hit := range hits {
-		idx := hit.Pattern()
-		if _, ok := seen[idx]; ok {
-			continue
-		}
-		seen[idx] = struct{}{}
-		result = append(result, m.patterns[idx])
+	if len(m.patterns) > 0 {
+		appendFlagIDMatches(&result, seen, m.ac.FindAll(text), m.patterns)
+	}
+	if len(m.shortPatterns) > 0 {
+		appendFlagIDMatches(&result, seen, m.shortAC.FindAll(text), m.shortPatterns)
 	}
 	return result
+}
+
+func appendFlagIDMatches(result *[]FlagMatch, seen map[string]struct{}, hits []ahocorasick.Match, patterns []FlagMatch) {
+	for _, hit := range hits {
+		match := patterns[hit.Pattern()]
+		if _, ok := seen[match.FlagID]; ok {
+			continue
+		}
+		seen[match.FlagID] = struct{}{}
+		*result = append(*result, match)
+	}
 }
 
 // ContainsAny returns true if the text contains any flagId pattern.
@@ -87,8 +120,8 @@ func (m *Matcher) ContainsAny(text string) bool {
 	if m == nil || m.empty {
 		return false
 	}
-	iter := m.ac.Iter(text)
-	return iter.Next() != nil
+	return (len(m.patterns) > 0 && m.ac.Iter(text).Next() != nil) ||
+		(len(m.shortPatterns) > 0 && m.shortAC.Iter(text).Next() != nil)
 }
 
 // PatternCount returns the number of patterns in the automaton.
@@ -96,7 +129,7 @@ func (m *Matcher) PatternCount() int {
 	if m == nil {
 		return 0
 	}
-	return len(m.patterns)
+	return len(m.patterns) + len(m.shortPatterns)
 }
 
 // --- Extensible Fast Flag Scanner ---

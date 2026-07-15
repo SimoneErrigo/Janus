@@ -20,6 +20,7 @@ import (
 const (
 	roundFetchGrace      = time.Second
 	roundCatchupInterval = 2 * time.Second
+	maxFetchErrorBackoff = time.Minute
 )
 
 // Poller periodically fetches flag IDs from the competition API.
@@ -48,8 +49,9 @@ type Poller struct {
 	// Reverse map: flagIDValue -> descKey (e.g., "8b026611-..." -> "answer_id")
 	valueKeyMap map[string]string
 
-	lastFetch time.Time
-	lastError string
+	lastFetch   time.Time
+	lastError   string
+	fetchErrors int
 
 	// Callback after successful fetch with the new current round number
 	onFetch func(currentRound int)
@@ -214,6 +216,7 @@ func (p *Poller) Reconfigure(cfg PollerConfig) {
 		p.matcher = nil
 		p.currentRound = 0
 		p.lastSnapshotHash = 0
+		p.fetchErrors = 0
 	}
 	p.mu.Unlock()
 
@@ -391,6 +394,19 @@ func (p *Poller) nextFetchDelayLocked(now time.Time) time.Duration {
 			delay = minDuration(delay, untilBoundary)
 		}
 	}
+	if p.fetchErrors > 0 {
+		shift := p.fetchErrors - 1
+		if shift > 5 {
+			shift = 5
+		}
+		retry := roundCatchupInterval * time.Duration(1<<shift)
+		if retry > maxFetchErrorBackoff {
+			retry = maxFetchErrorBackoff
+		}
+		if delay < retry {
+			delay = retry
+		}
+	}
 	if delay <= 0 {
 		return roundCatchupInterval
 	}
@@ -469,10 +485,10 @@ func (p *Poller) fetch(ctx context.Context, generation uint64) {
 		p.setFetchError(generation, fmt.Sprintf("invalid API URL %q", apiURL))
 		return
 	}
-	// ForcAD's /flag_ids endpoint returns every team's flag IDs in one document
-	// and ignores a ?team= query — we resolve our team key client-side. Other
-	// formats use the query param to scope the request to one team.
-	if teamID != "" && format != "forcad" {
+	// ForcAD and ENOWARS return every team's flag IDs in one document, so the
+	// local team key is resolved client-side. Other formats use the query param
+	// to scope the request to one team.
+	if teamID != "" && format != "forcad" && format != "enowars" {
 		query := fetchURL.Query()
 		query.Set("team", teamID)
 		fetchURL.RawQuery = query.Encode()
@@ -488,7 +504,6 @@ func (p *Poller) fetch(ctx context.Context, generation uint64) {
 	if err != nil {
 		if ctx.Err() == nil {
 			p.setFetchError(generation, fmt.Sprintf("fetch error: %v", err))
-			log.Printf("Flag ID fetch error: %v", err)
 		}
 		return
 	}
@@ -525,23 +540,37 @@ func (p *Poller) fetch(ctx context.Context, generation uint64) {
 		roundFlags, err = parseFaustCTFRounded(body, teamID, roundDuration, competitionStart)
 	case "forcad":
 		roundFlags, err = parseForcADRounded(body, teamID, roundDuration, competitionStart)
+	case "enowars":
+		roundFlags, err = parseENOWARSRounded(body, teamID)
 	default:
 		roundFlags, err = parseCyberChallengeRounded(body)
 	}
 
 	if err != nil {
 		p.setFetchError(generation, fmt.Sprintf("parse error: %v", err))
-		log.Printf("Flag ID parse error: %v", err)
 		return
+	}
+	if format == "enowars" {
+		freshRound := highestRound(roundFlags)
+		if countRoundFlagValues(roundFlags) == 0 {
+			p.setFetchError(generation, "ENOWARS response contains no usable attack-info for the configured team")
+			return
+		}
+		p.mu.RLock()
+		previous := cloneRoundFlags(p.roundFlags)
+		previousRound := p.currentRound
+		p.mu.RUnlock()
+		if previousRound > 0 && freshRound < previousRound {
+			p.setFetchError(generation, fmt.Sprintf("stale ENOWARS response: latest round %d, keeping round %d", freshRound, previousRound))
+			return
+		}
+		// attack.json may omit a temporarily unavailable service. Keep missing
+		// service/round entries from the last valid snapshot; fresh entries win.
+		roundFlags = mergeRoundFlags(previous, roundFlags)
 	}
 
 	// Determine current round (max round number seen)
-	maxRound := 0
-	for r := range roundFlags {
-		if r > maxRound {
-			maxRound = r
-		}
-	}
+	maxRound := highestRound(roundFlags)
 
 	// Prune old rounds: keep only the last keepRounds rounds
 	if maxRound > 0 {
@@ -566,6 +595,7 @@ func (p *Poller) fetch(ctx context.Context, generation uint64) {
 		p.mu.Lock()
 		p.lastFetch = time.Now()
 		p.lastError = ""
+		p.fetchErrors = 0
 		p.mu.Unlock()
 		log.Printf("Flag IDs unchanged: skipping matcher rebuild/backfill (round=%d)", maxRound)
 		return
@@ -596,6 +626,7 @@ func (p *Poller) fetch(ctx context.Context, generation uint64) {
 	p.valueKeyMap = vkm
 	p.lastFetch = time.Now()
 	p.lastError = ""
+	p.fetchErrors = 0
 	p.mu.Unlock()
 
 	total := 0
@@ -622,7 +653,58 @@ func (p *Poller) setFetchError(generation uint64, message string) {
 	p.mu.Lock()
 	p.lastError = message
 	p.lastFetch = time.Now()
+	p.fetchErrors++
+	failures := p.fetchErrors
 	p.mu.Unlock()
+	// Log the first error and then exponentially sparse repetitions. This keeps
+	// a pre-game 404 or temporary outage from drowning the useful proxy logs.
+	if failures == 1 || failures&(failures-1) == 0 {
+		log.Printf("Flag ID fetch degraded (%d consecutive): %s", failures, message)
+	}
+}
+
+func highestRound(roundFlags map[int]map[string][]string) int {
+	maxRound := 0
+	for round := range roundFlags {
+		if round > maxRound {
+			maxRound = round
+		}
+	}
+	return maxRound
+}
+
+func countRoundFlagValues(roundFlags map[int]map[string][]string) int {
+	total := 0
+	for _, services := range roundFlags {
+		for _, values := range services {
+			total += len(values)
+		}
+	}
+	return total
+}
+
+func cloneRoundFlags(source map[int]map[string][]string) map[int]map[string][]string {
+	clone := make(map[int]map[string][]string, len(source))
+	for round, services := range source {
+		clone[round] = make(map[string][]string, len(services))
+		for service, values := range services {
+			clone[round][service] = append([]string(nil), values...)
+		}
+	}
+	return clone
+}
+
+func mergeRoundFlags(previous, fresh map[int]map[string][]string) map[int]map[string][]string {
+	merged := cloneRoundFlags(previous)
+	for round, services := range fresh {
+		if merged[round] == nil {
+			merged[round] = make(map[string][]string)
+		}
+		for service, values := range services {
+			merged[round][service] = append([]string(nil), values...)
+		}
+	}
+	return merged
 }
 
 func hashRoundFlags(roundFlags map[int]map[string][]string) uint64 {
@@ -882,6 +964,88 @@ func parseSaarCTFRounded(body []byte, teamID string) (map[int]map[string][]strin
 		}
 	}
 	return result, nil
+}
+
+// parseENOWARSRounded parses ENOWARS attack-info responses:
+//
+//	{
+//	  "availableTeams": ["10.1.52.1"],
+//	  "services": {
+//	    "service_1": {
+//	      "10.1.52.1": { "7": [["user73"]], "8": [["user96"]] }
+//	    }
+//	  }
+//	}
+//
+// The configured team can be its full IP or the numeric team component used
+// by the standard 10.1.<team>.1 addressing scheme.
+func parseENOWARSRounded(body []byte, teamID string) (map[int]map[string][]string, error) {
+	var raw struct {
+		Services map[string]map[string]map[string]json.RawMessage `json:"services"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	if raw.Services == nil {
+		return nil, fmt.Errorf("ENOWARS response is missing services")
+	}
+
+	keys := make(map[string]struct{})
+	for _, perTeam := range raw.Services {
+		for key := range perTeam {
+			keys[key] = struct{}{}
+		}
+	}
+	targetKey := resolveENOWARSTeamKey(teamID, keys)
+	result := make(map[int]map[string][]string)
+	if targetKey == "" {
+		return nil, fmt.Errorf("configured ENOWARS team %q is not present in attack-info", teamID)
+	}
+
+	for serviceName, perTeam := range raw.Services {
+		for roundStr, value := range perTeam[targetKey] {
+			roundNum, err := strconv.Atoi(roundStr)
+			if err != nil || roundNum <= 0 {
+				continue
+			}
+			if result[roundNum] == nil {
+				result[roundNum] = make(map[string][]string)
+			}
+			seen := make(map[string]bool)
+			appendValue := func(item string) {
+				if item != "" && !seen[item] {
+					seen[item] = true
+					result[roundNum][serviceName] = append(result[roundNum][serviceName], item)
+				}
+			}
+			for _, item := range flattenRawToStrings(value) {
+				appendValue(item)
+				for _, alternate := range expandForcADValue(item) {
+					appendValue(alternate)
+				}
+			}
+		}
+	}
+	return result, nil
+}
+
+func resolveENOWARSTeamKey(teamID string, keys map[string]struct{}) string {
+	if _, ok := keys[teamID]; ok {
+		return teamID
+	}
+	if _, err := strconv.Atoi(teamID); err == nil {
+		var matches []string
+		for key := range keys {
+			parts := strings.Split(key, ".")
+			if len(parts) == 4 && parts[2] == teamID {
+				matches = append(matches, key)
+			}
+		}
+		if len(matches) == 1 {
+			return matches[0]
+		}
+	}
+	return resolveForcADTeamKey(teamID, keys)
 }
 
 // parseFaustCTFRounded parses FaustCTF's teams.json style:
