@@ -2,6 +2,7 @@ package pyfilter
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,9 +20,30 @@ type Script struct {
 	// (request or response) and flow.body/flow.content rewrites take effect.
 	// Non-blocking scripts stay on the async pipeline (alert-only, zero hot-path
 	// cost).
-	Blocking  bool  `json:"blocking"`
-	CreatedAt int64 `json:"created_at"`
-	UpdatedAt int64 `json:"updated_at"`
+	Blocking   bool     `json:"blocking"`
+	Mode       string   `json:"mode,omitempty"` // observe | block | rewrite
+	ServiceIDs []string `json:"service_ids,omitempty"`
+	Directions []string `json:"directions,omitempty"`
+	Protocols  []string `json:"protocols,omitempty"`
+	CreatedAt  int64    `json:"created_at"`
+	UpdatedAt  int64    `json:"updated_at"`
+}
+
+func (s *Script) normalize() {
+	if s.Mode == "" {
+		if s.Blocking {
+			s.Mode = "block"
+		} else {
+			s.Mode = "observe"
+		}
+	}
+	if s.Mode != "observe" && s.Mode != "block" && s.Mode != "rewrite" {
+		s.Mode = "observe"
+	}
+	s.Blocking = s.Mode == "block" || s.Mode == "rewrite"
+	if len(s.ServiceIDs) == 0 {
+		s.ServiceIDs = []string{"*"}
+	}
 }
 
 var idSanitize = regexp.MustCompile(`[^a-z0-9._-]+`)
@@ -53,6 +75,17 @@ func loadScripts(path string) ([]Script, error) {
 	if scripts == nil {
 		scripts = []Script{}
 	}
+	seen := make(map[string]struct{}, len(scripts))
+	for i := range scripts {
+		if strings.TrimSpace(scripts[i].ID) == "" {
+			return nil, fmt.Errorf("script entry %d has an empty ID", i)
+		}
+		if _, exists := seen[scripts[i].ID]; exists {
+			return nil, fmt.Errorf("duplicate script ID %q", scripts[i].ID)
+		}
+		seen[scripts[i].ID] = struct{}{}
+		scripts[i].normalize()
+	}
 	return scripts, nil
 }
 
@@ -65,9 +98,26 @@ func saveScripts(path string, scripts []Script) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".pyfilters-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }

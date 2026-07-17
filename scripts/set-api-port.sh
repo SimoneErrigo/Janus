@@ -4,9 +4,11 @@
 #
 # Updates, in one shot and consistently:
 #   - .env                          (API_PORT=...)            [only if it exists]
+#   - .env.example                  (API_PORT=...)
 #   - docker-compose.yml            (API_PORT=...)
 #   - docker-compose-competition.yml (API_PORT=...)
-#   - frontend/nginx.conf           (proxy_pass ...:<port>)   [both /api locations]
+#   - backend/Dockerfile             (standalone image API_PORT=...)
+#   - frontend runtime proxy env    (API_BACKEND_PORT=...)
 #   - frontend/vite.config.js       (dev proxy '/api' target)
 #
 # Replacements are anchored to those specific patterns, so unrelated 8080s
@@ -40,8 +42,18 @@ fi
 # --- portable in-place sed (BSD/macOS + GNU/Linux) ---
 sed_inplace() {
   local expr="$1" file="$2" tmp
-  tmp="$(mktemp)"
-  sed -E "$expr" "$file" > "$tmp" && mv "$tmp" "$file"
+  # Keep the temporary file beside the destination so the final rename is
+  # atomic, and copy metadata before truncating it so modes do not become 0600.
+  tmp="$(mktemp "${file}.tmp.XXXXXX")"
+  if ! cp -p "$file" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if sed -E "$expr" "$file" > "$tmp" && mv "$tmp" "$file"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
 }
 
 # Detect the current port for a friendly summary (best-effort).
@@ -54,7 +66,7 @@ current_port() {
       if [ -n "$p" ]; then echo "$p"; return; fi
     fi
   done
-  echo "8080"
+  echo "9090"
 }
 
 CUR="$(current_port)"
@@ -66,7 +78,7 @@ fi
 changed=0
 
 # API_PORT=<n>  in .env and both compose files
-for f in ".env" "docker-compose.yml" "docker-compose-competition.yml"; do
+for f in ".env" ".env.example" "docker-compose.yml" "docker-compose-competition.yml"; do
   path="$ROOT/$f"
   if [ -f "$path" ] && grep -qE '^[[:space:]]*-?[[:space:]]*API_PORT=' "$path"; then
     sed_inplace "s/^([[:space:]]*-?[[:space:]]*API_PORT=)[0-9]+/\1$NEW_PORT/" "$path"
@@ -75,18 +87,34 @@ for f in ".env" "docker-compose.yml" "docker-compose-competition.yml"; do
   fi
 done
 
-# nginx: proxy_pass http://${API_BACKEND}:<port>;  (two locations)
-NGINX="$ROOT/frontend/nginx.conf"
-if [ -f "$NGINX" ] && grep -qE 'proxy_pass[[:space:]]+http://\$\{API_BACKEND\}:[0-9]+' "$NGINX"; then
-  sed_inplace "s|(proxy_pass[[:space:]]+http://\\\$\{API_BACKEND\}:)[0-9]+|\1$NEW_PORT|g" "$NGINX"
-  echo "  updated frontend/nginx.conf (proxy_pass)"
+BACKEND_DOCKERFILE="$ROOT/backend/Dockerfile"
+if [ -f "$BACKEND_DOCKERFILE" ] && grep -qE '^ENV[[:space:]]+API_PORT=' "$BACKEND_DOCKERFILE"; then
+  sed_inplace "s/^(ENV[[:space:]]+API_PORT=)[0-9]+/\1$NEW_PORT/" "$BACKEND_DOCKERFILE"
+  echo "  updated backend/Dockerfile (API_PORT)"
   changed=$((changed + 1))
 fi
 
-# vite dev proxy: '/api': 'http://localhost:<port>'
+# Frontend proxy port in Compose and in the image's standalone default.
+for f in "docker-compose.yml" "docker-compose-competition.yml"; do
+  path="$ROOT/$f"
+  if [ -f "$path" ] && grep -qE '^[[:space:]]*-[[:space:]]*API_BACKEND_PORT=' "$path"; then
+    sed_inplace "s/^([[:space:]]*-[[:space:]]*API_BACKEND_PORT=)[0-9]+/\1$NEW_PORT/" "$path"
+    echo "  updated $f (API_BACKEND_PORT)"
+    changed=$((changed + 1))
+  fi
+done
+
+FRONTEND_DOCKERFILE="$ROOT/frontend/Dockerfile"
+if [ -f "$FRONTEND_DOCKERFILE" ] && grep -qE '^ENV[[:space:]]+API_BACKEND_PORT=' "$FRONTEND_DOCKERFILE"; then
+  sed_inplace "s/^(ENV[[:space:]]+API_BACKEND_PORT=)[0-9]+/\1$NEW_PORT/" "$FRONTEND_DOCKERFILE"
+  echo "  updated frontend/Dockerfile (API_BACKEND_PORT)"
+  changed=$((changed + 1))
+fi
+
+# Vite dev proxy (accept both historical localhost and current 127.0.0.1).
 VITE="$ROOT/frontend/vite.config.js"
-if [ -f "$VITE" ] && grep -qE "'/api':[[:space:]]*'http://localhost:[0-9]+'" "$VITE"; then
-  sed_inplace "s|('/api':[[:space:]]*'http://localhost:)[0-9]+'|\1$NEW_PORT'|" "$VITE"
+if [ -f "$VITE" ] && grep -qE "target:[[:space:]]*'http://(localhost|127\\.0\\.0\\.1):[0-9]+'" "$VITE"; then
+  sed_inplace "s@(target:[[:space:]]*'http://(localhost|127\\.0\\.0\\.1):)[0-9]+'@\1$NEW_PORT'@" "$VITE"
   echo "  updated frontend/vite.config.js (dev proxy)"
   changed=$((changed + 1))
 fi

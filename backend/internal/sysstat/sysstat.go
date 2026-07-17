@@ -18,13 +18,19 @@ var startTime = time.Now()
 
 // Stats holds a snapshot of system metrics.
 type Stats struct {
-	CPU         CPUStats     `json:"cpu"`
-	RAM         RAMStats     `json:"ram"`
-	Disk        DiskStats    `json:"disk"`
-	Process     ProcessStats `json:"process"`
-	DBSizeMB    float64      `json:"db_size_mb"`
-	RedisMemMB  *float64     `json:"redis_mem_mb,omitempty"`
-	UptimeSecs  int64        `json:"uptime_secs"`
+	CPU        CPUStats     `json:"cpu"`
+	RAM        RAMStats     `json:"ram"`
+	Disk       DiskStats    `json:"disk"`
+	Process    ProcessStats `json:"process"`
+	Capture    CaptureStats `json:"capture"`
+	DBSizeMB   float64      `json:"db_size_mb"`
+	RedisMemMB *float64     `json:"redis_mem_mb,omitempty"`
+	UptimeSecs int64        `json:"uptime_secs"`
+}
+
+type CaptureStats struct {
+	QueueDropped uint64 `json:"queue_dropped"`
+	WriterErrors uint64 `json:"writer_errors"`
 }
 
 type CPUStats struct {
@@ -73,7 +79,9 @@ func (c *Collector) Collect() (*Stats, error) {
 	}
 
 	// CPU
-	cpuPercent, err := cpu.Percent(500*time.Millisecond, false)
+	// interval=0 uses the delta maintained by gopsutil and returns immediately;
+	// the stats endpoint must not pause the control plane on every refresh.
+	cpuPercent, err := cpu.Percent(0, false)
 	if err == nil && len(cpuPercent) > 0 {
 		s.CPU.UsagePercent = cpuPercent[0]
 	}
@@ -117,6 +125,7 @@ func (c *Collector) Collect() (*Stats, error) {
 		if err == nil {
 			s.DBSizeMB = float64(dbSize) / 1024 / 1024
 		}
+		s.Capture.QueueDropped, s.Capture.WriterErrors = c.packetStore.WriterStats()
 	}
 
 	// Redis memory

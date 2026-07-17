@@ -2,12 +2,29 @@ package config
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 )
+
+type ControlPlaneConfig struct {
+	Bind string
+	Port string
+}
+
+type DataPlaneConfig struct {
+	DefaultBind string
+	BindMode    string
+}
+
+type BaselineRoundRange struct {
+	StartRound int `json:"start_round"`
+	EndRound   int `json:"end_round"`
+}
 
 // Config holds the global configuration loaded from .env.
 type Config struct {
@@ -22,11 +39,14 @@ type Config struct {
 	DataDir       string
 	APIPort       string
 	APIBind       string
+	ControlPlane  ControlPlaneConfig
+	DataPlane     DataPlaneConfig
 
 	// TeamIP is our team's address on the competition network. When a
 	// service's listen address omits the host (e.g. ":8080" or just a port),
 	// the proxy binds it to TeamIP instead of every interface.
-	TeamIP string
+	TeamIP       string
+	DataBindMode string
 
 	// Cleanup settings
 	CleanupMaxAgeMinutes int
@@ -40,9 +60,12 @@ type Config struct {
 	FlagIDFormat       string
 
 	// Competition timing
-	RoundDurationSec int    // duration of a single round in seconds (default 120)
-	CompetitionStart string // when the competition started (RFC3339, optional)
-	KeepRounds       int    // how many rounds of flagIds to keep (default 5)
+	RoundDurationSec      int                           // duration of a single round in seconds (default 120)
+	CompetitionStart      string                        // when the competition started (RFC3339, optional)
+	KeepRounds            int                           // how many rounds of flagIds to keep (default 5)
+	BaselineStartRound    int                           // default first baseline round (inclusive)
+	BaselineEndRound      int                           // default last baseline round (inclusive)
+	BaselineServiceRounds map[string]BaselineRoundRange // optional service-specific overrides
 
 	// Redis settings
 	RedisAddr     string
@@ -67,13 +90,41 @@ type Config struct {
 }
 
 var (
-	instance *Config
-	once     sync.Once
+	instance    *Config
+	instanceErr error
+	once        sync.Once
+	mu          sync.RWMutex
 )
+
+const runtimeConfigName = "runtime_config.json"
+
+// runtimeConfig is deliberately limited to settings editable from the UI.
+// Infrastructure-only values (bind addresses, Redis credentials, data path,
+// interpreter path, ...) remain controlled by the environment.
+type runtimeConfig struct {
+	TeamPassword             *string                       `json:"team_password,omitempty"`
+	FlagRegex                *string                       `json:"flag_regex,omitempty"`
+	CleanupMaxAgeMinutes     *int                          `json:"cleanup_max_age_minutes,omitempty"`
+	CleanupMaxDBSizeMB       *int                          `json:"cleanup_max_db_size_mb,omitempty"`
+	FlagIDEnabled            *bool                         `json:"flagid_enabled,omitempty"`
+	OurTeamID                *string                       `json:"our_team_id,omitempty"`
+	FlagIDAPIURL             *string                       `json:"flagid_api_url,omitempty"`
+	FlagIDPollInterval       *int                          `json:"flagid_poll_interval,omitempty"`
+	FlagIDFormat             *string                       `json:"flagid_format,omitempty"`
+	RoundDurationSec         *int                          `json:"round_duration_seconds,omitempty"`
+	CompetitionStart         *string                       `json:"competition_start,omitempty"`
+	KeepRounds               *int                          `json:"keep_rounds,omitempty"`
+	BaselineStartRound       *int                          `json:"baseline_start_round,omitempty"`
+	BaselineEndRound         *int                          `json:"baseline_end_round,omitempty"`
+	BaselineServiceRounds    map[string]BaselineRoundRange `json:"baseline_service_rounds,omitempty"`
+	TrafficMode              *string                       `json:"traffic_mode,omitempty"`
+	FlowCorrelationWindowSec *int                          `json:"flow_correlation_window_seconds,omitempty"`
+	PcapExportDir            *string                       `json:"pcap_export_dir,omitempty"`
+	PcapAutoSave             *bool                         `json:"pcap_auto_save,omitempty"`
+}
 
 // Load reads the .env file and returns the Config singleton.
 func Load(envPath string) (*Config, error) {
-	var loadErr error
 	once.Do(func() {
 		cfg := &Config{
 			// Defaults
@@ -85,16 +136,23 @@ func Load(envPath string) (*Config, error) {
 			APIBind:                  "0.0.0.0",
 			TrafficMode:              "live",
 			FlowCorrelationWindowSec: 120,
+			FlagIDPollInterval:       5,
 			FlagIDFormat:             "cyberchallenge",
+			RoundDurationSec:         120,
+			KeepRounds:               5,
+			BaselineStartRound:       1,
+			BaselineEndRound:         5,
+			BaselineServiceRounds:    make(map[string]BaselineRoundRange),
 			ProtoDir:                 "/protos",
 			PyFilterEnabled:          true,
+			DataBindMode:             "configured",
 		}
 
 		env, err := parseEnvFile(envPath)
 		if err != nil {
 			// .env is optional; use defaults if missing
 			if !os.IsNotExist(err) {
-				loadErr = fmt.Errorf("parsing .env: %w", err)
+				instanceErr = fmt.Errorf("parsing .env: %w", err)
 				return
 			}
 		}
@@ -113,6 +171,9 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v, ok := env["TEAM_IP"]; ok {
 			cfg.TeamIP = strings.TrimSpace(v)
+		}
+		if v, ok := env["DATA_BIND_MODE"]; ok && v != "" {
+			cfg.DataBindMode = strings.ToLower(strings.TrimSpace(v))
 		}
 		if v, ok := env["DATA_DIR"]; ok {
 			cfg.DataDir = v
@@ -152,6 +213,12 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v, ok := env["KEEP_ROUNDS"]; ok {
 			cfg.KeepRounds, _ = strconv.Atoi(v)
+		}
+		if v, ok := env["BASELINE_START_ROUND"]; ok {
+			cfg.BaselineStartRound, _ = strconv.Atoi(v)
+		}
+		if v, ok := env["BASELINE_END_ROUND"]; ok {
+			cfg.BaselineEndRound, _ = strconv.Atoi(v)
 		}
 		if v, ok := env["REDIS_ADDR"]; ok {
 			cfg.RedisAddr = v
@@ -197,6 +264,9 @@ func Load(envPath string) (*Config, error) {
 		if v := os.Getenv("TEAM_IP"); v != "" {
 			cfg.TeamIP = strings.TrimSpace(v)
 		}
+		if v := os.Getenv("DATA_BIND_MODE"); v != "" {
+			cfg.DataBindMode = strings.ToLower(strings.TrimSpace(v))
+		}
 		if v := os.Getenv("DATA_DIR"); v != "" {
 			cfg.DataDir = v
 		}
@@ -236,6 +306,12 @@ func Load(envPath string) (*Config, error) {
 		if v := os.Getenv("KEEP_ROUNDS"); v != "" {
 			cfg.KeepRounds, _ = strconv.Atoi(v)
 		}
+		if v := os.Getenv("BASELINE_START_ROUND"); v != "" {
+			cfg.BaselineStartRound, _ = strconv.Atoi(v)
+		}
+		if v := os.Getenv("BASELINE_END_ROUND"); v != "" {
+			cfg.BaselineEndRound, _ = strconv.Atoi(v)
+		}
 		if v := os.Getenv("REDIS_ADDR"); v != "" {
 			cfg.RedisAddr = v
 		}
@@ -264,26 +340,274 @@ func Load(envPath string) (*Config, error) {
 			cfg.PyFilterPython = strings.TrimSpace(v)
 		}
 
+		// Values explicitly saved from the dashboard survive restarts. They are
+		// applied after the environment because the dashboard is the latest
+		// operator intent; infrastructure-only settings are never persisted here.
+		if err := loadRuntimeConfig(cfg); err != nil {
+			instanceErr = err
+			return
+		}
+		normalizeDefaults(cfg)
+
 		// Derive PcapExportDir default from DataDir if not set
 		if cfg.PcapExportDir == "" {
 			cfg.PcapExportDir = cfg.DataDir + "/pcap"
 		}
+		// Materialize the logical plane split while preserving the legacy env
+		// variables as the public configuration surface.
+		materializePlanes(cfg)
 
+		mu.Lock()
 		instance = cfg
+		mu.Unlock()
 	})
 
-	if loadErr != nil {
-		return nil, loadErr
+	if instanceErr != nil {
+		return nil, instanceErr
 	}
-	return instance, nil
+	return Get(), nil
 }
 
-// Get returns the loaded Config singleton. Panics if Load was not called.
+// Get returns an immutable snapshot of the loaded configuration. Callers can
+// safely retain or modify their copy without racing with runtime updates.
 func Get() *Config {
+	mu.RLock()
+	defer mu.RUnlock()
 	if instance == nil {
 		panic("config.Load() must be called before config.Get()")
 	}
-	return instance
+	copy := *instance
+	copy.BaselineServiceRounds = cloneBaselineServiceRounds(instance.BaselineServiceRounds)
+	return &copy
+}
+
+// Update validates through mutate, atomically persists the next dashboard
+// configuration, and only then publishes it. A failed save leaves both the
+// in-memory and on-disk configuration unchanged.
+func Update(mutate func(*Config) error) (*Config, error) {
+	if mutate == nil {
+		return Get(), nil
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if instance == nil {
+		return nil, fmt.Errorf("config.Load() must be called before config.Update()")
+	}
+	next := *instance
+	next.BaselineServiceRounds = cloneBaselineServiceRounds(instance.BaselineServiceRounds)
+	if err := mutate(&next); err != nil {
+		return nil, err
+	}
+	materializePlanes(&next)
+	if err := saveRuntimeConfig(&next); err != nil {
+		return nil, err
+	}
+	next.BaselineServiceRounds = cloneBaselineServiceRounds(next.BaselineServiceRounds)
+	instance = &next
+	copy := next
+	copy.BaselineServiceRounds = cloneBaselineServiceRounds(next.BaselineServiceRounds)
+	return &copy, nil
+}
+
+func materializePlanes(cfg *Config) {
+	cfg.ControlPlane = ControlPlaneConfig{Bind: cfg.APIBind, Port: cfg.APIPort}
+	if cfg.DataBindMode != "configured" && cfg.DataBindMode != "wildcard" {
+		cfg.DataBindMode = "configured"
+	}
+	cfg.DataPlane = DataPlaneConfig{DefaultBind: cfg.TeamIP, BindMode: cfg.DataBindMode}
+}
+
+func normalizeDefaults(cfg *Config) {
+	if cfg.TeamPassword == "" {
+		cfg.TeamPassword = "changeme"
+	}
+	if cfg.FlagIDPollInterval <= 0 {
+		cfg.FlagIDPollInterval = 5
+	}
+	if cfg.RoundDurationSec <= 0 {
+		cfg.RoundDurationSec = 120
+	}
+	if cfg.KeepRounds <= 0 {
+		cfg.KeepRounds = 5
+	}
+	if cfg.BaselineStartRound <= 0 || cfg.BaselineStartRound >= 10000 {
+		cfg.BaselineStartRound = 1
+	}
+	span := cfg.BaselineEndRound - cfg.BaselineStartRound + 1
+	if span < 2 || span > 50 || cfg.BaselineEndRound > 10000 {
+		cfg.BaselineEndRound = cfg.BaselineStartRound + 4
+		if cfg.BaselineEndRound > 10000 {
+			cfg.BaselineEndRound = cfg.BaselineStartRound + 1
+		}
+	}
+	for serviceID, rounds := range cfg.BaselineServiceRounds {
+		span := rounds.EndRound - rounds.StartRound + 1
+		if serviceID == "" || rounds.StartRound < 1 || rounds.EndRound > 10000 || span < 2 || span > 50 {
+			delete(cfg.BaselineServiceRounds, serviceID)
+		}
+	}
+	if cfg.FlowCorrelationWindowSec <= 0 {
+		cfg.FlowCorrelationWindowSec = 120
+	}
+	if cfg.CleanupMaxAgeMinutes < 0 {
+		cfg.CleanupMaxAgeMinutes = 0
+	}
+	if cfg.CleanupMaxDBSizeMB < 0 {
+		cfg.CleanupMaxDBSizeMB = 0
+	}
+	switch cfg.FlagIDFormat {
+	case "cyberchallenge", "saarctf", "faustctf", "forcad", "enowars":
+	default:
+		cfg.FlagIDFormat = "cyberchallenge"
+	}
+	if cfg.TrafficMode != "live" && cfg.TrafficMode != "static" {
+		cfg.TrafficMode = "live"
+	}
+}
+
+func loadRuntimeConfig(cfg *Config) error {
+	path := filepath.Join(cfg.DataDir, runtimeConfigName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("reading runtime config: %w", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("securing runtime config: %w", err)
+	}
+	var saved runtimeConfig
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return fmt.Errorf("parsing %s: %w", path, err)
+	}
+	applyRuntimeConfig(cfg, saved)
+	return nil
+}
+
+func applyRuntimeConfig(cfg *Config, saved runtimeConfig) {
+	if saved.TeamPassword != nil {
+		cfg.TeamPassword = *saved.TeamPassword
+	}
+	if saved.FlagRegex != nil {
+		cfg.FlagRegex = *saved.FlagRegex
+	}
+	if saved.CleanupMaxAgeMinutes != nil {
+		cfg.CleanupMaxAgeMinutes = *saved.CleanupMaxAgeMinutes
+	}
+	if saved.CleanupMaxDBSizeMB != nil {
+		cfg.CleanupMaxDBSizeMB = *saved.CleanupMaxDBSizeMB
+	}
+	if saved.FlagIDEnabled != nil {
+		cfg.FlagIDEnabled = *saved.FlagIDEnabled
+	}
+	if saved.OurTeamID != nil {
+		cfg.OurTeamID = *saved.OurTeamID
+	}
+	if saved.FlagIDAPIURL != nil {
+		cfg.FlagIDAPIURL = *saved.FlagIDAPIURL
+	}
+	if saved.FlagIDPollInterval != nil {
+		cfg.FlagIDPollInterval = *saved.FlagIDPollInterval
+	}
+	if saved.FlagIDFormat != nil {
+		cfg.FlagIDFormat = *saved.FlagIDFormat
+	}
+	if saved.RoundDurationSec != nil {
+		cfg.RoundDurationSec = *saved.RoundDurationSec
+	}
+	if saved.CompetitionStart != nil {
+		cfg.CompetitionStart = *saved.CompetitionStart
+	}
+	if saved.KeepRounds != nil {
+		cfg.KeepRounds = *saved.KeepRounds
+	}
+	if saved.BaselineStartRound != nil {
+		cfg.BaselineStartRound = *saved.BaselineStartRound
+	}
+	if saved.BaselineEndRound != nil {
+		cfg.BaselineEndRound = *saved.BaselineEndRound
+	}
+	if saved.BaselineServiceRounds != nil {
+		cfg.BaselineServiceRounds = cloneBaselineServiceRounds(saved.BaselineServiceRounds)
+	}
+	if saved.TrafficMode != nil {
+		cfg.TrafficMode = *saved.TrafficMode
+	}
+	if saved.FlowCorrelationWindowSec != nil {
+		cfg.FlowCorrelationWindowSec = *saved.FlowCorrelationWindowSec
+	}
+	if saved.PcapExportDir != nil {
+		cfg.PcapExportDir = *saved.PcapExportDir
+	}
+	if saved.PcapAutoSave != nil {
+		cfg.PcapAutoSave = *saved.PcapAutoSave
+	}
+}
+
+func saveRuntimeConfig(cfg *Config) error {
+	saved := runtimeConfig{
+		TeamPassword: &cfg.TeamPassword, FlagRegex: &cfg.FlagRegex,
+		CleanupMaxAgeMinutes: &cfg.CleanupMaxAgeMinutes, CleanupMaxDBSizeMB: &cfg.CleanupMaxDBSizeMB,
+		FlagIDEnabled: &cfg.FlagIDEnabled, OurTeamID: &cfg.OurTeamID,
+		FlagIDAPIURL: &cfg.FlagIDAPIURL, FlagIDPollInterval: &cfg.FlagIDPollInterval,
+		FlagIDFormat: &cfg.FlagIDFormat, RoundDurationSec: &cfg.RoundDurationSec,
+		CompetitionStart: &cfg.CompetitionStart, KeepRounds: &cfg.KeepRounds,
+		BaselineStartRound: &cfg.BaselineStartRound, BaselineEndRound: &cfg.BaselineEndRound,
+		BaselineServiceRounds: cloneBaselineServiceRounds(cfg.BaselineServiceRounds),
+		TrafficMode:           &cfg.TrafficMode, FlowCorrelationWindowSec: &cfg.FlowCorrelationWindowSec,
+		PcapExportDir: &cfg.PcapExportDir, PcapAutoSave: &cfg.PcapAutoSave,
+	}
+	data, err := json.MarshalIndent(saved, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encoding runtime config: %w", err)
+	}
+	if err := os.MkdirAll(cfg.DataDir, 0o750); err != nil {
+		return fmt.Errorf("creating runtime config directory: %w", err)
+	}
+	tmp, err := os.CreateTemp(cfg.DataDir, ".runtime_config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating runtime config: %w", err)
+	}
+	tmpName := tmp.Name()
+	removeTemp := true
+	defer func() {
+		if removeTemp {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("securing runtime config: %w", err)
+	}
+	if _, err := tmp.Write(append(data, '\n')); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("writing runtime config: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("syncing runtime config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing runtime config: %w", err)
+	}
+	if err := os.Rename(tmpName, filepath.Join(cfg.DataDir, runtimeConfigName)); err != nil {
+		return fmt.Errorf("publishing runtime config: %w", err)
+	}
+	removeTemp = false
+	if dir, err := os.Open(cfg.DataDir); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return nil
+}
+
+func cloneBaselineServiceRounds(source map[string]BaselineRoundRange) map[string]BaselineRoundRange {
+	copy := make(map[string]BaselineRoundRange, len(source))
+	for serviceID, rounds := range source {
+		copy[serviceID] = rounds
+	}
+	return copy
 }
 
 // boolVal parses a truthy env value ("true"/"1"/"yes"/"on", case-insensitive).

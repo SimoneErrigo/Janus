@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	flowmodel "github.com/SimoneErrigo/Janus/backend/internal/flow"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 )
 
@@ -36,6 +37,7 @@ type packetEvent struct {
 	MatchedRules   []packetRuleEvent `json:"matched_rules"`
 	Flagged        bool              `json:"flagged"`
 	ContainsFlagID bool              `json:"contains_flagid"`
+	Dropped        bool              `json:"dropped"`
 	FlagIDRound    int               `json:"flagid_round,omitempty"`
 	BodySize       int               `json:"body_size"`
 	// Round computed from the poller's competition_start + round_duration.
@@ -68,7 +70,8 @@ func toPacketEvent(p *sniffer.Packet, rr RoundResolver) packetEvent {
 		DstIP: p.DstIP, DstPort: p.DstPort, Protocol: p.Protocol,
 		Direction: p.Direction, Method: p.Method, URL: p.URL, Status: p.Status,
 		MatchedRules: rules, Flagged: p.Flagged,
-		ContainsFlagID: p.ContainsFlagID, FlagIDRound: p.FlagIDRound, BodySize: len(p.Body),
+		ContainsFlagID: p.ContainsFlagID, Dropped: p.Verdict.Outcome == flowmodel.OutcomeDropped,
+		FlagIDRound: p.FlagIDRound, BodySize: len(p.Body),
 		Round: round,
 	}
 }
@@ -83,13 +86,17 @@ type PacketStreamHub struct {
 	// Packet buffer for streaming
 	bufMu  sync.Mutex
 	buffer []packetEvent
+	scores []sniffer.ScoreUpdate
 
 	// Computes the round number for a packet's timestamp. Optional —
 	// when nil the event's Round stays 0 and the frontend renders "—".
 	roundResolver RoundResolver
 
 	metaDirty atomic.Int32 // 1 = metadata changed, trigger refresh
+	stopped   atomic.Bool
 	stop      chan struct{}
+	done      chan struct{}
+	stopOnce  sync.Once
 }
 
 type sseMessage struct {
@@ -108,6 +115,7 @@ func NewPacketStreamHub(rr RoundResolver) *PacketStreamHub {
 		subs:          make(map[chan sseMessage]struct{}),
 		roundResolver: rr,
 		stop:          make(chan struct{}),
+		done:          make(chan struct{}),
 	}
 	go h.loop()
 	return h
@@ -115,25 +123,45 @@ func NewPacketStreamHub(rr RoundResolver) *PacketStreamHub {
 
 // PushPacket buffers a new packet for the next SSE broadcast.
 func (h *PacketStreamHub) PushPacket(pkt *sniffer.Packet) {
-	if h == nil || pkt == nil {
+	if h == nil || pkt == nil || h.stopped.Load() {
 		return
 	}
 	evt := toPacketEvent(pkt, h.roundResolver)
 	h.bufMu.Lock()
+	if h.stopped.Load() {
+		h.bufMu.Unlock()
+		return
+	}
 	h.buffer = append(h.buffer, evt)
+	h.bufMu.Unlock()
+}
+
+// PushScoreUpdate buffers a metadata patch for the next broadcast. Unlike a
+// generic refresh this lets Traffic update only the affected rows.
+func (h *PacketStreamHub) PushScoreUpdate(update sniffer.ScoreUpdate) {
+	if h == nil || len(update.PacketIDs) == 0 || h.stopped.Load() {
+		return
+	}
+	h.bufMu.Lock()
+	if h.stopped.Load() {
+		h.bufMu.Unlock()
+		return
+	}
+	h.scores = append(h.scores, update)
 	h.bufMu.Unlock()
 }
 
 // Notify signals that packet metadata changed (e.g. backfill).
 // Subscribers will get a refresh signal.
 func (h *PacketStreamHub) Notify() {
-	if h == nil {
+	if h == nil || h.stopped.Load() {
 		return
 	}
 	h.metaDirty.Store(1)
 }
 
 func (h *PacketStreamHub) loop() {
+	defer close(h.done)
 	ticker := time.NewTicker(streamInterval)
 	defer ticker.Stop()
 	for {
@@ -150,7 +178,9 @@ func (h *PacketStreamHub) flush() {
 	// Grab buffered packets
 	h.bufMu.Lock()
 	packets := h.buffer
+	scores := h.scores
 	h.buffer = nil
+	h.scores = nil
 	h.bufMu.Unlock()
 
 	// Send new-packets event if we have any
@@ -158,6 +188,12 @@ func (h *PacketStreamHub) flush() {
 		data, err := json.Marshal(packets)
 		if err == nil {
 			h.broadcast(sseMessage{event: "new-packets", data: data})
+		}
+	}
+	if len(scores) > 0 {
+		data, err := json.Marshal(scores)
+		if err == nil {
+			h.broadcast(sseMessage{event: "score-updates", data: data})
 		}
 	}
 
@@ -182,10 +218,15 @@ func (h *PacketStreamHub) Stop() {
 	if h == nil {
 		return
 	}
-	select {
-	case h.stop <- struct{}{}:
-	default:
-	}
+	h.stopOnce.Do(func() {
+		h.stopped.Store(true)
+		close(h.stop)
+	})
+	<-h.done
+	h.bufMu.Lock()
+	h.buffer = nil
+	h.scores = nil
+	h.bufMu.Unlock()
 }
 
 func (h *PacketStreamHub) subscribe() (notify <-chan sseMessage, unsubscribe func()) {
@@ -238,6 +279,8 @@ func (s *Server) handlePacketStream(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-r.Context().Done():
+			return
+		case <-s.packetHub.stop:
 			return
 		case msg := <-notify:
 			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", msg.event, msg.data)

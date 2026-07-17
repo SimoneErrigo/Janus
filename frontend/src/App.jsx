@@ -1,19 +1,21 @@
+import { lazy } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
 import { hasToken } from './api'
 import Layout from './components/Layout'
 import Login from './pages/Login'
-import Services from './pages/Services'
-import Traffic from './pages/Traffic'
-import Rules from './pages/Rules'
-import Alerts from './pages/Alerts'
-import Blocks from './pages/Blocks'
-import Config from './pages/Config'
-import System from './pages/System'
-import SavedFlows from './pages/SavedFlows'
-import RoundDiff from './pages/RoundDiff'
-import Protocols from './pages/Protocols'
-import FilterSandbox from './pages/FilterSandbox'
-import PyFilters from './pages/PyFilters'
+
+const Services = lazy(() => import('./pages/Services'))
+const Traffic = lazy(() => import('./pages/Traffic'))
+const Rules = lazy(() => import('./pages/Rules'))
+const Alerts = lazy(() => import('./pages/Alerts'))
+const Blocks = lazy(() => import('./pages/Blocks'))
+const Config = lazy(() => import('./pages/Config'))
+const System = lazy(() => import('./pages/System'))
+const SavedFlows = lazy(() => import('./pages/SavedFlows'))
+const RoundDiff = lazy(() => import('./pages/RoundDiff'))
+const Protocols = lazy(() => import('./pages/Protocols'))
+const FilterSandbox = lazy(() => import('./pages/FilterSandbox'))
+const PyFilters = lazy(() => import('./pages/PyFilters'))
 
 function ProtectedRoute({ children }) {
   if (!hasToken()) return <Navigate to="/login" replace />

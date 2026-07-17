@@ -52,8 +52,8 @@ func TestFlowByPeerIP_SNAT(t *testing.T) {
 	defer store.Close()
 
 	now := time.Now().UTC().Truncate(time.Second)
-	gw := "10.254.0.1"   // SNAT gateway — same for everyone
-	vm := "10.60.1.1"     // our vulnbox
+	gw := "10.254.0.1" // SNAT gateway — same for everyone
+	vm := "10.60.1.1"  // our vulnbox
 	svc := "svc-web"
 
 	// Attacker 1: POST /login → GET /admin/flag  (2 TCP connections)

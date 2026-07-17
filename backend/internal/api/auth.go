@@ -4,12 +4,15 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -18,9 +21,26 @@ import (
 
 var tokenSecret []byte
 
+const (
+	sessionCookieName      = "janus_session"
+	maxLoginLimiterEntries = 4096
+)
+
+type loginAttempt struct {
+	windowStart time.Time
+	failures    int
+}
+
+type loginLimiter struct {
+	mu       sync.Mutex
+	attempts map[string]loginAttempt
+}
+
 func init() {
 	tokenSecret = make([]byte, 32)
-	rand.Read(tokenSecret)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		panic("cannot initialize authentication secret: " + err.Error())
+	}
 }
 
 type loginRequest struct {
@@ -45,17 +65,28 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	clientIP := requestClientIP(r)
+	if retryAfter := s.loginLimiter.retryAfter(clientIP, time.Now()); retryAfter > 0 {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retryAfter.Seconds())+1))
+		http.Error(w, "too many login attempts", http.StatusTooManyRequests)
+		return
+	}
+
 	var req loginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
 
 	cfg := config.Get()
-	if req.Password != cfg.TeamPassword {
+	if subtle.ConstantTimeCompare([]byte(req.Password), []byte(cfg.TeamPassword)) != 1 {
+		s.loginLimiter.failure(clientIP, time.Now())
 		http.Error(w, "invalid password", http.StatusUnauthorized)
 		return
 	}
+	s.loginLimiter.success(clientIP)
 
 	// Sanitize display name: trim whitespace, cap at 32 chars, ASCII/UTF-8 only
 	name := strings.TrimSpace(req.DisplayName)
@@ -66,7 +97,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		// Default to guest-XXXX so teammates can identify each other
 		b := make([]byte, 2)
-		rand.Read(b)
+		if _, err := rand.Read(b); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
 		name = "guest-" + hex.EncodeToString(b)
 	}
 
@@ -75,13 +109,37 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookieName, Value: token, Path: "/", MaxAge: int((24 * time.Hour).Seconds()),
+		HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: requestIsHTTPS(r),
+	})
 
 	writeJSON(w, http.StatusOK, loginResponse{Token: token, DisplayName: name})
 }
 
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.sessionHub != nil {
+		if payload, err := decodeTokenPayload(AuthTokenFromRequest(r)); err == nil {
+			s.sessionHub.Remove(payload.ID)
+		}
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1,
+		Expires: time.Unix(1, 0), HttpOnly: true, SameSite: http.SameSiteStrictMode,
+		Secure: requestIsHTTPS(r),
+	})
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func generateTokenForUser(name string, duration time.Duration) (string, error) {
-	idBytes := make([]byte, 4)
-	rand.Read(idBytes)
+	idBytes := make([]byte, 8)
+	if _, err := rand.Read(idBytes); err != nil {
+		return "", err
+	}
 	payload := tokenPayload{
 		Exp:  time.Now().Add(duration).Unix(),
 		Name: name,
@@ -162,16 +220,19 @@ func validateToken(token string) bool {
 	return time.Now().Unix() < payload.Exp
 }
 
-// AuthTokenFromRequest returns a bearer token from the Authorization header or ?token= (for EventSource).
+// AuthTokenFromRequest returns a bearer token or the same-origin HttpOnly
+// session cookie used by EventSource and browser downloads. Tokens are never
+// accepted from URLs, where proxies and access logs could retain them.
 func AuthTokenFromRequest(r *http.Request) string {
 	auth := r.Header.Get("Authorization")
-	if auth != "" {
-		token := strings.TrimPrefix(auth, "Bearer ")
-		if token != auth {
-			return token
-		}
+	parts := strings.Fields(auth)
+	if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+		return parts[1]
 	}
-	return r.URL.Query().Get("token")
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		return cookie.Value
+	}
+	return ""
 }
 
 // authMiddleware protects routes by requiring a valid token.
@@ -198,4 +259,80 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func remoteIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err == nil {
+		return host
+	}
+	return remoteAddr
+}
+
+func requestClientIP(r *http.Request) string {
+	// The bundled nginx overwrites X-Real-IP with the actual browser peer. The
+	// backend is not published by the standard Compose setup, so preferring this
+	// single-hop value avoids rate-limiting every teammate as the nginx address.
+	peer := remoteIP(r.RemoteAddr)
+	peerIP := net.ParseIP(peer)
+	if peerIP != nil && (peerIP.IsLoopback() || peerIP.IsPrivate()) {
+		if forwarded := strings.TrimSpace(r.Header.Get("X-Real-IP")); net.ParseIP(forwarded) != nil {
+			return forwarded
+		}
+	}
+	return peer
+}
+
+func requestIsHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	proto := strings.TrimSpace(strings.SplitN(r.Header.Get("X-Forwarded-Proto"), ",", 2)[0])
+	return strings.EqualFold(proto, "https")
+}
+
+func (l *loginLimiter) retryAfter(ip string, now time.Time) time.Duration {
+	const window = time.Minute
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.attempts == nil {
+		l.attempts = make(map[string]loginAttempt)
+	}
+	attempt := l.attempts[ip]
+	if now.Sub(attempt.windowStart) >= window {
+		delete(l.attempts, ip)
+		return 0
+	}
+	if attempt.failures >= 10 {
+		return window - now.Sub(attempt.windowStart)
+	}
+	return 0
+}
+
+func (l *loginLimiter) failure(ip string, now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.attempts == nil {
+		l.attempts = make(map[string]loginAttempt)
+	}
+	attempt, exists := l.attempts[ip]
+	if !exists && len(l.attempts) >= maxLoginLimiterEntries {
+		// Evict one arbitrary entry in expected O(1). Exact LRU behavior adds no
+		// security value here and would let spoofed IP churn force O(n) scans.
+		for key := range l.attempts {
+			delete(l.attempts, key)
+			break
+		}
+	}
+	if attempt.windowStart.IsZero() || now.Sub(attempt.windowStart) >= time.Minute {
+		attempt = loginAttempt{windowStart: now}
+	}
+	attempt.failures++
+	l.attempts[ip] = attempt
+}
+
+func (l *loginLimiter) success(ip string) {
+	l.mu.Lock()
+	delete(l.attempts, ip)
+	l.mu.Unlock()
 }

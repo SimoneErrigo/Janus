@@ -8,12 +8,15 @@ function getToken() {
  * Live packet updates (SSE). Returns unsubscribe.
  * @param {function(Object[])} onNewPackets - called with array of new packet objects (streamed)
  * @param {function()} onRefresh - called when a full refresh is needed (metadata change)
+ * @param {function(Object[])} onScoreUpdates - targeted deterministic score patches
  */
-export function subscribePacketStream(onNewPackets, onRefresh) {
+export function subscribePacketStream(onNewPackets, onRefresh, onScoreUpdates = () => {}) {
   const token = getToken();
   if (!token) return () => {};
 
-  const url = `/api/packets/stream?token=${encodeURIComponent(token)}`;
+  // EventSource cannot set Authorization headers. Authentication is carried by
+  // the same-origin HttpOnly session cookie instead of leaking a token in URLs.
+  const url = '/api/packets/stream';
   let es;
   try {
     es = new EventSource(url);
@@ -24,16 +27,36 @@ export function subscribePacketStream(onNewPackets, onRefresh) {
     try {
       const packets = JSON.parse(e.data);
       if (Array.isArray(packets)) onNewPackets(packets);
-    } catch {}
+    } catch { /* malformed packet events are ignored; fallback refresh remains active */ }
   };
   const refreshHandler = () => onRefresh();
+	const scoreHandler = (e) => {
+		try {
+			const updates = JSON.parse(e.data);
+			if (Array.isArray(updates)) onScoreUpdates(updates);
+		} catch { /* malformed events are ignored; fallback refresh still runs */ }
+	};
   es.addEventListener('new-packets', newHandler);
   es.addEventListener('packets', refreshHandler);
-  const fallback = setInterval(onRefresh, 20000);
+	es.addEventListener('score-updates', scoreHandler);
+  let stopped = false;
+  let fallback;
+  const fallbackRefresh = async () => {
+    try {
+      await onRefresh();
+    } catch {
+      // The stream or next fallback tick will retry.
+    } finally {
+      if (!stopped) fallback = setTimeout(fallbackRefresh, 20000);
+    }
+  };
+  fallback = setTimeout(fallbackRefresh, 20000);
   return () => {
-    clearInterval(fallback);
+    stopped = true;
+    clearTimeout(fallback);
     es.removeEventListener('new-packets', newHandler);
     es.removeEventListener('packets', refreshHandler);
+		es.removeEventListener('score-updates', scoreHandler);
     es.close();
   };
 }
@@ -71,9 +94,13 @@ async function request(path, options = {}) {
   const res = await fetch(BASE + path, { ...options, headers });
 
   if (res.status === 401) {
-    clearToken();
-    window.location.href = '/login';
-    throw new Error('Unauthorized');
+    if (path !== '/login') {
+      clearToken();
+      window.location.href = '/login';
+      throw new Error('Unauthorized');
+    }
+    const text = await res.text();
+    throw new Error(text || 'Unauthorized');
   }
 
   if (!res.ok) {
@@ -87,6 +114,7 @@ async function request(path, options = {}) {
 
 export const api = {
   login: (password, displayName = '') => request('/login', { method: 'POST', body: { password, display_name: displayName } }),
+  logout: () => request('/logout', { method: 'POST' }),
 
   // Session / multi-user
   getSessionActive: () => request('/session/active'),
@@ -97,12 +125,10 @@ export const api = {
   listPcapFiles: () => request('/pcap/files'),
   deletePcapFile: (name) => request(`/pcap/files/${encodeURIComponent(name)}`, { method: 'DELETE' }),
   pcapDownloadUrl: (name) => {
-    const token = localStorage.getItem('janus_token') || '';
-    return `/api/pcap/files/${encodeURIComponent(name)}?token=${encodeURIComponent(token)}`;
+    return `/api/pcap/files/${encodeURIComponent(name)}`;
   },
   flowPcapDownloadUrl: (packetId) => {
-    const token = localStorage.getItem('janus_token') || '';
-    return `/api/packets/flow/pcap?packet_id=${packetId}&token=${encodeURIComponent(token)}`;
+    return `/api/packets/flow/pcap?packet_id=${packetId}`;
   },
   pcapImport: async (file, serviceId, protocolId) => {
     const token = getToken();
@@ -131,6 +157,7 @@ export const api = {
 
   // Services
   listServices: () => request('/services'),
+	listProtocolPresets: () => request('/protocol-presets'),
   getService: (id) => request(`/services/${id}`),
   createService: (data) => request('/services', { method: 'POST', body: data }),
   updateService: (id, data) => request(`/services/${id}`, { method: 'PUT', body: data }),
@@ -176,6 +203,7 @@ export const api = {
   getPacket: (id) => request(`/packets/${id}`),
   deletePacket: (id) => request(`/packets/${id}`, { method: 'DELETE' }),
   bulkDeletePackets: (ids) => request('/packets/bulk-delete', { method: 'POST', body: { ids } }),
+	labelPackets: (ids, label) => request('/packets/label', { method: 'POST', body: { ids, label } }),
   getPacketFlow: (packetId) => request(`/packets/flow?packet_id=${packetId}`),
   generateExploit: (packetId) => request(`/packets/exploit?packet_id=${packetId}`),
   decodePacket: (packetId) => request(`/packets/decoded?packet_id=${packetId}`),
@@ -243,6 +271,9 @@ export const api = {
   // Filter expression validation. Returns { ok: true } or
   // { ok: false, error, position }.
   validateFilter: (expression) => request('/filter/validate', { method: 'POST', body: { expression } }),
+	getFilterSchema: () => request('/filter/schema'),
+	getScoringStatus: () => request('/scoring/status'),
+	rebuildScoringBaseline: () => request('/scoring/baseline/rebuild', { method: 'POST' }),
 
   // Round diff — backend-computed novelty + suspicion analysis between two rounds.
   getRoundDiff: (params) => {

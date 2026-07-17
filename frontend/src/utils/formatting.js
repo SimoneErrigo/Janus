@@ -23,7 +23,7 @@ export function tryFormatJSON(str) {
       (trimmed[0] === '[' && trimmed[trimmed.length - 1] === ']')) {
     try {
       return { text: JSON.stringify(JSON.parse(trimmed), null, 2), isJSON: true }
-    } catch {}
+    } catch { /* not valid JSON; return the original text below */ }
   }
   return { text: str, isJSON: false }
 }

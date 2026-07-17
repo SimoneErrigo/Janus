@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -9,18 +10,76 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/SimoneErrigo/Janus/backend/internal/appdecode"
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
+	flowmodel "github.com/SimoneErrigo/Janus/backend/internal/flow"
+	"github.com/SimoneErrigo/Janus/backend/internal/framing"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 )
 
-const maxTCPCapture = 1 << 20 // 1 MB per direction per connection
+const (
+	maxTCPCapture               = 1 << 20 // 1 MB per direction per connection
+	maxTCPConnectionsPerService = 1024
+	tcpIdleTimeout              = 2 * time.Minute
+	tcpIdleCheckInterval        = 10 * time.Second
+)
+
+type tcpActivity struct{ last atomic.Int64 }
+
+func newTCPActivity() *tcpActivity {
+	activity := &tcpActivity{}
+	activity.touch()
+	return activity
+}
+
+func (a *tcpActivity) touch() { a.last.Store(time.Now().UnixNano()) }
+
+func (a *tcpActivity) idleFor(now time.Time) time.Duration {
+	return now.Sub(time.Unix(0, a.last.Load()))
+}
+
+type activeConn struct {
+	net.Conn
+	activity *tcpActivity
+}
+
+func (c *activeConn) Read(buffer []byte) (int, error) {
+	c.activity.touch()
+	n, err := c.Conn.Read(buffer)
+	if n > 0 {
+		c.activity.touch()
+	}
+	return n, err
+}
+
+func (c *activeConn) Write(buffer []byte) (int, error) {
+	c.activity.touch()
+	n, err := c.Conn.Write(buffer)
+	if n > 0 {
+		c.activity.touch()
+	}
+	return n, err
+}
 
 func (m *Manager) startTCPProxy(ctx context.Context, cancel context.CancelFunc, svc *storage.Service) (*runningProxy, error) {
-	listenAddr := fmt.Sprintf("0.0.0.0:%d", svc.ListenPort)
-	listener, err := net.Listen("tcp", listenAddr)
+	spec := svc.RuntimeSpec()
+	listenAddr := m.serviceListenAddress(spec)
+	var listener net.Listener
+	var err error
+	if spec.Listener.TLS == storage.ClientTLSTerminate {
+		tlsConfig, tlsErr := buildTLSConfig(svc)
+		if tlsErr != nil {
+			cancel()
+			return nil, fmt.Errorf("TLS config: %w", tlsErr)
+		}
+		listener, err = tls.Listen("tcp", listenAddr, tlsConfig)
+	} else {
+		listener, err = net.Listen("tcp", listenAddr)
+	}
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("TCP listen on %s: %w", listenAddr, err)
@@ -31,6 +90,8 @@ func (m *Manager) startTCPProxy(ctx context.Context, cancel context.CancelFunc, 
 		listener: listener,
 		cancel:   cancel,
 	}
+	connections := make(chan struct{}, maxTCPConnectionsPerService)
+	var rejected atomic.Uint64
 
 	go func() {
 		for {
@@ -44,7 +105,18 @@ func (m *Manager) startTCPProxy(ctx context.Context, cancel context.CancelFunc, 
 					continue
 				}
 			}
-			go m.handleTCPConn(ctx, svc, conn)
+			select {
+			case connections <- struct{}{}:
+				go func() {
+					defer func() { <-connections }()
+					m.handleTCPConn(ctx, svc, conn)
+				}()
+			default:
+				_ = conn.Close()
+				if count := rejected.Add(1); count == 1 || count%256 == 0 {
+					log.Printf("[%s] TCP connection limit reached (%d active, %d rejected)", svc.Name, cap(connections), count)
+				}
+			}
 		}
 	}()
 
@@ -67,16 +139,27 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 
 	srcIP, srcPortStr, _ := net.SplitHostPort(clientConn.RemoteAddr().String())
 	srcPort, _ := strconv.Atoi(srcPortStr)
-	dstIP := svc.ListenAddr
-	dstPort := svc.ListenPort
-	sessionID := sniffer.MakeSessionID(svc.ID, srcIP, srcPort)
+	spec := svc.RuntimeSpec()
+	dstIP := spec.Listener.Address
+	dstPort := spec.Listener.Port
+	sessionID := sniffer.MakeConnectionSessionID(svc.ID, srcIP, srcPort)
 
-	backendConn, err := net.DialTimeout("tcp", svc.TargetAddr, 10*time.Second)
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	var backendConn net.Conn
+	var err error
+	if spec.Upstream.TLS {
+		backendConn, err = tls.DialWithDialer(dialer, "tcp", spec.Upstream.Address, &tls.Config{InsecureSkipVerify: true})
+	} else {
+		backendConn, err = dialer.DialContext(ctx, "tcp", spec.Upstream.Address)
+	}
 	if err != nil {
 		log.Printf("[%s] TCP dial backend error: %v", svc.Name, err)
 		return
 	}
 	defer backendConn.Close()
+	activity := newTCPActivity()
+	clientIO := &activeConn{Conn: clientConn, activity: activity}
+	backendIO := &activeConn{Conn: backendConn, activity: activity}
 
 	// closeBoth tears down both connections immediately. Used for drop rules,
 	// ctx cancellation, and when the response side finishes.
@@ -100,13 +183,23 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 
 	var wg sync.WaitGroup
 	wg.Add(2)
+	requestFrames, err := framing.NewReader(clientIO, spec.Framing)
+	if err != nil {
+		log.Printf("[%s] TCP request framing error: %v", svc.Name, err)
+		return
+	}
+	responseFrames, err := framing.NewReader(backendIO, spec.Framing)
+	if err != nil {
+		log.Printf("[%s] TCP response framing error: %v", svc.Name, err)
+		return
+	}
 
 	// Client -> Backend (request direction) — evaluate rules on every chunk.
 	// No defer closeBoth here: on natural EOF we half-close instead of tearing
 	// down both sides, so the response goroutine can drain any late data.
 	go func() {
 		defer wg.Done()
-		m.sniffCopyWithRules(backendConn, clientConn, svc, sessionID, srcIP, srcPort, dstIP, dstPort, sniffer.DirectionRequest, closeBoth)
+		m.sniffCopyWithRules(backendIO, requestFrames, svc, sessionID, srcIP, srcPort, dstIP, dstPort, sniffer.DirectionRequest, closeBoth)
 		// Request side is done (natural EOF, write error, or drop).
 		// Half-close the write side so the backend knows the client is done,
 		// then arm a linger deadline so the response goroutine drains any
@@ -124,7 +217,7 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 	go func() {
 		defer wg.Done()
 		defer closeBoth()
-		m.sniffCopyWithRules(clientConn, backendConn, svc, sessionID, dstIP, dstPort, srcIP, srcPort, sniffer.DirectionResponse, closeBoth)
+		m.sniffCopyWithRules(clientIO, responseFrames, svc, sessionID, dstIP, dstPort, srcIP, srcPort, sniffer.DirectionResponse, closeBoth)
 	}()
 
 	done := make(chan struct{})
@@ -133,10 +226,21 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 		close(done)
 	}()
 
-	select {
-	case <-done:
-	case <-ctx.Done():
-		closeBoth()
+	idleTicker := time.NewTicker(tcpIdleCheckInterval)
+	defer idleTicker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			closeBoth()
+			return
+		case now := <-idleTicker.C:
+			if activity.idleFor(now) >= tcpIdleTimeout {
+				log.Printf("[%s] TCP idle timeout: closing connection", svc.Name)
+				closeBoth()
+			}
+		}
 	}
 }
 
@@ -146,149 +250,125 @@ func (m *Manager) handleTCPConn(ctx context.Context, svc *storage.Service, clien
 // inline rewrite swaps the forwarded bytes. Each chunk is logged as a separate
 // packet. Used for both directions: the regex dropper engine runs on requests
 // only, while inline Python filters (pyBlock) run on requests and responses.
-func (m *Manager) sniffCopyWithRules(dst io.Writer, src io.Reader, svc *storage.Service, sessionID string, srcIP string, srcPort int, dstIP string, dstPort int, dir sniffer.Direction, closeBoth func()) {
-	buf := make([]byte, 32*1024)
-	engine := m.engineFor(svc)
-
+func (m *Manager) sniffCopyWithRules(dst io.Writer, src *framing.Reader, svc *storage.Service, sessionID string, srcIP string, srcPort int, dstIP string, dstPort int, dir sniffer.Direction, closeBoth func()) {
 	for {
-		n, readErr := src.Read(buf)
-		if n > 0 {
-			chunk := buf[:n]
-
-			// Evaluate rules on this chunk. The regex dropper engine is
-			// request-only (its rules and IP/port scopes are written for
-			// requests); the response direction relies on inline Python
-			// filters below.
-			var matchedRules []sniffer.MatchedRuleInfo
-			shouldDrop := false
-			var alertRules []dropper.Rule
-
-			if engine != nil && dir == sniffer.DirectionRequest {
-				result := engine.EvaluateActions(&dropper.HTTPRequest{
-					ServiceID: svc.ID,
-					RawBytes:  chunk,
-					Body:      chunk,
-				})
-				for _, rule := range result.AllMatched {
-					matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{
-						ID:      rule.ID,
-						Name:    rule.Name,
-						Action:  string(rule.Action),
-						Pattern: rule.Pattern,
-						Scope:   string(rule.Scope),
-					})
-				}
-				shouldDrop = result.ShouldDrop
-				alertRules = result.AlertRules
-			}
-
-			// Inline (synchronous) Python filters on this chunk: they can block
-			// (close the connection) or rewrite the bytes before we forward them.
-			// Exact bytes ride as base64 so binary payloads survive JSON.
-			var pyBlockAlerts []*sniffer.Alert
-			if pyBlock := m.currentPyBlockFn(); pyBlock != nil {
-				// Tag flag/flagID presence up front so inline filters can use
-				// flow.flagged / flow.contains_flagid without parsing.
-				pyFlagged := sniffer.CheckFlagged(m.flagRegex, m.flagScanner, "", "", chunk)
-				pyContainsFlagID, _, _ := sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", chunk)
-				flow := map[string]any{
-					"service":         svc.ID,
-					"direction":       string(dir),
-					"src":             srcIP,
-					"dst":             dstIP,
-					"sport":           srcPort,
-					"dport":           dstPort,
-					"protocol":        string(svc.Protocol),
-					"body":            string(chunk),
-					"body_b64":        base64.StdEncoding.EncodeToString(chunk),
-					"flagged":         pyFlagged,
-					"contains_flagid": pyContainsFlagID,
-				}
-				res := pyBlock(flow)
-				for _, bm := range res.Blocks {
-					matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{
-						ID:      "pyfilter:" + bm.Script,
-						Name:    "Python block (" + bm.Script + ")",
-						Action:  "drop",
-						Pattern: bm.Reason,
-						Scope:   "python",
-					})
-					pyBlockAlerts = append(pyBlockAlerts, &sniffer.Alert{
-						RuleID:         "pyfilter:" + bm.Script,
-						ServiceID:      svc.ID,
-						SrcIP:          srcIP,
-						Timestamp:      time.Now(),
-						PatternMatched: bm.Reason,
-					})
-					shouldDrop = true
-				}
-				if res.Rewritten && !shouldDrop {
-					chunk = res.NewBody // forward + log the rewritten bytes
-				}
-			}
-
-			captureEnabled := m.shouldCapture()
-			mustPersist := captureEnabled || shouldDrop || len(alertRules) > 0 || len(pyBlockAlerts) > 0
-
-			// Log this chunk as a packet
-			if m.packetStore != nil && mustPersist {
-				now := time.Now()
-				flagged := sniffer.CheckFlagged(m.flagRegex, m.flagScanner, "", "", chunk)
-				containsFlagID, matchedFlagIDs, flagIDRound := false, []string(nil), 0
-				if m.shouldApplyFlagIDsOnIngest() {
-					containsFlagID, matchedFlagIDs, flagIDRound = sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", chunk)
-				}
-				if matchedRules == nil {
-					matchedRules = []sniffer.MatchedRuleInfo{}
-				}
-				data := make([]byte, len(chunk))
-				copy(data, chunk)
-				pkt := &sniffer.Packet{
-					ServiceID:      svc.ID,
-					SessionID:      sessionID,
-					Timestamp:      now,
-					SrcIP:          srcIP,
-					SrcPort:        srcPort,
-					DstIP:          dstIP,
-					DstPort:        dstPort,
-					Protocol:       string(svc.Protocol),
-					Direction:      dir,
-					Body:           data,
-					MatchedRules:   matchedRules,
-					Flagged:        flagged,
-					ContainsFlagID: containsFlagID,
-					MatchedFlagIDs: matchedFlagIDs,
-					FlagIDRound:    flagIDRound,
-				}
-				alertTemplates := make([]*sniffer.Alert, 0, len(alertRules)+len(pyBlockAlerts))
-				for _, rule := range alertRules {
-					alertTemplates = append(alertTemplates, &sniffer.Alert{
-						RuleID:         rule.ID,
-						ServiceID:      svc.ID,
-						SrcIP:          srcIP,
-						Timestamp:      now,
-						PatternMatched: rule.Pattern,
-					})
-				}
-				alertTemplates = append(alertTemplates, pyBlockAlerts...)
-				if err := m.packetStore.Enqueue(pkt, alertTemplates); err != nil {
-					log.Printf("[%s] sniffer: failed to log TCP packet: %v", svc.Name, err)
-				}
-			}
-
+		chunk, readErr := src.Next()
+		if len(chunk) > 0 {
+			forward, shouldDrop := m.inspectTransportMessage(svc, sessionID, srcIP, srcPort, dstIP, dstPort, dir, chunk)
 			if shouldDrop {
-				log.Printf("[%s] TCP DROP: %d rule(s) matched on chunk", svc.Name, len(matchedRules))
+				log.Printf("[%s] TCP DROP: message blocked before forwarding", svc.Name)
 				closeBoth()
 				return
 			}
-
-			// Forward chunk to backend
-			if _, writeErr := dst.Write(chunk); writeErr != nil {
+			if _, writeErr := dst.Write(forward); writeErr != nil {
 				return
 			}
+		}
+		if readErr != nil && readErr != io.EOF {
+			log.Printf("[%s] TCP framing/read error: %v", svc.Name, readErr)
 		}
 		if readErr != nil {
 			return
 		}
 	}
+}
+
+// inspectTransportMessage is shared by TCP and UDP. It evaluates every
+// consumer against one canonical decoded view, persists one packet and returns
+// the exact bytes that may be forwarded.
+func (m *Manager) inspectTransportMessage(svc *storage.Service, sessionID, srcIP string, srcPort int, dstIP string, dstPort int, dir sniffer.Direction, wire []byte) ([]byte, bool) {
+	observedAt := time.Now()
+	pyEventID := sniffer.MakePyFilterEventID(sessionID, dir, observedAt)
+	message := flowmodel.NewMessage(wire)
+	message.Decoded = appdecode.Decode(svc.RuntimeSpec(), message.Payload)
+	flagRegex, flagScanner := m.currentFlagMatchers()
+	flaggedAtBoundary := sniffer.CheckFlagged(flagRegex, flagScanner, "", "", message.Payload)
+	_, _, flagCountAtBoundary := sniffer.CountFlags(flagRegex, flagScanner, "", "", message.Payload)
+	containsFlagIDAtBoundary, matchedFlagIDsAtBoundary, _ := sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", message.Payload)
+	view := flowmodel.PacketView{
+		Service: svc.ID, Session: sessionID, OccurredAt: observedAt,
+		Source: flowmodel.Endpoint{IP: srcIP, Port: srcPort}, Destination: flowmodel.Endpoint{IP: dstIP, Port: dstPort},
+		ProtocolName: string(svc.Protocol), DirectionName: string(dir), Payload: message.Payload,
+		BodyText: string(message.Payload), Raw: message.Wire, Decoded: message.Decoded,
+		FlaggedValue: flaggedAtBoundary, ContainsFlagIDValue: containsFlagIDAtBoundary,
+	}
+
+	var matchedRules []sniffer.MatchedRuleInfo
+	var alertRules []dropper.Rule
+	shouldDrop := false
+	if engine := m.engineFor(svc); engine != nil && dir == sniffer.DirectionRequest {
+		result := engine.EvaluateView(view)
+		for _, rule := range result.AllMatched {
+			matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{ID: rule.ID, Name: rule.Name, Action: string(rule.Action), Pattern: rule.Pattern, Scope: string(rule.Scope)})
+		}
+		shouldDrop, alertRules = result.ShouldDrop, result.AlertRules
+	}
+
+	var pyAlerts []*sniffer.Alert
+	var pyFlow map[string]any
+	var pyResult sniffer.PyResult
+	rewritten := false
+	if pyBlock := m.currentPyBlockFn(); pyBlock != nil {
+		pyFlow = map[string]any{
+			"service": svc.ID, "session": sessionID, "event_id": pyEventID, "direction": string(dir), "src": srcIP, "dst": dstIP,
+			"sport": srcPort, "dport": dstPort, "protocol": string(svc.Protocol), "body": string(message.Payload),
+			"body_b64": base64.StdEncoding.EncodeToString(message.Payload), "decoded": message.Decoded,
+			"flagged": flaggedAtBoundary, "contains_flagid": containsFlagIDAtBoundary,
+			"matched_flagids": matchedFlagIDsAtBoundary, "flag_count_body": flagCountAtBoundary,
+			"admitted": !shouldDrop, "timestamp": float64(observedAt.UnixNano()) / float64(time.Second),
+		}
+		res := pyBlock(pyFlow)
+		pyResult = res
+		for _, alert := range res.Alerts {
+			matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{ID: "pyfilter:" + alert.Script, Name: "Python alert (" + alert.Script + ")", Action: "alert", Pattern: alert.Reason, Scope: "python"})
+			pyAlerts = append(pyAlerts, &sniffer.Alert{RuleID: "pyfilter:" + alert.Script, ServiceID: svc.ID, SrcIP: srcIP, Timestamp: time.Now(), PatternMatched: alert.Reason})
+		}
+		for _, bm := range res.Blocks {
+			matchedRules = append(matchedRules, sniffer.MatchedRuleInfo{ID: "pyfilter:" + bm.Script, Name: "Python block (" + bm.Script + ")", Action: "drop", Pattern: bm.Reason, Scope: "python"})
+			pyAlerts = append(pyAlerts, &sniffer.Alert{RuleID: "pyfilter:" + bm.Script, ServiceID: svc.ID, SrcIP: srcIP, Timestamp: time.Now(), PatternMatched: bm.Reason})
+			shouldDrop = true
+		}
+		if res.Rewritten && !shouldDrop {
+			message.Wire = append([]byte(nil), res.NewBody...)
+			message.Payload = message.Wire
+			message.Decoded = appdecode.Decode(svc.RuntimeSpec(), message.Payload)
+			rewritten = true
+		}
+	}
+
+	mustPersist := m.packetStore != nil && (m.shouldCapture() || shouldDrop || len(alertRules) > 0 || len(pyAlerts) > 0)
+	if mustPersist || rewritten {
+		flagRegex, flagScanner = m.currentFlagMatchers()
+		flagged := sniffer.CheckFlagged(flagRegex, flagScanner, "", "", message.Payload)
+		containsFlagID, matchedFlagIDs, flagIDRound := false, []string(nil), 0
+		_, _, flagCountBody := sniffer.CountFlags(flagRegex, flagScanner, "", "", message.Payload)
+		if m.shouldApplyFlagIDsOnIngest() {
+			containsFlagID, matchedFlagIDs, flagIDRound = sniffer.CheckFlagID(m.currentFlagIDChecker(), "", "", message.Payload)
+		}
+		pyResult.Reconcile(pyFlow, message.Payload, !shouldDrop, false, flagged, containsFlagID,
+			matchedFlagIDs, flagCountBody, 0, 0)
+		if !mustPersist {
+			return message.Wire, shouldDrop
+		}
+		if matchedRules == nil {
+			matchedRules = []sniffer.MatchedRuleInfo{}
+		}
+		now := time.Now()
+		pkt := &sniffer.Packet{
+			ServiceID: svc.ID, SessionID: sessionID, Timestamp: now, SrcIP: srcIP, SrcPort: srcPort, DstIP: dstIP, DstPort: dstPort,
+			Protocol: string(svc.Protocol), Direction: dir, Body: append([]byte(nil), message.Payload...), Decoded: message.Decoded,
+			MatchedRules: matchedRules, Flagged: flagged, ContainsFlagID: containsFlagID, MatchedFlagIDs: matchedFlagIDs,
+			FlagIDRound: flagIDRound, Verdict: sniffer.VerdictFor(dir, matchedRules, shouldDrop, rewritten, true),
+			FlagCountBody: flagCountBody, PyFilterEventID: pyEventID,
+		}
+		alerts := make([]*sniffer.Alert, 0, len(alertRules)+len(pyAlerts))
+		for _, rule := range alertRules {
+			alerts = append(alerts, &sniffer.Alert{RuleID: rule.ID, ServiceID: svc.ID, SrcIP: srcIP, Timestamp: now, PatternMatched: rule.Pattern})
+		}
+		alerts = append(alerts, pyAlerts...)
+		if err := m.packetStore.Enqueue(pkt, alerts); err != nil {
+			log.Printf("[%s] sniffer: failed to log packet: %v", svc.Name, err)
+		}
+	}
+	return message.Wire, shouldDrop
 }

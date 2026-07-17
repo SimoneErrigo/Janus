@@ -183,9 +183,11 @@ func TestWebSocketFrameParserFiltersFragmentedMessageAndPassesControl(t *testing
 	}
 }
 
-func TestWebSocketFrameParserDropsOversizedMessageAndRecovers(t *testing.T) {
+func TestWebSocketFrameParserForwardsOversizedMessageAndRecovers(t *testing.T) {
 	oversizedCalls := 0
+	filteredCalls := 0
 	parser := newWebSocketFrameParser(true, func(_ byte, payload []byte) websocketMessageDecision {
+		filteredCalls++
 		return websocketMessageDecision{Payload: payload}
 	}, func(_ byte, size uint64) {
 		oversizedCalls++
@@ -196,17 +198,25 @@ func TestWebSocketFrameParserDropsOversizedMessageAndRecovers(t *testing.T) {
 
 	tooLarge := bytes.Repeat([]byte("x"), maxWebSocketMessageCapture+1)
 	wire := append(testWebSocketFrame(true, webSocketOpcodeBinary, true, tooLarge), maskedTextFrame([]byte("still-alive"))...)
-	output := parser.Feed(wire)
+	var output []byte
+	for len(wire) > 0 {
+		n := 17 * 1024
+		if n > len(wire) {
+			n = len(wire)
+		}
+		output = append(output, parser.Feed(wire[:n])...)
+		wire = wire[n:]
+	}
 
 	if oversizedCalls != 1 {
 		t.Fatalf("oversized callback calls = %d, want 1", oversizedCalls)
 	}
-	payload, err := readMaskedTextFrame(bytes.NewReader(output))
-	if err != nil {
-		t.Fatalf("read post-limit message: %v", err)
+	if filteredCalls != 1 {
+		t.Fatalf("filter calls = %d, want only the following small message", filteredCalls)
 	}
-	if string(payload) != "still-alive" {
-		t.Fatalf("post-limit payload = %q, want still-alive", payload)
+	want := append(testWebSocketFrame(true, webSocketOpcodeBinary, true, tooLarge), maskedTextFrame([]byte("still-alive"))...)
+	if !bytes.Equal(output, want) {
+		t.Fatalf("oversized WebSocket message was not forwarded byte-for-byte")
 	}
 }
 

@@ -18,7 +18,7 @@ type PresetCategory struct {
 
 // GetPresets returns all built-in attack preset categories.
 func GetPresets() []PresetCategory {
-	return []PresetCategory{
+	presets := []PresetCategory{
 		{
 			Name: "SQL Injection",
 			Icon: "\U0001F5C3",
@@ -125,7 +125,7 @@ func GetPresets() []PresetCategory {
 			Name: "Flag Exfiltration",
 			Icon: "\U0001F6A9",
 			Rules: []PresetRule{
-				{Name: "Exfil: curl/wget out", Type: MatchRegex, Scope: ScopeBody, Pattern: `(?i)(curl|wget)\s+https?://(?!10\.)`, Action: ActionDrop},
+				{Name: "Exfil: curl/wget URL", Type: MatchRegex, Scope: ScopeBody, Pattern: `(?i)(curl|wget)\s+https?://`, Action: ActionAlert},
 				{Name: "Exfil: nc/ncat outbound", Type: MatchRegex, Scope: ScopeBody, Pattern: `(?i)(nc|ncat)\s+\S+\s+\d{2,5}`, Action: ActionDrop},
 				{Name: "Exfil: DNS exfil", Type: MatchRegex, Scope: ScopeBody, Pattern: `(?i)(dig|nslookup|host)\s+\S+\.\S+`, Action: ActionAlert},
 				{Name: "Exfil: base64 pipe", Type: MatchRegex, Scope: ScopeBody, Pattern: `(?i)base64[\s|]+`, Action: ActionAlert},
@@ -216,4 +216,12 @@ func GetPresets() []PresetCategory {
 			},
 		},
 	}
+	// Built-ins are discovery aids. Operators can promote a reviewed,
+	// service-specific rule to drop/both after checking real checker traffic.
+	for i := range presets {
+		for j := range presets[i].Rules {
+			presets[i].Rules[j].Action = ActionAlert
+		}
+	}
+	return presets
 }

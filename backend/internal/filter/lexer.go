@@ -21,9 +21,9 @@ const (
 	tkAnd
 	tkOr
 	tkNot
-	tkOp     // ==, !=, <, <=, >, >=
-	tkKwOp   // contains, icontains, matches, startswith, endswith, in
-	tkBool   // true / false
+	tkOp   // ==, !=, <, <=, >, >=
+	tkKwOp // contains, icontains, matches, startswith, endswith, in
+	tkBool // true / false
 )
 
 type token struct {
@@ -55,6 +55,8 @@ var keywordOps = map[string]bool{
 	"startswith": true,
 	"endswith":   true,
 	"in":         true,
+	"exists":     true,
+	"missing":    true,
 }
 
 // reserved logical keywords (case-insensitive).

@@ -58,6 +58,7 @@ func TestHTTPMiddlewarePreservesWebSocketHijacking(t *testing.T) {
 		func() bool { return false },
 		func() bool { return false },
 		nil,
+		nil,
 	)
 	server := httptest.NewServer(handler)
 	defer server.Close()

@@ -17,9 +17,12 @@ var errTimeout = errors.New("pyfilter: worker timed out")
 
 // scriptSpec is what we hand the harness for each script.
 type scriptSpec struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Code string `json:"code"`
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	Code       string   `json:"code"`
+	ServiceIDs []string `json:"service_ids,omitempty"`
+	Directions []string `json:"directions,omitempty"`
+	Protocols  []string `json:"protocols,omitempty"`
 }
 
 // Match is one script's verdict on a flow.
@@ -32,7 +35,15 @@ type Match struct {
 	// before it reaches the client. Only honored for scripts marked Blocking;
 	// produced by returning {"drop": True} or {"block": True} from match().
 	Block bool `json:"block"`
+	// Close is requested by flow.close(). TCP already closes on every blocked
+	// message; protocols that support message drops may expose it as best-effort.
+	Close bool `json:"close,omitempty"`
 	Error bool `json:"error"`
+}
+
+type ConsoleLine struct {
+	Script string `json:"script"`
+	Text   string `json:"text"`
 }
 
 // worker wraps a single long-lived `python3 harness.py` process. The protocol
@@ -48,6 +59,10 @@ type worker struct {
 
 // spawnWorker starts a new Python worker running the embedded harness.
 func spawnWorker(pythonPath, harness string) (*worker, error) {
+	// The worker deliberately has no portable in-process "sandbox": OS-level
+	// isolation and resource limits belong to the Janus deployment/container.
+	// Keeping that boundary explicit avoids platform-specific half-sandboxes
+	// that are easy to bypass while preserving local development support.
 	cmd := exec.Command(pythonPath, "-u", "-c", harness)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -84,7 +99,7 @@ func (w *worker) roundtrip(req any, timeout time.Duration, dst any) error {
 	}
 	payload = append(payload, '\n')
 	if _, err := w.stdin.Write(payload); err != nil {
-		w.dead = true
+		w.terminateLocked()
 		return err
 	}
 
@@ -101,23 +116,38 @@ func (w *worker) roundtrip(req any, timeout time.Duration, dst any) error {
 	select {
 	case r := <-ch:
 		if r.err != nil {
-			w.dead = true
+			w.terminateLocked()
 			return fmt.Errorf("pyfilter: read: %w", r.err)
 		}
 		if dst == nil {
 			return nil
 		}
 		if err := json.Unmarshal(r.line, dst); err != nil {
-			w.dead = true
+			w.terminateLocked()
 			return fmt.Errorf("pyfilter: decode: %w", err)
 		}
 		return nil
 	case <-time.After(timeout):
 		// The reader goroutine is still blocked; killing the process unblocks it
-		// and the abandoned goroutine exits. The worker is discarded.
-		w.dead = true
-		_ = w.cmd.Process.Kill()
+		// and the abandoned goroutine exits. Wait reaps the child before this
+		// method returns, so repeated script timeouts cannot accumulate zombies.
+		w.terminateLocked()
 		return errTimeout
+	}
+}
+
+// terminateLocked kills and reaps the interpreter. Caller holds w.mu.
+func (w *worker) terminateLocked() {
+	if w.dead {
+		return
+	}
+	w.dead = true
+	if w.stdin != nil {
+		_ = w.stdin.Close()
+	}
+	if w.cmd != nil && w.cmd.Process != nil {
+		_ = w.cmd.Process.Kill()
+		_ = w.cmd.Wait()
 	}
 }
 
@@ -125,10 +155,7 @@ func (w *worker) roundtrip(req any, timeout time.Duration, dst any) error {
 func (w *worker) stop() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.dead = true
-	if w.cmd != nil && w.cmd.Process != nil {
-		_ = w.cmd.Process.Kill()
-	}
+	w.terminateLocked()
 }
 
 func (w *worker) isDead() bool {

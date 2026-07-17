@@ -12,7 +12,7 @@
 
 import { getDisplayName } from './api'
 
-const MAX_HIDDEN = 2000 // matches backend cap (strconv.ParseInt list limit)
+const MAX_HIDDEN = 500 // matches the /api/packets exclude_ids cap
 
 function keyHidden() {
   return `janus_hidden_ids_${getDisplayName() || '_guest'}`
@@ -23,13 +23,16 @@ function keyCursor() {
 function keyHiddenAlerts() {
   return `janus_hidden_alert_ids_${getDisplayName() || '_guest'}`
 }
+function keyViewCursor(view) {
+  return `janus_${view}_clear_cursor_${getDisplayName() || '_guest'}`
+}
 
 export function getHiddenIds() {
   try {
     const raw = localStorage.getItem(keyHidden())
     if (!raw) return []
     const arr = JSON.parse(raw)
-    return Array.isArray(arr) ? arr : []
+    return Array.isArray(arr) ? arr.slice(-MAX_HIDDEN) : []
   } catch {
     return []
   }
@@ -41,11 +44,11 @@ export function addHiddenIds(ids) {
   for (const id of ids) existing.add(Number(id))
   let next = Array.from(existing)
   if (next.length > MAX_HIDDEN) next = next.slice(next.length - MAX_HIDDEN)
-  try { localStorage.setItem(keyHidden(), JSON.stringify(next)) } catch {}
+  try { localStorage.setItem(keyHidden(), JSON.stringify(next)) } catch { /* private mode/quota: hiding remains best-effort */ }
 }
 
 export function clearHiddenIds() {
-  try { localStorage.removeItem(keyHidden()) } catch {}
+  try { localStorage.removeItem(keyHidden()) } catch { /* local storage may be unavailable */ }
 }
 
 export function getHiddenAlertIds() {
@@ -53,7 +56,7 @@ export function getHiddenAlertIds() {
     const raw = localStorage.getItem(keyHiddenAlerts())
     if (!raw) return []
     const arr = JSON.parse(raw)
-    return Array.isArray(arr) ? arr : []
+    return Array.isArray(arr) ? arr.slice(-MAX_HIDDEN) : []
   } catch {
     return []
   }
@@ -65,11 +68,11 @@ export function addHiddenAlertIds(ids) {
   for (const id of ids) existing.add(Number(id))
   let next = Array.from(existing)
   if (next.length > MAX_HIDDEN) next = next.slice(next.length - MAX_HIDDEN)
-  try { localStorage.setItem(keyHiddenAlerts(), JSON.stringify(next)) } catch {}
+  try { localStorage.setItem(keyHiddenAlerts(), JSON.stringify(next)) } catch { /* private mode/quota: hiding remains best-effort */ }
 }
 
 export function clearHiddenAlertIds() {
-  try { localStorage.removeItem(keyHiddenAlerts()) } catch {}
+  try { localStorage.removeItem(keyHiddenAlerts()) } catch { /* local storage may be unavailable */ }
 }
 
 export function getClearCursor() {
@@ -77,11 +80,25 @@ export function getClearCursor() {
 }
 
 export function setClearCursor(iso) {
-  try { localStorage.setItem(keyCursor(), iso) } catch {}
+  try { localStorage.setItem(keyCursor(), iso) } catch { /* local storage may be unavailable */ }
 }
 
 export function resetClearCursor() {
-  try { localStorage.removeItem(keyCursor()) } catch {}
+  try { localStorage.removeItem(keyCursor()) } catch { /* local storage may be unavailable */ }
+}
+
+export function getViewClearCursor(view) {
+  try { return localStorage.getItem(keyViewCursor(view)) || '' } catch { return '' }
+}
+
+export function setViewClearCursor(view, iso) {
+  try { localStorage.setItem(keyViewCursor(view), iso) } catch { /* local storage may be unavailable */ }
+}
+
+export function getEffectiveClearCursor(view) {
+  const globalCursor = getClearCursor()
+  const viewCursor = getViewClearCursor(view)
+  return viewCursor > globalCursor ? viewCursor : globalCursor
 }
 
 // Build query params to send on /api/packets requests. Pruning is done when

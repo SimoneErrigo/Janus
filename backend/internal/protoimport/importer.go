@@ -569,7 +569,7 @@ func computedBytesField(payload, lenField string, localVars map[string]string, s
 	return f, true
 }
 
-var bytesConcatRe = regexp.MustCompile(`(\w+)\.bytes\s*\+`)          // hdr.bytes + data
+var bytesConcatRe = regexp.MustCompile(`(\w+)\.bytes\s*\+`)                // hdr.bytes + data
 var ctorAssignRe = regexp.MustCompile(`^\s*(\w+)\s*=\s*[\w.]*?(\w+)\s*\(`) // hdr = Network.ReqHdr(...)
 
 // buildRequestFields lays out the request when the client prepends a header

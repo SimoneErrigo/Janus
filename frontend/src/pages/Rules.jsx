@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useCallback, useState, useEffect, useRef } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import ErrorBanner from '../components/ErrorBanner'
@@ -24,6 +24,7 @@ export default function Rules() {
   const [selectedIds, setSelectedIds] = useState(new Set())
   const [actionFilter, setActionFilter] = useState('all') // 'all' | 'drop' | 'alert' | 'both'
   const ruleFormAnchorRef = useRef(null)
+  const rulesRequestRef = useRef(0)
   // Anchor for Shift+click range selection, set by any single checkbox toggle.
   const selectionAnchorRef = useRef(null)
   const location = useLocation()
@@ -33,44 +34,55 @@ export default function Rules() {
     api.listServices().then((data) => {
       const svcs = data || []
       setServices(svcs)
-      if (svcs.length > 0 && !selectedService) setSelectedService('_all')
+      if (svcs.length > 0) setSelectedService((current) => current || '_all')
     })
   }, [])
 
-  // Receive a pre-filled rule from another page (e.g. Traffic "New drop rule").
+  // Receive a pre-filled rule from another page (e.g. Traffic "New rule").
   // We consume location.state and clear it so a back-navigation doesn't re-open
   // the form. The form is opened immediately so the user only confirms + saves.
   useEffect(() => {
     const preset = location.state?.presetRule
     if (!preset) return
-    setEditing({
-      _isNew: true,
-      service_id: preset.service_id || (services[0]?.id || ''),
-      name: preset.name || '',
-      expression: preset.expression || '',
-      priority: 10,
-      enabled: true,
-      action: preset.action || 'drop',
-    })
-    if (preset.service_id) setSelectedService(preset.service_id)
-    navigate(location.pathname, { replace: true, state: null })
-    setTimeout(() => ruleFormAnchorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
+    let scrollTimer
+    const timer = setTimeout(() => {
+      setEditing({
+        _isNew: true,
+        service_id: preset.service_id || (services[0]?.id || ''),
+        name: preset.name || '',
+        expression: preset.expression || '',
+        priority: 10,
+        enabled: true,
+        action: preset.action || 'alert',
+      })
+      if (preset.service_id) setSelectedService(preset.service_id)
+      navigate(location.pathname, { replace: true, state: null })
+      scrollTimer = setTimeout(() => ruleFormAnchorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
+    }, 0)
+    return () => { clearTimeout(timer); clearTimeout(scrollTimer) }
   }, [location.state, location.pathname, navigate, services])
 
-  useEffect(() => {
-    loadRules()
-  }, [selectedService])
-
-  async function loadRules() {
+  const loadRules = useCallback(async () => {
+    const request = ++rulesRequestRef.current
     try {
       const serviceId = selectedService === '_all' ? '' : selectedService
       const data = await api.listRules(serviceId)
+      if (request !== rulesRequestRef.current) return
       setRules(data || [])
       setSelectedIds(new Set())
     } catch (err) {
-      setError(err.message)
+      if (request === rulesRequestRef.current) setError(err.message)
     }
-  }
+  }, [selectedService])
+  const invalidateRulesLoad = useCallback(() => { rulesRequestRef.current++ }, [])
+
+  useEffect(() => {
+    const timer = setTimeout(loadRules, 0)
+    return () => {
+      clearTimeout(timer)
+      invalidateRulesLoad()
+    }
+  }, [invalidateRulesLoad, loadRules])
 
   const { serviceName } = useServiceMap(services)
 
@@ -137,7 +149,7 @@ export default function Rules() {
     selectionAnchorRef.current = id
   }
 
-  const filteredRules = actionFilter === 'all' ? rules : rules.filter(r => (r.action || 'drop') === actionFilter)
+  const filteredRules = actionFilter === 'all' ? rules : rules.filter(r => (r.action || 'alert') === actionFilter)
 
   // Extend (or start) a selection from the anchor row to the clicked row, over
   // the currently filtered list. Mirrors the Traffic table behaviour. Returns
@@ -215,7 +227,7 @@ export default function Rules() {
             </button>
           )}
           <button
-            onClick={() => setEditing({ _isNew: true, service_id: selectedService === '_all' ? (services[0]?.id || '') : selectedService, name: '', expression: '', priority: 10, enabled: true, action: 'drop' })}
+            onClick={() => setEditing({ _isNew: true, service_id: selectedService === '_all' ? (services[0]?.id || '') : selectedService, name: '', expression: '', priority: 10, enabled: true, action: 'alert' })}
             disabled={!selectedService || services.length === 0}
             className="bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 text-white text-sm px-4 py-2 rounded transition-colors cursor-pointer"
           >
@@ -297,7 +309,7 @@ export default function Rules() {
                       rule.action === 'alert' ? 'bg-orange-900/40 text-orange-400' :
                       rule.action === 'both' ? 'bg-purple-900/40 text-purple-400' :
                       'bg-gray-800 text-gray-400'
-                    }`}>{rule.action || 'drop'}</span>
+                    }`}>{rule.action || 'alert'}</span>
                     <span className="text-gray-300">{ruleSummary(rule)}</span>
                     <span className="ml-2 text-gray-600">priority: {rule.priority}</span>
                     {rule.created_by && (
@@ -521,7 +533,7 @@ function PresetPanel({ services, defaultServiceId, onCreated, onCancel }) {
 function RuleForm({ rule, services, onSave, onCancel }) {
   const [form, setForm] = useState({
     ...rule,
-    action: rule.action || 'drop',
+    action: rule.action || 'alert',
     expression: rule.expression || '',
   })
   const [targetServices, setTargetServices] = useState([rule.service_id])

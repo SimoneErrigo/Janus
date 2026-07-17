@@ -158,6 +158,12 @@ func compilePredicate(pr *Predicate) (EvalFunc, error) {
 	getter := func(p PacketView) string {
 		return readString(p, fname, headerName)
 	}
+	if pr.Op == OpExists {
+		return func(p PacketView) bool { return getter(p) != "" }, nil
+	}
+	if pr.Op == OpMissing {
+		return func(p PacketView) bool { return getter(p) == "" }, nil
+	}
 
 	// IP fields get extra CIDR support on `==`, `!=`, `in`.
 	isIPField := fname == "src" || fname == "dst" || fname == "peer"
@@ -194,6 +200,9 @@ func compilePredicate(pr *Predicate) (EvalFunc, error) {
 		pat, err := stringValue(pr.Value)
 		if err != nil {
 			return nil, err
+		}
+		if len(pat) > 512 {
+			return nil, fmt.Errorf("regex is longer than 512 bytes")
 		}
 		re, err := regexp.Compile(pat)
 		if err != nil {

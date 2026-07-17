@@ -33,6 +33,20 @@ func TestDeriveExpression_Regex(t *testing.T) {
 	}
 }
 
+func TestBuiltInPresetsAreValidAlertRules(t *testing.T) {
+	for _, category := range GetPresets() {
+		for _, preset := range category.Rules {
+			if preset.Action != ActionAlert {
+				t.Errorf("%s / %s action=%s, want alert", category.Name, preset.Name, preset.Action)
+			}
+			expression := DeriveExpression(&Rule{Type: preset.Type, Scope: preset.Scope, Pattern: preset.Pattern})
+			if _, err := filter.Compile(expression); err != nil {
+				t.Errorf("%s / %s: %v", category.Name, preset.Name, err)
+			}
+		}
+	}
+}
+
 func TestDeriveExpression_BytesHexEscape(t *testing.T) {
 	// 0xDEADBEEF → \xDE\xAD\xBE\xEF
 	r := &Rule{Type: MatchBytes, Scope: ScopeRaw, Pattern: "DEADBEEF"}
@@ -177,5 +191,39 @@ func TestCreateRule_AutoDerivesExpression(t *testing.T) {
 	got, _ := store.GetRule("r-new")
 	if got.Expression != `body contains "pluto"` {
 		t.Fatalf("CreateRule should auto-derive Expression, got %q", got.Expression)
+	}
+}
+
+func TestCreateRulesBatchIsAtomic(t *testing.T) {
+	store, err := NewRuleStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := []*Rule{
+		{ID: "batch-1", ServiceID: "web", Name: "one", Expression: `body contains "one"`, Action: ActionAlert},
+		{ID: "batch-2", ServiceID: "tcp", Name: "two", Expression: `raw contains "two"`, Action: ActionAlert},
+	}
+	version := store.Version()
+	if err := store.CreateRules(rules); err != nil {
+		t.Fatal(err)
+	}
+	if store.Version() != version+1 || len(store.ListRules("")) != 2 {
+		t.Fatalf("batch was not published as one mutation")
+	}
+	for _, rule := range rules {
+		if history := store.ListRevisions(rule.ID); len(history) != 1 || history[0].Rule.Revision != 1 {
+			t.Fatalf("missing initial revision for %s: %#v", rule.ID, history)
+		}
+	}
+
+	invalid := []*Rule{
+		{ID: "batch-3", ServiceID: "web", Name: "three", Expression: `body contains "three"`, Action: ActionAlert},
+		{ID: "batch-4", ServiceID: "web", Name: "bad", Expression: `body matches "("`, Action: ActionAlert},
+	}
+	if err := store.CreateRules(invalid); err == nil {
+		t.Fatal("invalid batch unexpectedly succeeded")
+	}
+	if _, exists := store.GetRule("batch-3"); exists {
+		t.Fatal("valid prefix of an invalid batch was published")
 	}
 }

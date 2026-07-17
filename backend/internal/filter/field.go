@@ -1,5 +1,13 @@
 package filter
 
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+)
+
 // PacketView abstracts the bits of a packet/request the evaluator can read.
 // Implementations:
 //   - sniffer.Packet (residual eval after a SQL fetch)
@@ -84,30 +92,46 @@ func canonicalField(name string) string {
 
 // fields is the master registry. Adding a field = one entry here.
 var fields = map[string]Field{
-	"id":              {Name: "id", Type: TypeInt, SQLColumn: "id"},
-	"body":            {Name: "body", Type: TypeString, SQLColumn: "body_string"},
-	"raw":             {Name: "raw", Type: TypeBytes, SQLColumn: ""},
-	"url":             {Name: "url", Type: TypeString, SQLColumn: "url"},
-	"method":          {Name: "method", Type: TypeString, SQLColumn: "method"},
-	"status":          {Name: "status", Type: TypeInt, SQLColumn: "status"},
-	"round":           {Name: "round", Type: TypeInt, SQLColumn: ""},
-	"proto":           {Name: "proto", Type: TypeString, SQLColumn: "protocol"},
-	"service":         {Name: "service", Type: TypeString, SQLColumn: "service_id"},
-	"direction":       {Name: "direction", Type: TypeString, SQLColumn: "direction"},
-	"src":             {Name: "src", Type: TypeString, SQLColumn: "src_ip"},
-	"dst":             {Name: "dst", Type: TypeString, SQLColumn: "dst_ip"},
-	"peer":            {Name: "peer", Type: TypeString, SQLColumn: ""}, // peer is direction-aware, eval-only
-	"sport":           {Name: "sport", Type: TypeInt, SQLColumn: "src_port"},
-	"dport":           {Name: "dport", Type: TypeInt, SQLColumn: "dst_port"},
-	"header":          {Name: "header", Type: TypeHeaders, SQLColumn: "headers", IsHeaderField: true},
-	"flagged":         {Name: "flagged", Type: TypeBool, SQLColumn: "flagged"},
-	"contains_flagid": {Name: "contains_flagid", Type: TypeBool, SQLColumn: "contains_flagid"},
-	"dropped":         {Name: "dropped", Type: TypeBool, SQLColumn: "has_drop_match"},
+	"id":               {Name: "id", Type: TypeInt, SQLColumn: "id"},
+	"body":             {Name: "body", Type: TypeString, SQLColumn: "body_string"},
+	"raw":              {Name: "raw", Type: TypeBytes, SQLColumn: ""},
+	"url":              {Name: "url", Type: TypeString, SQLColumn: "url"},
+	"path":             {Name: "path", Type: TypeString, SQLColumn: ""},
+	"method":           {Name: "method", Type: TypeString, SQLColumn: "method"},
+	"status":           {Name: "status", Type: TypeInt, SQLColumn: "status"},
+	"round":            {Name: "round", Type: TypeInt, SQLColumn: ""},
+	"proto":            {Name: "proto", Type: TypeString, SQLColumn: "protocol"},
+	"service":          {Name: "service", Type: TypeString, SQLColumn: "service_id"},
+	"direction":        {Name: "direction", Type: TypeString, SQLColumn: "direction"},
+	"src":              {Name: "src", Type: TypeString, SQLColumn: "src_ip"},
+	"dst":              {Name: "dst", Type: TypeString, SQLColumn: "dst_ip"},
+	"peer":             {Name: "peer", Type: TypeString, SQLColumn: ""}, // peer is direction-aware, eval-only
+	"sport":            {Name: "sport", Type: TypeInt, SQLColumn: "src_port"},
+	"dport":            {Name: "dport", Type: TypeInt, SQLColumn: "dst_port"},
+	"header":           {Name: "header", Type: TypeHeaders, SQLColumn: "headers", IsHeaderField: true},
+	"flagged":          {Name: "flagged", Type: TypeBool, SQLColumn: "flagged"},
+	"contains_flagid":  {Name: "contains_flagid", Type: TypeBool, SQLColumn: "contains_flagid"},
+	"dropped":          {Name: "dropped", Type: TypeBool, SQLColumn: "has_drop_match"},
+	"attack_score":     {Name: "attack_score", Type: TypeInt, SQLColumn: "attack_score"},
+	"normal_score":     {Name: "normal_score", Type: TypeInt, SQLColumn: "normal_score"},
+	"score_coverage":   {Name: "score_coverage", Type: TypeInt, SQLColumn: "score_coverage"},
+	"score_confidence": {Name: "score_confidence", Type: TypeInt, SQLColumn: "score_confidence"},
+	"classification":   {Name: "classification", Type: TypeString, SQLColumn: "classification"},
+	"analyst_label":    {Name: "analyst_label", Type: TypeString, SQLColumn: "analyst_label"},
 }
 
 // LookupField returns the registered Field for a canonical name.
 func LookupField(name string) (Field, bool) {
-	f, ok := fields[canonicalField(name)]
+	name = canonicalField(name)
+	f, ok := fields[name]
+	if ok {
+		return f, true
+	}
+	for _, prefix := range []string{"decoded.", "json.", "query.", "form.", "cookie.", "dns.", "resp.", "mqtt."} {
+		if strings.HasPrefix(name, prefix) && len(name) > len(prefix) {
+			return Field{Name: name, Type: TypeString}, true
+		}
+	}
 	return f, ok
 }
 
@@ -117,7 +141,7 @@ func opCompatible(t FieldType, op Op) bool {
 	case TypeString, TypeBytes, TypeHeaders:
 		switch op {
 		case OpContains, OpIContains, OpEq, OpNeq, OpMatches,
-			OpStartsWith, OpEndsWith, OpIn:
+			OpStartsWith, OpEndsWith, OpIn, OpExists, OpMissing:
 			return true
 		}
 	case TypeInt:
@@ -144,6 +168,12 @@ func readString(p PacketView, field string, headerName string) string {
 		return string(p.RawBytes())
 	case "url":
 		return p.URL()
+	case "path":
+		u, err := url.Parse(p.URL())
+		if err == nil {
+			return u.Path
+		}
+		return p.URL()
 	case "method":
 		return p.Method()
 	case "proto":
@@ -158,13 +188,94 @@ func readString(p PacketView, field string, headerName string) string {
 		return p.DstIP()
 	case "peer":
 		return p.PeerIP()
+	case "classification":
+		if view, ok := p.(interface{ Classification() string }); ok {
+			return view.Classification()
+		}
+	case "analyst_label":
+		if view, ok := p.(interface{ AnalystLabel() string }); ok {
+			return view.AnalystLabel()
+		}
 	case "header":
 		if headerName != "" {
 			return p.Header(headerName)
 		}
 		return p.HeadersText()
 	}
+	if value, ok := readStructured(p, field); ok {
+		return value
+	}
 	return ""
+}
+
+func readStructured(p PacketView, field string) (string, bool) {
+	switch {
+	case strings.HasPrefix(field, "query."):
+		u, err := url.Parse(p.URL())
+		if err != nil {
+			return "", false
+		}
+		value, ok := u.Query()[strings.TrimPrefix(field, "query.")]
+		return strings.Join(value, ","), ok
+	case strings.HasPrefix(field, "form."):
+		values, err := url.ParseQuery(p.BodyString())
+		if err != nil {
+			return "", false
+		}
+		value, ok := values[strings.TrimPrefix(field, "form.")]
+		return strings.Join(value, ","), ok
+	case strings.HasPrefix(field, "cookie."):
+		req := &http.Request{Header: http.Header{"Cookie": []string{p.Header("Cookie")}}}
+		cookie, err := req.Cookie(strings.TrimPrefix(field, "cookie."))
+		if err != nil {
+			return "", false
+		}
+		return cookie.Value, true
+	case strings.HasPrefix(field, "json."):
+		var root any
+		if json.Unmarshal([]byte(p.BodyString()), &root) != nil {
+			return "", false
+		}
+		return walkValue(root, strings.Split(strings.TrimPrefix(field, "json."), "."))
+	default:
+		path := field
+		if strings.HasPrefix(path, "decoded.") {
+			path = strings.TrimPrefix(path, "decoded.")
+		}
+		if strings.HasPrefix(field, "dns.") || strings.HasPrefix(field, "resp.") || strings.HasPrefix(field, "mqtt.") || strings.HasPrefix(field, "decoded.") {
+			return walkValue(decodedFields(p), strings.Split(path, "."))
+		}
+	}
+	return "", false
+}
+
+func decodedFields(p PacketView) map[string]any {
+	if view, ok := p.(interface{ DecodedFields() map[string]any }); ok {
+		return view.DecodedFields()
+	}
+	return nil
+}
+
+func walkValue(root any, path []string) (string, bool) {
+	current := root
+	for _, part := range path {
+		object, ok := current.(map[string]any)
+		if !ok {
+			return "", false
+		}
+		current, ok = object[part]
+		if !ok {
+			return "", false
+		}
+	}
+	switch value := current.(type) {
+	case string:
+		return value, true
+	case nil:
+		return "", false
+	default:
+		return fmt.Sprint(value), true
+	}
 }
 
 func readInt(p PacketView, field string) int64 {
@@ -179,6 +290,9 @@ func readInt(p PacketView, field string) int64 {
 		return int64(p.SrcPort())
 	case "dport":
 		return int64(p.DstPort())
+	}
+	if view, ok := p.(interface{ ScoreInt(string) int64 }); ok {
+		return view.ScoreInt(field)
 	}
 	return 0
 }

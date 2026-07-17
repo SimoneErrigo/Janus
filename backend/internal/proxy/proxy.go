@@ -10,6 +10,8 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -49,6 +51,9 @@ type Status struct {
 	ServiceID   string    `json:"service_id"`
 	State       string    `json:"state"`
 	Running     bool      `json:"running"`
+	Transport   string    `json:"transport,omitempty"`
+	Application string    `json:"application,omitempty"`
+	BindAddress string    `json:"bind_address,omitempty"`
 	LastError   string    `json:"last_error,omitempty"`
 	LastAttempt time.Time `json:"last_attempt,omitempty"`
 }
@@ -56,17 +61,18 @@ type Status struct {
 // Manager manages proxy instances for configured services.
 type Manager struct {
 	mu            sync.RWMutex
-	proxies       map[string]*runningProxy // service ID -> running proxy
-	engineMu      sync.RWMutex
-	engines       map[string]*dropper.Engine // service ID -> shared drop engine
-	packetStore   *sniffer.PacketStore
-	ruleStore     *dropper.RuleStore
+	reconfigureMu sync.Mutex
+	proxies       map[string]*ServiceRuntime // service ID -> isolated runtime
+	packetStore   sniffer.PacketSink
+	ruleStore     dropper.RuleSource
 	flagRegex     *regexp.Regexp
 	flagScanner   *flagids.FlagScanner // optimized byte-level flag scanner
 	rulesCache    dropper.RulesCache
 	flagIDChecker sniffer.FlagIDChecker
 	captureCtrl   *sniffer.CaptureController
-	pyBlockFn     sniffer.PyBlockFunc // inline (synchronous) Python filter eval
+	pyBlockFn     sniffer.PyBlockFunc          // inline (synchronous) Python filter eval
+	pyShouldEval  sniffer.PyShouldEvaluateFunc // cheap scope preflight for HTTP response buffering
+	dataBindMode  string
 }
 
 // runningProxy tracks the lifecycle of a single proxy. The outer ctx/cancel
@@ -75,8 +81,9 @@ type Manager struct {
 // is automatically torn down when the outer ctx is cancelled (i.e. when
 // StopService is called). listener/server may be nil while the proxy is in
 // the retrying state.
-type runningProxy struct {
+type ServiceRuntime struct {
 	service  *storage.Service
+	spec     storage.ServiceSpec
 	ctx      context.Context
 	cancel   context.CancelFunc
 	retryNow chan struct{}
@@ -87,7 +94,12 @@ type runningProxy struct {
 	state       ProxyState
 	lastError   string
 	lastAttempt time.Time
+	engine      *dropper.Engine
 }
+
+// runningProxy remains as an internal alias while protocol helpers are moved
+// incrementally onto ServiceRuntime.
+type runningProxy = ServiceRuntime
 
 func (rp *runningProxy) markRunning(listener net.Listener, server *http.Server) {
 	rp.stateMu.Lock()
@@ -114,10 +126,17 @@ func (rp *runningProxy) markRetrying(err error) {
 func (rp *runningProxy) snapshot() Status {
 	rp.stateMu.RLock()
 	defer rp.stateMu.RUnlock()
+	bindAddress := ""
+	if rp.listener != nil {
+		bindAddress = rp.listener.Addr().String()
+	}
 	return Status{
 		ServiceID:   rp.service.ID,
 		State:       string(rp.state),
 		Running:     rp.state == StateRunning,
+		Transport:   string(rp.spec.Listener.Transport),
+		Application: string(rp.spec.Application.Profile),
+		BindAddress: bindAddress,
 		LastError:   rp.lastError,
 		LastAttempt: rp.lastAttempt,
 	}
@@ -139,15 +158,86 @@ func (rp *runningProxy) takeServerAndListener() (*http.Server, net.Listener) {
 }
 
 // NewManager creates a new proxy manager.
-func NewManager(packetStore *sniffer.PacketStore, ruleStore *dropper.RuleStore, flagRegex *regexp.Regexp, flagScanner *flagids.FlagScanner) *Manager {
+func NewManager(packetStore sniffer.PacketSink, ruleStore dropper.RuleSource, flagRegex *regexp.Regexp, flagScanner *flagids.FlagScanner) *Manager {
 	return &Manager{
-		proxies:     make(map[string]*runningProxy),
-		engines:     make(map[string]*dropper.Engine),
-		packetStore: packetStore,
-		ruleStore:   ruleStore,
-		flagRegex:   flagRegex,
-		flagScanner: flagScanner,
+		proxies:      make(map[string]*ServiceRuntime),
+		packetStore:  packetStore,
+		ruleStore:    ruleStore,
+		flagRegex:    flagRegex,
+		flagScanner:  flagScanner,
+		dataBindMode: "configured",
 	}
+}
+
+// SetFlagPattern atomically publishes new flag matchers. HTTP-family handlers
+// receive their matchers when they are built, so those listeners are restarted
+// after publication; stream/datagram/WebSocket message paths read the current
+// pair for every message. Invalid patterns leave the running configuration
+// untouched.
+func (m *Manager) SetFlagPattern(pattern string, caseInsensitive, decodeURL bool) error {
+	m.reconfigureMu.Lock()
+	defer m.reconfigureMu.Unlock()
+
+	var re *regexp.Regexp
+	var err error
+	regexpPattern := pattern
+	if caseInsensitive && pattern != "" && !strings.HasPrefix(pattern, "(?i)") {
+		regexpPattern = "(?i)" + pattern
+	}
+	if regexpPattern != "" {
+		re, err = regexp.Compile(regexpPattern)
+		if err != nil {
+			return fmt.Errorf("invalid flag regex: %w", err)
+		}
+	}
+	scanner := flagids.NewFlagScanner(pattern, caseInsensitive, decodeURL)
+
+	m.mu.Lock()
+	m.flagRegex, m.flagScanner = re, scanner
+	services := make([]*storage.Service, 0, len(m.proxies))
+	for _, runtime := range m.proxies {
+		switch runtime.spec.Application.Profile {
+		case storage.ApplicationHTTP, storage.ApplicationWebSocket, storage.ApplicationHTTP2, storage.ApplicationGRPC:
+			services = append(services, runtime.service)
+		}
+	}
+	m.mu.Unlock()
+
+	var firstErr error
+	for _, svc := range services {
+		_ = m.stopServiceLocked(svc.ID)
+		if err := m.startServiceLocked(svc); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("refreshing flag matcher for service %q: %w", svc.ID, err)
+			}
+		}
+	}
+	return firstErr
+}
+
+func (m *Manager) currentFlagMatchers() (*regexp.Regexp, *flagids.FlagScanner) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.flagRegex, m.flagScanner
+}
+
+// CountFlags exposes the live matcher pair to diagnostics such as the Python
+// filter dry-run, keeping synthetic samples consistent with captured traffic.
+func (m *Manager) CountFlags(url, headers string, body []byte) (urlCount, headerCount, bodyCount int) {
+	flagRegex, flagScanner := m.currentFlagMatchers()
+	return sniffer.CountFlags(flagRegex, flagScanner, url, headers, body)
+}
+
+// SetDataPlaneBindMode separates the checker-facing configured address from
+// the container runtime bind. Bridge Compose uses wildcard; host networking
+// uses configured.
+func (m *Manager) SetDataPlaneBindMode(mode string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if mode != "wildcard" {
+		mode = "configured"
+	}
+	m.dataBindMode = mode
 }
 
 // engineFor returns a shared drop engine for the given service, creating it on
@@ -158,32 +248,18 @@ func (m *Manager) engineFor(svc *storage.Service) *dropper.Engine {
 	if m.ruleStore == nil {
 		return nil
 	}
-	m.engineMu.RLock()
-	if e := m.engines[svc.ID]; e != nil {
-		m.engineMu.RUnlock()
-		return e
+	m.mu.RLock()
+	runtime := m.proxies[svc.ID]
+	m.mu.RUnlock()
+	if runtime != nil {
+		return runtime.engine
 	}
-	m.engineMu.RUnlock()
-
-	m.engineMu.Lock()
-	defer m.engineMu.Unlock()
-	if e := m.engines[svc.ID]; e != nil {
-		return e
-	}
-	e := dropper.NewEngine(m.ruleStore)
+	// Compatibility for isolated unit callers not registered with Manager.
+	engine := dropper.NewEngine(m.ruleStore)
 	if m.rulesCache != nil {
-		e.SetCache(m.rulesCache)
+		engine.SetCache(m.rulesCache)
 	}
-	m.engines[svc.ID] = e
-	return e
-}
-
-// dropEngineCache drops the cached engine for the given service ID.
-// Called when a service is stopped/deleted so its engine can be GC'd.
-func (m *Manager) dropEngineCache(serviceID string) {
-	m.engineMu.Lock()
-	delete(m.engines, serviceID)
-	m.engineMu.Unlock()
+	return engine
 }
 
 // SetRulesCache sets the Redis cache for rule lookups on all new engines.
@@ -191,6 +267,11 @@ func (m *Manager) SetRulesCache(c dropper.RulesCache) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.rulesCache = c
+	for _, runtime := range m.proxies {
+		if runtime.engine != nil {
+			runtime.engine.SetCache(c)
+		}
+	}
 }
 
 // SetFlagIDChecker sets the flag ID checker for marking packets at ingestion time.
@@ -218,6 +299,20 @@ func (m *Manager) currentPyBlockFn() sniffer.PyBlockFunc {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.pyBlockFn
+}
+
+// SetPyShouldEvaluateFn installs the scope preflight used to avoid buffering
+// HTTP responses when no enabled inline response filter can match them.
+func (m *Manager) SetPyShouldEvaluateFn(fn sniffer.PyShouldEvaluateFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pyShouldEval = fn
+}
+
+func (m *Manager) currentPyShouldEvaluateFn() sniffer.PyShouldEvaluateFunc {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.pyShouldEval
 }
 
 func (m *Manager) SetCaptureController(c *sniffer.CaptureController) {
@@ -254,6 +349,21 @@ func (m *Manager) shouldApplyFlagIDsOnIngest() bool {
 // back for a transient bind failure — they should look at Status / the
 // /api/services/status endpoint to see the live state.
 func (m *Manager) StartService(svc *storage.Service) error {
+	m.reconfigureMu.Lock()
+	defer m.reconfigureMu.Unlock()
+	return m.startServiceLocked(svc)
+}
+
+// startServiceLocked is the implementation shared by startup, restart, and
+// flag-matcher reconfiguration. The caller holds reconfigureMu so a stale
+// restart can never overwrite a concurrent service update.
+func (m *Manager) startServiceLocked(svc *storage.Service) error {
+	if svc == nil {
+		return fmt.Errorf("service is required")
+	}
+	if err := validateRuntimeSupport(svc.RuntimeSpec()); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	if _, exists := m.proxies[svc.ID]; exists {
 		m.mu.Unlock()
@@ -263,11 +373,18 @@ func (m *Manager) StartService(svc *storage.Service) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	rp := &runningProxy{
 		service:     svc,
+		spec:        svc.RuntimeSpec(),
 		ctx:         ctx,
 		cancel:      cancel,
 		retryNow:    make(chan struct{}, 1),
 		state:       StateRetrying,
 		lastAttempt: time.Now(),
+	}
+	if m.ruleStore != nil {
+		rp.engine = dropper.NewEngine(m.ruleStore)
+		if m.rulesCache != nil {
+			rp.engine.SetCache(m.rulesCache)
+		}
 	}
 	m.proxies[svc.ID] = rp
 	m.mu.Unlock()
@@ -286,10 +403,46 @@ func (m *Manager) StartService(svc *storage.Service) error {
 	return nil
 }
 
+func validateRuntimeSupport(spec storage.ServiceSpec) error {
+	switch spec.Listener.Transport {
+	case storage.TransportUDP:
+		if spec.Listener.TLS != storage.ClientTLSOff {
+			return fmt.Errorf("UDP listener TLS mode %q is not supported", spec.Listener.TLS)
+		}
+		if spec.Application.Profile != storage.ApplicationRaw && spec.Application.Profile != storage.ApplicationDNS {
+			return fmt.Errorf("application profile %q is not supported over UDP", spec.Application.Profile)
+		}
+	case storage.TransportTCP:
+		if !isSupportedTCPApplication(spec.Application.Profile) {
+			return fmt.Errorf("application profile %q is not supported over TCP", spec.Application.Profile)
+		}
+	default:
+		return fmt.Errorf("transport %q is not supported", spec.Listener.Transport)
+	}
+	return nil
+}
+
+func isSupportedTCPApplication(profile storage.ApplicationProfile) bool {
+	switch profile {
+	case storage.ApplicationHTTP, storage.ApplicationWebSocket, storage.ApplicationHTTP2,
+		storage.ApplicationGRPC, storage.ApplicationRaw, storage.ApplicationDNS,
+		storage.ApplicationRESP, storage.ApplicationMQTT:
+		return true
+	default:
+		return false
+	}
+}
+
 // StopService stops the proxy for the given service ID. Works whether the
 // proxy is currently running or in the retrying state — cancelling rp.ctx
 // terminates any in-flight retry loop alongside the live listener.
 func (m *Manager) StopService(id string) error {
+	m.reconfigureMu.Lock()
+	defer m.reconfigureMu.Unlock()
+	return m.stopServiceLocked(id)
+}
+
+func (m *Manager) stopServiceLocked(id string) error {
 	m.mu.Lock()
 	rp, exists := m.proxies[id]
 	if !exists {
@@ -304,27 +457,36 @@ func (m *Manager) StopService(id string) error {
 	server, listener := rp.takeServerAndListener()
 	if server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		server.Shutdown(ctx)
+		if err := server.Shutdown(ctx); err != nil {
+			_ = server.Close()
+		}
 		cancel()
 	}
 	if listener != nil {
 		listener.Close()
 	}
 
-	m.dropEngineCache(id)
 	log.Printf("Proxy stopped: %s", rp.service.Name)
 	return nil
 }
 
 // RestartService stops and restarts the proxy for the given service.
 func (m *Manager) RestartService(svc *storage.Service) error {
-	// Stop if running (ignore error if not running)
-	m.StopService(svc.ID)
-	return m.StartService(svc)
+	m.reconfigureMu.Lock()
+	defer m.reconfigureMu.Unlock()
+	// Stop if running (ignore error if not running).
+	_ = m.stopServiceLocked(svc.ID)
+	return m.startServiceLocked(svc)
 }
 
 // StopAll stops all running proxies.
 func (m *Manager) StopAll() {
+	m.reconfigureMu.Lock()
+	defer m.reconfigureMu.Unlock()
+	m.stopAllLocked()
+}
+
+func (m *Manager) stopAllLocked() {
 	m.mu.Lock()
 	rps := make(map[string]*runningProxy, len(m.proxies))
 	for id, rp := range m.proxies {
@@ -333,18 +495,19 @@ func (m *Manager) StopAll() {
 	}
 	m.mu.Unlock()
 
-	for id, rp := range rps {
+	for _, rp := range rps {
 		rp.cancel()
 		server, listener := rp.takeServerAndListener()
 		if server != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			server.Shutdown(ctx)
+			if err := server.Shutdown(ctx); err != nil {
+				_ = server.Close()
+			}
 			cancel()
 		}
 		if listener != nil {
 			listener.Close()
 		}
-		m.dropEngineCache(id)
 		log.Printf("Proxy stopped: %s", rp.service.Name)
 	}
 }
@@ -457,16 +620,30 @@ func (m *Manager) attemptBind(rp *runningProxy) error {
 	ctx, cancel := context.WithCancel(rp.ctx)
 	var inner *runningProxy
 	var err error
-	switch rp.service.Protocol {
-	case storage.ProtocolHTTP, storage.ProtocolWS:
-		inner, err = m.startHTTPProxy(ctx, cancel, rp.service)
-	case storage.ProtocolHTTPS, storage.ProtocolWSS, storage.ProtocolHTTP2, storage.ProtocolGRPC:
-		inner, err = m.startTLSProxy(ctx, cancel, rp.service)
-	case storage.ProtocolTCP:
+	spec := rp.service.RuntimeSpec()
+	if spec.Listener.Transport == storage.TransportUDP {
+		inner, err = m.startUDPProxy(ctx, cancel, rp.service)
+		if err == nil {
+			rp.markRunning(inner.listener, inner.server)
+		}
+		return err
+	}
+	if spec.Listener.Transport != storage.TransportTCP {
+		cancel()
+		return fmt.Errorf("transport %q not supported", spec.Listener.Transport)
+	}
+	switch spec.Application.Profile {
+	case storage.ApplicationHTTP, storage.ApplicationWebSocket, storage.ApplicationHTTP2, storage.ApplicationGRPC:
+		if spec.Listener.TLS == storage.ClientTLSTerminate {
+			inner, err = m.startTLSProxy(ctx, cancel, rp.service)
+		} else {
+			inner, err = m.startHTTPProxy(ctx, cancel, rp.service)
+		}
+	case storage.ApplicationRaw, storage.ApplicationDNS, storage.ApplicationRESP, storage.ApplicationMQTT:
 		inner, err = m.startTCPProxy(ctx, cancel, rp.service)
 	default:
 		cancel()
-		return fmt.Errorf("protocol %q not yet supported", rp.service.Protocol)
+		return fmt.Errorf("application profile %q not yet supported", spec.Application.Profile)
 	}
 	if err != nil {
 		// The per-protocol helper already called cancel() on its way out,
@@ -495,29 +672,54 @@ func (m *Manager) retryLoop(rp *runningProxy) {
 		case <-ticker.C:
 		case <-rp.retryNow:
 		}
-		if err := m.attemptBind(rp); err != nil {
+
+		// A retry is a lifecycle transition just like Start/Stop/Restart. Keep it
+		// under the same lock and re-check registration so an in-flight retry can
+		// never publish a listener after StopService has removed this runtime.
+		m.reconfigureMu.Lock()
+		m.mu.RLock()
+		registered := m.proxies[rp.service.ID] == rp
+		m.mu.RUnlock()
+		if !registered {
+			m.reconfigureMu.Unlock()
+			return
+		}
+		err := m.attemptBind(rp)
+		if err != nil {
 			rp.markRetrying(err)
+			m.reconfigureMu.Unlock()
 			continue
 		}
+		m.reconfigureMu.Unlock()
 		log.Printf("Proxy bound (retry succeeded): %s (%s:%d -> %s) [%s]", rp.service.Name, rp.service.ListenAddr, rp.service.ListenPort, rp.service.TargetAddr, rp.service.Protocol)
 		return
 	}
 }
 
 func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc, svc *storage.Service) (*runningProxy, error) {
+	spec := svc.RuntimeSpec()
 	targetScheme := "http"
-	if svc.TargetTLS {
+	if spec.Upstream.TLS {
 		targetScheme = "https"
 	}
-	targetURL, err := url.Parse(targetScheme + "://" + svc.TargetAddr)
+	targetURL, err := url.Parse(targetScheme + "://" + spec.Upstream.Address)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("invalid target address: %w", err)
 	}
 
 	reverseProxy := httputil.NewSingleHostReverseProxy(targetURL)
-	m.configureWebSocketReverseProxy(reverseProxy, svc)
-	if svc.TargetTLS {
+	m.configureWebSocketReverseProxy(ctx, reverseProxy, svc)
+	if spec.Application.Profile == storage.ApplicationGRPC || spec.Application.Profile == storage.ApplicationHTTP2 {
+		reverseProxy.FlushInterval = -1
+		if spec.Upstream.TLS {
+			reverseProxy.Transport = &http2.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+		} else {
+			reverseProxy.Transport = &http2.Transport{AllowHTTP: true, DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				return net.DialTimeout(network, addr, 10*time.Second)
+			}}
+		}
+	} else if spec.Upstream.TLS {
 		// Challenge backends commonly use a self-signed certificate. This is
 		// also what lets a public ws listener connect to a private wss backend.
 		reverseProxy.Transport = &http.Transport{
@@ -531,7 +733,7 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 		w.WriteHeader(http.StatusBadGateway)
 	}
 
-	listenAddr := fmt.Sprintf("0.0.0.0:%d", svc.ListenPort)
+	listenAddr := m.serviceListenAddress(spec)
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		cancel()
@@ -541,10 +743,15 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 	var handler http.Handler = reverseProxy
 	if m.packetStore != nil {
 		dropEngine := m.engineFor(svc)
-		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine, m.flagRegex, m.flagScanner, m.currentFlagIDChecker, m.shouldCapture, m.shouldApplyFlagIDsOnIngest, m.currentPyBlockFn())
+		flagRegex, flagScanner := m.currentFlagMatchers()
+		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine, flagRegex, flagScanner, m.currentFlagIDChecker, m.shouldCapture, m.shouldApplyFlagIDsOnIngest, m.currentPyBlockFn(), m.currentPyShouldEvaluateFn())
+	}
+	if spec.Application.Profile == storage.ApplicationGRPC || spec.Application.Profile == storage.ApplicationHTTP2 {
+		handler = h2c.NewHandler(handler, &http2.Server{})
 	}
 
-	server := newProxyHTTPServer(handler, svc.Protocol)
+	server := newProxyHTTPServerForSpec(handler, spec)
+	installConnectionSessions(server, svc.ID)
 
 	rp := &runningProxy{
 		service:  svc,
@@ -561,13 +768,14 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 
 	go func() {
 		<-ctx.Done()
-		server.Shutdown(context.Background())
+		shutdownProxyHTTPServer(server)
 	}()
 
 	return rp, nil
 }
 
 func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, svc *storage.Service) (*runningProxy, error) {
+	spec := svc.RuntimeSpec()
 	tlsConfig, err := buildTLSConfig(svc)
 	if err != nil {
 		cancel()
@@ -576,27 +784,27 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 
 	// Target is the backend service
 	targetScheme := "http"
-	if svc.TargetTLS {
+	if spec.Upstream.TLS {
 		targetScheme = "https"
 	}
-	targetURL, err := url.Parse(targetScheme + "://" + svc.TargetAddr)
+	targetURL, err := url.Parse(targetScheme + "://" + spec.Upstream.Address)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("invalid target address: %w", err)
 	}
 
 	reverseProxy := httputil.NewSingleHostReverseProxy(targetURL)
-	m.configureWebSocketReverseProxy(reverseProxy, svc)
+	m.configureWebSocketReverseProxy(ctx, reverseProxy, svc)
 	reverseProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		log.Printf("[%s] proxy error: %v", svc.Name, err)
 		w.WriteHeader(http.StatusBadGateway)
 	}
 
 	// For gRPC/HTTP2, configure HTTP/2 transport to backend
-	if svc.Protocol == storage.ProtocolGRPC || svc.Protocol == storage.ProtocolHTTP2 {
+	if spec.Application.Profile == storage.ApplicationGRPC || spec.Application.Profile == storage.ApplicationHTTP2 {
 		// Flush immediately after each write for streaming/gRPC support
 		reverseProxy.FlushInterval = -1
-		if svc.TargetTLS {
+		if spec.Upstream.TLS {
 			reverseProxy.Transport = &http2.Transport{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 			}
@@ -608,7 +816,7 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 				},
 			}
 		}
-	} else if svc.TargetTLS {
+	} else if spec.Upstream.TLS {
 		// For HTTPS backends with custom/self-signed certs (common in CTF), skip verification
 		reverseProxy.Transport = &http.Transport{
 			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
@@ -620,27 +828,29 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 	var handler http.Handler = reverseProxy
 	if m.packetStore != nil {
 		dropEngine := m.engineFor(svc)
-		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine, m.flagRegex, m.flagScanner, m.currentFlagIDChecker, m.shouldCapture, m.shouldApplyFlagIDsOnIngest, m.currentPyBlockFn())
+		flagRegex, flagScanner := m.currentFlagMatchers()
+		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine, flagRegex, flagScanner, m.currentFlagIDChecker, m.shouldCapture, m.shouldApplyFlagIDsOnIngest, m.currentPyBlockFn(), m.currentPyShouldEvaluateFn())
 	}
 
 	// For gRPC, support h2c (HTTP/2 cleartext) from backend if needed
-	if svc.Protocol == storage.ProtocolGRPC {
+	if spec.Application.Profile == storage.ApplicationGRPC {
 		h2s := &http2.Server{}
 		handler = h2c.NewHandler(handler, h2s)
 	}
 
-	listenAddr := fmt.Sprintf("0.0.0.0:%d", svc.ListenPort)
+	listenAddr := m.serviceListenAddress(spec)
 	listener, err := tls.Listen("tcp", listenAddr, tlsConfig)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("TLS listen on %s: %w", listenAddr, err)
 	}
 
-	server := newProxyHTTPServer(handler, svc.Protocol)
+	server := newProxyHTTPServerForSpec(handler, spec)
+	installConnectionSessions(server, svc.ID)
 
 	// A WSS listener deliberately advertises only HTTP/1.1: WebSocket uses the
 	// RFC 6455 Upgrade handshake, not HTTP/2 extended CONNECT.
-	if svc.Protocol != storage.ProtocolWSS {
+	if spec.Application.Profile != storage.ApplicationWebSocket {
 		if err := http2.ConfigureServer(server, &http2.Server{}); err != nil {
 			cancel()
 			listener.Close()
@@ -663,17 +873,36 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 
 	go func() {
 		<-ctx.Done()
-		server.Shutdown(context.Background())
+		shutdownProxyHTTPServer(server)
 	}()
 
 	return rp, nil
+}
+
+func shutdownProxyHTTPServer(server *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		_ = server.Close()
+	}
+}
+
+func (m *Manager) serviceListenAddress(spec storage.ServiceSpec) string {
+	m.mu.RLock()
+	mode := m.dataBindMode
+	m.mu.RUnlock()
+	host := spec.Listener.Address
+	if mode == "wildcard" {
+		host = "0.0.0.0"
+	}
+	return net.JoinHostPort(host, strconv.Itoa(spec.Listener.Port))
 }
 
 // newProxyHTTPServer keeps the normal defensive HTTP timeouts while allowing
 // WebSocket connections to remain open. Once a request is upgraded, net/http
 // hands the underlying connection to ReverseProxy; a ReadTimeout/WriteTimeout
 // would otherwise terminate a healthy WS/WSS tunnel after 30 seconds.
-func newProxyHTTPServer(handler http.Handler, protocol storage.Protocol) *http.Server {
+func newProxyHTTPServerForSpec(handler http.Handler, spec storage.ServiceSpec) *http.Server {
 	server := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 30 * time.Second,
@@ -681,9 +910,28 @@ func newProxyHTTPServer(handler http.Handler, protocol storage.Protocol) *http.S
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	if protocol == storage.ProtocolWS || protocol == storage.ProtocolWSS {
+	if spec.Application.Profile == storage.ApplicationWebSocket {
 		server.ReadTimeout = 0
 		server.WriteTimeout = 0
 	}
 	return server
+}
+
+func installConnectionSessions(server *http.Server, serviceID string) {
+	previous := server.ConnContext
+	server.ConnContext = func(ctx context.Context, conn net.Conn) context.Context {
+		if previous != nil {
+			ctx = previous(ctx, conn)
+		}
+		host, portText, _ := net.SplitHostPort(conn.RemoteAddr().String())
+		port, _ := strconv.Atoi(portText)
+		sessionID := sniffer.MakeConnectionSessionID(serviceID, host, port)
+		return sniffer.WithConnectionSession(ctx, sessionID)
+	}
+}
+
+// newProxyHTTPServer keeps compatibility with package integrations that still
+// construct a server from the beginner-facing preset.
+func newProxyHTTPServer(handler http.Handler, protocol storage.Protocol) *http.Server {
+	return newProxyHTTPServerForSpec(handler, storage.ProtocolPreset(protocol))
 }

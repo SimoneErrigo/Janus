@@ -34,7 +34,7 @@ func (s *Server) handleSavedFlowByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
+	if err != nil || id <= 0 {
 		http.Error(w, "invalid flow ID", http.StatusBadRequest)
 		return
 	}
@@ -67,12 +67,23 @@ func (s *Server) createSavedFlow(w http.ResponseWriter, r *http.Request) {
 		Name           string  `json:"name"`
 		Notes          string  `json:"notes"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if req.AnchorPacketID == 0 && len(req.PacketIDs) == 0 {
+	if req.AnchorPacketID < 0 || (req.AnchorPacketID == 0 && len(req.PacketIDs) == 0) {
 		http.Error(w, "anchor_packet_id or packet_ids is required", http.StatusBadRequest)
+		return
+	}
+	if len(req.PacketIDs) > 500 {
+		http.Error(w, "packet_ids must contain at most 500 packets", http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if len(req.Name) > 256 || len(req.Notes) > 16<<10 {
+		http.Error(w, "name or notes is too long", http.StatusBadRequest)
 		return
 	}
 
@@ -83,10 +94,20 @@ func (s *Server) createSavedFlow(w http.ResponseWriter, r *http.Request) {
 		// Pin an arbitrary selection of packets — they don't need to belong to
 		// the same logical flow. Snapshot in chronological order.
 		packets = make([]*sniffer.Packet, 0, len(req.PacketIDs))
+		seen := make(map[int64]struct{}, len(req.PacketIDs))
 		for _, pid := range req.PacketIDs {
+			if pid <= 0 {
+				http.Error(w, "packet_ids must be positive", http.StatusBadRequest)
+				return
+			}
+			if _, duplicate := seen[pid]; duplicate {
+				continue
+			}
+			seen[pid] = struct{}{}
 			pkt, err := s.packetStore.GetPacketByID(pid)
 			if err != nil {
-				continue
+				http.Error(w, "packet not found: "+strconv.FormatInt(pid, 10), http.StatusNotFound)
+				return
 			}
 			packets = append(packets, pkt)
 		}
@@ -95,6 +116,9 @@ func (s *Server) createSavedFlow(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sort.SliceStable(packets, func(i, j int) bool {
+			if packets[i].Timestamp.Equal(packets[j].Timestamp) {
+				return packets[i].ID < packets[j].ID
+			}
 			return packets[i].Timestamp.Before(packets[j].Timestamp)
 		})
 		if req.AnchorPacketID == 0 {

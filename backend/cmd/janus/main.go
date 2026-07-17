@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -18,6 +20,7 @@ import (
 	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
 	"github.com/SimoneErrigo/Janus/backend/internal/proxy"
 	"github.com/SimoneErrigo/Janus/backend/internal/pyfilter"
+	"github.com/SimoneErrigo/Janus/backend/internal/scoring"
 	"github.com/SimoneErrigo/Janus/backend/internal/sniffer"
 	"github.com/SimoneErrigo/Janus/backend/internal/storage"
 	"github.com/SimoneErrigo/Janus/backend/internal/sysstat"
@@ -85,6 +88,7 @@ func main() {
 	}
 
 	proxyMgr := proxy.NewManager(packetStore, ruleStore, flagRegex, flagScanner)
+	proxyMgr.SetDataPlaneBindMode(cfg.DataPlane.BindMode)
 	proxyMgr.SetRulesCache(redisCache)
 	captureCtrl := sniffer.NewCaptureController(cfg.TrafficMode)
 	proxyMgr.SetCaptureController(captureCtrl)
@@ -110,12 +114,22 @@ func main() {
 		cfg.RoundDurationSec, competitionStart, cfg.KeepRounds,
 	)
 	packetStore.SetRoundResolver(flagIDPoller.RoundForTime)
+	serviceBaselineRanges := make(map[string]scoring.BaselineRange, len(cfg.BaselineServiceRounds))
+	for serviceID, rounds := range cfg.BaselineServiceRounds {
+		serviceBaselineRanges[serviceID] = scoring.BaselineRange{StartRound: rounds.StartRound, EndRound: rounds.EndRound}
+	}
+	baselineConfig := scoring.NewBaselineConfig(
+		competitionStart, cfg.RoundDurationSec, cfg.BaselineStartRound, cfg.BaselineEndRound, serviceBaselineRanges,
+	)
+	scoreEngine := scoring.New(packetStore, baselineConfig)
+	defer scoreEngine.Close()
 
 	// Hub created after the poller so streamed packets carry their round
 	// (computed from competition_start + round_duration). Pushed packets
 	// happen via the listener below — but no packets flow yet because the
 	// proxy services aren't started until further down.
 	packetHub := api.NewPacketStreamHub(flagIDPoller)
+	packetStore.SetScoreChangeListener(packetHub.PushScoreUpdate)
 
 	// Python filter engine (mitmproxy-style scriptable filtering). Matches are
 	// recorded as alerts (rule_id "pyfilter:<script>"), evaluated asynchronously
@@ -156,21 +170,27 @@ func main() {
 			log.Printf("Python filters enabled but no python3 interpreter found — scripts will not run")
 		}
 
-		// Inline blocking: filters marked "Blocking" run synchronously on the
-		// request hot path so a match returning {"drop": True} drops the current
-		// request in real time. Bounded + fail-open inside EvaluateBlocking.
+		// Inline filters run synchronously before forwarding so drop, close, and
+		// rewrite decisions can affect the current message. Evaluation is bounded
+		// and fail-open inside EvaluateBlocking.
+		reconcilePyFlow := func(flow map[string]any) { pyMgr.ReconcileBlocking(pyfilter.Flow(flow)) }
 		proxyMgr.SetPyBlockFn(func(flow map[string]any) sniffer.PyResult {
 			matches, newBody := pyMgr.EvaluateBlocking(flow)
-			var res sniffer.PyResult
+			res := sniffer.PyResult{Finalize: reconcilePyFlow}
 			for _, mt := range matches {
-				if !mt.Block {
+				if mt.Error {
 					continue
 				}
 				reason := mt.Name
 				if mt.Reason != "" {
 					reason = mt.Name + ": " + mt.Reason
 				}
-				res.Blocks = append(res.Blocks, sniffer.PyBlockMatch{Script: mt.Script, Reason: reason})
+				match := sniffer.PyBlockMatch{Script: mt.Script, Reason: reason, Close: mt.Close}
+				if mt.Block {
+					res.Blocks = append(res.Blocks, match)
+				} else {
+					res.Alerts = append(res.Alerts, match)
+				}
 			}
 			if newBody != nil {
 				res.NewBody = newBody
@@ -178,11 +198,13 @@ func main() {
 			}
 			return res
 		})
+		proxyMgr.SetPyShouldEvaluateFn(pyMgr.ShouldEvaluateBlocking)
 	}
 
 	packetStore.SetPacketChangeListener(func(kind sniffer.PacketChangeKind, pkt *sniffer.Packet) {
 		if kind == sniffer.PacketChangeInsert && pkt != nil {
 			packetHub.PushPacket(pkt)
+			scoreEngine.Submit(pkt)
 			if pyMgr != nil {
 				pyMgr.Submit(api.FlowFromPacket(pkt))
 			}
@@ -207,6 +229,17 @@ func main() {
 	proxyMgr.SetFlagIDChecker(flagIDPoller)
 
 	// Auto-start enabled services (flag-ID checker must be set before middleware is built)
+	if pyMgr != nil {
+		serviceIDs := make([]string, 0, len(services))
+		for _, svc := range services {
+			if svc.Enabled {
+				serviceIDs = append(serviceIDs, svc.ID)
+			}
+		}
+		if err := pyMgr.PrewarmServices(serviceIDs); err != nil {
+			log.Printf("Warning: failed to prewarm Python filters: %v", err)
+		}
+	}
 	for _, svc := range services {
 		if svc.Enabled {
 			if err := proxyMgr.StartService(svc); err != nil {
@@ -228,26 +261,68 @@ func main() {
 
 	statsCollector := sysstat.NewCollector(packetStore, redisCache, cfg.DataDir)
 	apiServer := api.NewServer(store, proxyMgr, packetStore, ruleStore, cleanupMgr, flagIDPoller, redisCache, statsCollector, packetHub, captureCtrl, cfg.ProtoDir, pyMgr)
+	apiServer.SetScoringStatusProvider(scoreEngine)
 
-	// Graceful shutdown
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
-		log.Println("Shutting down...")
-		packetHub.Stop()
-		flagIDPoller.Stop()
-		cleanupMgr.Stop()
-		proxyMgr.StopAll()
-		redisCache.Close()
-		packetStore.Close()
-		os.Exit(0)
-	}()
+	addr := cfg.ControlPlane.Bind + ":" + cfg.ControlPlane.Port
+	httpServer := &http.Server{
+		Addr: addr, Handler: apiServer.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- httpServer.ListenAndServe() }()
 
-	addr := ":" + cfg.APIPort
-	addr = cfg.APIBind + addr
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 	log.Printf("Janus API listening on %s", addr)
-	if err := http.ListenAndServe(addr, apiServer.Handler()); err != nil {
-		log.Fatalf("API server error: %v", err)
+	var fatalServerErr error
+	select {
+	case sig := <-sigCh:
+		log.Printf("Shutting down after %s...", sig)
+	case serveErr := <-serverErr:
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			fatalServerErr = serveErr
+			log.Printf("API server error: %v", serveErr)
+		}
+	}
+
+	// Stop streams first so long-lived SSE requests don't hold HTTP shutdown
+	// open, then stop every producer before draining the persistence pipeline.
+	packetHub.Stop()
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP shutdown timed out: %v", err)
+		_ = httpServer.Close()
+	}
+	cancelShutdown()
+
+	flagIDPoller.Stop()
+	cleanupMgr.Stop()
+	proxyMgr.StopAll()
+
+	importsCtx, cancelImports := context.WithTimeout(context.Background(), 2*time.Minute)
+	if err := apiServer.WaitForPcapImports(importsCtx); err != nil {
+		log.Printf("PCAP import drain timed out: %v", err)
+	}
+	cancelImports()
+
+	packetStore.Drain()
+	if pyMgr != nil {
+		pyMgr.Close()
+	}
+	scoreEngine.Close()
+	if err := packetStore.Close(); err != nil {
+		log.Printf("packet store close error: %v", err)
+	}
+	if err := redisCache.Close(); err != nil {
+		log.Printf("Redis close error: %v", err)
+	}
+	log.Println("Shutdown complete")
+	if fatalServerErr != nil {
+		// Cleanup has completed; report a failing process status so Compose,
+		// systemd, and Kubernetes restart a control plane that never bound.
+		log.Fatalf("Janus API stopped unexpectedly: %v", fatalServerErr)
 	}
 }

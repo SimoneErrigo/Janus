@@ -52,5 +52,3 @@ func (s *Server) handleFlagIDRefresh(w http.ResponseWriter, r *http.Request) {
 	s.flagIDPoller.FetchNow()
 	writeJSON(w, http.StatusOK, s.flagIDPoller.GetStatus())
 }
-
-

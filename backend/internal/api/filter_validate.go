@@ -17,9 +17,12 @@ type validateFilterRequest struct {
 // On success: { ok: true }
 // On parse error: { ok: false, error: "...", position: N }
 type validateFilterResponse struct {
-	OK       bool   `json:"ok"`
-	Error    string `json:"error,omitempty"`
-	Position int    `json:"position,omitempty"`
+	OK             bool     `json:"ok"`
+	Error          string   `json:"error,omitempty"`
+	Position       int      `json:"position,omitempty"`
+	Fields         []string `json:"fields,omitempty"`
+	ServerRequired bool     `json:"server_required,omitempty"`
+	ClientSafe     bool     `json:"client_safe"`
 }
 
 // handleFilterValidate parses the supplied expression and reports any syntax
@@ -36,7 +39,11 @@ func (s *Server) handleFilterValidate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if _, err := filter.Compile(req.Expression); err != nil {
+	ast, err := filter.Parse(req.Expression)
+	if err == nil {
+		_, err = filter.CompileEval(ast)
+	}
+	if err != nil {
 		resp := validateFilterResponse{OK: false, Error: err.Error()}
 		var se *filter.SyntaxError
 		if errors.As(err, &se) {
@@ -45,5 +52,14 @@ func (s *Server) handleFilterValidate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	writeJSON(w, http.StatusOK, validateFilterResponse{OK: true})
+	serverRequired := filter.NeedsServerEvaluation(ast)
+	writeJSON(w, http.StatusOK, validateFilterResponse{OK: true, Fields: filter.FieldsUsed(ast), ServerRequired: serverRequired, ClientSafe: !serverRequired})
+}
+
+func (s *Server) handleFilterSchema(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, filter.PublicSchema())
 }

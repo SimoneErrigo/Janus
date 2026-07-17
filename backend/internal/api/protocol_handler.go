@@ -44,6 +44,10 @@ func (s *Server) handleProtocolImport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	if len(req.Code) > 1<<20 {
+		http.Error(w, "protocol source is too long", http.StatusBadRequest)
+		return
+	}
 	proto, warnings, err := protoimport.Parse(req.Code)
 	if err != nil {
 		// 422: the request was well-formed but we found nothing to import.
@@ -74,6 +78,8 @@ func (s *Server) handleProtocolByID(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		s.updateProtocol(w, r, id)
 	case http.MethodDelete:
+		s.protocolMu.Lock()
+		defer s.protocolMu.Unlock()
 		if err := s.store.DeleteProtocol(id); err != nil {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
@@ -97,6 +103,8 @@ func (s *Server) createProtocol(w http.ResponseWriter, r *http.Request) {
 	if p.ID == "" {
 		p.ID = uuid.NewString()
 	}
+	s.protocolMu.Lock()
+	defer s.protocolMu.Unlock()
 	now := time.Now().Unix()
 	p.CreatedAt = now
 	p.UpdatedAt = now
@@ -118,6 +126,8 @@ func (s *Server) updateProtocol(w http.ResponseWriter, r *http.Request, id strin
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.protocolMu.Lock()
+	defer s.protocolMu.Unlock()
 	// Preserve CreatedAt across updates so the user can sort by it.
 	if existing, ok := s.store.GetProtocol(id); ok {
 		p.CreatedAt = existing.CreatedAt
@@ -138,6 +148,29 @@ func validateProtocol(p *storage.CustomProtocol) error {
 	if strings.TrimSpace(p.Name) == "" {
 		return fmt.Errorf("name is required")
 	}
+	if len(p.Name) > 256 {
+		return fmt.Errorf("name is too long")
+	}
+	if p.ID != "" && (len(p.ID) > 128 || !serviceIDPattern.MatchString(p.ID)) {
+		return fmt.Errorf("invalid protocol id")
+	}
+	if len(p.RequestFields) > 512 || len(p.ResponseFields) > 512 || len(p.Structs) > 128 || len(p.Enums) > 128 {
+		return fmt.Errorf("protocol definition is too large")
+	}
+	totalFields := len(p.RequestFields) + len(p.ResponseFields)
+	for _, fields := range p.Structs {
+		totalFields += len(fields)
+	}
+	if totalFields > 4096 {
+		return fmt.Errorf("protocol has too many fields")
+	}
+	totalEnumValues := 0
+	for _, values := range p.Enums {
+		totalEnumValues += len(values)
+	}
+	if totalEnumValues > 4096 {
+		return fmt.Errorf("protocol has too many enum values")
+	}
 	if p.Endian != "" && p.Endian != storage.EndianLittle && p.Endian != storage.EndianBig {
 		return fmt.Errorf("endian must be 'little' or 'big'")
 	}
@@ -154,7 +187,7 @@ func validateProtocol(p *storage.CustomProtocol) error {
 		}
 	}
 	for ename, table := range p.Enums {
-		if strings.TrimSpace(ename) == "" {
+		if strings.TrimSpace(ename) == "" || len(ename) > 256 {
 			return fmt.Errorf("enum name cannot be empty")
 		}
 		for k := range table {
@@ -172,6 +205,9 @@ func validateFieldList(scope string, fields []storage.ProtocolField, p *storage.
 		if strings.TrimSpace(f.Name) == "" {
 			return fmt.Errorf("%s: field #%d has no name", scope, i+1)
 		}
+		if len(f.Name) > 256 || len(f.EnumRef) > 256 || len(f.DispatchOn) > 256 || len(f.LengthFrom) > 256 || len(f.LengthMulFrom) > 256 {
+			return fmt.Errorf("%s: field #%d contains an overlong name or reference", scope, i+1)
+		}
 		if seen[f.Name] {
 			return fmt.Errorf("%s: duplicate field name %q", scope, f.Name)
 		}
@@ -181,8 +217,8 @@ func validateFieldList(scope string, fields []storage.ProtocolField, p *storage.
 		}
 		switch f.Type {
 		case storage.FieldBytesFixed, storage.FieldStringFixed:
-			if f.Length <= 0 {
-				return fmt.Errorf("%s: field %q requires length > 0", scope, f.Name)
+			if f.Length <= 0 || f.Length > 16<<20 {
+				return fmt.Errorf("%s: field %q requires length between 1 and 16 MiB", scope, f.Name)
 			}
 		case storage.FieldDispatch:
 			if f.DispatchOn == "" {
@@ -246,7 +282,7 @@ func (s *Server) handlePacketDecodedCustom(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	pid, err := strconv.ParseInt(pidStr, 10, 64)
-	if err != nil {
+	if err != nil || pid <= 0 {
 		http.Error(w, "invalid packet_id", http.StatusBadRequest)
 		return
 	}

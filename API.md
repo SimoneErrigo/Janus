@@ -9,15 +9,18 @@ With Docker Compose, the frontend proxies requests to the backend. Use
 `http://localhost:2999/api` or the relative path `/api`. The normal Compose
 stack does not need to publish the backend separately.
 
-Every route except `POST /api/login` requires:
+Every route except `POST /api/login` requires either the same-origin
+`janus_session` cookie set at login or, for non-browser clients:
 
 ```http
 Authorization: Bearer <token>
 ```
 
-SSE and download routes also accept `?token=<token>`. Requests and responses
-are JSON unless the route explicitly handles PCAP data or multipart upload.
-Validation errors use HTTP 400; a missing resource uses HTTP 404.
+Tokens are deliberately not accepted in query strings. This keeps SSE and
+download credentials out of browser history, proxy logs, and copied links.
+Requests and responses are JSON unless the route explicitly handles PCAP data
+or multipart upload. Validation errors use HTTP 400; a missing resource uses
+HTTP 404.
 
 ### Login
 
@@ -28,7 +31,8 @@ Content-Type: application/json
 {"password":"...","display_name":"analyst"}
 ```
 
-The response returns a Bearer token. `display_name` is used only for the
+The response returns a Bearer token for API clients and also installs an
+HttpOnly session cookie for the dashboard. `display_name` is used only for the
 presence indicator in the dashboard.
 
 ## Routes
@@ -37,14 +41,16 @@ presence indicator in the dashboard.
 | --- | --- | --- | --- |
 | Session | GET | `/api/session/active` | Online users (heartbeat-based) |
 | Services | GET, POST | `/api/services` | List or create a service |
+|  | GET | `/api/protocol-presets` | Beginner protocol choices and generated runtime specs |
 |  | GET, PUT, DELETE | `/api/services/{id}` | Read, update, or delete a service |
 |  | POST | `/api/services/{id}/retry` | Immediately retry a listener bind |
 |  | GET | `/api/proxy/statuses` | Listener status and latest bind error |
 |  | POST | `/api/proxy/retry-all` | Retry every listener currently retrying |
-| Traffic | GET | `/api/packets` | Query packets (`q`, `sort`, `limit`, `offset`) |
+| Traffic | GET | `/api/packets` | Query packets (`q`, `sort`, `limit`, `offset`, opaque `cursor`) |
 |  | GET, DELETE | `/api/packets/{id}` | Read or remove one packet |
 |  | POST | `/api/packets/bulk-delete` | Remove a list of packet IDs |
-|  | GET | `/api/packets/stream` | SSE packet and metadata stream |
+|  | POST | `/api/packets/label` | Annotate packet IDs as exploit, checker, or normal |
+|  | GET | `/api/packets/stream` | SSE packet, score-patch and metadata stream |
 |  | GET | `/api/packets/flow?packet_id=N` | Reconstruct a packet flow |
 |  | GET | `/api/packets/flow/pcap?packet_id=N` | Download a flow as PCAP |
 |  | GET | `/api/packets/exploit?packet_id=N` | Generate a Python exploit skeleton |
@@ -52,10 +58,15 @@ presence indicator in the dashboard.
 |  | GET | `/api/packets/decoded-custom?packet_id=N[&protocol_id=P]` | Decode with a custom protocol |
 | Rules | GET, POST | `/api/rules` | List or create rules |
 |  | GET, PUT, DELETE | `/api/rules/{id}` | Read, update, or delete a rule |
+|  | GET | `/api/rules/{id}/revisions` | List immutable rule revisions |
+|  | POST | `/api/rules/{id}/rollback` | Activate an old snapshot as a new revision |
 |  | POST | `/api/rules/bulk-delete` | Remove rules by ID |
 |  | GET | `/api/rules/presets` | List attack-preset categories |
-|  | POST | `/api/rules/presets/apply` | Apply selected presets to services |
+|  | POST | `/api/rules/presets/apply` | Validate and apply selected alert presets to services |
 |  | POST | `/api/filter/validate` | Validate a filter expression |
+|  | GET | `/api/filter/schema` | Queryable fields, patterns, and valid operators |
+| Scoring | GET | `/api/scoring/status` | Opening-baseline progress and classification counts |
+|  | POST | `/api/scoring/baseline/rebuild` | Transactionally rebuild the selected baseline from retained traffic |
 | Alerts | GET, DELETE | `/api/alerts` | List or clear alerts |
 |  | GET | `/api/alerts/{id}` | Read alert detail |
 | PyFilters | GET, POST | `/api/pyfilters` | List scripts and engine status, or create a script |
@@ -109,7 +120,13 @@ presence indicator in the dashboard.
 }
 ```
 
-`protocol` is one of `http`, `https`, `ws`, `wss`, `h2`, `grpc`, or `tcp`.
+`protocol` is one of `http`, `https`, `ws`, `wss`, `h2`, `h2c`, `grpc`,
+`grpc-h2c`, `tcp`, `tcp-line`, `tls`, `udp`, `dns`, `dns-tcp`, `resp`, or
+`mqtt`. The UI obtains this list from `GET /api/protocol-presets`.
+It is the only architectural choice required from the user. Janus returns a
+generated `spec` containing `listener`, `application`, `upstream`, and
+`framing`, plus `model_version`; clients should treat these fields as
+read-only preset output. Legacy service records are migrated automatically.
 WebSocket services use `ws` for a cleartext listener and `wss` for a TLS
 listener. TLS fields are
 `tls_mode` (`selfsigned` or `challenge`), `cert_file`, `key_file`, and
@@ -119,7 +136,7 @@ listener. TLS fields are
 Captured WebSocket application messages use method `WS`, retain the handshake
 URL and session ID, and expose their decoded payload in `body`/`body_string`.
 `X-Janus-WebSocket-Opcode` identifies `text` or `binary` messages. Rules are
-evaluated on complete, unmasked client messages before forwarding. Blocking
+evaluated on complete, unmasked client messages before forwarding. Inline
 PyFilters also run on backend responses and may drop or rewrite the current
 message without closing the WebSocket. Subprotocol headers are preserved;
 WebSocket extensions are disabled so filtering always sees the clear
@@ -138,6 +155,24 @@ method == "POST" AND url contains "/login" AND body matches "(?i)union"
 See [FILTERS.md](FILTERS.md) for the complete language. Legacy packet search
 parameters (`contains`, `regex`, `src_ip`, ...) remain available.
 
+`POST /api/rules` defaults a missing `action` to `alert`. Built-in presets are
+also alert-only, prevalidated and rejected atomically before creation when the
+selection is invalid or duplicates an existing service/expression/action.
+
+Successful `POST /api/filter/validate` responses also include `fields` and
+`server_required`. The latter is true when browser-side evaluation cannot be
+guaranteed equivalent to the backend.
+
+Captured packets include `verdict` (`decision`, `outcome`, `phase`, `applied`,
+and matching rule IDs). `outcome=dropped` means bytes were actually stopped;
+`would_drop` records a post-forward match. `capture_truncated=true` means only
+the inspection copy was limited—the complete body was still forwarded.
+The optional `classification`, attack/normal scores, coverage, confidence, and
+reason ledger are deterministic shadow metadata; they never block traffic.
+`analyst_label` is a manual annotation and does not train or directly change a
+score. An `exploit` label excludes that flow the next time the opening baseline
+is rebuilt.
+
 ### PyFilters
 
 Create or replace a script with:
@@ -146,15 +181,108 @@ Create or replace a script with:
 {
   "name": "block-admin-post",
   "code": "def match(flow):\n    return False\n",
-  "enabled": true,
-  "blocking": false
+  "enabled": false,
+  "mode": "observe",
+  "service_ids": ["web"],
+  "directions": ["request"],
+  "protocols": ["http"]
 }
 ```
 
 `POST /api/pyfilter-engine/test` accepts `name`, `code`, and one of `flow`,
 `flows` (an ordered sequence), `packet_id`, or `flow_packet_id`. `repeat`
-replays the same sequence to exercise module-level state. See
-[PYFILTERS.md](PYFILTERS.md).
+replays the same sequence to exercise state. The optional `mode`,
+`service_ids`, `directions`, and `protocols` use the same scope as a saved
+script, so the tester also catches a sample excluded by its scope. Packet IDs
+and flow packet IDs are resolved server-side and preserve the captured bytes,
+timestamps, protocol, session, and direction.
+For manual `flow`/`flows`, Janus scans URL, headers, and body with the current
+configured flag matcher before the dry-run, so `flow.flags.*` has the same
+meaning as it does on captured traffic. Explicit `flag_count_*` fields remain
+available when a synthetic test needs to simulate metadata directly.
+Each returned test step includes `rewritten`; when true, `rewrite_b64` contains
+the exact replacement bytes (including binary payloads), while `rewrite` is a
+best-effort text preview. This also represents an intentional empty rewrite
+without confusing it with “no rewrite”.
+
+The dashboard presents two choices, **Observe** and **Inline**. At REST level
+`mode` accepts `observe`, `block`, or `rewrite` for backward compatibility;
+both `block` and `rewrite` select the inline runtime, while the script's return
+value decides whether it drops, closes, or rewrites.
+
+Every protocol receives the same forgiving `flow` object. Important groups are:
+
+- `flow.flags.count`, `known_count`, `body_count`, `header_count`, `url_count`,
+  and `matched_ids` for the current message;
+- `flow.connection` for read-only `age_ms`, `idle_ms`, message/byte/flag
+  counters, `rate_in(seconds)`, `rate_out(seconds)`, `recent`/`current` shapes,
+  and the payload-free `fingerprint()`;
+- `flow.state` for bounded per-connection/per-script state and the
+  `count`, `seen`, `distinct`, and `observe` window helpers (`flow.conn` remains
+  as a legacy alias);
+- `flow.alert()`, `flow.drop()`, `flow.close()`, and `flow.rewrite()` for clear
+  verdicts.
+
+Connection counters exclude the message currently being decided and count
+only traffic already admitted by Janus. History and state are isolated by
+connection/session rather than mixed across a service. Applied Inline rewrites
+are reconciled synchronously, so the following message sees the forwarded size,
+flags, and fingerprint rather than the original payload.
+
+Inline actions work in both directions for TCP, UDP, WS, and WSS. They
+also work for ordinary HTTP/1.1 and HTTPS responses while Janus can buffer the
+complete response (up to 1 MiB). A flushed/streaming or oversized response is
+forwarded and evaluated observe-only; HTTP/2 and gRPC responses are
+observe-only. HTTP request flows expose `body_complete` and `truncated`:
+unknown-length/chunked bodies are not pre-read, while known bodies over 1 MiB
+expose only their prefix inline. Require `body_complete` before body-based
+drop/rewrite logic; metadata remains available without delaying the service. See
+[PYFILTERS.md](PYFILTERS.md) for the complete API and protocol table.
+
+### Deterministic opening baseline
+
+`GET /api/config` includes `baseline_start_round` and
+`baseline_end_round` as the default service range, plus optional
+`baseline_service_rounds` overrides keyed by service ID. Every range is
+inclusive and must describe at least two and at most 50 rounds:
+
+```json
+{
+  "baseline_start_round": 1,
+  "baseline_end_round": 5,
+  "baseline_service_rounds": {
+    "web": { "start_round": 2, "end_round": 6 },
+    "database": { "start_round": 4, "end_round": 8 }
+  }
+}
+```
+
+Services without an override use the default `1`–`5` range. Sending an empty
+`baseline_service_rounds` object clears all overrides. Each distinct timing and
+range configuration has a persistent fingerprint snapshot. Selecting a new
+configuration builds it from retained packets in the exact windows; selecting
+one used previously restores it even if autoclean removed those packets.
+`POST /api/scoring/baseline/rebuild` takes no body and relearns the current
+snapshot in isolation. The replacement is committed only when retained safe
+traffic covers every required round; on missing data or errors, the existing
+snapshot remains active.
+
+`GET /api/scoring/status` returns `baseline_start_round`,
+`baseline_end_round`, `baseline_required_rounds`, `rebuilding`,
+`replayed_packets`, queue/storage errors, and per-service range,
+observed/candidate/trusted counts plus the exact `complete` state. A
+`snapshots` array lists preserved configurations, signature counts, active and
+timing-compatible state so clients can offer one-click range restoration. A
+signature is trusted only if the same safe deterministic shape occurs in every
+selected round. Truncated flows, rule/drop matches, suspicious payloads,
+request flags/Flag IDs, and exploit-labelled flows are excluded. Thus an
+otherwise distinct exploit signature seen in only one opening round is never
+trusted.
+
+This is static scoring, not AI. An exploit that is structurally identical to a
+recurring checker flow, or an identical safe-looking exploit repeated in every
+selected round, cannot be distinguished with certainty without external ground
+truth. Choose a cleaner range or label it and rebuild when that happens.
 
 ### Round Diff
 

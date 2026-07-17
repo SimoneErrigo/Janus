@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api'
 import ErrorBanner from '../components/ErrorBanner'
 
@@ -39,17 +39,27 @@ export default function Protocols() {
   const [protocols, setProtocols] = useState([])
   const [editing, setEditing] = useState(null) // protocol object or null
   const [error, setError] = useState('')
+  const loadRequestRef = useRef(0)
 
-  useEffect(() => { loadProtocols() }, [])
-
-  async function loadProtocols() {
+  const loadProtocols = useCallback(async () => {
+    const request = ++loadRequestRef.current
     try {
       const list = await api.listProtocols()
+      if (request !== loadRequestRef.current) return
       setProtocols(list || [])
     } catch (err) {
-      setError(err.message)
+      if (request === loadRequestRef.current) setError(err.message)
     }
-  }
+  }, [])
+  const invalidateLoad = useCallback(() => { loadRequestRef.current++ }, [])
+
+  useEffect(() => {
+    const timer = setTimeout(loadProtocols, 0)
+    return () => {
+      clearTimeout(timer)
+      invalidateLoad()
+    }
+  }, [invalidateLoad, loadProtocols])
 
   async function handleSave(p) {
     setError('')
@@ -60,7 +70,7 @@ export default function Protocols() {
         await api.updateProtocol(p.id, stripInternal(p))
       }
       setEditing(null)
-      loadProtocols()
+      await loadProtocols()
     } catch (err) {
       setError(err.message)
     }
@@ -70,7 +80,7 @@ export default function Protocols() {
     if (!confirm('Delete this protocol? Services bound to it will become unbound.')) return
     try {
       await api.deleteProtocol(id)
-      loadProtocols()
+      await loadProtocols()
     } catch (err) {
       setError(err.message)
     }

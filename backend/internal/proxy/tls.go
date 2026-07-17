@@ -37,8 +37,10 @@ func buildTLSConfig(svc *storage.Service) (*tls.Config, error) {
 	// RFC 6455 WebSocket upgrades use HTTP/1.1. Advertising h2 for a WSS-only
 	// listener can make a browser negotiate HTTP/2, where the classic Upgrade
 	// handshake is unavailable (extended CONNECT is a separate protocol).
-	if svc.Protocol == storage.ProtocolWSS {
+	if svc.RuntimeSpec().Application.Profile == storage.ApplicationWebSocket {
 		cfg.NextProtos = []string{"http/1.1"}
+	} else if svc.RuntimeSpec().Application.Profile == storage.ApplicationRaw {
+		cfg.NextProtos = nil
 	}
 	return cfg, nil
 }

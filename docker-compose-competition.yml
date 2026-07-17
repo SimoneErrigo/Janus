@@ -14,9 +14,9 @@ services:
     environment:
       - DATA_DIR=/data
       - API_PORT=9090
-      - API_BIND=0.0.0.0
+      - API_BIND=127.0.0.1
       - ENV_PATH=/dev/null
-      - REDIS_ADDR=127.0.0.1:6379
+      - DATA_BIND_MODE=configured
 
   redis:
     network_mode: host
@@ -30,9 +30,11 @@ services:
       fi'
 
   frontend:
+    network_mode: host
+    ports: !reset []
     environment:
-      - API_BACKEND=host.docker.internal
-      - FRONTEND_BIND=0.0.0.0
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
+      - API_BACKEND=127.0.0.1
+      - API_BACKEND_PORT=9090
+      - FRONTEND_BIND=127.0.0.1
+      - FRONTEND_PORT=2999
+      - FRONTEND_ROOT=/usr/share/nginx/html

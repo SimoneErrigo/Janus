@@ -25,12 +25,22 @@ export const FIELD_GROUPS = [
     fields: [
       { name: 'id',        type: 'int',    desc: 'Packet number (the # column)' },
       { name: 'url',       type: 'string', desc: 'Request URL/path' },
+	  { name: 'path',      type: 'string', desc: 'URL path without query string' },
       { name: 'method',    type: 'string', desc: 'HTTP method' },
       { name: 'status',    type: 'int',    desc: 'HTTP status code' },
       { name: 'round',     type: 'int',    desc: 'Scoreboard round' },
       { name: 'direction', type: 'string', desc: 'request | response' },
       { name: 'header',    type: 'header', desc: 'Header value (with optional sub-name)' },
     ],
+  },
+  {
+	label: 'Decoded',
+	fields: [
+	  { name: 'dns.qname', type: 'string', desc: 'DNS question name' },
+	  { name: 'dns.qtype', type: 'string', desc: 'DNS question type' },
+	  { name: 'resp.command', type: 'string', desc: 'Redis command' },
+	  { name: 'mqtt.topic', type: 'string', desc: 'MQTT topic' },
+	],
   },
   {
     label: 'Network',
@@ -52,6 +62,17 @@ export const FIELD_GROUPS = [
       { name: 'dropped',         type: 'bool', desc: 'Packet was dropped by a rule' },
     ],
   },
+	{
+		label: 'Janus score',
+		fields: [
+			{ name: 'classification', type: 'string', desc: 'likely_exploit | likely_checker | review | insufficient_data' },
+			{ name: 'analyst_label', type: 'string', desc: 'Manual annotation: exploit | checker | normal' },
+			{ name: 'attack_score', type: 'int', desc: 'Deterministic exploit evidence (0-100)' },
+			{ name: 'normal_score', type: 'int', desc: 'Opening-baseline evidence (0-100)' },
+			{ name: 'score_confidence', type: 'int', desc: 'Confidence adjusted by available evidence (0-100)' },
+			{ name: 'score_coverage', type: 'int', desc: 'How much evidence was available (0-100)' },
+		],
+	},
 ]
 
 const FIELD_INDEX = (() => {
@@ -62,11 +83,18 @@ const FIELD_INDEX = (() => {
 
 export function fieldType(name) { return FIELD_INDEX[name]?.type || 'string' }
 
+export function configureFieldSchema(schema) {
+	for (const field of schema?.fields || []) {
+		const type = field.type === 'headers' ? 'header' : field.type === 'bytes' ? 'string' : field.type
+		FIELD_INDEX[field.name] = { ...(FIELD_INDEX[field.name] || {}), ...field, type }
+	}
+}
+
 export function opsForType(t) {
   switch (t) {
     case 'string':
     case 'header':
-      return ['contains', 'icontains', '==', '!=', 'matches', 'startswith', 'endswith', 'in']
+	  return ['contains', 'icontains', '==', '!=', 'matches', 'startswith', 'endswith', 'in', 'exists', 'missing']
     case 'int':
       return ['==', '!=', '>', '<', '>=', '<=', 'in']
     case 'bool':
@@ -94,6 +122,7 @@ export function emptyPredicate() {
     headerName: '',
     op: 'contains',
     value: '',
+	length: false,
   }
 }
 
@@ -123,8 +152,10 @@ export function serialize(node, isRoot = true) {
 }
 
 function formatPredicate(p) {
-  const fld = (p.field === 'header' && p.headerName) ? `header.${p.headerName}` : p.field
-  const t = fieldType(p.field)
+	let fld = (p.field === 'header' && p.headerName) ? `header.${p.headerName}` : p.field
+	if (p.length) fld += '.length'
+	const t = p.length ? 'int' : fieldType(p.field)
+	if (p.op === 'exists' || p.op === 'missing') return `${fld} ${p.op}`
 
   // Bool shortcut: write `flagged` or `NOT flagged` instead of `flagged == true`.
   if (t === 'bool' && p.op === '==') {
@@ -275,10 +306,9 @@ class Parser {
       return inner
     }
     if (t.kind === 'BOOL') {
-      this.next()
-      // A standalone bool literal isn't useful in the builder — represent it
-      // as a synthetic predicate against `flagged` (the user can adjust).
-      return { kind: 'predicate', not: false, field: 'flagged', headerName: '', op: '==', value: t.val === 'true' }
+	  // Keep constants in text/server mode. Mapping `true` to `flagged` changed
+	  // its meaning and made streamed rows disagree with the REST query.
+	  throw new ParseError('standalone boolean expressions require text mode', t.pos)
     }
     if (t.kind === 'IDENT') {
       return this.parsePredicate()
@@ -290,25 +320,31 @@ class Parser {
     const fieldTok = this.next()
     let field = fieldTok.val.toLowerCase()
     let headerName = ''
+	let length = false
     if (this.peek().kind === 'DOT') {
-      if (field !== 'header' && field !== 'headers') {
-        throw new ParseError(`only header. accepts a sub-name`, this.peek().pos)
-      }
-      this.next()
-      const nm = this.expect('IDENT')
-      field = 'header'
-      headerName = nm.val
+	  const parts = [field]
+	  while (this.peek().kind === 'DOT') {
+		this.next()
+		const nm = (this.peek().kind === 'IDENT' || this.peek().kind === 'KWOP') ? this.next() : this.expect('IDENT')
+		if (['length', 'len', 'size'].includes(nm.val.toLowerCase()) && this.peek().kind !== 'DOT') { length = true; break }
+		parts.push(nm.val.toLowerCase())
+	  }
+	  if ((parts[0] === 'header' || parts[0] === 'headers') && parts.length === 2) { field = 'header'; headerName = parts[1] }
+	  else field = parts.join('.')
     }
     field = canonicalField(field)
 
     // Validate field exists — bail if not (so caller reverts to text mode).
-    if (!FIELD_INDEX[field]) {
+	if (!FIELD_INDEX[field] && !/^(decoded|json|query|form|cookie|dns|resp|mqtt)\./.test(field)) {
       throw new ParseError(`unknown field "${field}"`, fieldTok.pos)
     }
 
     // Bare bool predicate (`flagged`)
     const upcoming = this.peek()
     if (upcoming.kind === 'AND' || upcoming.kind === 'OR' || upcoming.kind === 'RP' || upcoming.kind === 'EOF') {
+	  if (length || fieldType(field) !== 'bool') {
+		throw new ParseError(`expected operator after "${field}"`, upcoming.pos)
+	  }
       return { kind: 'predicate', not: false, field, headerName, op: '==', value: true }
     }
 
@@ -324,6 +360,7 @@ class Parser {
     } else {
       throw new ParseError(`expected operator after "${field}"`, opTok.pos)
     }
+	if (op === 'exists' || op === 'missing') return { kind: 'predicate', not: false, field, headerName, length, op, value: '' }
 
     // value
     let value
@@ -348,7 +385,7 @@ class Parser {
       value = vTok.kind === 'BOOL' ? (vTok.val === 'true') : vTok.val
     }
 
-    return { kind: 'predicate', not: false, field, headerName, op, value }
+	return { kind: 'predicate', not: false, field, headerName, length, op, value }
   }
 }
 
@@ -467,7 +504,7 @@ function tokenize(src) {
   return toks
 }
 
-const KEYWORD_OPS = new Set(['contains', 'icontains', 'matches', 'startswith', 'endswith', 'in'])
+const KEYWORD_OPS = new Set(['contains', 'icontains', 'matches', 'startswith', 'endswith', 'in', 'exists', 'missing'])
 
 // ----- Client-side evaluator (used by Traffic SSE filter) -----
 
@@ -497,14 +534,17 @@ function evalNode(node, p) {
 }
 
 function evalPredicate(pr, p) {
-  const t = fieldType(pr.field)
-  const get = readField(pr, p)
+  const t = pr.length ? 'int' : fieldType(pr.field)
+	let get = readField(pr, p)
+	if (pr.length) get = new TextEncoder().encode(String(get ?? '')).length
+	if (pr.op === 'exists') return get !== '' && get != null
+	if (pr.op === 'missing') return get === '' || get == null
   if (t === 'bool') {
     const want = pr.value === true || pr.value === 'true'
     return pr.op === '==' ? get === want : get !== want
   }
   if (t === 'int') {
-    const got = Number(get) | 0
+	const got = Number(get)
     const want = parseInt(pr.value, 10)
     if (pr.op === 'in') {
       return splitList(pr.value).map(s => parseInt(s, 10)).includes(got)
@@ -583,6 +623,9 @@ function readField(pr, p) {
     case 'body':            return p.body_string ?? ''
     case 'raw':             return p.body_string ?? ''
     case 'url':             return p.url ?? ''
+	case 'path': {
+	  try { return decodeURIComponent(new URL(p.url ?? '', 'http://janus.invalid').pathname) } catch { return p.url ?? '' }
+	}
     case 'method':          return p.method ?? ''
     case 'status':          return p.status ?? 0
     case 'round':           return p.round ?? p.flagid_round ?? 0
@@ -596,7 +639,13 @@ function readField(pr, p) {
     case 'dport':           return p.dst_port ?? 0
     case 'flagged':         return !!p.flagged
     case 'contains_flagid': return !!p.contains_flagid
-    case 'dropped':         return Array.isArray(p.matched_rules) && p.matched_rules.some(r => r.action === 'drop' || r.action === 'both')
+	case 'dropped':         return !!p.dropped
+		case 'classification':   return p.classification ?? ''
+		case 'analyst_label':    return p.analyst_label ?? ''
+		case 'attack_score':     return p.attack_score ?? 0
+		case 'normal_score':     return p.normal_score ?? 0
+		case 'score_confidence': return p.score_confidence ?? 0
+		case 'score_coverage':   return p.score_coverage ?? 0
     case 'header': {
       const h = p.headers || {}
       if (pr.headerName) {
@@ -606,7 +655,19 @@ function readField(pr, p) {
       }
       return Object.entries(h).map(([k, v]) => `${k}: ${v}`).join('\n')
     }
-  }
+	}
+	if (pr.field.startsWith('query.')) {
+	  try {
+		return new URL(p.url ?? '', 'http://janus.invalid').searchParams
+		  .getAll(pr.field.slice('query.'.length)).join(',')
+	  } catch { return '' }
+	}
+	if (/^(decoded\.)?(dns|resp|mqtt)\./.test(pr.field)) {
+	  const parts = pr.field.replace(/^decoded\./, '').split('.')
+	  let value = p.decoded || {}
+	  for (const part of parts) value = value?.[part]
+	  return value ?? ''
+	}
   return ''
 }
 

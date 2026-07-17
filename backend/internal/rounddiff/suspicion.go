@@ -30,7 +30,10 @@ type suspicionPattern struct {
 
 var suspicionPatterns = []suspicionPattern{
 	{TagSQLi, regexp.MustCompile(`(?i)(?:union\s+(?:all\s+)?select|\bselect\b[\s\S]{0,80}\bfrom\b|string_agg\s*\(|extractvalue\s*\(|updatexml\s*\(|sleep\s*\(|benchmark\s*\(|pg_sleep\s*\(|sqlite_version|sqlite_master|into\s+(?:out|dump)file|load_file\s*\()`)},
-	{TagSQLiSyntax, regexp.MustCompile(`(?i)(?:'|"|` + "`" + `)\s*(?:or|and)\s+['"` + "`" + `]?\d+['"` + "`" + `]?\s*=\s*['"` + "`" + `]?\d+|(?:^|[\s'")])--\s|/\*[\s\S]*?\*/|;\s*(?:drop|alter|delete|update|insert|create|truncate)\b|\|\|\s*\(?\s*select\b`)},
+	// A plain C-style comment is common in source, CSS and documentation and
+	// is not evidence of SQL injection. Keep only comments joined to SQL
+	// operators/keywords (including MySQL executable comments).
+	{TagSQLiSyntax, regexp.MustCompile(`(?i)(?:'|"|` + "`" + `)\s*(?:or|and)\s+['"` + "`" + `]?\d+['"` + "`" + `]?\s*=\s*['"` + "`" + `]?\d+|(?:^|[\s'")])--\s|/\*![\s\S]*?\*/|\b(?:union|select|or|and)\b\s*/\*[\s\S]{0,80}?\*/|/\*[\s\S]{0,80}?\*/\s*\b(?:union|select|or|and)\b|;\s*(?:drop|alter|delete|update|insert|create|truncate)\b|\|\|\s*\(?\s*select\b`)},
 	{TagXSS, regexp.MustCompile(`(?i)<\s*(?:script|svg|iframe|img|object|embed|body|input)\b|\bon(?:error|load|click|mouseover|focus|blur|submit|toggle|animationend)\s*=|javascript\s*:`)},
 	// `&&` / `||` only trigger when followed by a word char so SQL string
 	// concatenation (`' || (SELECT …`) doesn't cross-tag as command injection.

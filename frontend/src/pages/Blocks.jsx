@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useInfiniteList } from '../hooks/useInfiniteList'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { api, subscribePacketStream } from '../api'
-import { hideParams, addHiddenIds } from '../userHidden'
+import { hideParams, addHiddenIds, getEffectiveClearCursor, setViewClearCursor } from '../userHidden'
 import HighlightedBodyBase from '../components/HighlightedBody'
 import FilterExpression from '../components/FilterExpression'
 import { tryFormatJSON } from '../utils/formatting'
@@ -108,14 +108,31 @@ export default function Blocks() {
   const [filterNegated, setFilterNegated] = useState({ service_id: false, src_ip: false })
   const [paused, setPaused] = useState(false)
   const pausedRef = useRef(false)
+  const selectionRequestRef = useRef(0)
 
-  const fetchPage = useCallback(async (offset, limit) => {
-    const params = { ...filters, ...hideParams(), dropped: 'true', sort: 'desc', limit, offset }
+  const selectPacket = useCallback((packet) => {
+    selectionRequestRef.current++
+    setSelectedPacket(packet)
+  }, [])
+
+  const clearSelection = useCallback(() => {
+    selectionRequestRef.current++
+    setSelectedPacket(null)
+  }, [])
+
+  const fetchPage = useCallback(async (offset, limit, cursor) => {
+    const params = { ...filters, ...hideParams(), dropped: 'true', sort: 'desc', limit }
+    const clearCursor = getEffectiveClearCursor('blocks')
+    if (clearCursor) params.hidden_before = clearCursor
+    params.offset = offset
+    if (cursor) params.cursor = cursor
     if (expression.trim()) params.q = expression
     if (filterNegated.service_id && params.service_id) { params.not_service_id = params.service_id; delete params.service_id }
     if (filterNegated.src_ip && params.src_ip) { params.not_src_ip = params.src_ip; delete params.src_ip }
     const data = await api.getPackets(params)
-    return { items: data.packets || [], total: data.total }
+    const result = { items: data.packets || [], total: data.total }
+    if (Object.prototype.hasOwnProperty.call(data, 'next_cursor')) result.nextCursor = data.next_cursor
+    return result
   }, [filters, expression, filterNegated])
 
   const {
@@ -148,11 +165,12 @@ export default function Blocks() {
   useEffect(() => {
     const id = location.state?.restoreBlockedPacketId
     if (id == null) return
+    const request = ++selectionRequestRef.current
     navigate(location.pathname, { replace: true, state: {} })
     ;(async () => {
       try {
         const full = await api.getPacket(id)
-        setSelectedPacket(full)
+        if (request === selectionRequestRef.current) setSelectedPacket(full)
       } catch (err) {
         console.error(err)
       }
@@ -161,9 +179,9 @@ export default function Blocks() {
 
   function handleClearAll() {
     if (!confirm('Hide all blocked packets from your view? (Teammates still see them.)')) return
-    if (packets.length > 0) addHiddenIds(packets.map((p) => p.id))
+    setViewClearCursor('blocks', new Date().toISOString())
+    clearSelection()
     resetBlocks()
-    setSelectedPacket(null)
   }
 
   // Live refresh blocks only when streamed packets include drop-capable matches.
@@ -178,7 +196,7 @@ export default function Blocks() {
         )
         if (shouldReload) refreshBlocks()
       },
-      () => { if (!pausedRef.current) refreshBlocks() },
+      () => pausedRef.current ? undefined : refreshBlocks(),
     )
     return () => unsub()
   }, [refreshBlocks])
@@ -270,7 +288,7 @@ export default function Blocks() {
                 {packets.map((pkt) => (
                   <tr
                     key={pkt.id}
-                    onClick={() => setSelectedPacket(pkt)}
+                    onClick={() => selectPacket(pkt)}
                     className={`border-b border-gray-800/50 cursor-pointer transition-colors ${
                       selectedPacket?.id === pkt.id ? 'bg-red-950/30' : 'hover:bg-gray-900/80'
                     }`}
@@ -345,7 +363,7 @@ export default function Blocks() {
                     onClick={() => {
                       if (!confirm('Hide this packet from your view? (Teammates still see it.)')) return
                       addHiddenIds([selectedPacket.id])
-                      setSelectedPacket(null)
+                      clearSelection()
                       resetBlocks()
                     }}
                     className="text-xs text-red-500 hover:text-red-400 cursor-pointer"
@@ -353,7 +371,7 @@ export default function Blocks() {
                   >
                     Hide
                   </button>
-                  <button type="button" onClick={() => setSelectedPacket(null)} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
+                  <button type="button" onClick={clearSelection} className="text-gray-500 hover:text-gray-300 cursor-pointer text-lg leading-none">&times;</button>
                 </div>
               </div>
               <div className="p-3 space-y-3 text-sm">

@@ -3,6 +3,7 @@ package flagids
 import (
 	"bytes"
 	"regexp"
+	"sort"
 	"strings"
 
 	ahocorasick "github.com/petar-dambovaliev/aho-corasick"
@@ -16,47 +17,75 @@ type FlagMatch struct {
 
 // Matcher wraps an Aho-Corasick automaton for O(text_length) multi-pattern matching.
 type Matcher struct {
-	patterns []FlagMatch          // ordered list matching automaton pattern indices
-	ac       ahocorasick.AhoCorasick
-	empty    bool
-	byValue  map[string]int       // flagID value -> index in patterns (for dedup)
+	patterns      []FlagMatch // ordered list matching automaton pattern indices
+	ac            ahocorasick.AhoCorasick
+	shortPatterns []FlagMatch // five-byte IDs, matched only on word boundaries
+	shortAC       ahocorasick.AhoCorasick
+	empty         bool
 }
 
 // BuildMatcher constructs an Aho-Corasick automaton from round-aware flagId data.
 // roundFlags: roundNum -> serviceName -> []flagIdValue
 func BuildMatcher(roundFlags map[int]map[string][]string) *Matcher {
-	m := &Matcher{byValue: make(map[string]int)}
-
-	var values []string
-	for round, services := range roundFlags {
-		for _, flagIDs := range services {
-			for _, v := range flagIDs {
-				if len(v) < 6 {
-					continue // skip short values to avoid false positives
+	m := &Matcher{}
+	seen := make(map[string]struct{})
+	var values, shortValues []string
+	rounds := make([]int, 0, len(roundFlags))
+	for round := range roundFlags {
+		rounds = append(rounds, round)
+	}
+	// A repeated value belongs to the newest retained round. Sorting rounds and
+	// service names also makes matcher metadata stable across process restarts.
+	sort.Sort(sort.Reverse(sort.IntSlice(rounds)))
+	for _, round := range rounds {
+		services := roundFlags[round]
+		names := make([]string, 0, len(services))
+		for name := range services {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			for _, value := range services[name] {
+				if len(value) < 5 {
+					continue
 				}
-				if _, exists := m.byValue[v]; exists {
-					continue // deduplicate
+				if _, exists := seen[value]; exists {
+					continue
 				}
-				m.byValue[v] = len(m.patterns)
-				m.patterns = append(m.patterns, FlagMatch{FlagID: v, Round: round})
-				values = append(values, v)
+				seen[value] = struct{}{}
+				match := FlagMatch{FlagID: value, Round: round}
+				if len(value) == 5 {
+					m.shortPatterns = append(m.shortPatterns, match)
+					shortValues = append(shortValues, value)
+				} else {
+					m.patterns = append(m.patterns, match)
+					values = append(values, value)
+				}
 			}
 		}
 	}
 
-	if len(values) == 0 {
+	if len(values) == 0 && len(shortValues) == 0 {
 		m.empty = true
 		return m
 	}
+	if len(values) > 0 {
+		m.ac = buildFlagIDAutomaton(values, false)
+	}
+	if len(shortValues) > 0 {
+		m.shortAC = buildFlagIDAutomaton(shortValues, true)
+	}
+	return m
+}
 
+func buildFlagIDAutomaton(values []string, wholeWords bool) ahocorasick.AhoCorasick {
 	builder := ahocorasick.NewAhoCorasickBuilder(ahocorasick.Opts{
 		AsciiCaseInsensitive: false,
-		MatchOnlyWholeWords:  false,
+		MatchOnlyWholeWords:  wholeWords,
 		MatchKind:            ahocorasick.StandardMatch,
-		DFA:                  true, // DFA is faster for repeated searches
+		DFA:                  true,
 	})
-	m.ac = builder.Build(values)
-	return m
+	return builder.Build(values)
 }
 
 // FindMatches returns all flag IDs found in the text, deduplicated.
@@ -64,22 +93,26 @@ func (m *Matcher) FindMatches(text string) []FlagMatch {
 	if m == nil || m.empty {
 		return nil
 	}
-	hits := m.ac.FindAll(text)
-	if len(hits) == 0 {
-		return nil
-	}
-
-	seen := make(map[int]struct{}, len(hits))
+	seen := make(map[string]struct{})
 	var result []FlagMatch
-	for _, hit := range hits {
-		idx := hit.Pattern()
-		if _, ok := seen[idx]; ok {
-			continue
-		}
-		seen[idx] = struct{}{}
-		result = append(result, m.patterns[idx])
+	if len(m.patterns) > 0 {
+		appendFlagIDMatches(&result, seen, m.ac.FindAll(text), m.patterns)
+	}
+	if len(m.shortPatterns) > 0 {
+		appendFlagIDMatches(&result, seen, m.shortAC.FindAll(text), m.shortPatterns)
 	}
 	return result
+}
+
+func appendFlagIDMatches(result *[]FlagMatch, seen map[string]struct{}, hits []ahocorasick.Match, patterns []FlagMatch) {
+	for _, hit := range hits {
+		match := patterns[hit.Pattern()]
+		if _, ok := seen[match.FlagID]; ok {
+			continue
+		}
+		seen[match.FlagID] = struct{}{}
+		*result = append(*result, match)
+	}
 }
 
 // ContainsAny returns true if the text contains any flagId pattern.
@@ -87,8 +120,8 @@ func (m *Matcher) ContainsAny(text string) bool {
 	if m == nil || m.empty {
 		return false
 	}
-	iter := m.ac.Iter(text)
-	return iter.Next() != nil
+	return (len(m.patterns) > 0 && m.ac.Iter(text).Next() != nil) ||
+		(len(m.shortPatterns) > 0 && m.shortAC.Iter(text).Next() != nil)
 }
 
 // PatternCount returns the number of patterns in the automaton.
@@ -96,7 +129,7 @@ func (m *Matcher) PatternCount() int {
 	if m == nil {
 		return 0
 	}
-	return len(m.patterns)
+	return len(m.patterns) + len(m.shortPatterns)
 }
 
 // --- Extensible Fast Flag Scanner ---
@@ -108,7 +141,8 @@ type FlagScanner struct {
 	scanBytes  func(data []byte) bool
 	scanString func(s string) bool
 	// fallback regex for unsupported patterns
-	regex *regexp.Regexp
+	regex      *regexp.Regexp
+	countRegex *regexp.Regexp
 	// decodeURL also scans a percent-decoded copy of the input, so
 	// URL-encoded flags are caught even when the raw bytes don't match.
 	decodeURL bool
@@ -136,7 +170,15 @@ func NewFlagScanner(flagRegex string, caseInsensitive, decodeURL bool) *FlagScan
 		pat = pat[len("(?i)"):]
 	}
 
-	fs := &FlagScanner{decodeURL: decodeURL}
+	compilePat := pat
+	if ci && !strings.HasPrefix(compilePat, "(?i)") {
+		compilePat = "(?i)" + compilePat
+	}
+	countRegex, err := regexp.Compile(compilePat)
+	if err != nil {
+		return nil
+	}
+	fs := &FlagScanner{decodeURL: decodeURL, countRegex: countRegex}
 
 	// Try to parse known CTF flag patterns and build optimized scanners
 	if spec := parseSuffixPattern(pat, ci); spec != nil {
@@ -165,17 +207,9 @@ func NewFlagScanner(flagRegex string, caseInsensitive, decodeURL bool) *FlagScan
 	}
 
 	// Unknown pattern: fall back to compiled regexp
-	compilePat := pat
-	if ci && !strings.HasPrefix(compilePat, "(?i)") {
-		compilePat = "(?i)" + compilePat
-	}
-	re, err := regexp.Compile(compilePat)
-	if err != nil {
-		return nil
-	}
-	fs.regex = re
-	fs.scanBytes = func(data []byte) bool { return re.Match(data) }
-	fs.scanString = func(s string) bool { return re.MatchString(s) }
+	fs.regex = countRegex
+	fs.scanBytes = func(data []byte) bool { return countRegex.Match(data) }
+	fs.scanString = func(s string) bool { return countRegex.MatchString(s) }
 	return fs
 }
 
@@ -209,6 +243,26 @@ func (fs *FlagScanner) MatchString(s string) bool {
 		}
 	}
 	return false
+}
+
+// CountBytes returns the number of non-overlapping flag matches. When URL
+// decoding is enabled it scans the decoded representation only, so the same raw
+// match is never counted twice while encoded flags are still included.
+func (fs *FlagScanner) CountBytes(data []byte) int {
+	if fs == nil || fs.countRegex == nil || len(data) == 0 {
+		return 0
+	}
+	if fs.decodeURL {
+		if decoded, changed := lenientPercentDecode(data); changed {
+			data = decoded
+		}
+	}
+	return len(fs.countRegex.FindAll(data, -1))
+}
+
+// CountString is the string counterpart of CountBytes.
+func (fs *FlagScanner) CountString(value string) int {
+	return fs.CountBytes([]byte(value))
 }
 
 // lenientPercentDecode decodes "%HH" escapes in-place, leaving any invalid or

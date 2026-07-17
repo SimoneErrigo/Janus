@@ -3,10 +3,13 @@ package sniffer
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,17 +17,18 @@ import (
 	"unicode/utf8"
 
 	"github.com/SimoneErrigo/Janus/backend/internal/filter"
+	flowmodel "github.com/SimoneErrigo/Janus/backend/internal/flow"
 	_ "modernc.org/sqlite"
 )
 
 // packetSelectCols is the standard column list for packet SELECTs.
-const packetSelectCols = "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, matched_rules, flagged, contains_flagid, matched_flagids, flagid_round"
+const packetSelectCols = "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, headers, body, body_string, decoded, capture_truncated, matched_rules, flagged, contains_flagid, flag_count_body, flag_count_headers, flag_count_url, matched_flagids, flagid_round, verdict, attack_score, normal_score, score_coverage, score_confidence, classification, score_reasons, analyst_label"
 
 // packetSummaryCols is the slim column list for list-view queries: skips
 // body (raw blob), body_string (returned truncated via substr below), and
 // matched_flagids JSON. Headers are still selected because the row cell
 // preview falls back to body_string substring when URL is empty.
-const packetSummaryCols = "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, substr(body_string, 1, 80), matched_rules, flagged, contains_flagid, flagid_round"
+const packetSummaryCols = "id, service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, direction, method, url, status, substr(body_string, 1, 80), capture_truncated, matched_rules, flagged, contains_flagid, flag_count_body, flag_count_headers, flag_count_url, flagid_round, verdict, attack_score, normal_score, score_coverage, score_confidence, classification, score_reasons, analyst_label"
 
 // PacketStore handles SQLite persistence for captured packets.
 // Uses separate read/write connection pools for WAL-mode concurrency:
@@ -37,6 +41,7 @@ type PacketStore struct {
 	dbPath   string // path to packets.db (for accurate file-size reporting)
 	muChange sync.RWMutex
 	onChange func(PacketChangeKind, *Packet)
+	onScore  func(ScoreUpdate)
 
 	roundResolver func(time.Time) int
 
@@ -47,6 +52,14 @@ type PacketStore struct {
 	queue  chan batchItem
 	stopCh chan struct{}
 	doneCh chan struct{}
+
+	lifecycleMu   sync.RWMutex
+	writerStopped bool
+	stopOnce      sync.Once
+	closeOnce     sync.Once
+	closeErr      error
+	queueDropped  atomic.Uint64
+	writerErrors  atomic.Uint64
 }
 
 // batchItem carries a packet and any alerts that must be linked to it.
@@ -60,6 +73,11 @@ const (
 	packetQueueSize    = 8192
 	packetBatchMax     = 64
 	packetBatchFlushMs = 25
+)
+
+var (
+	ErrPacketStoreClosed = errors.New("packet store is closed")
+	ErrPacketQueueFull   = errors.New("packet capture queue is full")
 )
 
 // NewPacketStore opens (or creates) the SQLite database at dataDir/packets.db.
@@ -144,6 +162,12 @@ func (s *PacketStore) SetPacketChangeListener(fn func(PacketChangeKind, *Packet)
 	s.onChange = fn
 }
 
+func (s *PacketStore) SetScoreChangeListener(fn func(ScoreUpdate)) {
+	s.muChange.Lock()
+	defer s.muChange.Unlock()
+	s.onScore = fn
+}
+
 func (s *PacketStore) emitChange(kind PacketChangeKind, pkt *Packet) {
 	s.muChange.RLock()
 	fn := s.onChange
@@ -152,6 +176,17 @@ func (s *PacketStore) emitChange(kind PacketChangeKind, pkt *Packet) {
 		return
 	}
 	fn(kind, pkt)
+}
+
+func (s *PacketStore) emitScoreChange(update ScoreUpdate) bool {
+	s.muChange.RLock()
+	fn := s.onScore
+	s.muChange.RUnlock()
+	if fn != nil {
+		fn(update)
+		return true
+	}
+	return false
 }
 
 func migrate(db *sql.DB) error {
@@ -173,9 +208,15 @@ func migrate(db *sql.DB) error {
 			headers       TEXT    NOT NULL DEFAULT '{}',
 			body          BLOB,
 			body_string   TEXT    NOT NULL DEFAULT '',
+			decoded       TEXT    NOT NULL DEFAULT '{}',
+			capture_truncated INTEGER NOT NULL DEFAULT 0,
 			matched_rules    TEXT    NOT NULL DEFAULT '[]',
 			flagged          INTEGER NOT NULL DEFAULT 0,
-			contains_flagid  INTEGER NOT NULL DEFAULT 0,
+				contains_flagid  INTEGER NOT NULL DEFAULT 0,
+				flag_count_body INTEGER NOT NULL DEFAULT 0,
+				flag_count_headers INTEGER NOT NULL DEFAULT 0,
+				flag_count_url INTEGER NOT NULL DEFAULT 0,
+			flagid_scanned_round INTEGER NOT NULL DEFAULT 0,
 			has_drop_match   INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS idx_packets_service_id ON packets(service_id);
@@ -195,48 +236,121 @@ func migrate(db *sql.DB) error {
 		"ALTER TABLE packets ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE packets ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE packets ADD COLUMN contains_flagid INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE packets ADD COLUMN flag_count_body INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE packets ADD COLUMN flag_count_headers INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE packets ADD COLUMN flag_count_url INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE packets ADD COLUMN matched_flagids TEXT NOT NULL DEFAULT '[]'",
 		"ALTER TABLE packets ADD COLUMN flagid_round INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE packets ADD COLUMN flagid_scanned_round INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE packets ADD COLUMN has_drop_match INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE packets ADD COLUMN verdict TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE packets ADD COLUMN capture_truncated INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE packets ADD COLUMN decoded TEXT NOT NULL DEFAULT '{}'",
+		"ALTER TABLE packets ADD COLUMN attack_score INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE packets ADD COLUMN normal_score INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE packets ADD COLUMN score_coverage INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE packets ADD COLUMN score_confidence INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE packets ADD COLUMN classification TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE packets ADD COLUMN score_reasons TEXT NOT NULL DEFAULT '[]'",
+		"ALTER TABLE packets ADD COLUMN analyst_label TEXT NOT NULL DEFAULT ''",
 		// inserted_at tracks when the row was added to *this* DB, distinct
 		// from the wire timestamp. Cleanup-by-age uses it so imports of old
 		// PCAPs aren't immediately wiped just because their capture clock
 		// is in the past.
 		"ALTER TABLE packets ADD COLUMN inserted_at TEXT NOT NULL DEFAULT ''",
 	} {
-		db.Exec(col) // ignore "duplicate column" errors
+		if _, err := db.Exec(col); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return fmt.Errorf("migrating packets column: %w", err)
+		}
 	}
 
-	// One-time backfill: rows present before the inserted_at column existed
-	// get inserted_at = timestamp so the cutoff comparison stays meaningful
-	// for them. New inserts populate the column directly.
-	db.Exec("UPDATE packets SET inserted_at = timestamp WHERE inserted_at = ''")
+	// One-time backfills and indexes for columns added above. Unlike duplicate
+	// ALTER errors, failures here indicate a damaged/unwritable DB and must stop
+	// startup instead of leaving a partially migrated store.
+	for _, statement := range []string{
+		"UPDATE packets SET inserted_at = timestamp WHERE inserted_at = ''",
+		`UPDATE packets SET timestamp = CASE
+			WHEN length(timestamp) = 20 THEN substr(timestamp, 1, 19) || '.000000000Z'
+			ELSE substr(timestamp, 1, length(timestamp) - 1) || substr('000000000', 1, 30 - length(timestamp)) || 'Z'
+		END WHERE substr(timestamp, -1) = 'Z' AND length(timestamp) BETWEEN 20 AND 29
+			AND (length(timestamp) = 20 OR substr(timestamp, 20, 1) = '.')`,
+		`UPDATE packets SET inserted_at = CASE
+			WHEN length(inserted_at) = 20 THEN substr(inserted_at, 1, 19) || '.000000000Z'
+			ELSE substr(inserted_at, 1, length(inserted_at) - 1) || substr('000000000', 1, 30 - length(inserted_at)) || 'Z'
+		END WHERE substr(inserted_at, -1) = 'Z' AND length(inserted_at) BETWEEN 20 AND 29
+			AND (length(inserted_at) = 20 OR substr(inserted_at, 20, 1) = '.')`,
+		"UPDATE packets SET flagid_scanned_round = flagid_round WHERE flagid_scanned_round = 0 AND flagid_round > 0",
+		// Old schemas only knew a boolean. Keep an explicit conservative lower
+		// bound; all newly captured rows persist exact component counts.
+		"UPDATE packets SET flag_count_body = 1 WHERE flagged = 1 AND flag_count_body + flag_count_headers + flag_count_url = 0",
+		"CREATE INDEX IF NOT EXISTS idx_packets_session_id ON packets(session_id)",
+		"CREATE INDEX IF NOT EXISTS idx_packets_contains_flagid ON packets(contains_flagid)",
+		"CREATE INDEX IF NOT EXISTS idx_packets_has_drop_match ON packets(has_drop_match)",
+		"CREATE INDEX IF NOT EXISTS idx_packets_service_ts ON packets(service_id, timestamp DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_packets_flagged_ts ON packets(flagged, timestamp DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_packets_contains_flagid_ts ON packets(contains_flagid, timestamp DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_packets_drop_ts ON packets(has_drop_match, timestamp DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_packets_direction_ts ON packets(direction, timestamp DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_packets_src_ts ON packets(src_ip, timestamp DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_packets_backfill ON packets(contains_flagid, timestamp)",
+		"CREATE INDEX IF NOT EXISTS idx_packets_flagid_round ON packets(flagid_round, timestamp)",
+		"CREATE INDEX IF NOT EXISTS idx_packets_flagid_scanned_round ON packets(flagid_scanned_round, timestamp)",
+		"CREATE INDEX IF NOT EXISTS idx_packets_inserted_at ON packets(inserted_at)",
+		"CREATE INDEX IF NOT EXISTS idx_packets_classification_ts ON packets(classification, timestamp DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_packets_attack_score_ts ON packets(attack_score, timestamp DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_packets_analyst_label_ts ON packets(analyst_label, timestamp DESC)",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("finishing packet migration: %w", err)
+		}
+	}
 
-	// Create indexes for columns added by migrations (must run after ALTER TABLE)
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_session_id ON packets(session_id)")
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_contains_flagid ON packets(contains_flagid)")
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_has_drop_match ON packets(has_drop_match)")
-
-	// Composite index for the most common query: filter by service + sort by time
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_service_ts ON packets(service_id, timestamp DESC)")
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_flagged_ts ON packets(flagged, timestamp DESC)")
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_contains_flagid_ts ON packets(contains_flagid, timestamp DESC)")
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_drop_ts ON packets(has_drop_match, timestamp DESC)")
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_direction_ts ON packets(direction, timestamp DESC)")
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_src_ts ON packets(src_ip, timestamp DESC)")
-
-	// Composite index for backfill: find recent unmarked packets quickly
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_backfill ON packets(contains_flagid, timestamp)")
-
-	// Index for smart backfill: find packets scanned with older AC automaton
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_flagid_round ON packets(flagid_round, timestamp)")
-
-	// Cleanup-by-age and cleanup-by-size both order on inserted_at.
-	db.Exec("CREATE INDEX IF NOT EXISTS idx_packets_inserted_at ON packets(inserted_at)")
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS baseline_signatures (
+		service_id TEXT NOT NULL, signature TEXT NOT NULL, rounds TEXT NOT NULL DEFAULT '[]',
+		PRIMARY KEY(service_id, signature)
+	);
+	CREATE TABLE IF NOT EXISTS baseline_meta (
+		key TEXT PRIMARY KEY, value TEXT NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS baseline_snapshot_meta (
+		epoch TEXT PRIMARY KEY,
+		definition TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS baseline_snapshot_signatures (
+		epoch TEXT NOT NULL,
+		service_id TEXT NOT NULL,
+		signature TEXT NOT NULL,
+		rounds TEXT NOT NULL DEFAULT '[]',
+		PRIMARY KEY(epoch, service_id, signature)
+	)`)
+	if err != nil {
+		return err
+	}
+	// Preserve the legacy single active baseline as the first versioned
+	// snapshot. The INSERTs are idempotent and make upgrades crash-safe.
+	now := CanonicalTimestamp(time.Now())
+	if _, err := db.Exec(`INSERT OR IGNORE INTO baseline_snapshot_meta(epoch, definition, created_at, updated_at)
+		SELECT value, '', ?, ? FROM baseline_meta WHERE key = 'epoch'`, now, now); err != nil {
+		return fmt.Errorf("migrating baseline snapshot metadata: %w", err)
+	}
+	if _, err := db.Exec(`INSERT OR IGNORE INTO baseline_snapshot_signatures(epoch, service_id, signature, rounds)
+		SELECT m.value, s.service_id, s.signature, s.rounds
+		FROM baseline_signatures s CROSS JOIN baseline_meta m WHERE m.key = 'epoch'`); err != nil {
+		return fmt.Errorf("migrating baseline snapshot signatures: %w", err)
+	}
 
 	// Backfill existing rows once after migration.
 	// A row is considered dropped if any matched rule has action drop/both.
-	db.Exec("UPDATE packets SET has_drop_match = CASE WHEN (matched_rules LIKE '%\"action\":\"drop\"%' OR matched_rules LIKE '%\"action\":\"both\"%') THEN 1 ELSE 0 END WHERE has_drop_match = 0")
+	if _, err := db.Exec("UPDATE packets SET has_drop_match = CASE WHEN (matched_rules LIKE '%\"action\":\"drop\"%' OR matched_rules LIKE '%\"action\":\"both\"%') THEN 1 ELSE 0 END WHERE has_drop_match = 0"); err != nil {
+		return fmt.Errorf("backfilling packet drops: %w", err)
+	}
+	// A response was already forwarded by the legacy pipeline before its rules
+	// were evaluated, so it must never be migrated as an actual drop.
+	if _, err := db.Exec("UPDATE packets SET has_drop_match = 0 WHERE direction = 'response'"); err != nil {
+		return fmt.Errorf("normalizing response verdicts: %w", err)
+	}
 
 	// Step 6: alerts table
 	_, err = db.Exec(`
@@ -257,6 +371,13 @@ func migrate(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
+	if _, err := db.Exec(`UPDATE alerts SET timestamp = CASE
+		WHEN length(timestamp) = 20 THEN substr(timestamp, 1, 19) || '.000000000Z'
+		ELSE substr(timestamp, 1, length(timestamp) - 1) || substr('000000000', 1, 30 - length(timestamp)) || 'Z'
+	END WHERE substr(timestamp, -1) = 'Z' AND length(timestamp) BETWEEN 20 AND 29
+		AND (length(timestamp) = 20 OR substr(timestamp, 20, 1) = '.')`); err != nil {
+		return fmt.Errorf("normalizing alert timestamps: %w", err)
+	}
 
 	// Step 21: saved flows table
 	_, err = db.Exec(`
@@ -272,6 +393,13 @@ func migrate(db *sql.DB) error {
 	`)
 	if err != nil {
 		return err
+	}
+	if _, err := db.Exec(`UPDATE saved_flows SET created_at = CASE
+		WHEN length(created_at) = 20 THEN substr(created_at, 1, 19) || '.000000000Z'
+		ELSE substr(created_at, 1, length(created_at) - 1) || substr('000000000', 1, 30 - length(created_at)) || 'Z'
+	END WHERE substr(created_at, -1) = 'Z' AND length(created_at) BETWEEN 20 AND 29
+		AND (length(created_at) = 20 OR substr(created_at, 20, 1) = '.')`); err != nil {
+		return fmt.Errorf("normalizing saved-flow timestamps: %w", err)
 	}
 
 	// Snapshot of full packet data per saved flow — survives packet purges so
@@ -340,6 +468,38 @@ func autoFillBodyString(p *Packet) {
 	}
 }
 
+// ensurePacketVerdict reconstructs a conservative verdict for legacy callers
+// and rows. New data-plane paths set Verdict explicitly before persistence.
+func ensurePacketVerdict(p *Packet) {
+	if p == nil || p.Verdict.Outcome != "" {
+		return
+	}
+	hasDrop, hasAlert := false, false
+	ruleIDs := make([]string, 0, len(p.MatchedRules))
+	for _, rule := range p.MatchedRules {
+		ruleIDs = append(ruleIDs, rule.ID)
+		switch rule.Action {
+		case "drop":
+			hasDrop = true
+		case "both":
+			hasDrop, hasAlert = true, true
+		case "alert":
+			hasAlert = true
+		}
+	}
+	phase := string(p.Direction)
+	switch {
+	case hasDrop && p.Direction == DirectionRequest:
+		p.Verdict = flowmodel.Verdict{Decision: flowmodel.DecisionDrop, Outcome: flowmodel.OutcomeDropped, Phase: phase, Applied: true, RuleIDs: ruleIDs}
+	case hasDrop:
+		p.Verdict = flowmodel.Verdict{Decision: flowmodel.DecisionDrop, Outcome: flowmodel.OutcomeWouldDrop, Phase: phase, Applied: false, RuleIDs: ruleIDs}
+	case hasAlert:
+		p.Verdict = flowmodel.Verdict{Decision: flowmodel.DecisionAlert, Outcome: flowmodel.OutcomeForwarded, Phase: phase, Applied: true, RuleIDs: ruleIDs}
+	default:
+		p.Verdict = flowmodel.Forwarded(phase)
+	}
+}
+
 // isBinaryContentType reports whether the headers declare a body format that
 // shouldn't be rendered as text (gRPC, protobuf, raw octets). The check is
 // case-insensitive and tolerant of "type/subtype; charset=…" suffixes.
@@ -373,7 +533,11 @@ func isBinaryContentType(headers map[string]string) bool {
 
 // Insert stores a packet in the database.
 func (s *PacketStore) Insert(p *Packet) error {
+	if p == nil {
+		return nil
+	}
 	autoFillBodyString(p)
+	ensurePacketVerdict(p)
 
 	headersJSON, err := json.Marshal(p.Headers)
 	if err != nil {
@@ -384,6 +548,10 @@ func (s *PacketStore) Insert(p *Packet) error {
 	if err != nil {
 		matchedRulesJSON = []byte("[]")
 	}
+	decodedJSON, err := json.Marshal(p.Decoded)
+	if err != nil {
+		decodedJSON = []byte("{}")
+	}
 
 	flaggedInt := 0
 	if p.Flagged {
@@ -393,12 +561,17 @@ func (s *PacketStore) Insert(p *Packet) error {
 	if p.ContainsFlagID {
 		containsFlagIDInt = 1
 	}
+	captureTruncatedInt := 0
+	if p.CaptureTruncated {
+		captureTruncatedInt = 1
+	}
 	hasDropMatchInt := 0
-	for _, r := range p.MatchedRules {
-		switch r.Action {
-		case "drop", "both":
-			hasDropMatchInt = 1
-		}
+	if p.Verdict.Outcome == flowmodel.OutcomeDropped {
+		hasDropMatchInt = 1
+	}
+	verdictJSON, err := json.Marshal(p.Verdict)
+	if err != nil {
+		verdictJSON = []byte("{}")
 	}
 
 	if p.MatchedFlagIDs == nil {
@@ -409,24 +582,25 @@ func (s *PacketStore) Insert(p *Packet) error {
 		matchedFlagIDsJSON = []byte("[]")
 	}
 
-	insertedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	insertedAt := CanonicalTimestamp(time.Now())
 	res, err := s.execInsertRetry(`
 		INSERT INTO packets (service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port,
-			protocol, direction, method, url, status, headers, body, body_string,
-			matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, has_drop_match,
-			inserted_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			protocol, direction, method, url, status, headers, body, body_string, decoded, capture_truncated,
+				matched_rules, flagged, contains_flagid, flag_count_body, flag_count_headers, flag_count_url, matched_flagids, flagid_round, has_drop_match,
+				flagid_scanned_round, inserted_at, verdict)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ServiceID, p.SessionID,
-		p.Timestamp.UTC().Format(time.RFC3339Nano),
+		CanonicalTimestamp(p.Timestamp),
 		p.SrcIP, p.SrcPort,
 		p.DstIP, p.DstPort,
 		p.Protocol, p.Direction,
 		p.Method, p.URL, p.Status,
 		string(headersJSON),
-		p.Body, p.BodyString,
+		p.Body, p.BodyString, string(decodedJSON), captureTruncatedInt,
 		string(matchedRulesJSON), flaggedInt, containsFlagIDInt,
-		string(matchedFlagIDsJSON), p.FlagIDRound, hasDropMatchInt,
-		insertedAt,
+		p.FlagCountBody, p.FlagCountHeaders, p.FlagCountURL,
+		string(matchedFlagIDsJSON), p.FlagIDRound, hasDropMatchInt, p.FlagIDRound,
+		insertedAt, string(verdictJSON),
 	)
 	if err != nil {
 		return fmt.Errorf("inserting packet: %w", err)
@@ -434,13 +608,15 @@ func (s *PacketStore) Insert(p *Packet) error {
 
 	id, _ := res.LastInsertId()
 	p.ID = id
+	s.annotateRound(p)
 	s.emitChange(PacketChangeInsert, p)
 	return nil
 }
 
 // Enqueue submits a packet (and any linked alerts whose PacketID will be filled
-// in by the writer) to the async batched writer. Falls back to a synchronous
-// Insert if the queue is full or the writer has been shut down.
+// in by the writer) to the async batched writer. It never waits for SQLite:
+// under sustained overload capture metadata is dropped rather than delaying
+// checker traffic through the proxy.
 func (s *PacketStore) Enqueue(pkt *Packet, alerts []*Alert) error {
 	if pkt == nil {
 		return nil
@@ -452,22 +628,25 @@ func (s *PacketStore) Enqueue(pkt *Packet, alerts []*Alert) error {
 	if pkt.MatchedRules == nil {
 		pkt.MatchedRules = []MatchedRuleInfo{}
 	}
+	ensurePacketVerdict(pkt)
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+	if s.writerStopped {
+		return ErrPacketStoreClosed
+	}
 	select {
 	case s.queue <- batchItem{pkt: pkt, alerts: alerts}:
 		return nil
 	default:
+		s.queueDropped.Add(1)
+		return ErrPacketQueueFull
 	}
-	// Queue full — fall back to sync insert so we don't drop packets under load.
-	if err := s.Insert(pkt); err != nil {
-		return err
-	}
-	for _, a := range alerts {
-		a.PacketID = pkt.ID
-		if err := s.InsertAlert(a); err != nil {
-			return err
-		}
-	}
-	return nil
+}
+
+// WriterStats exposes bounded capture degradation without putting metrics on
+// the forwarding hot path.
+func (s *PacketStore) WriterStats() (queueDropped, writerErrors uint64) {
+	return s.queueDropped.Load(), s.writerErrors.Load()
 }
 
 func (s *PacketStore) runBatchWriter() {
@@ -521,11 +700,11 @@ func (s *PacketStore) flushBatch(batch []batchItem) {
 	}
 
 	// --- Build packet INSERT ---
-	const packetCols = 22
-	rowPlaceholder := "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+	const packetCols = 29
+	rowPlaceholder := "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 	placeholders := make([]string, len(batch))
 	args := make([]interface{}, 0, len(batch)*packetCols)
-	insertedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	insertedAt := CanonicalTimestamp(time.Now())
 	for i, it := range batch {
 		placeholders[i] = rowPlaceholder
 		p := it.pkt
@@ -538,9 +717,18 @@ func (s *PacketStore) flushBatch(batch []batchItem) {
 		if err != nil {
 			matchedRulesJSON = []byte("[]")
 		}
+		decodedJSON, err := json.Marshal(p.Decoded)
+		if err != nil {
+			decodedJSON = []byte("{}")
+		}
 		matchedFlagIDsJSON, err := json.Marshal(p.MatchedFlagIDs)
 		if err != nil {
 			matchedFlagIDsJSON = []byte("[]")
+		}
+		ensurePacketVerdict(p)
+		verdictJSON, err := json.Marshal(p.Verdict)
+		if err != nil {
+			verdictJSON = []byte("{}")
 		}
 
 		flaggedInt := 0
@@ -551,47 +739,57 @@ func (s *PacketStore) flushBatch(batch []batchItem) {
 		if p.ContainsFlagID {
 			containsFlagIDInt = 1
 		}
+		captureTruncatedInt := 0
+		if p.CaptureTruncated {
+			captureTruncatedInt = 1
+		}
 		hasDropMatchInt := 0
-		for _, r := range p.MatchedRules {
-			switch r.Action {
-			case "drop", "both":
-				hasDropMatchInt = 1
-			}
+		if p.Verdict.Outcome == flowmodel.OutcomeDropped {
+			hasDropMatchInt = 1
 		}
 
 		args = append(args,
 			p.ServiceID, p.SessionID,
-			p.Timestamp.UTC().Format(time.RFC3339Nano),
+			CanonicalTimestamp(p.Timestamp),
 			p.SrcIP, p.SrcPort,
 			p.DstIP, p.DstPort,
 			p.Protocol, p.Direction,
 			p.Method, p.URL, p.Status,
 			string(headersJSON),
-			p.Body, p.BodyString,
+			p.Body, p.BodyString, string(decodedJSON), captureTruncatedInt,
 			string(matchedRulesJSON), flaggedInt, containsFlagIDInt,
-			string(matchedFlagIDsJSON), p.FlagIDRound, hasDropMatchInt,
-			insertedAt,
+			p.FlagCountBody, p.FlagCountHeaders, p.FlagCountURL,
+			string(matchedFlagIDsJSON), p.FlagIDRound, hasDropMatchInt, p.FlagIDRound,
+			insertedAt, string(verdictJSON),
 		)
 	}
 
 	query := `INSERT INTO packets (service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port,
-		protocol, direction, method, url, status, headers, body, body_string,
-		matched_rules, flagged, contains_flagid, matched_flagids, flagid_round, has_drop_match,
-		inserted_at)
+		protocol, direction, method, url, status, headers, body, body_string, decoded, capture_truncated,
+			matched_rules, flagged, contains_flagid, flag_count_body, flag_count_headers, flag_count_url, matched_flagids, flagid_round, has_drop_match,
+		flagid_scanned_round, inserted_at, verdict)
 		VALUES ` + strings.Join(placeholders, ",")
 
 	res, err := s.execInsertRetry(query, args...)
 	if err != nil {
 		// Batch failed — fall back to one-by-one Insert (and InsertAlert) so we
 		// don't drop captures wholesale.
+		failures := 0
 		for _, it := range batch {
 			if ierr := s.Insert(it.pkt); ierr != nil {
+				failures++
 				continue
 			}
 			for _, a := range it.alerts {
 				a.PacketID = it.pkt.ID
-				_ = s.InsertAlert(a)
+				if aerr := s.InsertAlert(a); aerr != nil {
+					failures++
+				}
 			}
+		}
+		if failures > 0 {
+			s.writerErrors.Add(uint64(failures))
+			log.Printf("packet writer: batch insert failed (%v); %d fallback row(s) also failed", err, failures)
 		}
 		return
 	}
@@ -611,7 +809,7 @@ func (s *PacketStore) flushBatch(batch []batchItem) {
 			alertPlaceholders = append(alertPlaceholders, "(?,?,?,?,?,?)")
 			alertArgs = append(alertArgs,
 				a.PacketID, a.RuleID, a.ServiceID, a.SrcIP,
-				a.Timestamp.UTC().Format(time.RFC3339Nano),
+				CanonicalTimestamp(a.Timestamp),
 				a.PatternMatched,
 			)
 		}
@@ -621,27 +819,443 @@ func (s *PacketStore) flushBatch(batch []batchItem) {
 			strings.Join(alertPlaceholders, ",")
 		if _, err := s.execInsertRetry(alertQuery, alertArgs...); err != nil {
 			// Best-effort retry per-row so we don't lose alerts on a single bad input
+			failures := 0
 			for _, it := range batch {
 				for _, a := range it.alerts {
-					_ = s.InsertAlert(a)
+					if aerr := s.InsertAlert(a); aerr != nil {
+						failures++
+					}
 				}
+			}
+			if failures > 0 {
+				s.writerErrors.Add(uint64(failures))
+				log.Printf("packet writer: alert batch insert failed (%v); %d fallback row(s) also failed", err, failures)
 			}
 		}
 	}
 
 	// --- Notify SSE for each newly-inserted packet ---
 	for _, it := range batch {
+		s.annotateRound(it.pkt)
 		s.emitChange(PacketChangeInsert, it.pkt)
 	}
+}
+
+// UpdateFlowScore stores one deterministic classification on every packet in
+// the same scored flow. Scoring remains metadata-only and never affects the
+// forwarding verdict.
+func (s *PacketStore) UpdateFlowScore(packetIDs []int64, score FlowScore) error {
+	if len(packetIDs) == 0 {
+		return nil
+	}
+	reasons, err := json.Marshal(score.Reasons)
+	if err != nil {
+		return fmt.Errorf("encoding score reasons: %w", err)
+	}
+
+	const chunkSize = 256
+	for start := 0; start < len(packetIDs); start += chunkSize {
+		end := start + chunkSize
+		if end > len(packetIDs) {
+			end = len(packetIDs)
+		}
+		ids := packetIDs[start:end]
+		marks := make([]string, len(ids))
+		args := make([]any, 0, 6+len(ids))
+		args = append(args, score.Attack, score.Normal, score.Coverage, score.Confidence, score.Classification, string(reasons))
+		for i, id := range ids {
+			marks[i] = "?"
+			args = append(args, id)
+		}
+		query := `UPDATE packets SET attack_score = ?, normal_score = ?, score_coverage = ?,
+			score_confidence = ?, classification = ?, score_reasons = ? WHERE id IN (` + strings.Join(marks, ",") + `)`
+		if _, err := s.db.Exec(query, args...); err != nil {
+			return fmt.Errorf("updating flow score: %w", err)
+		}
+	}
+	if !s.emitScoreChange(NewScoreUpdate(packetIDs, score)) {
+		s.emitChange(PacketChangeMetadata, nil)
+	}
+	return nil
+}
+
+// ScoreCounts returns packet counts by deterministic classification. It is a
+// cheap indexed aggregation used by the Traffic summary.
+func (s *PacketStore) ScoreCounts() (map[string]int64, error) {
+	rows, err := s.rdb.Query(`SELECT classification, COUNT(*) FROM packets
+		WHERE classification <> '' GROUP BY classification`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var classification string
+		var count int64
+		if err := rows.Scan(&classification, &count); err != nil {
+			return nil, err
+		}
+		out[classification] = count
+	}
+	return out, rows.Err()
+}
+
+// SetAnalystLabel annotates selected packets for later review. Labels never
+// directly alter a score; an explicit "exploit" label is only consumed when
+// the operator requests a deterministic baseline rebuild.
+func (s *PacketStore) SetAnalystLabel(packetIDs []int64, label string) error {
+	if len(packetIDs) == 0 {
+		return nil
+	}
+	const chunkSize = 256
+	for start := 0; start < len(packetIDs); start += chunkSize {
+		end := start + chunkSize
+		if end > len(packetIDs) {
+			end = len(packetIDs)
+		}
+		marks := make([]string, end-start)
+		args := make([]any, 0, 1+len(marks))
+		args = append(args, label)
+		for i, id := range packetIDs[start:end] {
+			marks[i] = "?"
+			args = append(args, id)
+		}
+		if _, err := s.db.Exec(`UPDATE packets SET analyst_label = ? WHERE id IN (`+strings.Join(marks, ",")+`)`, args...); err != nil {
+			return fmt.Errorf("setting analyst label: %w", err)
+		}
+	}
+	s.emitChange(PacketChangeMetadata, nil)
+	return nil
+}
+
+// LoadBaselineSignatures restores the frozen opening-round baseline.
+func (s *PacketStore) LoadBaselineSignatures() ([]BaselineSignature, error) {
+	rows, err := s.rdb.Query(`SELECT service_id, signature, rounds FROM baseline_signatures`)
+	if err != nil {
+		return nil, fmt.Errorf("loading baseline signatures: %w", err)
+	}
+	defer rows.Close()
+	var out []BaselineSignature
+	for rows.Next() {
+		var item BaselineSignature
+		var roundsJSON string
+		if err := rows.Scan(&item.ServiceID, &item.Signature, &roundsJSON); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(roundsJSON), &item.Rounds); err != nil {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+// CountBaselinePackets preflights the exact default and service-specific
+// windows before the active baseline is cleared.
+func (s *PacketStore) CountBaselinePackets(defaultWindow BaselineWindow, serviceWindows map[string]BaselineWindow) (int, error) {
+	where, args := baselineSelection(defaultWindow, serviceWindows)
+	if where == "" {
+		return 0, nil
+	}
+	var total int
+	if err := s.rdb.QueryRow("SELECT COUNT(*) FROM packets WHERE "+where, args...).Scan(&total); err != nil {
+		return 0, fmt.Errorf("counting baseline replay: %w", err)
+	}
+	return total, nil
+}
+
+// ReplayBaselinePackets streams a bounded, chronological replay window in
+// small batches. This avoids retaining thousands of captured bodies when the
+// operator changes baseline rounds after traffic has already been captured.
+func (s *PacketStore) ReplayBaselinePackets(defaultWindow BaselineWindow, serviceWindows map[string]BaselineWindow, limit int, visit func(*Packet) error) (int, error) {
+	selection, selectionArgs := baselineSelection(defaultWindow, serviceWindows)
+	if selection == "" {
+		return 0, nil
+	}
+	if limit <= 0 || visit == nil {
+		return 0, fmt.Errorf("baseline replay requires a positive limit and visitor")
+	}
+	const batchSize = 128
+	total, err := s.CountBaselinePackets(defaultWindow, serviceWindows)
+	if err != nil {
+		return 0, err
+	}
+	if total > limit {
+		return 0, fmt.Errorf("baseline window contains %d packets and exceeds the %d-packet safety limit; choose a narrower round range", total, limit)
+	}
+	count := 0
+	var cursorTS string
+	var cursorID int64
+	for {
+		fetch := batchSize
+		if remaining := limit - count + 1; remaining < fetch {
+			fetch = remaining
+		}
+		where := "(" + selection + ")"
+		args := append(make([]interface{}, 0, len(selectionArgs)+4), selectionArgs...)
+		if cursorTS != "" {
+			where += " AND (timestamp > ? OR (timestamp = ? AND id > ?))"
+			args = append(args, cursorTS, cursorTS, cursorID)
+		}
+		args = append(args, fetch)
+		packets, err := s.scanPackets("SELECT "+packetSelectCols+" FROM packets WHERE "+where+" ORDER BY timestamp ASC, id ASC LIMIT ?", args)
+		if err != nil {
+			return count, fmt.Errorf("loading baseline replay: %w", err)
+		}
+		if len(packets) == 0 {
+			return count, nil
+		}
+		for _, packet := range packets {
+			if count >= limit {
+				return count, fmt.Errorf("baseline window exceeds the %d-packet safety limit; choose a narrower round range", limit)
+			}
+			if err := visit(packet); err != nil {
+				return count, err
+			}
+			count++
+		}
+		last := packets[len(packets)-1]
+		cursorTS, cursorID = CanonicalTimestamp(last.Timestamp), last.ID
+		if len(packets) < fetch {
+			return count, nil
+		}
+	}
+}
+
+func baselineSelection(defaultWindow BaselineWindow, serviceWindows map[string]BaselineWindow) (string, []interface{}) {
+	serviceIDs := make([]string, 0, len(serviceWindows))
+	for serviceID, window := range serviceWindows {
+		if serviceID != "" && validBaselineWindow(window) {
+			serviceIDs = append(serviceIDs, serviceID)
+		}
+	}
+	sort.Strings(serviceIDs)
+
+	clauses := make([]string, 0, len(serviceIDs)+1)
+	args := make([]interface{}, 0, 2+len(serviceIDs)*3)
+	if validBaselineWindow(defaultWindow) {
+		clause := "(timestamp >= ? AND timestamp < ?"
+		args = append(args, CanonicalTimestamp(defaultWindow.From), CanonicalTimestamp(defaultWindow.To))
+		if len(serviceIDs) > 0 {
+			clause += " AND service_id NOT IN (" + strings.TrimSuffix(strings.Repeat("?,", len(serviceIDs)), ",") + ")"
+			for _, serviceID := range serviceIDs {
+				args = append(args, serviceID)
+			}
+		}
+		clauses = append(clauses, clause+")")
+	}
+	for _, serviceID := range serviceIDs {
+		window := serviceWindows[serviceID]
+		clauses = append(clauses, "(service_id = ? AND timestamp >= ? AND timestamp < ?)")
+		args = append(args, serviceID, CanonicalTimestamp(window.From), CanonicalTimestamp(window.To))
+	}
+	return strings.Join(clauses, " OR "), args
+}
+
+func validBaselineWindow(window BaselineWindow) bool {
+	return !window.From.IsZero() && !window.To.IsZero() && window.To.After(window.From)
+}
+
+// PrepareBaseline activates a versioned snapshot. Switching configurations
+// restores its signatures instead of deleting the previously active set.
+func (s *PacketStore) PrepareBaseline(epoch, definition string) error {
+	epoch = strings.TrimSpace(epoch)
+	if epoch == "" {
+		return fmt.Errorf("baseline epoch is empty")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var stored string
+	err = tx.QueryRow(`SELECT value FROM baseline_meta WHERE key = 'epoch'`).Scan(&stored)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("reading baseline epoch: %w", err)
+	}
+	now := CanonicalTimestamp(time.Now())
+	if _, err := tx.Exec(`INSERT INTO baseline_snapshot_meta(epoch, definition, created_at, updated_at)
+		VALUES(?, ?, ?, ?)
+		ON CONFLICT(epoch) DO UPDATE SET definition = excluded.definition`, epoch, definition, now, now); err != nil {
+		return fmt.Errorf("saving baseline snapshot metadata: %w", err)
+	}
+	if err == sql.ErrNoRows || stored != epoch {
+		if _, err := tx.Exec(`DELETE FROM baseline_signatures`); err != nil {
+			return fmt.Errorf("switching baseline: %w", err)
+		}
+		if _, err := tx.Exec(`INSERT INTO baseline_signatures(service_id, signature, rounds)
+			SELECT service_id, signature, rounds FROM baseline_snapshot_signatures WHERE epoch = ?`, epoch); err != nil {
+			return fmt.Errorf("restoring baseline snapshot: %w", err)
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO baseline_meta(key, value) VALUES('epoch', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, epoch); err != nil {
+		return fmt.Errorf("saving baseline epoch: %w", err)
+	}
+	return tx.Commit()
+}
+
+// UpsertBaselineSignature persists the observed opening rounds for a safe
+// signature. Callers own anti-poisoning and freeze policy.
+func (s *PacketStore) UpsertBaselineSignature(serviceID, signature string, rounds []int) error {
+	encoded, err := json.Marshal(rounds)
+	if err != nil {
+		return fmt.Errorf("encoding baseline rounds: %w", err)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	epoch, err := activeBaselineEpoch(tx)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO baseline_signatures(service_id, signature, rounds) VALUES(?, ?, ?)
+		ON CONFLICT(service_id, signature) DO UPDATE SET rounds = excluded.rounds`, serviceID, signature, string(encoded)); err != nil {
+		return fmt.Errorf("saving baseline signature: %w", err)
+	}
+	if _, err = tx.Exec(`INSERT INTO baseline_snapshot_signatures(epoch, service_id, signature, rounds) VALUES(?, ?, ?, ?)
+		ON CONFLICT(epoch, service_id, signature) DO UPDATE SET rounds = excluded.rounds`, epoch, serviceID, signature, string(encoded)); err != nil {
+		return fmt.Errorf("saving versioned baseline signature: %w", err)
+	}
+	if err := touchBaselineSnapshot(tx, epoch); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// DeleteBaselineSignature removes a weak candidate evicted by the bounded
+// in-memory baseline. Recurring candidates are never selected for eviction.
+func (s *PacketStore) DeleteBaselineSignature(serviceID, signature string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	epoch, err := activeBaselineEpoch(tx)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM baseline_signatures WHERE service_id = ? AND signature = ?`, serviceID, signature); err != nil {
+		return fmt.Errorf("deleting baseline signature: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM baseline_snapshot_signatures WHERE epoch = ? AND service_id = ? AND signature = ?`, epoch, serviceID, signature); err != nil {
+		return fmt.Errorf("deleting versioned baseline signature: %w", err)
+	}
+	if err := touchBaselineSnapshot(tx, epoch); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ReplaceBaselineSignatures atomically publishes a completed historical
+// rebuild. Live learning continues to use the cheaper single-row upsert.
+func (s *PacketStore) ReplaceBaselineSignatures(items []BaselineSignature) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("starting baseline replacement: %w", err)
+	}
+	defer tx.Rollback()
+	epoch, err := activeBaselineEpoch(tx)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM baseline_signatures`); err != nil {
+		return fmt.Errorf("clearing baseline replacement: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM baseline_snapshot_signatures WHERE epoch = ?`, epoch); err != nil {
+		return fmt.Errorf("clearing versioned baseline replacement: %w", err)
+	}
+	activeStmt, err := tx.Prepare(`INSERT INTO baseline_signatures(service_id, signature, rounds) VALUES(?, ?, ?)`)
+	if err != nil {
+		return fmt.Errorf("preparing baseline replacement: %w", err)
+	}
+	defer activeStmt.Close()
+	snapshotStmt, err := tx.Prepare(`INSERT INTO baseline_snapshot_signatures(epoch, service_id, signature, rounds) VALUES(?, ?, ?, ?)`)
+	if err != nil {
+		return fmt.Errorf("preparing versioned baseline replacement: %w", err)
+	}
+	defer snapshotStmt.Close()
+	for _, item := range items {
+		encoded, err := json.Marshal(item.Rounds)
+		if err != nil {
+			return fmt.Errorf("encoding baseline rounds: %w", err)
+		}
+		if _, err := activeStmt.Exec(item.ServiceID, item.Signature, string(encoded)); err != nil {
+			return fmt.Errorf("replacing baseline signature: %w", err)
+		}
+		if _, err := snapshotStmt.Exec(epoch, item.ServiceID, item.Signature, string(encoded)); err != nil {
+			return fmt.Errorf("replacing versioned baseline signature: %w", err)
+		}
+	}
+	if err := touchBaselineSnapshot(tx, epoch); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ListBaselineSnapshots returns every preserved configuration, including the
+// active one. Packet cleanup never touches these tables.
+func (s *PacketStore) ListBaselineSnapshots() ([]BaselineSnapshot, error) {
+	rows, err := s.rdb.Query(`SELECT m.epoch, m.definition, m.created_at, m.updated_at,
+		COUNT(s.signature), CASE WHEN m.epoch = COALESCE((SELECT value FROM baseline_meta WHERE key = 'epoch'), '') THEN 1 ELSE 0 END
+		FROM baseline_snapshot_meta m
+		LEFT JOIN baseline_snapshot_signatures s ON s.epoch = m.epoch
+		GROUP BY m.epoch, m.definition, m.created_at, m.updated_at
+		ORDER BY m.updated_at DESC, m.epoch ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("listing baseline snapshots: %w", err)
+	}
+	defer rows.Close()
+	var out []BaselineSnapshot
+	for rows.Next() {
+		var item BaselineSnapshot
+		var createdAt, updatedAt string
+		var active int
+		if err := rows.Scan(&item.Epoch, &item.Definition, &createdAt, &updatedAt, &item.SignatureCount, &active); err != nil {
+			return nil, err
+		}
+		item.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+		item.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+		item.Active = active != 0
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func activeBaselineEpoch(tx *sql.Tx) (string, error) {
+	var epoch string
+	if err := tx.QueryRow(`SELECT value FROM baseline_meta WHERE key = 'epoch'`).Scan(&epoch); err != nil {
+		if err == sql.ErrNoRows {
+			return "", fmt.Errorf("active baseline is not prepared")
+		}
+		return "", fmt.Errorf("reading active baseline: %w", err)
+	}
+	return epoch, nil
+}
+
+func touchBaselineSnapshot(tx *sql.Tx, epoch string) error {
+	if _, err := tx.Exec(`UPDATE baseline_snapshot_meta SET updated_at = ? WHERE epoch = ?`, CanonicalTimestamp(time.Now()), epoch); err != nil {
+		return fmt.Errorf("updating baseline snapshot metadata: %w", err)
+	}
+	return nil
 }
 
 // Query retrieves packets matching the given filters.
 // The regex filter and any DSL-residual predicates are applied in Go after
 // the SQL query for correct pagination.
 func (s *PacketStore) Query(q PacketQuery) ([]*Packet, int, error) {
+	packets, total, _, err := s.QueryPage(q)
+	return packets, total, err
+}
+
+// QueryPage is Query plus pagination metadata used by the UI to distinguish
+// exact totals from bounded residual scans.
+func (s *PacketStore) QueryPage(q PacketQuery) ([]*Packet, int, QueryMeta, error) {
 	where, args, residual, err := buildWhereAndResidual(q)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, QueryMeta{}, err
 	}
 	hasRegex := q.Regex != "" || q.NotRegex != ""
 	hasResidual := residual != nil
@@ -669,7 +1283,7 @@ func (s *PacketStore) Query(q PacketQuery) ([]*Packet, int, error) {
 	}
 
 	if hasRegex || hasResidual {
-		// Fetch all SQL-matching rows, filter in Go (regex + residual), paginate.
+		// Residual predicates are evaluated in bounded keyset chunks.
 		return s.queryWithGoFilter(q, where, args, selectCols, sortOrder, limit, offset, residual)
 	}
 
@@ -677,9 +1291,14 @@ func (s *PacketStore) Query(q PacketQuery) ([]*Packet, int, error) {
 	// predicates over body_string/headers is a full table scan and dominates
 	// query time — in practice the UI only needs a bound ("is there another
 	// page?") so we skip the expensive COUNT and estimate total.
+	pageWhere, pageArgs := withPacketCursor(where, args, q.CursorTimestamp, q.CursorID, sortOrder)
+	sqlOffset := offset
+	if q.CursorTimestamp != "" {
+		sqlOffset = 0
+	}
 	querySQL := "SELECT " + selectCols + " FROM packets" +
-		where + " ORDER BY timestamp " + sortOrder + " LIMIT ? OFFSET ?"
-	queryArgs := append(args, limit, offset)
+		pageWhere + " ORDER BY timestamp " + sortOrder + ", id " + sortOrder + " LIMIT ? OFFSET ?"
+	queryArgs := append(pageArgs, limit+1, sqlOffset)
 
 	var packets []*Packet
 	if useSummary {
@@ -688,25 +1307,53 @@ func (s *PacketStore) Query(q PacketQuery) ([]*Packet, int, error) {
 		packets, err = s.scanPackets(querySQL, queryArgs)
 	}
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, QueryMeta{}, err
+	}
+	more := len(packets) > limit
+	if more {
+		packets = packets[:limit]
 	}
 
-	total, err := s.countOrEstimate(q, where, args, offset, len(packets), limit)
+	total, err := s.countOrEstimate(q, where, args, offset, len(packets), more)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, QueryMeta{}, err
 	}
-	return packets, total, nil
+	meta := QueryMeta{TotalExact: !isExpensiveTextPredicate(q)}
+	if more && len(packets) > 0 {
+		last := packets[len(packets)-1]
+		meta.NextTimestamp, meta.NextID = last.Timestamp, last.ID
+	}
+	return packets, total, meta, nil
+}
+
+func withPacketCursor(where string, args []interface{}, timestamp string, id int64, sortOrder string) (string, []interface{}) {
+	out := append([]interface{}(nil), args...)
+	if timestamp == "" || id <= 0 {
+		return where, out
+	}
+	op := "<"
+	if sortOrder == "ASC" {
+		op = ">"
+	}
+	clause := fmt.Sprintf("(timestamp %s ? OR (timestamp = ? AND id %s ?))", op, op)
+	if where == "" {
+		where = " WHERE " + clause
+	} else {
+		where += " AND " + clause
+	}
+	out = append(out, timestamp, timestamp, id)
+	return where, out
 }
 
 // countOrEstimate returns the exact COUNT(*) when the predicate is cheap, or an
 // estimated total otherwise. "Cheap" = no wildcard LIKE / negation text scans.
 // The estimate is tight enough for infinite-scroll (offset + returned ± 1).
-func (s *PacketStore) countOrEstimate(q PacketQuery, where string, args []interface{}, offset, returned, limit int) (int, error) {
+func (s *PacketStore) countOrEstimate(q PacketQuery, where string, args []interface{}, offset, returned int, more bool) (int, error) {
 	if isExpensiveTextPredicate(q) {
 		// Estimate: the backend doesn't know the true total without a full scan.
 		// Return offset+returned when the page isn't full (we've reached the end),
 		// otherwise offset+returned+1 to signal "more available" to the client.
-		if returned < limit {
+		if !more {
 			return offset + returned, nil
 		}
 		return offset + returned + 1, nil
@@ -725,64 +1372,125 @@ func isExpensiveTextPredicate(q PacketQuery) bool {
 	return q.Contains != "" || q.NotContains != "" ||
 		q.ContainsBody != "" || q.NotContainsBody != "" ||
 		q.ContainsHeaders != "" || q.NotContainsHeaders != "" ||
-		q.URL != "" || q.NotURL != ""
+		q.URL != "" || q.NotURL != "" || strings.TrimSpace(q.Q) != ""
 }
 
 // queryWithGoFilter fetches SQL-filtered rows, applies regex/not-regex and any
 // DSL residual evaluator in Go, then paginates. Used whenever post-SQL
 // filtering is required.
-func (s *PacketStore) queryWithGoFilter(q PacketQuery, where string, args []interface{}, selectCols, sortOrder string, limit, offset int, residual filter.EvalFunc) ([]*Packet, int, error) {
+func (s *PacketStore) queryWithGoFilter(q PacketQuery, where string, args []interface{}, selectCols, sortOrder string, limit, offset int, residual filter.EvalFunc) ([]*Packet, int, QueryMeta, error) {
 	var re, notRe *regexp.Regexp
 	if q.Regex != "" {
 		var err error
 		re, err = regexp.Compile(q.Regex)
 		if err != nil {
-			return nil, 0, fmt.Errorf("invalid regex: %w", err)
+			return nil, 0, QueryMeta{}, fmt.Errorf("invalid regex: %w", err)
 		}
 	}
 	if q.NotRegex != "" {
 		var err error
 		notRe, err = regexp.Compile(q.NotRegex)
 		if err != nil {
-			return nil, 0, fmt.Errorf("invalid not_regex: %w", err)
+			return nil, 0, QueryMeta{}, fmt.Errorf("invalid not_regex: %w", err)
 		}
 	}
 
-	querySQL := "SELECT " + selectCols + " FROM packets" +
-		where + " ORDER BY timestamp " + sortOrder
-
-	allPackets, err := s.scanPackets(querySQL, args)
-	if err != nil {
-		return nil, 0, err
+	const chunkSize = 512
+	const maxScan = 20000
+	skip := offset
+	if q.CursorTimestamp != "" {
+		skip = 0
 	}
-
-	// Apply regex / not-regex / DSL-residual filters
-	var filtered []*Packet
-	for _, p := range allPackets {
-		if re != nil && !regexMatchesPacket(re, p) {
-			continue
+	wanted := skip + limit + 1
+	matched, scanned := 0, 0
+	var selected []*Packet
+	cursorTS := q.CursorTimestamp
+	cursorID := q.CursorID
+	var lastScanned *Packet
+	exhausted := false
+	for scanned < maxScan && matched < wanted {
+		pageWhere := where
+		pageArgs := append([]interface{}(nil), args...)
+		if cursorTS != "" {
+			op := "<"
+			if sortOrder == "ASC" {
+				op = ">"
+			}
+			cursorClause := fmt.Sprintf("(timestamp %s ? OR (timestamp = ? AND id %s ?))", op, op)
+			if pageWhere == "" {
+				pageWhere = " WHERE " + cursorClause
+			} else {
+				pageWhere += " AND " + cursorClause
+			}
+			pageArgs = append(pageArgs, cursorTS, cursorTS, cursorID)
 		}
-		if notRe != nil && regexMatchesPacket(notRe, p) {
-			continue
+		remaining := maxScan - scanned
+		fetch := chunkSize
+		if remaining < fetch {
+			fetch = remaining
 		}
-		if residual != nil && !residual(AsView(p)) {
-			continue
+		querySQL := "SELECT " + selectCols + " FROM packets" + pageWhere + " ORDER BY timestamp " + sortOrder + ", id " + sortOrder + " LIMIT ?"
+		pageArgs = append(pageArgs, fetch)
+		page, err := s.scanPackets(querySQL, pageArgs)
+		if err != nil {
+			return nil, 0, QueryMeta{}, err
 		}
-		filtered = append(filtered, p)
+		if len(page) == 0 {
+			exhausted = true
+			break
+		}
+		scanned += len(page)
+		last := page[len(page)-1]
+		lastScanned = last
+		cursorTS, cursorID = CanonicalTimestamp(last.Timestamp), last.ID
+		for _, p := range page {
+			if re != nil && !regexMatchesPacket(re, p) {
+				continue
+			}
+			if notRe != nil && regexMatchesPacket(notRe, p) {
+				continue
+			}
+			if residual != nil && !residual(AsView(p)) {
+				continue
+			}
+			if matched >= skip && len(selected) < limit+1 {
+				selected = append(selected, p)
+			}
+			matched++
+		}
+		if len(page) < fetch {
+			exhausted = true
+			break
+		}
 	}
-
-	total := len(filtered)
-
-	// Paginate
-	if offset >= len(filtered) {
-		return []*Packet{}, total, nil
+	more := len(selected) > limit
+	if more {
+		selected = selected[:limit]
 	}
-	end := offset + limit
-	if end > len(filtered) {
-		end = len(filtered)
+	total := matched
+	if q.CursorTimestamp != "" {
+		total += offset
 	}
-
-	return filtered[offset:end], total, nil
+	if !exhausted {
+		minimum := offset + len(selected)
+		if more {
+			minimum++
+		}
+		if total < minimum {
+			total = minimum
+		}
+	}
+	meta := QueryMeta{TotalExact: exhausted, Partial: !exhausted && !more}
+	if more && len(selected) > 0 {
+		last := selected[len(selected)-1]
+		meta.NextTimestamp, meta.NextID = last.Timestamp, last.ID
+	} else if !exhausted && lastScanned != nil {
+		// The bounded scan may cross a long run with few/no residual matches.
+		// Continue after the last row actually inspected so later matches remain
+		// reachable without rescanning the same 20k rows.
+		meta.NextTimestamp, meta.NextID = lastScanned.Timestamp, lastScanned.ID
+	}
+	return selected, total, meta, nil
 }
 
 func regexMatchesPacket(re *regexp.Regexp, p *Packet) bool {
@@ -815,15 +1523,19 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 		var headersJSON string
 		var matchedRulesJSON string
 		var matchedFlagIDsJSON string
-		var flaggedInt, containsFlagIDInt int
+		var verdictJSON string
+		var decodedJSON string
+		var scoreReasonsJSON string
+		var flaggedInt, containsFlagIDInt, captureTruncatedInt int
 		if err := rows.Scan(
 			&p.ID, &p.ServiceID, &p.SessionID, &ts,
 			&p.SrcIP, &p.SrcPort, &p.DstIP, &p.DstPort,
 			&p.Protocol, &p.Direction,
 			&p.Method, &p.URL, &p.Status,
-			&headersJSON, &p.Body, &p.BodyString,
+			&headersJSON, &p.Body, &p.BodyString, &decodedJSON, &captureTruncatedInt,
 			&matchedRulesJSON, &flaggedInt, &containsFlagIDInt,
-			&matchedFlagIDsJSON, &p.FlagIDRound,
+			&p.FlagCountBody, &p.FlagCountHeaders, &p.FlagCountURL,
+			&matchedFlagIDsJSON, &p.FlagIDRound, &verdictJSON, &p.AttackScore, &p.NormalScore, &p.ScoreCoverage, &p.ScoreConfidence, &p.Classification, &scoreReasonsJSON, &p.AnalystLabel,
 		); err != nil {
 			return nil, fmt.Errorf("scanning packet: %w", err)
 		}
@@ -831,9 +1543,13 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 		p.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
 		p.Flagged = flaggedInt != 0
 		p.ContainsFlagID = containsFlagIDInt != 0
+		p.CaptureTruncated = captureTruncatedInt != 0
 
 		if headersJSON != "" && headersJSON != "{}" {
 			json.Unmarshal([]byte(headersJSON), &p.Headers)
+		}
+		if decodedJSON != "" && decodedJSON != "{}" {
+			json.Unmarshal([]byte(decodedJSON), &p.Decoded)
 		}
 
 		if matchedRulesJSON != "" && matchedRulesJSON != "[]" {
@@ -843,6 +1559,13 @@ func (s *PacketStore) scanPackets(querySQL string, args []interface{}) ([]*Packe
 		if matchedFlagIDsJSON != "" && matchedFlagIDsJSON != "[]" {
 			json.Unmarshal([]byte(matchedFlagIDsJSON), &p.MatchedFlagIDs)
 		}
+		if verdictJSON != "" && verdictJSON != "{}" {
+			json.Unmarshal([]byte(verdictJSON), &p.Verdict)
+		}
+		if scoreReasonsJSON != "" && scoreReasonsJSON != "[]" {
+			json.Unmarshal([]byte(scoreReasonsJSON), &p.ScoreReasons)
+		}
+		ensurePacketVerdict(p)
 
 		if p.MatchedRules == nil {
 			p.MatchedRules = []MatchedRuleInfo{}
@@ -875,16 +1598,17 @@ func (s *PacketStore) scanPacketsSummary(querySQL string, args []interface{}) ([
 	var packets []*Packet
 	for rows.Next() {
 		p := &Packet{Lite: true}
-		var ts, bodyPreview, matchedRulesJSON string
-		var flaggedInt, containsFlagIDInt int
+		var ts, bodyPreview, matchedRulesJSON, verdictJSON, scoreReasonsJSON string
+		var flaggedInt, containsFlagIDInt, captureTruncatedInt int
 		if err := rows.Scan(
 			&p.ID, &p.ServiceID, &p.SessionID, &ts,
 			&p.SrcIP, &p.SrcPort, &p.DstIP, &p.DstPort,
 			&p.Protocol, &p.Direction,
 			&p.Method, &p.URL, &p.Status,
-			&bodyPreview,
+			&bodyPreview, &captureTruncatedInt,
 			&matchedRulesJSON, &flaggedInt, &containsFlagIDInt,
-			&p.FlagIDRound,
+			&p.FlagCountBody, &p.FlagCountHeaders, &p.FlagCountURL,
+			&p.FlagIDRound, &verdictJSON, &p.AttackScore, &p.NormalScore, &p.ScoreCoverage, &p.ScoreConfidence, &p.Classification, &scoreReasonsJSON, &p.AnalystLabel,
 		); err != nil {
 			return nil, fmt.Errorf("scanning packet summary: %w", err)
 		}
@@ -892,6 +1616,7 @@ func (s *PacketStore) scanPacketsSummary(querySQL string, args []interface{}) ([
 		p.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
 		p.Flagged = flaggedInt != 0
 		p.ContainsFlagID = containsFlagIDInt != 0
+		p.CaptureTruncated = captureTruncatedInt != 0
 		p.BodyString = bodyPreview
 
 		if matchedRulesJSON != "" && matchedRulesJSON != "[]" {
@@ -899,6 +1624,13 @@ func (s *PacketStore) scanPacketsSummary(querySQL string, args []interface{}) ([
 		}
 		if p.MatchedRules == nil {
 			p.MatchedRules = []MatchedRuleInfo{}
+		}
+		if verdictJSON != "" && verdictJSON != "{}" {
+			json.Unmarshal([]byte(verdictJSON), &p.Verdict)
+		}
+		ensurePacketVerdict(p)
+		if scoreReasonsJSON != "" && scoreReasonsJSON != "[]" {
+			json.Unmarshal([]byte(scoreReasonsJSON), &p.ScoreReasons)
 		}
 		p.MatchedFlagIDs = []string{}
 
@@ -921,15 +1653,19 @@ func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
 	var headersJSON string
 	var matchedRulesJSON string
 	var matchedFlagIDsJSON string
-	var flaggedInt, containsFlagIDInt int
+	var verdictJSON string
+	var decodedJSON string
+	var scoreReasonsJSON string
+	var flaggedInt, containsFlagIDInt, captureTruncatedInt int
 	if err := row.Scan(
 		&p.ID, &p.ServiceID, &p.SessionID, &ts,
 		&p.SrcIP, &p.SrcPort, &p.DstIP, &p.DstPort,
 		&p.Protocol, &p.Direction,
 		&p.Method, &p.URL, &p.Status,
-		&headersJSON, &p.Body, &p.BodyString,
+		&headersJSON, &p.Body, &p.BodyString, &decodedJSON, &captureTruncatedInt,
 		&matchedRulesJSON, &flaggedInt, &containsFlagIDInt,
-		&matchedFlagIDsJSON, &p.FlagIDRound,
+		&p.FlagCountBody, &p.FlagCountHeaders, &p.FlagCountURL,
+		&matchedFlagIDsJSON, &p.FlagIDRound, &verdictJSON, &p.AttackScore, &p.NormalScore, &p.ScoreCoverage, &p.ScoreConfidence, &p.Classification, &scoreReasonsJSON, &p.AnalystLabel,
 	); err != nil {
 		return nil, err
 	}
@@ -937,9 +1673,13 @@ func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
 	p.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
 	p.Flagged = flaggedInt != 0
 	p.ContainsFlagID = containsFlagIDInt != 0
+	p.CaptureTruncated = captureTruncatedInt != 0
 
 	if headersJSON != "" && headersJSON != "{}" {
 		json.Unmarshal([]byte(headersJSON), &p.Headers)
+	}
+	if decodedJSON != "" && decodedJSON != "{}" {
+		json.Unmarshal([]byte(decodedJSON), &p.Decoded)
 	}
 	if matchedRulesJSON != "" && matchedRulesJSON != "[]" {
 		json.Unmarshal([]byte(matchedRulesJSON), &p.MatchedRules)
@@ -947,6 +1687,13 @@ func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
 	if matchedFlagIDsJSON != "" && matchedFlagIDsJSON != "[]" {
 		json.Unmarshal([]byte(matchedFlagIDsJSON), &p.MatchedFlagIDs)
 	}
+	if verdictJSON != "" && verdictJSON != "{}" {
+		json.Unmarshal([]byte(verdictJSON), &p.Verdict)
+	}
+	if scoreReasonsJSON != "" && scoreReasonsJSON != "[]" {
+		json.Unmarshal([]byte(scoreReasonsJSON), &p.ScoreReasons)
+	}
+	ensurePacketVerdict(p)
 	if p.MatchedRules == nil {
 		p.MatchedRules = []MatchedRuleInfo{}
 	}
@@ -964,7 +1711,7 @@ func (s *PacketStore) InsertAlert(a *Alert) error {
 		INSERT INTO alerts (packet_id, rule_id, service_id, src_ip, timestamp, pattern_matched)
 		VALUES (?, ?, ?, ?, ?, ?)`,
 		a.PacketID, a.RuleID, a.ServiceID, a.SrcIP,
-		a.Timestamp.UTC().Format(time.RFC3339Nano),
+		CanonicalTimestamp(a.Timestamp),
 		a.PatternMatched,
 	)
 	if err != nil {
@@ -1006,11 +1753,11 @@ func (s *PacketStore) QueryAlerts(q AlertQuery) ([]*Alert, int, error) {
 	}
 	if q.TimeFrom != nil {
 		conditions = append(conditions, "a.timestamp >= ?")
-		args = append(args, q.TimeFrom.UTC().Format(time.RFC3339Nano))
+		args = append(args, CanonicalTimestamp(*q.TimeFrom))
 	}
 	if q.TimeTo != nil {
 		conditions = append(conditions, "a.timestamp <= ?")
-		args = append(args, q.TimeTo.UTC().Format(time.RFC3339Nano))
+		args = append(args, CanonicalTimestamp(*q.TimeTo))
 	}
 
 	where := ""
@@ -1035,7 +1782,7 @@ func (s *PacketStore) QueryAlerts(q AlertQuery) ([]*Alert, int, error) {
 	}
 
 	querySQL := "SELECT a.id, a.packet_id, a.rule_id, a.service_id, a.src_ip, a.timestamp, a.pattern_matched FROM alerts a" +
-		where + " ORDER BY a.timestamp DESC LIMIT ? OFFSET ?"
+		where + " ORDER BY a.timestamp DESC, a.id DESC LIMIT ? OFFSET ?"
 	queryArgs := append(args, limit, offset)
 
 	rows, err := s.rdb.Query(querySQL, queryArgs...)
@@ -1108,7 +1855,7 @@ func (s *PacketStore) InsertSavedFlow(sf *SavedFlow, packets []*Packet) error {
 		`INSERT INTO saved_flows (name, anchor_packet_id, packet_ids, created_by, created_at, notes)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		sf.Name, sf.AnchorPacketID, string(idsJSON), sf.CreatedBy,
-		sf.CreatedAt.UTC().Format(time.RFC3339Nano), sf.Notes,
+		CanonicalTimestamp(sf.CreatedAt), sf.Notes,
 	)
 	if err != nil {
 		return fmt.Errorf("inserting saved flow: %w", err)
@@ -1219,17 +1966,26 @@ func (s *PacketStore) GetSavedFlowByID(id int64) (*SavedFlow, error) {
 
 // DeleteSavedFlow removes a saved flow by ID along with its snapshotted packets.
 func (s *PacketStore) DeleteSavedFlow(id int64) error {
-	res, err := s.db.Exec("DELETE FROM saved_flows WHERE id = ?", id)
+	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	n, _ := res.RowsAffected()
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM saved_flow_packets WHERE saved_flow_id = ?", id); err != nil {
+		return fmt.Errorf("deleting saved flow snapshots: %w", err)
+	}
+	res, err := tx.Exec("DELETE FROM saved_flows WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("deleting saved flow: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking saved flow deletion: %w", err)
+	}
 	if n == 0 {
 		return fmt.Errorf("saved flow not found")
 	}
-	// Best-effort cleanup of the snapshot rows; leftover rows would just sit unused.
-	_, _ = s.db.Exec("DELETE FROM saved_flow_packets WHERE saved_flow_id = ?", id)
-	return nil
+	return tx.Commit()
 }
 
 type rowScanner interface {
@@ -1252,37 +2008,49 @@ func scanSavedFlow(row rowScanner) (*SavedFlow, error) {
 // PurgeAll deletes all packets and alerts from the database.
 // Returns the number of rows deleted from each table.
 func (s *PacketStore) PurgeAll() (packetsDeleted, alertsDeleted int64, err error) {
-	res, err := s.db.Exec("DELETE FROM alerts")
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec("DELETE FROM alerts")
 	if err != nil {
 		return 0, 0, fmt.Errorf("deleting all alerts: %w", err)
 	}
 	alertsDeleted, _ = res.RowsAffected()
 
-	res, err = s.db.Exec("DELETE FROM packets")
+	res, err = tx.Exec("DELETE FROM packets")
 	if err != nil {
-		return 0, alertsDeleted, fmt.Errorf("deleting all packets: %w", err)
+		return 0, 0, fmt.Errorf("deleting all packets: %w", err)
 	}
 	packetsDeleted, _ = res.RowsAffected()
-
-	// Reclaim disk space
-	s.db.Exec("VACUUM")
-
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	s.CheckpointWAL()
 	return packetsDeleted, alertsDeleted, nil
 }
 
 // PurgePackets deletes all packets (and their associated alerts) but preserves
 // standalone alert configuration. Returns the number of packets deleted.
 func (s *PacketStore) PurgePackets() (int64, error) {
-	// Delete alerts that reference packets first (FK-safe)
-	s.db.Exec("DELETE FROM alerts")
-
-	res, err := s.db.Exec("DELETE FROM packets")
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM alerts"); err != nil {
+		return 0, fmt.Errorf("deleting packet alerts: %w", err)
+	}
+	res, err := tx.Exec("DELETE FROM packets")
 	if err != nil {
 		return 0, fmt.Errorf("deleting all packets: %w", err)
 	}
 	n, _ := res.RowsAffected()
-
-	s.db.Exec("VACUUM")
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	s.CheckpointWAL()
 	return n, nil
 }
 
@@ -1292,20 +2060,36 @@ func (s *PacketStore) DeletePacketIDs(ids []int64) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	placeholders := strings.Repeat("?,", len(ids))
-	placeholders = placeholders[:len(placeholders)-1]
-	args := make([]interface{}, len(ids))
-	for i, id := range ids {
-		args[i] = id
-	}
-	// Remove linked alerts first (best-effort)
-	_, _ = s.db.Exec("DELETE FROM alerts WHERE packet_id IN ("+placeholders+")", args...)
-	// Delete the packets
-	res, err := s.db.Exec("DELETE FROM packets WHERE id IN ("+placeholders+")", args...)
+	tx, err := s.db.Begin()
 	if err != nil {
-		return 0, fmt.Errorf("deleting packets by ID: %w", err)
+		return 0, err
 	}
-	n, _ := res.RowsAffected()
+	defer tx.Rollback()
+	var n int64
+	for start := 0; start < len(ids); start += 500 {
+		end := start + 500
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		marks := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		if _, err := tx.Exec("DELETE FROM alerts WHERE packet_id IN ("+marks+")", args...); err != nil {
+			return 0, fmt.Errorf("deleting packet alerts by ID: %w", err)
+		}
+		res, err := tx.Exec("DELETE FROM packets WHERE id IN ("+marks+")", args...)
+		if err != nil {
+			return 0, fmt.Errorf("deleting packets by ID: %w", err)
+		}
+		deleted, _ := res.RowsAffected()
+		n += deleted
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
 	if n > 0 {
 		s.emitChange(PacketChangeMetadata, nil)
 	}
@@ -1315,13 +2099,22 @@ func (s *PacketStore) DeletePacketIDs(ids []int64) (int64, error) {
 // PurgeDroppedPackets deletes all packets that were dropped by a rule (has_drop_match=1)
 // and their associated alerts. Returns the number of packets deleted.
 func (s *PacketStore) PurgeDroppedPackets() (int64, error) {
-	s.db.Exec("DELETE FROM alerts WHERE packet_id IN (SELECT id FROM packets WHERE has_drop_match = 1)")
-
-	res, err := s.db.Exec("DELETE FROM packets WHERE has_drop_match = 1")
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM alerts WHERE packet_id IN (SELECT id FROM packets WHERE has_drop_match = 1)"); err != nil {
+		return 0, fmt.Errorf("deleting dropped packet alerts: %w", err)
+	}
+	res, err := tx.Exec("DELETE FROM packets WHERE has_drop_match = 1")
 	if err != nil {
 		return 0, fmt.Errorf("deleting dropped packets: %w", err)
 	}
 	n, _ := res.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
 	return n, nil
 }
 
@@ -1330,21 +2123,90 @@ func (s *PacketStore) PurgeDroppedPackets() (int64, error) {
 // timestamp — so importing an old PCAP doesn't immediately make every row
 // eligible for deletion just because the capture clock is in the past.
 func (s *PacketStore) DeleteOlderThan(before time.Time) (packetsDeleted, alertsDeleted int64, err error) {
-	ts := before.UTC().Format(time.RFC3339Nano)
-
-	// Delete alerts for packets that will be removed
-	res, err := s.db.Exec("DELETE FROM alerts WHERE packet_id IN (SELECT id FROM packets WHERE inserted_at < ?)", ts)
+	ts := CanonicalTimestamp(before)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec("DELETE FROM alerts WHERE packet_id IN (SELECT id FROM packets WHERE inserted_at < ?)", ts)
 	if err != nil {
 		return 0, 0, fmt.Errorf("deleting old alerts: %w", err)
 	}
 	alertsDeleted, _ = res.RowsAffected()
 
-	res, err = s.db.Exec("DELETE FROM packets WHERE inserted_at < ?", ts)
+	res, err = tx.Exec("DELETE FROM packets WHERE inserted_at < ?", ts)
 	if err != nil {
-		return 0, alertsDeleted, fmt.Errorf("deleting old packets: %w", err)
+		return 0, 0, fmt.Errorf("deleting old packets: %w", err)
 	}
 	packetsDeleted, _ = res.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return packetsDeleted, alertsDeleted, nil
+}
 
+// DeleteOlderThanBatch removes at most limit old packets. Automatic cleanup
+// deliberately uses small transactions so the proxy writer can acquire the
+// single SQLite write connection between batches.
+func (s *PacketStore) DeleteOlderThanBatch(before time.Time, limit int) (packetsDeleted, alertsDeleted int64, err error) {
+	if limit <= 0 {
+		return 0, 0, nil
+	}
+	ts := CanonicalTimestamp(before)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`DELETE FROM alerts WHERE packet_id IN (
+		SELECT id FROM packets WHERE inserted_at < ? ORDER BY inserted_at ASC LIMIT ?
+	)`, ts, limit)
+	if err != nil {
+		return 0, 0, fmt.Errorf("batch deleting old alerts: %w", err)
+	}
+	alertsDeleted, _ = res.RowsAffected()
+	res, err = tx.Exec(`DELETE FROM packets WHERE id IN (
+		SELECT id FROM packets WHERE inserted_at < ? ORDER BY inserted_at ASC LIMIT ?
+	)`, ts, limit)
+	if err != nil {
+		return 0, 0, fmt.Errorf("batch deleting old packets: %w", err)
+	}
+	packetsDeleted, _ = res.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return packetsDeleted, alertsDeleted, nil
+}
+
+// DeleteOldestBatch removes at most limit packets, ordered by insertion time.
+// It is the primitive used by size-based automatic cleanup.
+func (s *PacketStore) DeleteOldestBatch(limit int) (packetsDeleted, alertsDeleted int64, err error) {
+	if limit <= 0 {
+		return 0, 0, nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`DELETE FROM alerts WHERE packet_id IN (
+		SELECT id FROM packets ORDER BY inserted_at ASC LIMIT ?
+	)`, limit)
+	if err != nil {
+		return 0, 0, fmt.Errorf("batch deleting alerts: %w", err)
+	}
+	alertsDeleted, _ = res.RowsAffected()
+	res, err = tx.Exec(`DELETE FROM packets WHERE id IN (
+		SELECT id FROM packets ORDER BY inserted_at ASC LIMIT ?
+	)`, limit)
+	if err != nil {
+		return 0, 0, fmt.Errorf("batch deleting packets: %w", err)
+	}
+	packetsDeleted, _ = res.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
 	return packetsDeleted, alertsDeleted, nil
 }
 
@@ -1352,7 +2214,7 @@ func (s *PacketStore) DeleteOlderThan(before time.Time) (packetsDeleted, alertsD
 // Returns the number of rows deleted from each table.
 func (s *PacketStore) DeleteOldestUntilSize(maxSizeBytes int64) (packetsDeleted, alertsDeleted int64, err error) {
 	for {
-		size, sizeErr := s.DBSize()
+		size, sizeErr := s.DBUsedSize()
 		if sizeErr != nil {
 			return packetsDeleted, alertsDeleted, sizeErr
 		}
@@ -1360,25 +2222,11 @@ func (s *PacketStore) DeleteOldestUntilSize(maxSizeBytes int64) (packetsDeleted,
 			return packetsDeleted, alertsDeleted, nil
 		}
 
-		// Delete a batch of oldest packets — ordering by inserted_at so the
-		// "oldest" set is what was added to this DB first, not what was
-		// captured first on the wire.
-		const batchSize = 1000
-		res, execErr := s.db.Exec(`
-			DELETE FROM alerts WHERE packet_id IN (
-				SELECT id FROM packets ORDER BY inserted_at ASC LIMIT ?
-			)`, batchSize)
+		pd, ad, execErr := s.DeleteOldestBatch(1000)
 		if execErr != nil {
-			return packetsDeleted, alertsDeleted, fmt.Errorf("batch deleting alerts: %w", execErr)
+			return packetsDeleted, alertsDeleted, execErr
 		}
-		ad, _ := res.RowsAffected()
 		alertsDeleted += ad
-
-		res, execErr = s.db.Exec("DELETE FROM packets WHERE id IN (SELECT id FROM packets ORDER BY inserted_at ASC LIMIT ?)", batchSize)
-		if execErr != nil {
-			return packetsDeleted, alertsDeleted, fmt.Errorf("batch deleting packets: %w", execErr)
-		}
-		pd, _ := res.RowsAffected()
 		packetsDeleted += pd
 
 		if pd == 0 {
@@ -1399,7 +2247,7 @@ func (s *PacketStore) SmartBackfillFlagIDs(checker FlagIDChecker, currentRound i
 	// Only backfill packets from the last 60 seconds (the limbo between round start
 	// and flagId fetch completion). Older packets were already scanned with the
 	// automaton that was current at their insertion time.
-	cutoff := time.Now().Add(-60 * time.Second).UTC().Format(time.RFC3339Nano)
+	cutoff := CanonicalTimestamp(time.Now().Add(-60 * time.Second))
 
 	var total int64
 	const batchSize = 500
@@ -1407,7 +2255,7 @@ func (s *PacketStore) SmartBackfillFlagIDs(checker FlagIDChecker, currentRound i
 
 	for {
 		rows, err := s.db.Query(
-			"SELECT id, body_string, url, headers FROM packets WHERE flagid_round < ? AND timestamp >= ? ORDER BY id ASC LIMIT ?",
+			"SELECT id, body, body_string, url, headers FROM packets WHERE flagid_scanned_round < ? AND timestamp >= ? ORDER BY id ASC LIMIT ?",
 			currentRound, cutoff, batchSize,
 		)
 		if err != nil {
@@ -1424,12 +2272,16 @@ func (s *PacketStore) SmartBackfillFlagIDs(checker FlagIDChecker, currentRound i
 
 		for rows.Next() {
 			var id int64
+			var body []byte
 			var bodyStr, url, headers string
-			if err := rows.Scan(&id, &bodyStr, &url, &headers); err != nil {
+			if err := rows.Scan(&id, &body, &bodyStr, &url, &headers); err != nil {
 				rows.Close()
 				return total, fmt.Errorf("smart backfill scan: %w", err)
 			}
 			text := url + " " + headers + " " + bodyStr
+			if len(body) > 0 {
+				text += " " + string(body)
+			}
 			matches := checker.FindMatchingFlagIDs(text)
 			if len(matches) > 0 {
 				vals := make([]string, len(matches))
@@ -1440,6 +2292,10 @@ func (s *PacketStore) SmartBackfillFlagIDs(checker FlagIDChecker, currentRound i
 			} else {
 				markProcessed = append(markProcessed, id)
 			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return total, fmt.Errorf("smart backfill rows: %w", err)
 		}
 		rows.Close()
 
@@ -1466,18 +2322,19 @@ func (s *PacketStore) SmartBackfillFlagIDs(checker FlagIDChecker, currentRound i
 			if err != nil {
 				return total, fmt.Errorf("smart backfill begin tx: %w", err)
 			}
+			matchedInChunk := int64(0)
 			for _, op := range allOps[chunkStart:chunkEnd] {
 				if op.matched != nil {
 					mjson, _ := json.Marshal(op.matched)
 					_, err = tx.Exec(
-						"UPDATE packets SET contains_flagid = 1, matched_flagids = ?, flagid_round = ? WHERE id = ?",
-						string(mjson), op.round, op.id,
+						"UPDATE packets SET contains_flagid = 1, matched_flagids = ?, flagid_round = ?, flagid_scanned_round = ? WHERE id = ?",
+						string(mjson), op.round, currentRound, op.id,
 					)
-					total++
+					matchedInChunk++
 				} else {
 					_, err = tx.Exec(
-						"UPDATE packets SET flagid_round = ? WHERE id = ?",
-						op.round, op.id,
+						"UPDATE packets SET flagid_round = ?, flagid_scanned_round = ? WHERE id = ?",
+						op.round, currentRound, op.id,
 					)
 				}
 				if err != nil {
@@ -1488,6 +2345,7 @@ func (s *PacketStore) SmartBackfillFlagIDs(checker FlagIDChecker, currentRound i
 			if err := tx.Commit(); err != nil {
 				return total, fmt.Errorf("smart backfill commit: %w", err)
 			}
+			total += matchedInChunk
 		}
 
 		if batchCount < batchSize {
@@ -1507,8 +2365,8 @@ func (s *PacketStore) BackfillFlagIDsWindow(checker FlagIDChecker, currentRound 
 	if checker == nil || currentRound == 0 {
 		return 0, nil
 	}
-	fromTS := from.UTC().Format(time.RFC3339Nano)
-	toTS := to.UTC().Format(time.RFC3339Nano)
+	fromTS := CanonicalTimestamp(from)
+	toTS := CanonicalTimestamp(to)
 
 	var total int64
 	const batchSize = 500
@@ -1559,6 +2417,10 @@ func (s *PacketStore) BackfillFlagIDsWindow(checker FlagIDChecker, currentRound 
 				markProcessed = append(markProcessed, id)
 			}
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return total, fmt.Errorf("window backfill rows: %w", err)
+		}
 		rows.Close()
 
 		batchCount := len(updates) + len(markProcessed)
@@ -1581,18 +2443,19 @@ func (s *PacketStore) BackfillFlagIDsWindow(checker FlagIDChecker, currentRound 
 			if err != nil {
 				return total, fmt.Errorf("window backfill begin tx: %w", err)
 			}
+			matchedInChunk := int64(0)
 			for _, op := range allOps[chunkStart:chunkEnd] {
 				if op.matched != nil {
 					mjson, _ := json.Marshal(op.matched)
 					_, err = tx.Exec(
-						"UPDATE packets SET contains_flagid = 1, matched_flagids = ?, flagid_round = ? WHERE id = ?",
-						string(mjson), op.round, op.id,
+						"UPDATE packets SET contains_flagid = 1, matched_flagids = ?, flagid_round = ?, flagid_scanned_round = ? WHERE id = ?",
+						string(mjson), op.round, currentRound, op.id,
 					)
-					total++
+					matchedInChunk++
 				} else {
 					_, err = tx.Exec(
-						"UPDATE packets SET flagid_round = ? WHERE id = ?",
-						op.round, op.id,
+						"UPDATE packets SET flagid_round = ?, flagid_scanned_round = ? WHERE id = ?",
+						op.round, currentRound, op.id,
 					)
 				}
 				if err != nil {
@@ -1603,6 +2466,7 @@ func (s *PacketStore) BackfillFlagIDsWindow(checker FlagIDChecker, currentRound 
 			if err := tx.Commit(); err != nil {
 				return total, fmt.Errorf("window backfill commit: %w", err)
 			}
+			total += matchedInChunk
 		}
 
 		if batchCount < batchSize {
@@ -1627,12 +2491,58 @@ func (s *PacketStore) DBSize() (int64, error) {
 	return total, nil
 }
 
-// Close stops the batched writer (draining any queued packets) and closes the database.
-func (s *PacketStore) Close() error {
-	close(s.stopCh)
+// DBUsedSize reports logical SQLite bytes currently in use. Physical files do
+// not shrink after DELETE and the WAL may temporarily grow, so using DBSize as
+// an automatic-cleanup stop condition can otherwise delete every packet while
+// waiting for a VACUUM/checkpoint that never happens.
+func (s *PacketStore) DBUsedSize() (int64, error) {
+	var pageCount, freePages, pageSize int64
+	if err := s.db.QueryRow("PRAGMA page_count").Scan(&pageCount); err != nil {
+		return 0, err
+	}
+	if err := s.db.QueryRow("PRAGMA freelist_count").Scan(&freePages); err != nil {
+		return 0, err
+	}
+	if err := s.db.QueryRow("PRAGMA page_size").Scan(&pageSize); err != nil {
+		return 0, err
+	}
+	usedPages := pageCount - freePages
+	if usedPages < 0 {
+		usedPages = 0
+	}
+	return usedPages * pageSize, nil
+}
+
+// CheckpointWAL asks SQLite to recycle completed WAL pages without waiting for
+// active readers. It is safe for background cleanup and avoids VACUUM stalls.
+func (s *PacketStore) CheckpointWAL() {
+	_, _ = s.db.Exec("PRAGMA wal_checkpoint(PASSIVE)")
+}
+
+// NotifyMetadataChange refreshes live clients once after a group of cleanup
+// batches, instead of once per DELETE.
+func (s *PacketStore) NotifyMetadataChange() {
+	s.emitChange(PacketChangeMetadata, nil)
+}
+
+// Drain stops the batched writer and waits until every packet accepted before
+// the stop has been flushed. The database remains available to downstream
+// scoring/filter workers during an orderly shutdown.
+func (s *PacketStore) Drain() {
+	s.lifecycleMu.Lock()
+	s.writerStopped = true
+	s.lifecycleMu.Unlock()
+	s.stopOnce.Do(func() { close(s.stopCh) })
 	<-s.doneCh
-	s.rdb.Close()
-	return s.db.Close()
+}
+
+// Close is concurrent-safe and idempotent.
+func (s *PacketStore) Close() error {
+	s.closeOnce.Do(func() {
+		s.Drain()
+		s.closeErr = errors.Join(s.rdb.Close(), s.db.Close())
+	})
+	return s.closeErr
 }
 
 // QueryFlow finds all packets in the same logical flow as the given packet.
@@ -1647,13 +2557,23 @@ func (s *PacketStore) QueryFlow(packetID int64) ([]*Packet, error) {
 		return nil, fmt.Errorf("packet %d not found: %w", packetID, err)
 	}
 
-	// Step 2: get all packets in the same session (same TCP connection)
-	sessionPackets, err := s.scanPackets(
-		"SELECT "+packetSelectCols+" FROM packets WHERE session_id = ? ORDER BY timestamp ASC",
-		[]interface{}{startPkt.SessionID},
-	)
-	if err != nil {
-		return nil, err
+	// Step 2: get all packets in the same service/session. Legacy or imported
+	// rows may have an empty session ID; querying "session_id = ''" would join
+	// every such packet in the database into one unrelated flow.
+	sessionPackets := []*Packet{startPkt}
+	if startPkt.SessionID != "" {
+		sessionPackets, err = s.scanPackets(
+			"SELECT "+packetSelectCols+" FROM packets WHERE service_id = ? AND session_id = ? ORDER BY timestamp ASC, id ASC",
+			[]interface{}{startPkt.ServiceID, startPkt.SessionID},
+		)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// An empty legacy/import session is not a correlation key. Even a token
+		// match cannot safely fetch session_id='' because that would include every
+		// unrelated legacy packet carrying the same missing value.
+		return sessionPackets, nil
 	}
 
 	// Step 3: extract auth tokens from all packets in this session
@@ -1668,8 +2588,8 @@ func (s *PacketStore) QueryFlow(packetID int64) ([]*Packet, error) {
 	w := s.flowCorrelationWindow()
 	minTime := sessionPackets[0].Timestamp.Add(-w)
 	maxTime := sessionPackets[len(sessionPackets)-1].Timestamp.Add(w)
-	minTS := minTime.UTC().Format(time.RFC3339Nano)
-	maxTS := maxTime.UTC().Format(time.RFC3339Nano)
+	minTS := CanonicalTimestamp(minTime)
+	maxTS := CanonicalTimestamp(maxTime)
 
 	// In non-SNAT environments, constrain token correlation to the same peer IP.
 	peerIP := startPkt.SrcIP
@@ -1678,26 +2598,38 @@ func (s *PacketStore) QueryFlow(packetID int64) ([]*Packet, error) {
 	}
 	peerFilter := !s.looksLikeSNAT(startPkt.ServiceID, sessionPackets[0].Timestamp)
 
-	// Step 4: find all packets containing any of these tokens (scoped to same service)
+	// Step 4: find packets containing any token in one bounded query (scoped to
+	// the same service). Escaping LIKE metacharacters prevents a token such as
+	// "%" or "_" from accidentally matching unrelated sessions.
 	sessionIDs := map[string]bool{startPkt.SessionID: true}
+	clauses := make([]string, 0, len(tokens))
+	args := []interface{}{startPkt.ServiceID, minTS, maxTS}
 	for _, token := range tokens {
-		if len(token) < 8 {
+		if len(token) < 8 || len(token) > 4096 {
 			continue // skip very short tokens to avoid false matches
 		}
-		like := "%" + token + "%"
-		query := "SELECT " + packetSelectCols + " FROM packets WHERE service_id = ? AND timestamp BETWEEN ? AND ? AND (headers LIKE ? OR body_string LIKE ?)"
-		args := []interface{}{startPkt.ServiceID, minTS, maxTS, like, like}
+		like := "%" + escapeLike(token) + "%"
+		clauses = append(clauses, `(headers LIKE ? ESCAPE '\' OR body_string LIKE ? ESCAPE '\')`)
+		args = append(args, like, like)
+	}
+	if len(clauses) > 0 {
+		query := "SELECT " + packetSelectCols + " FROM packets WHERE service_id = ? AND timestamp BETWEEN ? AND ? AND (" + strings.Join(clauses, " OR ") + ")"
 		if peerFilter && peerIP != "" {
 			query += " AND ((direction = 'request' AND src_ip = ?) OR (direction = 'response' AND dst_ip = ?))"
 			args = append(args, peerIP, peerIP)
 		}
-		query += " LIMIT 500"
-		rows, err := s.scanPackets(query, args)
-		if err != nil {
-			continue
+		query += " ORDER BY timestamp ASC, id ASC LIMIT 500"
+		packets, queryErr := s.scanPackets(query, args)
+		if queryErr != nil {
+			return nil, fmt.Errorf("correlating flow tokens: %w", queryErr)
 		}
-		for _, p := range rows {
-			sessionIDs[p.SessionID] = true
+		for _, packet := range packets {
+			if len(sessionIDs) >= 30 {
+				break
+			}
+			if packet.SessionID != "" {
+				sessionIDs[packet.SessionID] = true
+			}
 		}
 	}
 
@@ -1784,20 +2716,26 @@ func (s *PacketStore) flowByPeerIP(startPkt *Packet, sessionPackets []*Packet) (
 		 AND timestamp BETWEEN ? AND ?
 		 LIMIT 30`,
 		startPkt.ServiceID, peerIP,
-		minTime.UTC().Format(time.RFC3339Nano),
-		maxTime.UTC().Format(time.RFC3339Nano),
+		CanonicalTimestamp(minTime),
+		CanonicalTimestamp(maxTime),
 	)
 	if err != nil {
-		return sessionPackets, nil
+		return sessionPackets, err
 	}
 	defer rows.Close()
 
 	sessionIDs := map[string]bool{startPkt.SessionID: true}
 	for rows.Next() {
 		var sid string
-		if err := rows.Scan(&sid); err == nil {
+		if err := rows.Scan(&sid); err != nil {
+			return sessionPackets, err
+		}
+		if sid != "" {
 			sessionIDs[sid] = true
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return sessionPackets, err
 	}
 
 	// SNAT detection: if multiple sessions share this peer IP, check whether
@@ -1815,23 +2753,27 @@ func (s *PacketStore) flowByPeerIP(startPkt *Packet, sessionPackets []*Packet) (
 // NAT (e.g., CyberChallenge cloud router 10.254.0.1 rewrites all src addresses).
 // Uses a ±2 minute window around the reference time for a reliable sample.
 func (s *PacketStore) looksLikeSNAT(serviceID string, around time.Time) bool {
-	wideMin := around.Add(-2 * time.Minute).UTC().Format(time.RFC3339Nano)
-	wideMax := around.Add(2 * time.Minute).UTC().Format(time.RFC3339Nano)
+	wideMin := CanonicalTimestamp(around.Add(-2 * time.Minute))
+	wideMax := CanonicalTimestamp(around.Add(2 * time.Minute))
 
-	var distinctIPs int
+	var totalRequests, distinctIPs int
 	err := s.rdb.QueryRow(
-		`SELECT COUNT(DISTINCT src_ip) FROM packets
+		`SELECT COUNT(*), COUNT(DISTINCT src_ip) FROM packets
 		 WHERE service_id = ? AND direction = 'request'
 		 AND timestamp BETWEEN ? AND ?`,
 		serviceID, wideMin, wideMax,
-	).Scan(&distinctIPs)
+	).Scan(&totalRequests, &distinctIPs)
 	if err != nil {
 		return false
 	}
 
 	// In SNAT, all traffic comes from 1 gateway IP.
 	// In normal environments, multiple attacker IPs are visible.
-	return distinctIPs <= 1
+	// Five independent request sessions are enough evidence for this defensive
+	// fallback. The previous threshold of ten counted only requests even though
+	// it was calibrated against request+response packet counts, so small but
+	// realistic SNAT samples were incorrectly merged.
+	return totalRequests >= 5 && distinctIPs <= 1
 }
 
 // fetchSessions returns packets from all discovered sessions, or the original
@@ -1842,13 +2784,14 @@ func (s *PacketStore) fetchSessions(originalSID string, sessionIDs map[string]bo
 	}
 
 	var placeholders []string
-	var args []interface{}
+	serviceID := sessionPackets[0].ServiceID
+	args := []interface{}{serviceID}
 	for sid := range sessionIDs {
 		placeholders = append(placeholders, "?")
 		args = append(args, sid)
 	}
 
-	query := "SELECT " + packetSelectCols + " FROM packets WHERE session_id IN (" + strings.Join(placeholders, ",") + ") ORDER BY timestamp ASC LIMIT 500"
+	query := "SELECT " + packetSelectCols + " FROM packets WHERE service_id = ? AND session_id IN (" + strings.Join(placeholders, ",") + ") ORDER BY timestamp ASC, id ASC LIMIT 500"
 	return s.scanPackets(query, args)
 }
 
@@ -1856,11 +2799,12 @@ func (s *PacketStore) fetchSessions(originalSID string, sessionIDs map[string]bo
 // fields from packet headers and bodies. These values are used to correlate
 // packets across TCP connections that belong to the same logical session.
 func extractAuthTokens(packets []*Packet) []string {
+	const maxTokens = 32
 	seen := map[string]bool{}
 	var tokens []string
 
 	add := func(v string) {
-		if v != "" && !seen[v] {
+		if len(tokens) < maxTokens && v != "" && !seen[v] {
 			seen[v] = true
 			tokens = append(tokens, v)
 		}
@@ -1868,12 +2812,12 @@ func extractAuthTokens(packets []*Packet) []string {
 
 	for _, p := range packets {
 		// Check Authorization header (Bearer tokens)
-		if auth, ok := p.Headers["Authorization"]; ok {
+		if auth, ok := packetHeader(p.Headers, "Authorization"); ok {
 			add(extractBearerToken(auth))
 		}
 
 		// Check Cookie header (requests) — e.g., "session=abc123; csrftoken=xyz"
-		if cookie, ok := p.Headers["Cookie"]; ok {
+		if cookie, ok := packetHeader(p.Headers, "Cookie"); ok {
 			for _, v := range extractCookieValues(cookie) {
 				add(v)
 			}
@@ -1881,7 +2825,7 @@ func extractAuthTokens(packets []*Packet) []string {
 
 		// Check Set-Cookie header (responses) — e.g., "session=abc123; Path=/; HttpOnly"
 		if p.Direction == DirectionResponse {
-			if sc, ok := p.Headers["Set-Cookie"]; ok {
+			if sc, ok := packetHeader(p.Headers, "Set-Cookie"); ok {
 				for _, v := range extractSetCookieValues(sc) {
 					add(v)
 				}
@@ -1902,13 +2846,20 @@ func extractAuthTokens(packets []*Packet) []string {
 // extractBearerToken extracts the token from "Bearer xxx" or "Bearer: xxx" format.
 func extractBearerToken(auth string) string {
 	auth = strings.TrimSpace(auth)
-	if strings.HasPrefix(auth, "Bearer: ") {
-		return strings.TrimSpace(auth[8:])
-	}
-	if strings.HasPrefix(auth, "Bearer ") {
-		return strings.TrimSpace(auth[7:])
+	parts := strings.Fields(strings.Replace(auth, ":", " ", 1))
+	if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+		return parts[1]
 	}
 	return ""
+}
+
+func packetHeader(headers map[string]string, name string) (string, bool) {
+	for key, value := range headers {
+		if strings.EqualFold(key, name) {
+			return value, true
+		}
+	}
+	return "", false
 }
 
 // extractJSONTokens extracts token values from JSON body strings.
@@ -1946,7 +2897,7 @@ func extractCookieValues(header string) []string {
 // Format per cookie: name=value; Path=/; HttpOnly
 func extractSetCookieValues(header string) []string {
 	var values []string
-	for _, cookie := range strings.Split(header, ",") {
+	for _, cookie := range splitSetCookieHeader(header) {
 		cookie = strings.TrimSpace(cookie)
 		// Take only the name=value part (before first ";")
 		if semi := strings.IndexByte(cookie, ';'); semi >= 0 {
@@ -1963,6 +2914,49 @@ func extractSetCookieValues(header string) []string {
 	return values
 }
 
+func splitSetCookieHeader(header string) []string {
+	var out []string
+	start := 0
+	quoted := false
+	for i := 0; i < len(header); i++ {
+		switch header[i] {
+		case '"':
+			quoted = !quoted
+		case ',':
+			if quoted {
+				continue
+			}
+			j := i + 1
+			for j < len(header) && (header[j] == ' ' || header[j] == '\t') {
+				j++
+			}
+			nameStart := j
+			for j < len(header) && isCookieNameByte(header[j]) {
+				j++
+			}
+			if j > nameStart && j < len(header) && header[j] == '=' {
+				out = append(out, strings.TrimSpace(header[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	if tail := strings.TrimSpace(header[start:]); tail != "" {
+		out = append(out, tail)
+	}
+	return out
+}
+
+func isCookieNameByte(b byte) bool {
+	if b <= 0x20 || b >= 0x7f {
+		return false
+	}
+	return !strings.ContainsRune("()<>@,;:\\\"/[]?={}", rune(b))
+}
+
+func escapeLike(value string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(value)
+}
+
 // headerSearchPattern builds a SQL LIKE pattern for searching headers.
 // Headers are stored as a JSON object like {"X-Powered-By":"Express","Content-Type":"application/json"}.
 // If the query contains a colon ("Name: Value"), it's split so users can paste header lines
@@ -1973,12 +2967,12 @@ func headerSearchPattern(q string) string {
 		value := strings.TrimSpace(q[idx+1:])
 		if name != "" {
 			if value == "" {
-				return `%"` + name + `"%`
+				return "%\"" + escapeLike(name) + "\"%"
 			}
-			return `%"` + name + `"%` + value + `%`
+			return "%\"" + escapeLike(name) + "\"%" + escapeLike(value) + "%"
 		}
 	}
-	return "%" + q + "%"
+	return "%" + escapeLike(q) + "%"
 }
 
 // buildWhereAndResidual extends buildWhere with the DSL filter (q.Q).
@@ -2047,27 +3041,27 @@ func buildWhere(q PacketQuery) (string, []interface{}) {
 	}
 	if q.TimeFrom != nil {
 		conditions = append(conditions, "timestamp >= ?")
-		args = append(args, q.TimeFrom.UTC().Format(time.RFC3339Nano))
+		args = append(args, CanonicalTimestamp(*q.TimeFrom))
 	}
 	if q.TimeTo != nil {
 		conditions = append(conditions, "timestamp <= ?")
-		args = append(args, q.TimeTo.UTC().Format(time.RFC3339Nano))
+		args = append(args, CanonicalTimestamp(*q.TimeTo))
 	}
 	if q.URL != "" {
-		conditions = append(conditions, "url LIKE ?")
-		args = append(args, "%"+q.URL+"%")
+		conditions = append(conditions, `url LIKE ? ESCAPE '\'`)
+		args = append(args, "%"+escapeLike(q.URL)+"%")
 	}
 	if q.Contains != "" {
-		conditions = append(conditions, "(body_string LIKE ? OR headers LIKE ? OR url LIKE ?)")
-		like := "%" + q.Contains + "%"
+		conditions = append(conditions, `(body_string LIKE ? ESCAPE '\' OR headers LIKE ? ESCAPE '\' OR url LIKE ? ESCAPE '\')`)
+		like := "%" + escapeLike(q.Contains) + "%"
 		args = append(args, like, like, like)
 	}
 	if q.ContainsBody != "" {
-		conditions = append(conditions, "body_string LIKE ?")
-		args = append(args, "%"+q.ContainsBody+"%")
+		conditions = append(conditions, `body_string LIKE ? ESCAPE '\'`)
+		args = append(args, "%"+escapeLike(q.ContainsBody)+"%")
 	}
 	if q.ContainsHeaders != "" {
-		conditions = append(conditions, "headers LIKE ?")
+		conditions = append(conditions, `headers LIKE ? ESCAPE '\'`)
 		args = append(args, headerSearchPattern(q.ContainsHeaders))
 	}
 	// Negation conditions
@@ -2100,20 +3094,20 @@ func buildWhere(q PacketQuery) (string, []interface{}) {
 		args = append(args, q.NotPeerIP, q.NotPeerIP)
 	}
 	if q.NotURL != "" {
-		conditions = append(conditions, "url NOT LIKE ?")
-		args = append(args, "%"+q.NotURL+"%")
+		conditions = append(conditions, `url NOT LIKE ? ESCAPE '\'`)
+		args = append(args, "%"+escapeLike(q.NotURL)+"%")
 	}
 	if q.NotContains != "" {
-		conditions = append(conditions, "NOT (body_string LIKE ? OR headers LIKE ? OR url LIKE ?)")
-		like := "%" + q.NotContains + "%"
+		conditions = append(conditions, `NOT (body_string LIKE ? ESCAPE '\' OR headers LIKE ? ESCAPE '\' OR url LIKE ? ESCAPE '\')`)
+		like := "%" + escapeLike(q.NotContains) + "%"
 		args = append(args, like, like, like)
 	}
 	if q.NotContainsBody != "" {
-		conditions = append(conditions, "body_string NOT LIKE ?")
-		args = append(args, "%"+q.NotContainsBody+"%")
+		conditions = append(conditions, `body_string NOT LIKE ? ESCAPE '\'`)
+		args = append(args, "%"+escapeLike(q.NotContainsBody)+"%")
 	}
 	if q.NotContainsHeaders != "" {
-		conditions = append(conditions, "headers NOT LIKE ?")
+		conditions = append(conditions, `headers NOT LIKE ? ESCAPE '\'`)
 		args = append(args, headerSearchPattern(q.NotContainsHeaders))
 	}
 	if q.Flagged != nil {
@@ -2141,13 +3135,17 @@ func buildWhere(q PacketQuery) (string, []interface{}) {
 			conditions = append(conditions, "matched_rules = '[]'")
 		}
 	}
-	if q.Dropped != nil && *q.Dropped {
+	if q.Dropped != nil {
 		// Fast path: indexed column computed at ingestion time.
-		conditions = append(conditions, "has_drop_match = 1")
+		if *q.Dropped {
+			conditions = append(conditions, "has_drop_match = 1")
+		} else {
+			conditions = append(conditions, "has_drop_match = 0")
+		}
 	}
 	if q.HiddenBefore != nil {
 		conditions = append(conditions, "timestamp >= ?")
-		args = append(args, q.HiddenBefore.UTC().Format(time.RFC3339Nano))
+		args = append(args, CanonicalTimestamp(*q.HiddenBefore))
 	}
 	if len(q.ExcludeIDs) > 0 {
 		placeholders := make([]string, len(q.ExcludeIDs))
