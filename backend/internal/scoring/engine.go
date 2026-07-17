@@ -911,13 +911,16 @@ func (e *Engine) score(packets []*sniffer.Packet, signature string) sniffer.Flow
 
 	actualDrop, wouldDrop, alertRule := false, false, false
 	requestHasFlag, responseHasFlag, response5xx := false, false, false
-	tagSet := map[rounddiff.SuspicionTag]struct{}{}
+	hasRequest, hasResponse := false, false
+	requestTags := map[rounddiff.SuspicionTag]struct{}{}
 	decoded, truncated := false, false
 	for _, packet := range packets {
 		actualDrop = actualDrop || packet.Verdict.Outcome == flowmodel.OutcomeDropped
 		wouldDrop = wouldDrop || packet.Verdict.Outcome == flowmodel.OutcomeWouldDrop
 		truncated = truncated || packet.CaptureTruncated
 		decoded = decoded || len(packet.Decoded) > 0
+		hasRequest = hasRequest || packet.Direction == sniffer.DirectionRequest
+		hasResponse = hasResponse || packet.Direction == sniffer.DirectionResponse
 		response5xx = response5xx || (packet.Direction == sniffer.DirectionResponse && packet.Status >= 500)
 		if packet.ContainsFlagID || packet.Flagged {
 			if packet.Direction == sniffer.DirectionRequest {
@@ -938,42 +941,41 @@ func (e *Engine) score(packets []*sniffer.Packet, signature string) sniffer.Flow
 				alertRule = true
 			}
 		}
-		text := packetSuspicionText(packet)
-		for _, tag := range rounddiff.SuspicionTags(text) {
-			tagSet[tag] = struct{}{}
+		// Response bodies routinely contain source code, SQL snippets and HTML.
+		// They can corroborate another signal (5xx or a returned flag), but they
+		// must not turn an otherwise normal flow into an exploit on their own.
+		if packet.Direction == sniffer.DirectionRequest {
+			for _, tag := range packetSuspicionTags(packet) {
+				requestTags[tag] = struct{}{}
+			}
 		}
 	}
 
 	switch {
 	case actualDrop:
-		addAttack("rule_drop", "Blocked by an explicit rule", 35)
+		addAttack("rule_drop", "Blocked by an explicit rule", 55)
 	case wouldDrop:
-		addAttack("rule_would_drop", "Block rule matched in observation only", 18)
+		addAttack("rule_would_drop", "Block rule matched in observation only", 28)
 	case alertRule:
-		addAttack("rule_alert", "Flagged by an explicit rule", 8)
+		addAttack("rule_alert", "Flagged by an explicit rule", 12)
 	}
-	if n := len(tagSet); n > 0 {
-		points := 12
-		if n == 2 {
-			points = 20
-		} else if n >= 3 {
-			points = 25
-		}
+	if n := len(requestTags); n > 0 {
+		points := suspicionPoints(requestTags)
 		labels := make([]string, 0, n)
-		for tag := range tagSet {
+		for tag := range requestTags {
 			labels = append(labels, string(tag))
 		}
 		sort.Strings(labels)
-		addAttack("payload_patterns", "Suspicious patterns: "+strings.Join(labels, ", "), points)
+		addAttack("request_patterns", "Suspicious request patterns: "+strings.Join(labels, ", "), points)
 	}
 	if requestHasFlag {
-		addAttack("flag_in_request", "Known flag present in the request", 25)
-	} else if responseHasFlag && len(tagSet) > 0 {
+		addAttack("flag_in_request", "Known flag present in the request", 30)
+	} else if responseHasFlag && len(requestTags) > 0 {
 		addAttack("suspicious_flag_response", "Flag response after a suspicious request", 25)
 	} else if responseHasFlag {
-		addAttack("flag_in_response", "Response contains a flag", 8)
+		addAttack("flag_in_response", "Response contains a flag", 5)
 	}
-	if response5xx && len(tagSet) > 0 {
+	if response5xx && len(requestTags) > 0 {
 		addAttack("suspicious_5xx", "5xx response after a suspicious payload", 8)
 	}
 
@@ -983,40 +985,52 @@ func (e *Engine) score(packets []*sniffer.Packet, signature string) sniffer.Flow
 	if round > baselineRounds.EndRound && baselineComplete {
 		switch {
 		case trusted && currentSafe:
-			addNormal("opening_baseline", fmt.Sprintf("Flow repeated in every baseline round (%d-%d)", baselineRounds.StartRound, baselineRounds.EndRound), 70)
+			addNormal("opening_baseline", fmt.Sprintf("Flow repeated in every baseline round (%d-%d)", baselineRounds.StartRound, baselineRounds.EndRound), 75)
 		case trusted:
-			addAttack("unsafe_baseline_match", "Known shape carries current attack indicators", 15)
+			addAttack("unsafe_baseline_match", "Known shape carries current attack indicators", 10)
 		default:
-			addAttack("baseline_novelty", "Sequence absent from the trusted baseline", 15)
+			// Novel flows are common after deploys and checker variation. Novelty is
+			// useful supporting evidence, never a strong exploit signal by itself.
+			points := 8
+			if actualDrop || wouldDrop || alertRule || requestHasFlag || len(requestTags) > 0 {
+				points = 12
+			}
+			addAttack("baseline_novelty", "Sequence absent from the trusted baseline", points)
 		}
 	}
 
 	attack, normal = clamp(attack), clamp(normal)
-	coverage := 25
-	if round > baselineRounds.EndRound {
-		if baselineComplete {
-			coverage = 70
-		} else {
-			coverage = 40
-		}
+	coverage := 20
+	if hasRequest && hasResponse {
+		coverage += 20
+	} else if hasRequest || hasResponse {
+		coverage += 10
+	}
+	if round > baselineRounds.EndRound && baselineComplete {
+		coverage += 25
 	}
 	if decoded {
 		coverage += 15
 	}
 	if !truncated {
-		coverage += 15
+		coverage += 20
 	} else {
-		coverage -= 25
+		coverage -= 20
 	}
 	coverage = clamp(coverage)
 	confidence := abs(attack-normal) * coverage / 100
 
 	classification := "review"
 	margin := attack - normal
+	corroboratedAttack := actualDrop ||
+		(wouldDrop && len(requestTags) > 0) ||
+		(requestHasFlag && len(requestTags) > 0) ||
+		(responseHasFlag && len(requestTags) > 0) ||
+		(response5xx && len(requestTags) > 0)
 	switch {
-	case attack >= 60 && margin >= 25:
+	case corroboratedAttack && attack >= 55 && margin >= 30 && confidence >= 35:
 		classification = "likely_exploit"
-	case currentSafe && coverage >= 60 && normal >= 65 && attack < 35 && margin <= -25:
+	case currentSafe && coverage >= 65 && normal >= 70 && attack < 30 && margin <= -30:
 		classification = "likely_checker"
 	case coverage < 50 || round <= baselineRounds.EndRound:
 		classification = "insufficient_data"
@@ -1170,34 +1184,79 @@ func baselineSafe(packets []*sniffer.Packet) bool {
 		if packet.Direction == sniffer.DirectionRequest && (packet.ContainsFlagID || packet.Flagged) {
 			return false
 		}
-		if len(rounddiff.SuspicionTags(packetSuspicionText(packet))) > 0 {
+		if packet.Direction == sniffer.DirectionRequest && len(packetSuspicionTags(packet)) > 0 {
 			return false
 		}
 	}
 	return true
 }
 
-func packetSuspicionText(packet *sniffer.Packet) string {
-	var out strings.Builder
-	out.WriteString(packet.URL)
-	headerNames := make([]string, 0, len(packet.Headers))
-	for name := range packet.Headers {
-		headerNames = append(headerNames, name)
+var ignoredSuspicionHeaders = map[string]struct{}{
+	"accept": {}, "accept-charset": {}, "accept-encoding": {}, "accept-language": {},
+	"cache-control": {}, "connection": {}, "content-length": {}, "content-type": {},
+	"date": {}, "dnt": {}, "expect": {}, "keep-alive": {}, "priority": {},
+	"range": {}, "te": {}, "trailer": {}, "transfer-encoding": {}, "upgrade": {}, "via": {},
+}
+
+// packetSuspicionTags evaluates independent, attacker-controlled surfaces.
+// Keeping them separate prevents a regex from starting in one field and
+// finishing in another. Pure HTTP negotiation/transport headers are ignored:
+// values such as "/* */" in Accept-Encoding describe protocol preferences,
+// not an application payload. Cookies, authorization and custom headers stay
+// in scope because applications commonly parse them as input.
+func packetSuspicionTags(packet *sniffer.Packet) []rounddiff.SuspicionTag {
+	seen := make(map[rounddiff.SuspicionTag]struct{})
+	add := func(value string) {
+		for _, tag := range rounddiff.SuspicionTags(value) {
+			seen[tag] = struct{}{}
+		}
 	}
-	sort.Strings(headerNames)
-	for _, name := range headerNames {
-		out.WriteByte('\n')
-		out.WriteString(name)
-		out.WriteString(": ")
-		out.WriteString(packet.Headers[name])
-	}
-	out.WriteByte('\n')
+	add(packet.URL)
 	if packet.BodyString != "" {
-		out.WriteString(packet.BodyString)
+		add(packet.BodyString)
 	} else {
-		out.Write(packet.Body)
+		add(string(packet.Body))
 	}
-	return out.String()
+	for name, value := range packet.Headers {
+		canonical := strings.ToLower(strings.TrimSpace(name))
+		if _, ignored := ignoredSuspicionHeaders[canonical]; ignored ||
+			strings.HasPrefix(canonical, "sec-ch-ua") || strings.HasPrefix(canonical, "sec-fetch-") {
+			continue
+		}
+		add(value)
+	}
+	tags := make([]rounddiff.SuspicionTag, 0, len(seen))
+	for tag := range seen {
+		tags = append(tags, tag)
+	}
+	sort.Slice(tags, func(i, j int) bool { return tags[i] < tags[j] })
+	return tags
+}
+
+func suspicionPoints(tags map[rounddiff.SuspicionTag]struct{}) int {
+	strong, weak := 0, 0
+	for tag := range tags {
+		switch tag {
+		case rounddiff.TagSQLiSyntax, rounddiff.TagEnc:
+			weak++
+		default:
+			strong++
+		}
+	}
+	if strong == 0 {
+		if weak == 1 {
+			return 6
+		}
+		return 10
+	}
+	// One concrete exploit family is meaningful; additional independent
+	// families increase the score gradually and are capped to avoid regex
+	// density alone dominating the result.
+	points := 18 + (strong-1)*5 + weak*3
+	if points > 30 {
+		return 30
+	}
+	return points
 }
 
 var (

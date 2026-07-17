@@ -168,6 +168,9 @@ analyst_label == "exploit"
 
 The score is explainable shadow metadata only: no AI, no automatic blocking.
 Manual analyst labels are stored separately and never train or alter it.
+Protocol negotiation/transport headers do not contribute payload-pattern
+evidence. Generic syntax and baseline novelty have low weight, and a
+`likely_exploit` classification requires corroborating signals.
 
 ---
 

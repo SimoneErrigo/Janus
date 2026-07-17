@@ -34,5 +34,7 @@ services:
     ports: !reset []
     environment:
       - API_BACKEND=127.0.0.1
+      - API_BACKEND_PORT=9090
       - FRONTEND_BIND=127.0.0.1
       - FRONTEND_PORT=2999
+      - FRONTEND_ROOT=/usr/share/nginx/html

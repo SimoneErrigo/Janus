@@ -19,6 +19,7 @@ Start here, then use the focused reference for the task at hand:
 
 | Document | Use it for |
 | --- | --- |
+| [DEPLOYMENT.md](DEPLOYMENT.md) | CI releases, amd64/arm64 artifacts, and split frontend/backend deployment over a VPN |
 | [API.md](API.md) | REST endpoints, payloads, and authentication |
 | [FLAGIDS.md](FLAGIDS.md) | Flag ID configuration and supported scoreboard formats |
 | [FILTERS.md](FILTERS.md) | Filter-expression language used by Traffic and Rules |
@@ -204,6 +205,14 @@ inclusive opening range and optional service-specific ranges. A signature become
 only after it appears in every selected round; a distinct exploit fingerprint
 seen in one round therefore remains untrusted. Truncated flows, request flags,
 rule/suspicion matches, and flows labelled `exploit` are excluded.
+
+Scoring inspects request URL/body and application-controlled headers, while
+ignoring HTTP negotiation/transport headers such as `Accept-Encoding`.
+Generic syntax and baseline novelty are weak evidence; `likely_exploit`
+requires corroboration such as a rule decision, a flag, or a suspicious server
+outcome. In **Traffic**, **Hide score** removes the summary, quick filters,
+table column and detail card; the preference is kept in the browser and can be
+restored with **Show Janus score**.
 
 No static method can separate an exploit that is structurally identical to a
 recurring checker flow, or prove that a safe-looking exploit repeated unchanged

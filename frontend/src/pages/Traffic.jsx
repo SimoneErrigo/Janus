@@ -38,8 +38,8 @@ function bytesToHex(bytes, maxBytes = 1024 * 64) {
 }
 
 // Highlight matching text with support for multiple patterns (flags=yellow, flagIDs=cyan)
-const HighlightedText = memo(function HighlightedText({ text, contains, regex, flagidRegex }) {
-  if (!text || (!contains && !regex && !flagidRegex)) return <>{text}</>
+const HighlightedText = memo(function HighlightedText({ text, contains, regex, flagRegex, flagRegexCaseInsensitive = false, flagidRegex }) {
+	if (!text || (!contains && !regex && !flagRegex && !flagidRegex)) return <>{text}</>
 
 	const ranges = []
   try {
@@ -56,6 +56,16 @@ const HighlightedText = memo(function HighlightedText({ text, contains, regex, f
     // Search highlights: contains (orange) and regex (yellow) — both apply independently
     if (contains) addMatches(contains.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi', 'bg-orange-500/40 text-orange-200')
     if (regex) addMatches(regex, 'gi', 'bg-yellow-500/40 text-yellow-200')
+
+    // Flag highlighting must use the same case-sensitivity as backend flag
+    // detection. Go accepts a leading (?i), while JavaScript does not, so
+    // translate that form into the RegExp i flag before rendering matches.
+    if (flagRegex) {
+      const inlineCaseInsensitive = flagRegex.startsWith('(?i)')
+      const pattern = inlineCaseInsensitive ? flagRegex.slice(4) : flagRegex
+      const flags = (flagRegexCaseInsensitive || inlineCaseInsensitive) ? 'gi' : 'g'
+      addMatches(pattern, flags, 'bg-yellow-500/40 text-yellow-200')
+    }
 
     // FlagID highlights (cyan) — regex built from backend-provided matched values (tiny, 1-3 values)
     if (flagidRegex) addMatches(flagidRegex, 'g', 'bg-teal-500/30 text-teal-200 border-b border-teal-400/50')
@@ -571,6 +581,12 @@ function hasAlertAction(pkt) {
   return pkt.matched_rules.some((r) => r.action === 'alert' || r.action === 'both')
 }
 
+const SCORE_VISIBILITY_KEY = 'janus_score_visible'
+
+function initialScoreVisibility() {
+	try { return localStorage.getItem(SCORE_VISIBILITY_KEY) !== 'false' } catch { return true }
+}
+
 function ScoreBadge({ packet, detailed = false, baselineStart, baselineEnd }) {
   const classification = packet?.classification
   if (!classification) return <span className="text-gray-700">—</span>
@@ -630,6 +646,7 @@ export default function Traffic() {
   const [filtersCollapsed, setFiltersCollapsed] = useState(false)
   const [flagFilter, setFlagFilter] = useState(false)
   const [flagRegex, setFlagRegex] = useState('')
+  const [flagRegexCaseInsensitive, setFlagRegexCaseInsensitive] = useState(false)
   const [flagIDFilter, setFlagIDFilter] = useState(false)
   const [flagIDEnabled, setFlagIDEnabled] = useState(false)
   const [blockedFilter, setBlockedFilter] = useState(false)
@@ -659,6 +676,14 @@ export default function Traffic() {
 	const [filterSchema, setFilterSchema] = useState(null)
 	const [expressionFields, setExpressionFields] = useState([])
 	const [scoringStatus, setScoringStatus] = useState(null)
+	const [scoreVisible, setScoreVisible] = useState(initialScoreVisibility)
+	const toggleScoreVisibility = useCallback(() => {
+		setScoreVisible((current) => {
+			const next = !current
+			try { localStorage.setItem(SCORE_VISIBILITY_KEY, String(next)) } catch { /* best-effort UI preference */ }
+			return next
+		})
+	}, [])
 	const baselineByService = useMemo(() => Object.fromEntries(
 		(scoringStatus?.services || []).map((status) => [status.service_id, status]),
 	), [scoringStatus])
@@ -777,6 +802,7 @@ export default function Traffic() {
     api.listProtocols().then((data) => setCustomProtocols(data || [])).catch(() => {})
     api.getConfig().then((cfg) => {
       if (cfg?.flag_regex) setFlagRegex(cfg.flag_regex)
+      setFlagRegexCaseInsensitive(!!cfg?.flag_regex_case_insensitive)
       setFlagIDEnabled(!!cfg?.flagid_enabled)
       setTrafficMode(cfg?.traffic_mode || 'live')
     }).catch(() => {})
@@ -1723,9 +1749,9 @@ export default function Traffic() {
   const highlightRuleInURL = !selectedRuleScope || selectedRuleScope.includes('url') || selectedRuleScope.includes('raw')
   const highlightRuleInHeaders = !selectedRuleScope || selectedRuleScope.includes('header') || selectedRuleScope.includes('raw')
   const highlightRuleInBody = !selectedRuleScope || selectedRuleScope.includes('body') || selectedRuleScope.includes('raw')
-  const urlRegex = [flagRegex, userURLRegex, highlightRuleInURL ? selectedRulePattern : ''].filter(Boolean).join('|')
-  const headersRegex = [flagRegex, userHeadersAnyRegex, highlightRuleInHeaders ? selectedRulePattern : ''].filter(Boolean).join('|')
-  const bodyRegex = [flagRegex, userBodyRegex, highlightRuleInBody ? selectedRulePattern : ''].filter(Boolean).join('|')
+  const urlRegex = [userURLRegex, highlightRuleInURL ? selectedRulePattern : ''].filter(Boolean).join('|')
+  const headersRegex = [userHeadersAnyRegex, highlightRuleInHeaders ? selectedRulePattern : ''].filter(Boolean).join('|')
+  const bodyRegex = [userBodyRegex, highlightRuleInBody ? selectedRulePattern : ''].filter(Boolean).join('|')
 
   const { serviceName } = useServiceMap(services)
 
@@ -2057,18 +2083,20 @@ export default function Traffic() {
               >
                 FlagID probes
               </button>
-			  <button
-				onClick={() => addQuickFilter('classification == "likely_exploit"')}
-				className="text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 bg-gray-800 text-gray-400 border border-gray-700 hover:text-red-300"
-			  >
-				Likely exploits
-			  </button>
-			  <button
-				onClick={() => addQuickFilter('classification == "review"')}
-				className="text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 bg-gray-800 text-gray-400 border border-gray-700 hover:text-amber-300"
-			  >
-				Needs review
-			  </button>
+			  {scoreVisible && <>
+				<button
+				  onClick={() => addQuickFilter('classification == "likely_exploit"')}
+				  className="text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 bg-gray-800 text-gray-400 border border-gray-700 hover:text-red-300"
+				>
+				  Likely exploits
+				</button>
+				<button
+				  onClick={() => addQuickFilter('classification == "review"')}
+				  className="text-xs px-3 py-1.5 rounded transition-colors cursor-pointer flex items-center gap-1.5 bg-gray-800 text-gray-400 border border-gray-700 hover:text-amber-300"
+				>
+				  Needs review
+				</button>
+			  </>}
               <select
                 value={sortOrder}
                 onChange={(e) => setSortOrder(e.target.value)}
@@ -2082,7 +2110,16 @@ export default function Traffic() {
           </div>
         )}
 	  </div>
-	  {scoringStatus?.available && (
+	  {!scoreVisible && (
+		<div className="mb-2 flex justify-end">
+		  <button type="button" onClick={toggleScoreVisibility}
+			className="rounded border border-gray-800 bg-gray-900/40 px-2 py-1 text-[10px] text-gray-600 hover:border-cyan-900 hover:text-cyan-400 cursor-pointer"
+			title="Show Janus score summaries, table badges and packet details">
+			Show Janus score
+		  </button>
+		</div>
+	  )}
+	  {scoringStatus?.available && scoreVisible && (
 		<div className="mb-2 rounded border border-gray-800 bg-gray-900/60 px-3 py-2">
 		  <div className="flex items-center gap-2 flex-wrap">
 			<span className="text-[10px] uppercase tracking-wide text-gray-500" title="Static deterministic heuristics; these are packet counts, not probabilities">Janus score · captured packets</span>
@@ -2097,6 +2134,11 @@ export default function Traffic() {
 			  </button>
 			))}
 			<span className="ml-auto text-[10px] text-gray-600">confidence score · advisory only</span>
+			<button type="button" onClick={toggleScoreVisibility}
+			  className="rounded border border-gray-800 px-1.5 py-0.5 text-[10px] text-gray-500 hover:border-gray-700 hover:text-gray-300 cursor-pointer"
+			  title="Hide Janus score summaries, table badges and packet details">
+			  Hide score
+			</button>
 		  </div>
 		  {(scoringStatus.services || []).length > 0 && (
 			<div className="mt-1.5 flex items-center gap-1.5 overflow-x-auto text-[10px]">
@@ -2142,7 +2184,7 @@ export default function Traffic() {
                   <th className="px-3 py-2 font-medium">Service</th>
                   <th className="px-3 py-2 font-medium">Dir</th>
                   <th className="px-3 py-2 font-medium">Status</th>
-				  <th className="px-3 py-2 font-medium">Janus score</th>
+				  {scoreVisible && <th className="px-3 py-2 font-medium">Janus score</th>}
                   <th className="px-3 py-2 font-medium w-16"></th>
                   <th className="px-3 py-2 font-medium">Method</th>
                   <th className="px-3 py-2 font-medium">URL / Body</th>
@@ -2151,7 +2193,7 @@ export default function Traffic() {
               </thead>
               <tbody>
                 {topPad > 0 && (
-				  <tr aria-hidden="true" style={{ height: topPad }}><td colSpan="12" /></tr>
+				  <tr aria-hidden="true" style={{ height: topPad }}><td colSpan={scoreVisible ? 12 : 11} /></tr>
                 )}
                 {visiblePackets.map((pkt) => {
                   const rowBg = pkt.matched_rules?.length > 0
@@ -2220,7 +2262,7 @@ export default function Traffic() {
                     <td className="px-3 py-1.5 text-xs">
                       {pkt.status > 0 && <span className={`${pkt.status < 400 ? 'text-green-400' : 'text-red-400'}`}>{pkt.status}</span>}
                     </td>
-					<td className="px-3 py-1.5 text-xs">{(() => { const range = baselineForService(pkt.service_id); return <ScoreBadge packet={pkt} baselineStart={range.start} baselineEnd={range.end} /> })()}</td>
+					{scoreVisible && <td className="px-3 py-1.5 text-xs">{(() => { const range = baselineForService(pkt.service_id); return <ScoreBadge packet={pkt} baselineStart={range.start} baselineEnd={range.end} /> })()}</td>}
                     <td className="px-3 py-1.5">
                       <div className="flex items-center gap-1">
                         {pkt.flagged && <span className="text-yellow-400 text-xs" title="Contains flag">&#9873;</span>}
@@ -2248,17 +2290,17 @@ export default function Traffic() {
                   );
                 })}
                 {bottomPad > 0 && (
-				  <tr aria-hidden="true" style={{ height: bottomPad }}><td colSpan="12" /></tr>
+				  <tr aria-hidden="true" style={{ height: bottomPad }}><td colSpan={scoreVisible ? 12 : 11} /></tr>
                 )}
                 {displayPackets.length === 0 && (
-				  <tr><td colSpan="12" className="text-center py-8 text-gray-600">No packets found</td></tr>
+				  <tr><td colSpan={scoreVisible ? 12 : 11} className="text-center py-8 text-gray-600">No packets found</td></tr>
                 )}
               </tbody>
               {/* Infinite scroll sentinel — only shown outside flow mode */}
               {!flowMode && (
                 <tfoot>
                   <tr>
-					<td colSpan="12" className="py-3 text-center text-xs text-gray-700">
+					<td colSpan={scoreVisible ? 12 : 11} className="py-3 text-center text-xs text-gray-700">
                       <span ref={packetSentinelRef}>
                         {loading ? 'Loading…' : (!hasMore && packets.length > 0) ? '— end —' : ''}
                       </span>
@@ -2502,7 +2544,7 @@ export default function Traffic() {
                   {selected.status > 0 && <div><span className="text-gray-500">Status </span><span className={selected.status < 400 ? 'text-green-400' : 'text-red-400'}>{selected.status}</span></div>}
                 </div>
 
-				{selected.classification && (
+				{scoreVisible && selected.classification && (
 				  <div className="rounded border border-gray-700 bg-gray-800/40 p-2 text-xs">
 					<div className="flex items-center justify-between gap-2">
 					  <div className="flex items-center gap-2">
@@ -2541,7 +2583,7 @@ export default function Traffic() {
                   <div className="text-xs">
                     <span className="text-gray-500">URL </span>
                     <span className="text-gray-300 break-all font-mono">
-                      <HighlightedText text={selected.url} regex={urlRegex} flagidRegex={flagidHighlightRegex} />
+                      <HighlightedText text={selected.url} regex={urlRegex} flagRegex={flagRegex} flagRegexCaseInsensitive={flagRegexCaseInsensitive} flagidRegex={flagidHighlightRegex} />
                     </span>
                   </div>
                 )}
@@ -2566,7 +2608,7 @@ export default function Traffic() {
                       {Object.entries(selected.headers).map(([k, v]) => (
                         <div key={k}>
                           <span className="text-cyan-400">{k}:</span>{' '}
-                          <HighlightedText text={v} regex={headersRegex} flagidRegex={flagidHighlightRegex} />
+                          <HighlightedText text={v} regex={headersRegex} flagRegex={flagRegex} flagRegexCaseInsensitive={flagRegexCaseInsensitive} flagidRegex={flagidHighlightRegex} />
                         </div>
                       ))}
                     </div>
@@ -2621,7 +2663,7 @@ export default function Traffic() {
                     </div>
                     <pre className="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 overflow-auto whitespace-pre-wrap break-all" style={{ maxHeight: '60vh' }}>
                       {selected.body_string ? (
-                        <HighlightedText text={formattedBody.text} regex={bodyRegex} flagidRegex={flagidHighlightRegex} />
+                        <HighlightedText text={formattedBody.text} regex={bodyRegex} flagRegex={flagRegex} flagRegexCaseInsensitive={flagRegexCaseInsensitive} flagidRegex={flagidHighlightRegex} />
                       ) : (
                         <span className="text-gray-500">
                           (non-UTF8 body) — use “Copy bytes”
@@ -2760,7 +2802,7 @@ export default function Traffic() {
                                 frameJSON={frame.json}
                                 onLeafAction={handleDecodedFieldAction}
                                 fallbackHighlight={
-                                  <HighlightedText text={frame.json} regex={bodyRegex} flagidRegex={flagidHighlightRegex} />
+                                  <HighlightedText text={frame.json} regex={bodyRegex} flagRegex={flagRegex} flagRegexCaseInsensitive={flagRegexCaseInsensitive} flagidRegex={flagidHighlightRegex} />
                                 }
                               />
                             ) : (

@@ -17,13 +17,15 @@ services:
       - "3000-3001:3000-3001"
       - "5555:5555"
       - "3333:3333"
+      - "5050:5050"
+      - "5051:5051"
       - "5060:5060"
       - "80:80"
       - "6006:6006"
       - "1337:1337"
       - "8081:8081"
     healthcheck:
-      test: ["CMD", "nc", "-z", "127.0.0.1", "9090"]
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 \"$$API_PORT\""]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -51,15 +53,17 @@ services:
       dockerfile: Dockerfile
     environment:
       - API_BACKEND=janus
+      - API_BACKEND_PORT=9090
       - FRONTEND_BIND=0.0.0.0
       - FRONTEND_PORT=3000
+      - FRONTEND_ROOT=/usr/share/nginx/html
     ports:
       - "0.0.0.0:2999:3000"
     depends_on:
       janus:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/"]
+      test: ["CMD-SHELL", "wget -q --spider \"http://127.0.0.1:$${FRONTEND_PORT}/\""]
       interval: 10s
       timeout: 3s
       retries: 3

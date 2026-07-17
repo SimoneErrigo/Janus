@@ -1,0 +1,4 @@
+janus
+*.test
+coverage.out
+.DS_Store
