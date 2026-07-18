@@ -762,7 +762,9 @@ func (m *Manager) startHTTPProxy(ctx context.Context, cancel context.CancelFunc,
 	if m.packetStore != nil {
 		dropEngine := m.engineFor(svc)
 		flagRegex, flagScanner := m.currentFlagMatchers()
-		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine, flagRegex, flagScanner, m.currentFlagIDChecker, m.shouldCaptureService, m.shouldApplyFlagIDsOnIngest, m.currentPyBlockFn(), m.currentPyShouldEvaluateFn())
+		handler = sniffer.HTTPMiddleware(reverseProxy, svc, m.packetStore, dropEngine, flagRegex, flagScanner, m.currentFlagIDChecker, func() bool {
+			return m.shouldCaptureService(svc.ID)
+		}, m.shouldApplyFlagIDsOnIngest, m.currentPyBlockFn(), m.currentPyShouldEvaluateFn())
 	}
 	if spec.Application.Profile == storage.ApplicationGRPC || spec.Application.Profile == storage.ApplicationHTTP2 {
 		handler = h2c.NewHandler(handler, &http2.Server{})
@@ -847,7 +849,9 @@ func (m *Manager) startTLSProxy(ctx context.Context, cancel context.CancelFunc, 
 	if m.packetStore != nil {
 		dropEngine := m.engineFor(svc)
 		flagRegex, flagScanner := m.currentFlagMatchers()
-		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine, flagRegex, flagScanner, m.currentFlagIDChecker, m.shouldCaptureService, m.shouldApplyFlagIDsOnIngest, m.currentPyBlockFn(), m.currentPyShouldEvaluateFn())
+		handler = sniffer.HTTPMiddleware(handler, svc, m.packetStore, dropEngine, flagRegex, flagScanner, m.currentFlagIDChecker, func() bool {
+			return m.shouldCaptureService(svc.ID)
+		}, m.shouldApplyFlagIDsOnIngest, m.currentPyBlockFn(), m.currentPyShouldEvaluateFn())
 	}
 
 	// For gRPC, support h2c (HTTP/2 cleartext) from backend if needed

@@ -54,10 +54,10 @@ type PyBlockFunc func(flow map[string]any) PyResult
 // HTTP uses the exact response query before deciding to buffer a response.
 type PyShouldEvaluateFunc func(service, direction, protocol string) bool
 
-// ShouldCaptureFunc is the service-aware storage admission gate used by every
-// data-plane protocol. A nil callback preserves the legacy capture-all
-// behavior for isolated integrations.
-type ShouldCaptureFunc func(serviceID string) bool
+// ShouldCaptureFunc is the storage admission gate for one service. Proxy
+// wiring binds the service ID in the callback closure, preserving the original
+// no-argument middleware API. A nil callback captures everything.
+type ShouldCaptureFunc func() bool
 
 func roundFromFlagIDMatches(matches []flagids.FlagMatch, fallback int) int {
 	round := 0
@@ -119,7 +119,7 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store PacketSink, d
 		reqHeaders := flattenHeaders(r.Header)
 		headersStr := FlattenHeadersString(r.Header)
 
-		captureEnabled := shouldCapture == nil || shouldCapture(svc.ID)
+		captureEnabled := shouldCapture == nil || shouldCapture()
 		applyFlagIDsNow := shouldApplyFlagIDsOnIngest == nil || shouldApplyFlagIDsOnIngest()
 
 		// Compute metadata before rule evaluation so live rules see the same
