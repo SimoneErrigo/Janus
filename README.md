@@ -53,6 +53,7 @@ Useful settings:
 | `SCORING_ENABLED` | Initial deterministic scoring state; also switchable live from Config (default `true`) |
 | `BASELINE_START_ROUND` / `BASELINE_END_ROUND` | Default inclusive rounds used by the deterministic checker baseline (`1`–`5`); Config can override them per service |
 | `TRAFFIC_MODE` | `live` (normal operation) or `static` (manual capture) |
+| `STATIC_CAPTURE_SERVICE_IDS` | Comma-separated preset of services to capture in `static` mode; empty means none |
 
 ### 2. Start Janus
 
@@ -166,8 +167,15 @@ bypass generic filtering. Messages larger than 1 MiB are dropped and audited.
 
 | Mode | Behaviour |
 | --- | --- |
-| `live` | Captures continuously, streams events, polls Flag IDs, automatically backfills recent traffic after a changed Flag ID response, and runs cleanup. |
-| `static` | Capture is started/stopped manually. Polling, automatic backfill, and cleanup are disabled; use **Apply Flag IDs** to rescan the captured window. |
+| `live` | Captures continuously, streams events, polls Flag IDs, automatically backfills recent traffic after a changed Flag ID response, and runs cleanup. The static service preset is ignored. |
+| `static` | Capture is started/stopped manually for one or more explicitly selected services. An empty selection captures nothing and disables **Start Capture**. Polling, automatic backfill, and cleanup are disabled; use **Apply Flag IDs** to rescan the captured window. |
+
+The static service selection is snapshotted when capture starts, so changing its
+preset affects the next capture. Ordinary traffic from services outside that
+snapshot does not enter the packet queue or database, reducing retention memory
+and storage. Proxying and native/inline rules still run for every service;
+security `drop` or `alert` events from outside the capture scope can therefore
+still be retained for audit purposes.
 
 ## Common workflows
 

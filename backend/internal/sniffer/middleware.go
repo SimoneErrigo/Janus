@@ -54,6 +54,11 @@ type PyBlockFunc func(flow map[string]any) PyResult
 // HTTP uses the exact response query before deciding to buffer a response.
 type PyShouldEvaluateFunc func(service, direction, protocol string) bool
 
+// ShouldCaptureFunc is the service-aware storage admission gate used by every
+// data-plane protocol. A nil callback preserves the legacy capture-all
+// behavior for isolated integrations.
+type ShouldCaptureFunc func(serviceID string) bool
+
 func roundFromFlagIDMatches(matches []flagids.FlagMatch, fallback int) int {
 	round := 0
 	for _, m := range matches {
@@ -90,7 +95,7 @@ func CheckFlagID(checker FlagIDChecker, url, headers string, body []byte) (bool,
 
 // HTTPMiddleware returns an http.Handler that logs requests/responses and evaluates drop rules.
 // getFlagIDChecker is called per request so updates from SetFlagIDChecker apply without restarting the proxy.
-func HTTPMiddleware(next http.Handler, svc *storage.Service, store PacketSink, dropEngine *dropper.Engine, flagRegex *regexp.Regexp, flagScanner *flagids.FlagScanner, getFlagIDChecker func() FlagIDChecker, shouldCapture func() bool, shouldApplyFlagIDsOnIngest func() bool, pyBlock PyBlockFunc, pyShouldEvaluate PyShouldEvaluateFunc) http.Handler {
+func HTTPMiddleware(next http.Handler, svc *storage.Service, store PacketSink, dropEngine *dropper.Engine, flagRegex *regexp.Regexp, flagScanner *flagids.FlagScanner, getFlagIDChecker func() FlagIDChecker, shouldCapture ShouldCaptureFunc, shouldApplyFlagIDsOnIngest func() bool, pyBlock PyBlockFunc, pyShouldEvaluate PyShouldEvaluateFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
@@ -114,7 +119,7 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store PacketSink, d
 		reqHeaders := flattenHeaders(r.Header)
 		headersStr := FlattenHeadersString(r.Header)
 
-		captureEnabled := shouldCapture == nil || shouldCapture()
+		captureEnabled := shouldCapture == nil || shouldCapture(svc.ID)
 		applyFlagIDsNow := shouldApplyFlagIDsOnIngest == nil || shouldApplyFlagIDsOnIngest()
 
 		// Compute metadata before rule evaluation so live rules see the same
@@ -249,38 +254,43 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store PacketSink, d
 		// In static mode without capture, still persist drops and alert-triggering traffic so Alerts/Blocks stay useful.
 		mustPersistReq := captureEnabled || shouldDrop || len(alertRules) > 0 || len(pyBlockAlerts) > 0
 
-		// Build and insert request packet
-		reqPacket := &Packet{
-			ServiceID:        svc.ID,
-			SessionID:        sessionID,
-			Timestamp:        start,
-			SrcIP:            srcIP,
-			SrcPort:          srcPort,
-			DstIP:            dstIP,
-			DstPort:          dstPort,
-			Protocol:         string(svc.Protocol),
-			Direction:        DirectionRequest,
-			Method:           r.Method,
-			URL:              r.URL.String(),
-			Headers:          reqHeaders,
-			Body:             reqBody,
-			CaptureTruncated: reqBodyTruncated,
-			MatchedRules:     matchedRules,
-			Flagged:          flagged,
-			ContainsFlagID:   containsFlagID,
-			MatchedFlagIDs:   matchedFlagIDs,
-			FlagIDRound:      flagIDRound,
-			FlagCountBody:    flagBodyCount,
-			FlagCountHeaders: flagHeaderCount,
-			FlagCountURL:     flagURLCount,
-			PyFilterEventID:  pyEventID,
-			Verdict:          VerdictFor(DirectionRequest, matchedRules, shouldDrop, requestRewritten, true),
-		}
-		if reqPacket.MatchedRules == nil {
-			reqPacket.MatchedRules = []MatchedRuleInfo{}
+		// Avoid allocating a retained packet object for ordinary excluded
+		// traffic. Unknown-length bodies still need one because a rule can match
+		// the captured prefix after the backend has consumed the stream.
+		var reqPacket *Packet
+		if mustPersistReq || streamingCapture != nil {
+			reqPacket = &Packet{
+				ServiceID:        svc.ID,
+				SessionID:        sessionID,
+				Timestamp:        start,
+				SrcIP:            srcIP,
+				SrcPort:          srcPort,
+				DstIP:            dstIP,
+				DstPort:          dstPort,
+				Protocol:         string(svc.Protocol),
+				Direction:        DirectionRequest,
+				Method:           r.Method,
+				URL:              r.URL.String(),
+				Headers:          reqHeaders,
+				Body:             reqBody,
+				CaptureTruncated: reqBodyTruncated,
+				MatchedRules:     matchedRules,
+				Flagged:          flagged,
+				ContainsFlagID:   containsFlagID,
+				MatchedFlagIDs:   matchedFlagIDs,
+				FlagIDRound:      flagIDRound,
+				FlagCountBody:    flagBodyCount,
+				FlagCountHeaders: flagHeaderCount,
+				FlagCountURL:     flagURLCount,
+				PyFilterEventID:  pyEventID,
+				Verdict:          VerdictFor(DirectionRequest, matchedRules, shouldDrop, requestRewritten, true),
+			}
+			if reqPacket.MatchedRules == nil {
+				reqPacket.MatchedRules = []MatchedRuleInfo{}
+			}
 		}
 		persistRequest := func() {
-			if !mustPersistReq {
+			if !mustPersistReq || reqPacket == nil {
 				return
 			}
 			alertTemplates := make([]*Alert, 0, len(alertRules)+len(pyBlockAlerts))
@@ -360,7 +370,10 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store PacketSink, d
 		respTime := time.Now()
 		respStatus := rw.statusCode
 		respHeaders := flattenHeaders(rw.Header())
-		respBody := append([]byte(nil), rw.body.Bytes()...)
+		// Evaluate directly against the bounded response buffer. Copy it only if
+		// the packet is admitted to the async store; excluded ordinary traffic
+		// should not pay for a second body-sized allocation.
+		respBody := rw.body.Bytes()
 		respHeadersStr := FlattenHeadersString(rw.Header())
 		respFlagged := CheckFlagged(flagRegex, flagScanner, "", respHeadersStr, respBody)
 		_, respFlagHeaderCount, respFlagBodyCount := CountFlags(flagRegex, flagScanner, "", respHeadersStr, respBody)
@@ -478,38 +491,40 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store PacketSink, d
 				rw.commit(respBody)
 			}
 		}
-		if respMatchedRules == nil {
-			respMatchedRules = []MatchedRuleInfo{}
-		}
-		mustPersistResp := captureEnabled || len(respAlertRules) > 0 || len(respPyAlerts) > 0 || respRewritten
-
-		respPacket := &Packet{
-			ServiceID:        svc.ID,
-			SessionID:        sessionID,
-			Timestamp:        respTime,
-			SrcIP:            dstIP,
-			SrcPort:          dstPort,
-			DstIP:            srcIP,
-			DstPort:          srcPort,
-			Protocol:         string(svc.Protocol),
-			Direction:        DirectionResponse,
-			Method:           r.Method,
-			URL:              r.URL.String(),
-			Status:           respStatus,
-			Headers:          respHeaders,
-			Body:             respBody,
-			CaptureTruncated: rw.truncated,
-			MatchedRules:     respMatchedRules,
-			Flagged:          respFlagged,
-			ContainsFlagID:   respContainsFlagID,
-			MatchedFlagIDs:   respMatchedFlagIDs,
-			FlagIDRound:      respFlagIDRound,
-			FlagCountBody:    respFlagBodyCount,
-			FlagCountHeaders: respFlagHeaderCount,
-			PyFilterEventID:  respEventID,
-			Verdict:          VerdictFor(DirectionResponse, respMatchedRules, respDropped, respRewritten, responseEnforceable),
-		}
+		// A response-side native drop is reported as a would_drop match rather
+		// than enforced, so key persistence off every matched rule (not only the
+		// alert subset). This keeps security evidence outside the capture scope.
+		mustPersistResp := captureEnabled || len(respMatchedRules) > 0 || respRewritten
 		if mustPersistResp {
+			if respMatchedRules == nil {
+				respMatchedRules = []MatchedRuleInfo{}
+			}
+			respPacket := &Packet{
+				ServiceID:        svc.ID,
+				SessionID:        sessionID,
+				Timestamp:        respTime,
+				SrcIP:            dstIP,
+				SrcPort:          dstPort,
+				DstIP:            srcIP,
+				DstPort:          srcPort,
+				Protocol:         string(svc.Protocol),
+				Direction:        DirectionResponse,
+				Method:           r.Method,
+				URL:              r.URL.String(),
+				Status:           respStatus,
+				Headers:          respHeaders,
+				Body:             append([]byte(nil), respBody...),
+				CaptureTruncated: rw.truncated,
+				MatchedRules:     respMatchedRules,
+				Flagged:          respFlagged,
+				ContainsFlagID:   respContainsFlagID,
+				MatchedFlagIDs:   respMatchedFlagIDs,
+				FlagIDRound:      respFlagIDRound,
+				FlagCountBody:    respFlagBodyCount,
+				FlagCountHeaders: respFlagHeaderCount,
+				PyFilterEventID:  respEventID,
+				Verdict:          VerdictFor(DirectionResponse, respMatchedRules, respDropped, respRewritten, responseEnforceable),
+			}
 			alertTemplates := make([]*Alert, 0, len(respAlertRules)+len(respPyAlerts))
 			for _, rule := range respAlertRules {
 				alertTemplates = append(alertTemplates, &Alert{
@@ -586,8 +601,11 @@ func (c *streamingBodyCapture) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (c *streamingBodyCapture) Close() error    { return c.source.Close() }
-func (c *streamingBodyCapture) Bytes() []byte   { return append([]byte(nil), c.body.Bytes()...) }
+func (c *streamingBodyCapture) Close() error { return c.source.Close() }
+
+// Bytes remains valid after capture completes because the buffer is never
+// mutated again; callers that enqueue it retain the backing slice directly.
+func (c *streamingBodyCapture) Bytes() []byte   { return c.body.Bytes() }
 func (c *streamingBodyCapture) Truncated() bool { return c.truncated || !c.complete }
 
 func prepareRequestCapture(r *http.Request) ([]byte, bool, *streamingBodyCapture, error) {

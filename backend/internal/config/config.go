@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -73,6 +74,9 @@ type Config struct {
 
 	// Traffic capture mode
 	TrafficMode string // "live" | "static"
+	// StaticCaptureServiceIDs is the persisted preset for the next manual
+	// capture. An empty list means no service, never an implicit wildcard.
+	StaticCaptureServiceIDs []string
 	// Optional processing pipelines. These can be disabled independently from
 	// live capture; the native Go drop/alert rule engine is always active.
 	ScoringEnabled bool
@@ -121,6 +125,7 @@ type runtimeConfig struct {
 	BaselineEndRound         *int                          `json:"baseline_end_round,omitempty"`
 	BaselineServiceRounds    map[string]BaselineRoundRange `json:"baseline_service_rounds,omitempty"`
 	TrafficMode              *string                       `json:"traffic_mode,omitempty"`
+	StaticCaptureServiceIDs  *[]string                     `json:"static_capture_service_ids,omitempty"`
 	ScoringEnabled           *bool                         `json:"scoring_enabled,omitempty"`
 	PyFilterEnabled          *bool                         `json:"pyfilter_enabled,omitempty"`
 	FlowCorrelationWindowSec *int                          `json:"flow_correlation_window_seconds,omitempty"`
@@ -140,6 +145,7 @@ func Load(envPath string) (*Config, error) {
 			APIPort:                  "8080",
 			APIBind:                  "0.0.0.0",
 			TrafficMode:              "live",
+			StaticCaptureServiceIDs:  []string{},
 			ScoringEnabled:           true,
 			FlowCorrelationWindowSec: 120,
 			FlagIDPollInterval:       5,
@@ -234,6 +240,9 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v, ok := env["TRAFFIC_MODE"]; ok && v != "" {
 			cfg.TrafficMode = strings.ToLower(v)
+		}
+		if v, ok := env["STATIC_CAPTURE_SERVICE_IDS"]; ok {
+			cfg.StaticCaptureServiceIDs = normalizeStringSet(strings.Split(v, ","))
 		}
 		if v, ok := env["SCORING_ENABLED"]; ok {
 			cfg.ScoringEnabled = boolVal(v)
@@ -330,6 +339,11 @@ func Load(envPath string) (*Config, error) {
 		if v := os.Getenv("TRAFFIC_MODE"); v != "" {
 			cfg.TrafficMode = strings.ToLower(v)
 		}
+		// Unlike most scalar settings, an explicitly empty value is meaningful:
+		// it clears a preset inherited from the .env file.
+		if v, ok := os.LookupEnv("STATIC_CAPTURE_SERVICE_IDS"); ok {
+			cfg.StaticCaptureServiceIDs = normalizeStringSet(strings.Split(v, ","))
+		}
 		if v := os.Getenv("SCORING_ENABLED"); v != "" {
 			cfg.ScoringEnabled = boolVal(v)
 		}
@@ -390,6 +404,7 @@ func Get() *Config {
 	}
 	copy := *instance
 	copy.BaselineServiceRounds = cloneBaselineServiceRounds(instance.BaselineServiceRounds)
+	copy.StaticCaptureServiceIDs = cloneStrings(instance.StaticCaptureServiceIDs)
 	return &copy
 }
 
@@ -407,17 +422,21 @@ func Update(mutate func(*Config) error) (*Config, error) {
 	}
 	next := *instance
 	next.BaselineServiceRounds = cloneBaselineServiceRounds(instance.BaselineServiceRounds)
+	next.StaticCaptureServiceIDs = cloneStrings(instance.StaticCaptureServiceIDs)
 	if err := mutate(&next); err != nil {
 		return nil, err
 	}
+	next.StaticCaptureServiceIDs = normalizeStringSet(next.StaticCaptureServiceIDs)
 	materializePlanes(&next)
 	if err := saveRuntimeConfig(&next); err != nil {
 		return nil, err
 	}
 	next.BaselineServiceRounds = cloneBaselineServiceRounds(next.BaselineServiceRounds)
+	next.StaticCaptureServiceIDs = cloneStrings(next.StaticCaptureServiceIDs)
 	instance = &next
 	copy := next
 	copy.BaselineServiceRounds = cloneBaselineServiceRounds(next.BaselineServiceRounds)
+	copy.StaticCaptureServiceIDs = cloneStrings(next.StaticCaptureServiceIDs)
 	return &copy, nil
 }
 
@@ -475,6 +494,7 @@ func normalizeDefaults(cfg *Config) {
 	if cfg.TrafficMode != "live" && cfg.TrafficMode != "static" {
 		cfg.TrafficMode = "live"
 	}
+	cfg.StaticCaptureServiceIDs = normalizeStringSet(cfg.StaticCaptureServiceIDs)
 }
 
 func loadRuntimeConfig(cfg *Config) error {
@@ -546,6 +566,9 @@ func applyRuntimeConfig(cfg *Config, saved runtimeConfig) {
 	if saved.TrafficMode != nil {
 		cfg.TrafficMode = *saved.TrafficMode
 	}
+	if saved.StaticCaptureServiceIDs != nil {
+		cfg.StaticCaptureServiceIDs = normalizeStringSet(*saved.StaticCaptureServiceIDs)
+	}
 	if saved.ScoringEnabled != nil {
 		cfg.ScoringEnabled = *saved.ScoringEnabled
 	}
@@ -564,6 +587,7 @@ func applyRuntimeConfig(cfg *Config, saved runtimeConfig) {
 }
 
 func saveRuntimeConfig(cfg *Config) error {
+	staticCaptureServiceIDs := normalizeStringSet(cfg.StaticCaptureServiceIDs)
 	saved := runtimeConfig{
 		TeamPassword: &cfg.TeamPassword, FlagRegex: &cfg.FlagRegex,
 		CleanupMaxAgeMinutes: &cfg.CleanupMaxAgeMinutes, CleanupMaxDBSizeMB: &cfg.CleanupMaxDBSizeMB,
@@ -574,6 +598,7 @@ func saveRuntimeConfig(cfg *Config) error {
 		BaselineStartRound: &cfg.BaselineStartRound, BaselineEndRound: &cfg.BaselineEndRound,
 		BaselineServiceRounds:    cloneBaselineServiceRounds(cfg.BaselineServiceRounds),
 		TrafficMode:              &cfg.TrafficMode,
+		StaticCaptureServiceIDs:  &staticCaptureServiceIDs,
 		ScoringEnabled:           &cfg.ScoringEnabled,
 		PyFilterEnabled:          &cfg.PyFilterEnabled,
 		FlowCorrelationWindowSec: &cfg.FlowCorrelationWindowSec,
@@ -629,6 +654,29 @@ func cloneBaselineServiceRounds(source map[string]BaselineRoundRange) map[string
 		copy[serviceID] = rounds
 	}
 	return copy
+}
+
+func cloneStrings(source []string) []string {
+	if len(source) == 0 {
+		return []string{}
+	}
+	return append([]string(nil), source...)
+}
+
+func normalizeStringSet(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value != "" {
+			seen[value] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(seen))
+	for value := range seen {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
 }
 
 // boolVal parses a truthy env value ("true"/"1"/"yes"/"on", case-insensitive).

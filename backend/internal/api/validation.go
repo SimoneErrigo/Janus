@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -44,6 +45,46 @@ func applyServiceDefaults(svc *storage.Service) {
 // characters slip through json.Unmarshal silently and break later map lookups
 // (LIST returns the service but UPDATE/DELETE 404s on the URL-derived key).
 var serviceIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+const maxStaticCaptureServices = 256
+
+// normalizeCaptureServiceIDs gives the static-capture preset deterministic set
+// semantics. An empty result is intentionally preserved as "capture nothing".
+func normalizeCaptureServiceIDs(values []string) ([]string, error) {
+	if len(values) > maxStaticCaptureServices {
+		return nil, fmt.Errorf("static capture supports at most %d services", maxStaticCaptureServices)
+	}
+	seen := make(map[string]struct{}, len(values))
+	for _, raw := range values {
+		id := strings.TrimSpace(raw)
+		if id == "" || len(id) > 128 || !serviceIDPattern.MatchString(id) {
+			return nil, fmt.Errorf("static capture service IDs must match %s", serviceIDPattern.String())
+		}
+		seen[id] = struct{}{}
+	}
+	result := make([]string, 0, len(seen))
+	for id := range seen {
+		result = append(result, id)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func (s *Server) validateCaptureServiceIDs(serviceIDs []string, requireEnabled bool) error {
+	if s.store == nil {
+		return fmt.Errorf("service store is unavailable")
+	}
+	for _, id := range serviceIDs {
+		svc, ok := s.store.GetService(id)
+		if !ok {
+			return fmt.Errorf("static capture service %q does not exist", id)
+		}
+		if requireEnabled && !svc.Enabled {
+			return fmt.Errorf("static capture service %q is disabled", id)
+		}
+	}
+	return nil
+}
 
 // slugifyServiceID derives a URL/JSON-safe service id from a human name, e.g.
 // "Buggy Web!" -> "buggy-web". Returns "" when the name has no usable chars.
