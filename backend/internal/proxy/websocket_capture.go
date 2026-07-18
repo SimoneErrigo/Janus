@@ -238,7 +238,6 @@ func websocketMessageHeaders(opcode byte) (string, map[string]string) {
 // The returned decision is applied before bytes reach the opposite peer.
 func (m *Manager) processWebSocketMessage(svc *storage.Service, meta websocketCaptureMeta, dir sniffer.Direction, opcode byte, payload []byte) websocketMessageDecision {
 	observedAt := time.Now()
-	pyEventID := sniffer.MakePyFilterEventID(meta.sessionID, dir, observedAt)
 	body := append([]byte(nil), payload...)
 	opcodeName, headers := websocketMessageHeaders(opcode)
 	srcIP, srcPort, dstIP, dstPort := websocketEndpoints(meta, dir)
@@ -280,8 +279,10 @@ func (m *Manager) processWebSocketMessage(svc *storage.Service, meta websocketCa
 	var pyBlockAlerts []*sniffer.Alert
 	var pyFlow map[string]any
 	var pyResult sniffer.PyResult
+	var pyEventID string
 	rewritten := false
-	if pyBlock := m.currentPyBlockFn(); pyBlock != nil {
+	if pyBlock := m.pyBlockForMessage(svc.ID, string(svc.Protocol)); pyBlock != nil {
+		pyEventID = sniffer.MakePyFilterEventID(meta.sessionID, dir, observedAt)
 		pyFlow = map[string]any{
 			"service":          svc.ID,
 			"session":          meta.sessionID,

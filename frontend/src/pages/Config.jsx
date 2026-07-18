@@ -9,12 +9,14 @@ function configForForm(data) {
     ...(data || {}),
     team_password_set: data?.team_password_set ?? !!data?.team_password,
     team_password: '',
+    scoring_enabled: data?.scoring_enabled ?? true,
+    pyfilter_enabled: data?.pyfilter_enabled ?? true,
   }
 }
 
 const GENERAL_CONFIG_FIELDS = [
   'team_password', 'team_password_set', 'flag_regex', 'traffic_mode',
-  'flow_correlation_window_seconds',
+  'scoring_enabled', 'pyfilter_enabled', 'flow_correlation_window_seconds',
 ]
 
 const FLAGID_CONFIG_FIELDS = [
@@ -318,6 +320,8 @@ export default function Config() {
         team_password: form.team_password,
         flag_regex: form.flag_regex,
         traffic_mode: form.traffic_mode || 'live',
+        scoring_enabled: !!form.scoring_enabled,
+        pyfilter_enabled: !!form.pyfilter_enabled,
         flow_correlation_window_seconds: parseInt(form.flow_correlation_window_seconds, 10) || 120,
       })
       const next = configForForm(data)
@@ -325,6 +329,7 @@ export default function Config() {
       setForm((current) => mergeConfigFields(current, next, GENERAL_CONFIG_FIELDS))
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
+      setTimeout(loadScoringStatus, 200)
     } catch (err) {
       setError(err.message)
     }
@@ -503,6 +508,37 @@ export default function Config() {
             className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-gray-100 text-sm focus:outline-none focus:border-cyan-500 transition-colors"
           />
           <p className="text-xs text-gray-600 mt-1">Used by flow reconstruction to correlate related sessions in high-load traffic.</p>
+        </div>
+
+        <div className="border-t border-gray-800 pt-4 space-y-3">
+          <div>
+            <h3 className="text-sm font-medium text-gray-300">Live processing</h3>
+            <p className="text-xs text-gray-600 mt-1">Reduce background analysis while keeping live proxying, capture and native Go rules available.</p>
+          </div>
+          <label className="flex items-start gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={!!form.scoring_enabled}
+              onChange={(e) => set('scoring_enabled', e.target.checked)}
+              className="mt-0.5 accent-cyan-500"
+            />
+            <span>
+              <span className="block text-sm text-gray-300">Enable deterministic scoring</span>
+              <span className="block text-xs text-gray-600 mt-0.5">When disabled, new packets are not copied or grouped for checker/exploit scoring. Existing scores remain stored.</span>
+            </span>
+          </label>
+          <label className="flex items-start gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={!!form.pyfilter_enabled}
+              onChange={(e) => set('pyfilter_enabled', e.target.checked)}
+              className="mt-0.5 accent-cyan-500"
+            />
+            <span>
+              <span className="block text-sm text-gray-300">Enable Python filters</span>
+              <span className="block text-xs text-gray-600 mt-0.5">Controls observe and inline Python scripts only. Fast native drop/alert rules remain active.</span>
+            </span>
+          </label>
         </div>
 
         <ErrorBanner error={error} />
@@ -817,13 +853,17 @@ export default function Config() {
               <button
                 type="button"
                 onClick={rebuildBaseline}
-                disabled={baselineRebuilding || scoringStatus?.rebuilding || baselineDirty || !scoringStatus?.available}
+                disabled={!form.scoring_enabled || baselineRebuilding || scoringStatus?.rebuilding || baselineDirty || !scoringStatus?.available}
                 className="bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-gray-300 px-3 py-1.5 rounded border border-gray-700 cursor-pointer"
               >
                 {baselineRebuilding || scoringStatus?.rebuilding ? 'Rebuilding…' : 'Rebuild from captured traffic'}
               </button>
               <span className="text-gray-500">
-                {baselineDirty ? 'Save competition timing and baseline ranges before rebuilding.' : 'Use after labeling a contaminated flow as exploit.'}
+                {!form.scoring_enabled
+                  ? 'Enable scoring and save before rebuilding.'
+                  : baselineDirty
+                    ? 'Save competition timing and baseline ranges before rebuilding.'
+                    : 'Use after labeling a contaminated flow as exploit.'}
                 {Number.isFinite(scoringStatus?.replayed_packets) && ` Last replay: ${scoringStatus.replayed_packets} packets.`}
               </span>
             </div>

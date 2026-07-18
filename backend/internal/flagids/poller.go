@@ -582,8 +582,10 @@ func (p *Poller) fetch(ctx context.Context, generation uint64) {
 		}
 	}
 
-	// Compute a deterministic snapshot hash before rebuilding matcher.
-	// If unchanged, skip matcher rebuild and avoid triggering backfill.
+	// Compute a deterministic snapshot hash before rebuilding matcher. An
+	// unchanged fetch still invokes onFetch: a request that started just before
+	// the previous matcher swap can enqueue its old-round capture after that
+	// swap, so the next cheap backfill pass is the recovery path for that race.
 	snapshotHash := hashRoundFlags(roundFlags)
 	p.mu.RLock()
 	prevHash := p.lastSnapshotHash
@@ -597,7 +599,14 @@ func (p *Poller) fetch(ctx context.Context, generation uint64) {
 		p.lastError = ""
 		p.fetchErrors = 0
 		p.mu.Unlock()
-		log.Printf("Flag IDs unchanged: skipping matcher rebuild/backfill (round=%d)", maxRound)
+		log.Printf("Flag IDs unchanged: skipping matcher rebuild (round=%d)", maxRound)
+		p.mu.RLock()
+		onFetch := p.onFetch
+		curRound := p.currentRound
+		p.mu.RUnlock()
+		if onFetch != nil {
+			onFetch(curRound)
+		}
 		return
 	}
 

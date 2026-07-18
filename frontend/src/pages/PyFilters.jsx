@@ -483,6 +483,7 @@ export default function PyFilters() {
 
   const statusBadges = useMemo(() => {
     if (!status) return null
+    if (status.enabled === false) return <Badge tone="amber">live Python paused in Config</Badge>
     if (!status.available) return <Badge tone="red">python3 not found — filters cannot run</Badge>
     return (
       <div className="flex items-center justify-end gap-2 flex-wrap">

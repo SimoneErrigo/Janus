@@ -53,6 +53,7 @@ type Config struct {
 // Status is a snapshot of engine health for the API/UI.
 type Status struct {
 	Available     bool   `json:"available"` // python3 interpreter found
+	Enabled       bool   `json:"enabled"`   // live traffic evaluation master switch
 	PythonPath    string `json:"python_path,omitempty"`
 	WorkerHealthy bool   `json:"worker_healthy"` // a live worker is running
 	ScriptCount   int    `json:"script_count"`
@@ -83,6 +84,14 @@ type Manager struct {
 	cfg        Config
 	pythonPath string
 	available  bool
+
+	// runtimeEnabled is the live-traffic master switch. It is deliberately
+	// separate from each script's Enabled flag: scripts remain persisted and
+	// editable while live Python evaluation is paused. runtimeMu serializes
+	// transitions so a concurrent enable cannot race a disable tearing workers
+	// down underneath it.
+	runtimeMu      sync.Mutex
+	runtimeEnabled atomic.Bool
 
 	// scripts state
 	smu     sync.Mutex
@@ -162,6 +171,7 @@ func NewManager(cfg Config) *Manager {
 		m.pythonPath = detectPython()
 	}
 	m.available = m.pythonPath != ""
+	m.runtimeEnabled.Store(true)
 
 	if scripts, err := loadScripts(m.path); err == nil {
 		m.scripts = scripts
@@ -174,6 +184,76 @@ func NewManager(cfg Config) *Manager {
 	go m.runPipeline()
 	go m.runPrewarmRecovery()
 	return m
+}
+
+// RuntimeEnabled reports whether live traffic may be evaluated by Python.
+// Script CRUD and isolated admin tests remain available while this is false.
+func (m *Manager) RuntimeEnabled() bool {
+	return m != nil && !m.closed.Load() && m.runtimeEnabled.Load()
+}
+
+// SetRuntimeEnabled toggles all live Python evaluation without changing any
+// script's own Enabled flag. Disabling is an admission barrier: queued async
+// flows are discarded, connection-tracker snapshots are released, and idle
+// Python workers are stopped. An evaluation already inside Python is bounded by
+// its lane timeout; its result/callback is suppressed after the switch flips.
+func (m *Manager) SetRuntimeEnabled(enabled bool) {
+	if m == nil {
+		return
+	}
+	m.runtimeMu.Lock()
+	defer m.runtimeMu.Unlock()
+	if m.closed.Load() {
+		m.runtimeEnabled.Store(false)
+		return
+	}
+	if m.runtimeEnabled.Swap(enabled) == enabled {
+		return
+	}
+	if enabled {
+		// Script edits made while disabled deliberately skip prewarming. Bring
+		// the current inline generation back before returning to live traffic.
+		_ = m.PrewarmServices(nil)
+		return
+	}
+
+	// Pair the second enabled check in Submit with queueMu so no producer can
+	// enqueue after this drain has completed.
+	m.queueMu.Lock()
+	for {
+		select {
+		case _, ok := <-m.queue:
+			if !ok {
+				m.queueMu.Unlock()
+				return
+			}
+		default:
+			m.queueMu.Unlock()
+			m.tracker.reset()
+			m.stopEvaluationWorkers()
+			return
+		}
+	}
+}
+
+func (m *Manager) stopEvaluationWorkers() {
+	m.async.mu.Lock()
+	discardLaneWorkerLocked(&m.async)
+	m.async.loadedGen = -1
+	m.async.mu.Unlock()
+
+	m.blockMu.Lock()
+	lanes := make([]*lane, 0, len(m.blockByService))
+	for _, l := range m.blockByService {
+		lanes = append(lanes, l)
+	}
+	m.blockMu.Unlock()
+	for _, l := range lanes {
+		l.mu.Lock()
+		discardLaneWorkerLocked(l)
+		l.loadedGen = -1
+		l.mu.Unlock()
+	}
 }
 
 // detectPython returns the first available interpreter path, or "".
@@ -314,7 +394,7 @@ func (m *Manager) SetEnabled(id string, enabled bool) (Script, error) {
 // services after script CRUD. Work is serialized so concurrent saves/starts do
 // not spawn duplicate interpreters.
 func (m *Manager) PrewarmServices(ids []string) error {
-	if m.closed.Load() || !m.available {
+	if m.closed.Load() {
 		return nil
 	}
 	m.prewarmMu.Lock()
@@ -336,6 +416,12 @@ func (m *Manager) PrewarmServices(ids []string) error {
 		}
 		m.serviceIDs[id] = struct{}{}
 		targetSet[id] = struct{}{}
+	}
+	// Registration is useful even while paused: a later runtime enable can
+	// synchronously prewarm every already-running service before traffic reaches
+	// Python. Only process creation/evaluation is gated by RuntimeEnabled.
+	if !m.RuntimeEnabled() || !m.available {
+		return nil
 	}
 	if all {
 		for id := range m.serviceIDs {
@@ -370,6 +456,9 @@ func (m *Manager) PrewarmServices(ids []string) error {
 }
 
 func (m *Manager) prewarmService(service string) error {
+	if !m.RuntimeEnabled() {
+		return nil
+	}
 	applicable := m.hasEnabledBlockingForService(service)
 	m.blockMu.Lock()
 	l := m.blockByService[service]
@@ -384,7 +473,7 @@ func (m *Manager) prewarmService(service string) error {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if m.closed.Load() {
+	if !m.RuntimeEnabled() {
 		return nil
 	}
 	// A disabled/removed last script leaves no executable hot-path work. Avoid
@@ -428,7 +517,7 @@ func (m *Manager) currentGeneration() int {
 
 func (m *Manager) schedulePrewarm(service string) {
 	service = strings.TrimSpace(service)
-	if service == "" || m.closed.Load() {
+	if service == "" || !m.RuntimeEnabled() {
 		return
 	}
 	m.recoveryMu.Lock()
@@ -570,11 +659,14 @@ func (m *Manager) hasEnabled(blocking bool) bool {
 	return false
 }
 
-// ShouldEvaluateBlocking reports whether an enabled inline script can match the
-// supplied scope. HTTP uses it to avoid buffering responses when no response
-// filter could run.
+// ShouldEvaluateBlocking reports whether live inline processing is needed for
+// the supplied scope. An empty direction intentionally ignores direction
+// scopes: callers use that cheap query before building a flow so messages that
+// do not themselves match can still update connection history for a later
+// stateful script. HTTP passes an exact response direction separately when it
+// decides whether response buffering is necessary.
 func (m *Manager) ShouldEvaluateBlocking(service, direction, protocol string) bool {
-	if m.closed.Load() || !m.available {
+	if !m.RuntimeEnabled() || !m.available {
 		return false
 	}
 	m.smu.Lock()
@@ -582,7 +674,29 @@ func (m *Manager) ShouldEvaluateBlocking(service, direction, protocol string) bo
 	for _, script := range m.scripts {
 		if !script.Enabled || !script.Blocking ||
 			(!contains(script.ServiceIDs, "*") && !contains(script.ServiceIDs, service)) ||
-			(len(script.Directions) > 0 && !contains(script.Directions, direction)) ||
+			(direction != "" && len(script.Directions) > 0 && !contains(script.Directions, direction)) ||
+			(len(script.Protocols) > 0 && !containsFold(script.Protocols, protocol)) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// ShouldSubmitAsync reports whether a captured message for service/protocol is
+// useful to any live non-blocking script. Direction is deliberately ignored so
+// stateful scripts retain the whole connection history. Call this before
+// converting a packet into Flow (which copies/stringifies/base64-encodes body
+// data) and then call Submit only when it returns true.
+func (m *Manager) ShouldSubmitAsync(service, protocol string) bool {
+	if !m.RuntimeEnabled() || !m.available {
+		return false
+	}
+	m.smu.Lock()
+	defer m.smu.Unlock()
+	for _, script := range m.scripts {
+		if !script.Enabled || script.Blocking ||
+			(!contains(script.ServiceIDs, "*") && !contains(script.ServiceIDs, service)) ||
 			(len(script.Protocols) > 0 && !containsFold(script.Protocols, protocol)) {
 			continue
 		}
@@ -628,6 +742,7 @@ func (m *Manager) Status() Status {
 	m.blockMu.Unlock()
 	return Status{
 		Available:     m.available,
+		Enabled:       m.RuntimeEnabled(),
 		PythonPath:    m.pythonPath,
 		WorkerHealthy: m.async.healthy() || blockHealthy,
 		ScriptCount:   total,
@@ -693,7 +808,7 @@ type loadResp struct {
 // returns the matches. Returns nil when the engine is unavailable or has no
 // enabled non-blocking scripts. Used by the async Submit pipeline.
 func (m *Manager) Evaluate(flow Flow) []Match {
-	if m.closed.Load() {
+	if !m.RuntimeEnabled() {
 		return nil
 	}
 	canonical, tracked := m.tracker.prepare(flow)
@@ -713,7 +828,7 @@ func (m *Manager) Evaluate(flow Flow) []Match {
 // to drop now) and, when a script rewrote the content inline, the new bytes to
 // forward.
 func (m *Manager) EvaluateBlocking(flow Flow) ([]Match, []byte) {
-	if m.closed.Load() {
+	if !m.RuntimeEnabled() {
 		return nil, nil
 	}
 	canonical, tracked := m.tracker.prepare(flow)
@@ -761,7 +876,7 @@ func (m *Manager) EvaluateBlocking(flow Flow) ([]Match, []byte) {
 // invokes Python; the later persisted Submit reuses the event snapshot and
 // performs the normal deduplication/forget lifecycle.
 func (m *Manager) ReconcileBlocking(flow Flow) {
-	if m.closed.Load() {
+	if !m.RuntimeEnabled() {
 		return
 	}
 	_, tracked := m.tracker.prepare(flow)
@@ -782,6 +897,9 @@ func enforceableByCaller(flow Flow) bool {
 // runs one evaluation. On any transport error the worker is discarded (respawned
 // next call) and (nil, nil) is returned.
 func (m *Manager) evalLane(l *lane, flow Flow, drain bool) ([]Match, []byte) {
+	if !m.RuntimeEnabled() {
+		return nil, nil
+	}
 	started := time.Now()
 	if l.blocking {
 		// Inline traffic must never wait behind another request. Busy lanes fail
@@ -793,7 +911,7 @@ func (m *Manager) evalLane(l *lane, flow Flow, drain bool) ([]Match, []byte) {
 		l.mu.Lock()
 	}
 	defer l.mu.Unlock()
-	if m.closed.Load() && !drain {
+	if !m.RuntimeEnabled() {
 		return nil, nil
 	}
 	var remaining time.Duration
@@ -829,6 +947,9 @@ func (m *Manager) evalLane(l *lane, flow Flow, drain bool) ([]Match, []byte) {
 		}
 		return nil, nil
 	}
+	if !m.RuntimeEnabled() {
+		return nil, nil
+	}
 	m.evaluated.Add(1)
 	return resp.Matches, decodeRewrite(resp.Rewrite)
 }
@@ -837,6 +958,9 @@ func (m *Manager) evalLane(l *lane, flow Flow, drain bool) ([]Match, []byte) {
 // subset when the generation changed. Caller holds l.mu. Inline callers use it
 // only from PrewarmServices, never while forwarding traffic.
 func (m *Manager) ensureLaneLocked(l *lane, loadTimeout time.Duration) error {
+	if !m.RuntimeEnabled() {
+		return nil
+	}
 	if l.worker == nil || l.worker.isDead() {
 		w, err := spawnWorker(m.pythonPath, harness)
 		if err != nil {
@@ -879,7 +1003,7 @@ func firstError(errs map[string]string) string {
 // Submit queues a flow for asynchronous evaluation. Non-blocking: when the
 // backlog is full the flow is dropped (live tagging is best-effort).
 func (m *Manager) Submit(flow Flow) {
-	if m.closed.Load() {
+	if !m.RuntimeEnabled() {
 		return
 	}
 	canonical, tracked := m.tracker.prepare(flow)
@@ -890,7 +1014,7 @@ func (m *Manager) Submit(flow Flow) {
 	}
 	m.queueMu.Lock()
 	defer m.queueMu.Unlock()
-	if m.closed.Load() {
+	if !m.RuntimeEnabled() {
 		return
 	}
 	select {
@@ -904,10 +1028,12 @@ func (m *Manager) runPipeline() {
 	defer close(m.pipelineDone)
 	for flow := range m.queue {
 		var matches []Match
-		if m.available && m.hasEnabled(false) {
+		if m.RuntimeEnabled() && m.available && m.hasEnabled(false) {
 			matches, _ = m.evalLane(&m.async, flow, true)
 		}
-		m.runCallbacksBounded(flow, matches)
+		if m.RuntimeEnabled() {
+			m.runCallbacksBounded(flow, matches)
+		}
 	}
 }
 
@@ -916,7 +1042,7 @@ func (m *Manager) runPipeline() {
 // EvalTimeout: running it off the pipeline goroutine then also makes callback ->
 // Close re-entrant instead of waiting on itself forever.
 func (m *Manager) runCallbacksBounded(flow Flow, matches []Match) {
-	if m.cfg.OnMatch == nil || len(matches) == 0 {
+	if !m.RuntimeEnabled() || m.cfg.OnMatch == nil || len(matches) == 0 {
 		return
 	}
 	valid := make([]Match, 0, len(matches))
@@ -937,6 +1063,9 @@ func (m *Manager) runCallbacksBounded(flow Flow, matches []Match) {
 	go func() {
 		defer func() { done <- callbackResult{panicValue: recover()} }()
 		for _, mt := range valid {
+			if !m.RuntimeEnabled() {
+				return
+			}
 			select {
 			case <-expired:
 				return
@@ -1084,6 +1213,8 @@ func (m *Manager) Test(name, code string, flow Flow, repeat int) ([]Match, strin
 // Close stops the pipeline and terminates both lane workers.
 func (m *Manager) Close() {
 	m.closeOnce.Do(func() {
+		m.runtimeMu.Lock()
+		m.runtimeEnabled.Store(false)
 		// queueMu is the admission barrier: every Submit that won it first has
 		// either enqueued or failed before the queue is closed. Later calls see
 		// closed and cannot race a send against close(queue).
@@ -1092,6 +1223,7 @@ func (m *Manager) Close() {
 		close(m.closing)
 		close(m.queue)
 		m.queueMu.Unlock()
+		m.runtimeMu.Unlock()
 
 		// The queue is finite and every evaluation/callback has a timeout, so this
 		// drains all accepted work without an unbounded worker wait.

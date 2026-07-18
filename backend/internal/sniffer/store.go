@@ -1,11 +1,13 @@
 package sniffer
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -65,14 +67,24 @@ type PacketStore struct {
 // batchItem carries a packet and any alerts that must be linked to it.
 // The alerts have PacketID unset; the writer fills it in once the packet ID is known.
 type batchItem struct {
-	pkt    *Packet
-	alerts []*Alert
+	pkt       *Packet
+	alerts    []*Alert
+	flushDone chan struct{}
 }
 
 const (
 	packetQueueSize    = 8192
 	packetBatchMax     = 64
 	packetBatchFlushMs = 25
+
+	// Internal writes are serialized by the one-connection writer pool. This
+	// timeout is therefore only a guard for short-lived external/recovery locks;
+	// keeping it bounded prevents a stalled writer from exhausting the capture
+	// queue under competition load.
+	sqliteBusyTimeoutMS      = 5_000
+	sqliteCacheSizeKiB       = 32_000
+	sqliteWriterMaxOpenConns = 1
+	sqliteReaderMaxOpenConns = 4
 )
 
 var (
@@ -82,31 +94,67 @@ var (
 
 // NewPacketStore opens (or creates) the SQLite database at dataDir/packets.db.
 func NewPacketStore(dataDir string) (*PacketStore, error) {
-	dbPath := filepath.Join(dataDir, "packets.db")
-	connStr := dbPath + "?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=30000&_cache_size=-32000"
+	dbPath, err := filepath.Abs(filepath.Join(dataDir, "packets.db"))
+	if err != nil {
+		return nil, fmt.Errorf("resolving sqlite path: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+		return nil, fmt.Errorf("creating sqlite data directory: %w", err)
+	}
+
+	writerDSN := sqliteFileDSN(dbPath, "rwc",
+		fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeoutMS),
+		"journal_mode(WAL)",
+		"synchronous(NORMAL)",
+		fmt.Sprintf("cache_size(-%d)", sqliteCacheSizeKiB),
+	)
 
 	// Writer connection: single conn to serialize INSERTs/UPDATEs/DELETEs
-	db, err := sql.Open("sqlite", connStr)
+	db, err := sql.Open("sqlite", writerDSN)
 	if err != nil {
 		return nil, fmt.Errorf("opening sqlite writer: %w", err)
 	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	db.SetMaxOpenConns(sqliteWriterMaxOpenConns)
+	db.SetMaxIdleConns(sqliteWriterMaxOpenConns)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("connecting sqlite writer: %w", err)
+	}
+	if err := verifySQLiteWriter(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrating sqlite: %w", err)
+	}
 
 	// Reader connection pool: multiple conns for concurrent SELECTs
-	// WAL mode allows concurrent readers even while a write is in progress
-	rdb, err := sql.Open("sqlite", connStr+"&mode=ro")
+	// WAL mode allows concurrent readers even while a write is in progress. Open
+	// it only after the writer has created/migrated the DB and enabled WAL, since
+	// a genuinely read-only URI cannot initialize either of those things.
+	readerDSN := sqliteFileDSN(dbPath, "ro",
+		fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeoutMS),
+		"query_only(ON)",
+		fmt.Sprintf("cache_size(-%d)", sqliteCacheSizeKiB),
+	)
+	rdb, err := sql.Open("sqlite", readerDSN)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("opening sqlite reader: %w", err)
 	}
-	rdb.SetMaxOpenConns(4)
-	rdb.SetMaxIdleConns(4)
-
-	if err := migrate(db); err != nil {
+	rdb.SetMaxOpenConns(sqliteReaderMaxOpenConns)
+	rdb.SetMaxIdleConns(sqliteReaderMaxOpenConns)
+	if err := rdb.Ping(); err != nil {
 		db.Close()
 		rdb.Close()
-		return nil, fmt.Errorf("migrating sqlite: %w", err)
+		return nil, fmt.Errorf("connecting sqlite reader: %w", err)
+	}
+	if err := verifySQLiteReader(rdb); err != nil {
+		db.Close()
+		rdb.Close()
+		return nil, err
 	}
 
 	ps := &PacketStore{
@@ -118,8 +166,126 @@ func NewPacketStore(dataDir string) (*PacketStore, error) {
 		doneCh: make(chan struct{}),
 	}
 	ps.flowCorrelationWindowSec.Store(120)
+	log.Printf("SQLite packet store ready (WAL, busy_timeout=%dms, writer_pool=%d, reader_pool=%d)",
+		sqliteBusyTimeoutMS, sqliteWriterMaxOpenConns, sqliteReaderMaxOpenConns)
 	go ps.runBatchWriter()
 	return ps, nil
+}
+
+// sqliteFileDSN builds a real SQLite URI. modernc.org/sqlite only forwards
+// standard URI options such as mode=ro to SQLite when the DSN starts with
+// "file:"; driver-level PRAGMAs must be supplied through repeated _pragma
+// parameters. Using net/url also keeps paths containing spaces, '#', or '?'
+// unambiguous.
+func sqliteFileDSN(dbPath, mode string, pragmas ...string) string {
+	uriPath := filepath.ToSlash(dbPath)
+	if filepath.VolumeName(dbPath) != "" && !strings.HasPrefix(uriPath, "/") {
+		uriPath = "/" + uriPath
+	}
+	u := &url.URL{Scheme: "file", Path: uriPath}
+	q := u.Query()
+	q.Set("mode", mode)
+	for _, pragma := range pragmas {
+		q.Add("_pragma", pragma)
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func verifySQLiteWriter(db *sql.DB) error {
+	if got := db.Stats().MaxOpenConnections; got != sqliteWriterMaxOpenConns {
+		return fmt.Errorf("sqlite writer pool has %d max connections, want %d", got, sqliteWriterMaxOpenConns)
+	}
+	readOnly, err := sqliteMainIsReadOnly(db)
+	if err != nil {
+		return fmt.Errorf("verifying sqlite writer access mode: %w", err)
+	}
+	if readOnly {
+		return fmt.Errorf("sqlite writer connection is read-only")
+	}
+	if err := expectSQLitePragmaString(db, "journal_mode", "wal"); err != nil {
+		return fmt.Errorf("verifying sqlite writer WAL mode: %w", err)
+	}
+	if err := expectSQLitePragmaInt(db, "busy_timeout", sqliteBusyTimeoutMS); err != nil {
+		return fmt.Errorf("verifying sqlite writer busy timeout: %w", err)
+	}
+	if err := expectSQLitePragmaInt(db, "synchronous", 1); err != nil { // NORMAL
+		return fmt.Errorf("verifying sqlite writer synchronous mode: %w", err)
+	}
+	if err := expectSQLitePragmaInt(db, "cache_size", -sqliteCacheSizeKiB); err != nil {
+		return fmt.Errorf("verifying sqlite writer cache size: %w", err)
+	}
+	return nil
+}
+
+func verifySQLiteReader(db *sql.DB) error {
+	if got := db.Stats().MaxOpenConnections; got != sqliteReaderMaxOpenConns {
+		return fmt.Errorf("sqlite reader pool has %d max connections, want %d", got, sqliteReaderMaxOpenConns)
+	}
+	readOnly, err := sqliteMainIsReadOnly(db)
+	if err != nil {
+		return fmt.Errorf("verifying sqlite reader access mode: %w", err)
+	}
+	if !readOnly {
+		return fmt.Errorf("sqlite reader connection is not read-only")
+	}
+	if err := expectSQLitePragmaString(db, "journal_mode", "wal"); err != nil {
+		return fmt.Errorf("verifying sqlite reader WAL mode: %w", err)
+	}
+	if err := expectSQLitePragmaInt(db, "busy_timeout", sqliteBusyTimeoutMS); err != nil {
+		return fmt.Errorf("verifying sqlite reader busy timeout: %w", err)
+	}
+	if err := expectSQLitePragmaInt(db, "query_only", 1); err != nil {
+		return fmt.Errorf("verifying sqlite reader query-only mode: %w", err)
+	}
+	if err := expectSQLitePragmaInt(db, "cache_size", -sqliteCacheSizeKiB); err != nil {
+		return fmt.Errorf("verifying sqlite reader cache size: %w", err)
+	}
+	return nil
+}
+
+func sqliteMainIsReadOnly(db *sql.DB) (bool, error) {
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+
+	var readOnly bool
+	err = conn.Raw(func(driverConn any) error {
+		checker, ok := driverConn.(interface {
+			IsReadOnly(string) (bool, error)
+		})
+		if !ok {
+			return fmt.Errorf("sqlite driver connection %T does not expose IsReadOnly", driverConn)
+		}
+		var checkErr error
+		readOnly, checkErr = checker.IsReadOnly("main")
+		return checkErr
+	})
+	return readOnly, err
+}
+
+func expectSQLitePragmaString(db *sql.DB, name, want string) error {
+	var got string
+	if err := db.QueryRow("PRAGMA " + name).Scan(&got); err != nil {
+		return err
+	}
+	if !strings.EqualFold(got, want) {
+		return fmt.Errorf("PRAGMA %s is %q, want %q", name, got, want)
+	}
+	return nil
+}
+
+func expectSQLitePragmaInt(db *sql.DB, name string, want int) error {
+	var got int
+	if err := db.QueryRow("PRAGMA " + name).Scan(&got); err != nil {
+		return err
+	}
+	if got != want {
+		return fmt.Errorf("PRAGMA %s is %d, want %d", name, got, want)
+	}
+	return nil
 }
 
 func (s *PacketStore) SetFlowCorrelationWindowSec(sec int) {
@@ -219,12 +385,9 @@ func migrate(db *sql.DB) error {
 			flagid_scanned_round INTEGER NOT NULL DEFAULT 0,
 			has_drop_match   INTEGER NOT NULL DEFAULT 0
 		);
-		CREATE INDEX IF NOT EXISTS idx_packets_service_id ON packets(service_id);
 		CREATE INDEX IF NOT EXISTS idx_packets_timestamp  ON packets(timestamp);
-		CREATE INDEX IF NOT EXISTS idx_packets_src_ip     ON packets(src_ip);
 		CREATE INDEX IF NOT EXISTS idx_packets_dst_ip     ON packets(dst_ip);
 		CREATE INDEX IF NOT EXISTS idx_packets_protocol   ON packets(protocol);
-		CREATE INDEX IF NOT EXISTS idx_packets_flagged    ON packets(flagged);
 	`)
 	if err != nil {
 		return err
@@ -284,21 +447,27 @@ func migrate(db *sql.DB) error {
 		// bound; all newly captured rows persist exact component counts.
 		"UPDATE packets SET flag_count_body = 1 WHERE flagged = 1 AND flag_count_body + flag_count_headers + flag_count_url = 0",
 		"CREATE INDEX IF NOT EXISTS idx_packets_session_id ON packets(session_id)",
-		"CREATE INDEX IF NOT EXISTS idx_packets_contains_flagid ON packets(contains_flagid)",
-		"CREATE INDEX IF NOT EXISTS idx_packets_has_drop_match ON packets(has_drop_match)",
 		"CREATE INDEX IF NOT EXISTS idx_packets_service_ts ON packets(service_id, timestamp DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_packets_flagged_ts ON packets(flagged, timestamp DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_packets_contains_flagid_ts ON packets(contains_flagid, timestamp DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_packets_drop_ts ON packets(has_drop_match, timestamp DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_packets_direction_ts ON packets(direction, timestamp DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_packets_src_ts ON packets(src_ip, timestamp DESC)",
-		"CREATE INDEX IF NOT EXISTS idx_packets_backfill ON packets(contains_flagid, timestamp)",
 		"CREATE INDEX IF NOT EXISTS idx_packets_flagid_round ON packets(flagid_round, timestamp)",
 		"CREATE INDEX IF NOT EXISTS idx_packets_flagid_scanned_round ON packets(flagid_scanned_round, timestamp)",
 		"CREATE INDEX IF NOT EXISTS idx_packets_inserted_at ON packets(inserted_at)",
 		"CREATE INDEX IF NOT EXISTS idx_packets_classification_ts ON packets(classification, timestamp DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_packets_attack_score_ts ON packets(attack_score, timestamp DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_packets_analyst_label_ts ON packets(analyst_label, timestamp DESC)",
+		// These single-column indexes are left-prefix duplicates of the compound
+		// timestamp indexes above. Removing them cuts packet index maintenance by
+		// six B-trees while preserving their lookup paths.
+		"DROP INDEX IF EXISTS idx_packets_service_id",
+		"DROP INDEX IF EXISTS idx_packets_src_ip",
+		"DROP INDEX IF EXISTS idx_packets_flagged",
+		"DROP INDEX IF EXISTS idx_packets_contains_flagid",
+		"DROP INDEX IF EXISTS idx_packets_has_drop_match",
+		"DROP INDEX IF EXISTS idx_packets_backfill",
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			return fmt.Errorf("finishing packet migration: %w", err)
@@ -367,6 +536,7 @@ func migrate(db *sql.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_alerts_rule_id    ON alerts(rule_id);
 		CREATE INDEX IF NOT EXISTS idx_alerts_timestamp  ON alerts(timestamp);
 		CREATE INDEX IF NOT EXISTS idx_alerts_src_ip     ON alerts(src_ip);
+		CREATE INDEX IF NOT EXISTS idx_alerts_packet_id  ON alerts(packet_id);
 	`)
 	if err != nil {
 		return err
@@ -431,23 +601,6 @@ func isSQLiteBusy(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "SQLITE_BUSY")
-}
-
-// execInsertRetry retries Exec on SQLITE_BUSY (backfill vs proxy traffic).
-func (s *PacketStore) execInsertRetry(query string, args ...interface{}) (sql.Result, error) {
-	var res sql.Result
-	var err error
-	for attempt := 0; attempt < 12; attempt++ {
-		res, err = s.db.Exec(query, args...)
-		if err == nil {
-			return res, nil
-		}
-		if !isSQLiteBusy(err) {
-			return nil, err
-		}
-		time.Sleep(time.Duration(3+attempt*4) * time.Millisecond)
-	}
-	return nil, err
 }
 
 // autoFillBodyString populates p.BodyString with the UTF-8 view of the body
@@ -583,7 +736,7 @@ func (s *PacketStore) Insert(p *Packet) error {
 	}
 
 	insertedAt := CanonicalTimestamp(time.Now())
-	res, err := s.execInsertRetry(`
+	res, err := s.db.Exec(`
 		INSERT INTO packets (service_id, session_id, timestamp, src_ip, src_port, dst_ip, dst_port,
 			protocol, direction, method, url, status, headers, body, body_string, decoded, capture_truncated,
 				matched_rules, flagged, contains_flagid, flag_count_body, flag_count_headers, flag_count_url, matched_flagids, flagid_round, has_drop_match,
@@ -643,6 +796,41 @@ func (s *PacketStore) Enqueue(pkt *Packet, alerts []*Alert) error {
 	}
 }
 
+// Flush waits until every packet accepted before this call has reached the
+// database. The marker shares the packet queue, so it is an ordering barrier
+// without stopping the writer or blocking the proxy's Enqueue hot path.
+func (s *PacketStore) Flush(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan struct{})
+
+	// Keep Drain from stopping the writer between the lifecycle check and the
+	// marker enqueue. Waiting for queue capacity here is safe: Flush is a control
+	// plane operation, whereas packet Enqueue remains non-blocking.
+	s.lifecycleMu.RLock()
+	if s.writerStopped {
+		s.lifecycleMu.RUnlock()
+		return ErrPacketStoreClosed
+	}
+	select {
+	case s.queue <- batchItem{flushDone: done}:
+		s.lifecycleMu.RUnlock()
+	case <-ctx.Done():
+		s.lifecycleMu.RUnlock()
+		return ctx.Err()
+	}
+
+	select {
+	case <-done:
+		return nil
+	case <-s.doneCh:
+		return ErrPacketStoreClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // WriterStats exposes bounded capture degradation without putting metrics on
 // the forwarding hot path.
 func (s *PacketStore) WriterStats() (queueDropped, writerErrors uint64) {
@@ -671,6 +859,11 @@ func (s *PacketStore) runBatchWriter() {
 			for {
 				select {
 				case it := <-s.queue:
+					if it.flushDone != nil {
+						flush()
+						close(it.flushDone)
+						continue
+					}
 					batch = append(batch, it)
 					if len(batch) >= packetBatchMax {
 						flush()
@@ -681,6 +874,11 @@ func (s *PacketStore) runBatchWriter() {
 				}
 			}
 		case it := <-s.queue:
+			if it.flushDone != nil {
+				flush()
+				close(it.flushDone)
+				continue
+			}
 			batch = append(batch, it)
 			if len(batch) >= packetBatchMax {
 				flush()
@@ -770,8 +968,17 @@ func (s *PacketStore) flushBatch(batch []batchItem) {
 		flagid_scanned_round, inserted_at, verdict)
 		VALUES ` + strings.Join(placeholders, ",")
 
-	res, err := s.execInsertRetry(query, args...)
+	res, err := s.db.Exec(query, args...)
 	if err != nil {
+		// The connection-level busy handler has already waited for the bounded
+		// timeout. Retrying every row would multiply that delay by the batch size
+		// and starve the capture queue, so only data-specific failures use the
+		// row-by-row salvage path.
+		if isSQLiteBusy(err) {
+			s.writerErrors.Add(uint64(len(batch)))
+			log.Printf("packet writer: batch insert timed out waiting for SQLite; dropped %d capture row(s): %v", len(batch), err)
+			return
+		}
 		// Batch failed — fall back to one-by-one Insert (and InsertAlert) so we
 		// don't drop captures wholesale.
 		failures := 0
@@ -817,19 +1024,24 @@ func (s *PacketStore) flushBatch(batch []batchItem) {
 	if len(alertPlaceholders) > 0 {
 		alertQuery := `INSERT INTO alerts (packet_id, rule_id, service_id, src_ip, timestamp, pattern_matched) VALUES ` +
 			strings.Join(alertPlaceholders, ",")
-		if _, err := s.execInsertRetry(alertQuery, alertArgs...); err != nil {
-			// Best-effort retry per-row so we don't lose alerts on a single bad input
-			failures := 0
-			for _, it := range batch {
-				for _, a := range it.alerts {
-					if aerr := s.InsertAlert(a); aerr != nil {
-						failures++
+		if _, err := s.db.Exec(alertQuery, alertArgs...); err != nil {
+			if isSQLiteBusy(err) {
+				s.writerErrors.Add(uint64(len(alertPlaceholders)))
+				log.Printf("packet writer: alert batch timed out waiting for SQLite; dropped %d alert row(s): %v", len(alertPlaceholders), err)
+			} else {
+				// Best-effort retry per-row so we don't lose alerts on a single bad input.
+				failures := 0
+				for _, it := range batch {
+					for _, a := range it.alerts {
+						if aerr := s.InsertAlert(a); aerr != nil {
+							failures++
+						}
 					}
 				}
-			}
-			if failures > 0 {
-				s.writerErrors.Add(uint64(failures))
-				log.Printf("packet writer: alert batch insert failed (%v); %d fallback row(s) also failed", err, failures)
+				if failures > 0 {
+					s.writerErrors.Add(uint64(failures))
+					log.Printf("packet writer: alert batch insert failed (%v); %d fallback row(s) also failed", err, failures)
+				}
 			}
 		}
 	}
@@ -1707,7 +1919,7 @@ func (s *PacketStore) GetPacketByID(id int64) (*Packet, error) {
 
 // InsertAlert stores an alert in the database.
 func (s *PacketStore) InsertAlert(a *Alert) error {
-	res, err := s.execInsertRetry(`
+	res, err := s.db.Exec(`
 		INSERT INTO alerts (packet_id, rule_id, service_id, src_ip, timestamp, pattern_matched)
 		VALUES (?, ?, ?, ?, ?, ?)`,
 		a.PacketID, a.RuleID, a.ServiceID, a.SrcIP,
@@ -2243,6 +2455,12 @@ func (s *PacketStore) SmartBackfillFlagIDs(checker FlagIDChecker, currentRound i
 	if checker == nil || currentRound == 0 {
 		return 0, nil
 	}
+	// The poller publishes the new matcher before invoking this callback. A
+	// queue marker therefore separates packets scanned with the previous matcher
+	// from newly accepted packets, and guarantees the former are queryable below.
+	if err := s.Flush(context.Background()); err != nil {
+		return 0, fmt.Errorf("flushing packet writer before smart backfill: %w", err)
+	}
 
 	// Only backfill packets from the last 60 seconds (the limbo between round start
 	// and flagId fetch completion). Older packets were already scanned with the
@@ -2252,11 +2470,21 @@ func (s *PacketStore) SmartBackfillFlagIDs(checker FlagIDChecker, currentRound i
 	var total int64
 	const batchSize = 500
 	const updateChunk = 32
+	cursorTS := cutoff
+	var cursorID int64
 
 	for {
-		rows, err := s.db.Query(
-			"SELECT id, body, body_string, url, headers FROM packets WHERE flagid_scanned_round < ? AND timestamp >= ? ORDER BY id ASC LIMIT ?",
-			currentRound, cutoff, batchSize,
+		// Scan through the read-only pool so decoding large bodies never occupies
+		// the sole writer connection. Timestamp keyset pagination limits each
+		// round-change backfill to the recent limbo window instead of walking the
+		// historical table in row-id order.
+		rows, err := s.rdb.Query(
+			`SELECT id, timestamp, body, body_string, url, headers
+			 FROM packets
+			 WHERE flagid_scanned_round < ? AND timestamp >= ?
+			   AND (timestamp > ? OR (timestamp = ? AND id > ?))
+			 ORDER BY timestamp ASC, id ASC LIMIT ?`,
+			currentRound, cutoff, cursorTS, cursorTS, cursorID, batchSize,
 		)
 		if err != nil {
 			return total, fmt.Errorf("smart backfill select: %w", err)
@@ -2272,14 +2500,16 @@ func (s *PacketStore) SmartBackfillFlagIDs(checker FlagIDChecker, currentRound i
 
 		for rows.Next() {
 			var id int64
+			var timestamp string
 			var body []byte
 			var bodyStr, url, headers string
-			if err := rows.Scan(&id, &body, &bodyStr, &url, &headers); err != nil {
+			if err := rows.Scan(&id, &timestamp, &body, &bodyStr, &url, &headers); err != nil {
 				rows.Close()
 				return total, fmt.Errorf("smart backfill scan: %w", err)
 			}
+			cursorTS, cursorID = timestamp, id
 			text := url + " " + headers + " " + bodyStr
-			if len(body) > 0 {
+			if bodyStr == "" && len(body) > 0 {
 				text += " " + string(body)
 			}
 			matches := checker.FindMatchingFlagIDs(text)
@@ -2365,6 +2595,9 @@ func (s *PacketStore) BackfillFlagIDsWindow(checker FlagIDChecker, currentRound 
 	if checker == nil || currentRound == 0 {
 		return 0, nil
 	}
+	if err := s.Flush(context.Background()); err != nil {
+		return 0, fmt.Errorf("flushing packet writer before window backfill: %w", err)
+	}
 	fromTS := CanonicalTimestamp(from)
 	toTS := CanonicalTimestamp(to)
 
@@ -2374,7 +2607,7 @@ func (s *PacketStore) BackfillFlagIDsWindow(checker FlagIDChecker, currentRound 
 
 	var lastID int64
 	for {
-		rows, err := s.db.Query(
+		rows, err := s.rdb.Query(
 			`SELECT id, body, body_string, url, headers
 			 FROM packets
 			 WHERE id > ? AND timestamp >= ? AND timestamp <= ?

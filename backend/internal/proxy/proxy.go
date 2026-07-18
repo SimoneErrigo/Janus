@@ -71,7 +71,7 @@ type Manager struct {
 	flagIDChecker sniffer.FlagIDChecker
 	captureCtrl   *sniffer.CaptureController
 	pyBlockFn     sniffer.PyBlockFunc          // inline (synchronous) Python filter eval
-	pyShouldEval  sniffer.PyShouldEvaluateFunc // cheap scope preflight for HTTP response buffering
+	pyShouldEval  sniffer.PyShouldEvaluateFunc // cheap live-Python allocation/scope preflight
 	dataBindMode  string
 }
 
@@ -301,8 +301,9 @@ func (m *Manager) currentPyBlockFn() sniffer.PyBlockFunc {
 	return m.pyBlockFn
 }
 
-// SetPyShouldEvaluateFn installs the scope preflight used to avoid buffering
-// HTTP responses when no enabled inline response filter can match them.
+// SetPyShouldEvaluateFn installs the live-Python allocation/scope preflight.
+// It avoids constructing flows when Python is paused and avoids HTTP response
+// buffering when no enabled inline response filter can match.
 func (m *Manager) SetPyShouldEvaluateFn(fn sniffer.PyShouldEvaluateFunc) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -313,6 +314,23 @@ func (m *Manager) currentPyShouldEvaluateFn() sniffer.PyShouldEvaluateFunc {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.pyShouldEval
+}
+
+// pyBlockForMessage is the allocation gate for TCP/UDP/WebSocket messages.
+// Querying with an empty direction keeps whole-connection tracking intact for
+// direction-scoped stateful scripts while avoiding flow maps/body strings/base64
+// entirely when the Python runtime (or all applicable scripts) is disabled.
+func (m *Manager) pyBlockForMessage(service, protocol string) sniffer.PyBlockFunc {
+	m.mu.RLock()
+	block, shouldEvaluate := m.pyBlockFn, m.pyShouldEval
+	m.mu.RUnlock()
+	if block == nil {
+		return nil
+	}
+	if shouldEvaluate != nil && !shouldEvaluate(service, "", protocol) {
+		return nil
+	}
+	return block
 }
 
 func (m *Manager) SetCaptureController(c *sniffer.CaptureController) {

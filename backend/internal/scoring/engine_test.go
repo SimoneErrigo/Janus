@@ -77,6 +77,96 @@ func TestScoreRequiresCorroboratedAttackEvidence(t *testing.T) {
 	}
 }
 
+func TestSubmitSkipsCopiesWhenScoringIsDisabled(t *testing.T) {
+	engine := &Engine{in: make(chan *sniffer.Packet, 1)}
+	packet := &sniffer.Packet{
+		ID: 1, Body: []byte("body"),
+		MatchedRules:   []sniffer.MatchedRuleInfo{{ID: "rule"}},
+		MatchedFlagIDs: []string{"flag"},
+	}
+
+	engine.Submit(packet)
+	if got := len(engine.in); got != 0 {
+		t.Fatalf("disabled scorer admitted %d packets", got)
+	}
+	if allocations := testing.AllocsPerRun(100, func() { engine.Submit(packet) }); allocations != 0 {
+		t.Fatalf("disabled Submit allocated %.2f objects per call", allocations)
+	}
+
+	engine.enabled = true
+	engine.Submit(packet)
+	queued := <-engine.in
+	packet.Body[0] = 'X'
+	packet.MatchedRules[0].ID = "changed"
+	packet.MatchedFlagIDs[0] = "changed"
+	if got := string(queued.Body); got != "body" {
+		t.Fatalf("queued body was not copied: %q", got)
+	}
+	if got := queued.MatchedRules[0].ID; got != "rule" {
+		t.Fatalf("queued rules were not copied: %q", got)
+	}
+	if got := queued.MatchedFlagIDs[0]; got != "flag" {
+		t.Fatalf("queued flag IDs were not copied: %q", got)
+	}
+}
+
+func TestSetEnabledDiscardsPendingScoringWork(t *testing.T) {
+	engine := &Engine{
+		config:  NewBaselineConfig(time.Unix(1, 0), 120, 1, 5, nil),
+		in:      make(chan *sniffer.Packet, 4),
+		reset:   make(chan resetRequest),
+		disable: make(chan chan struct{}),
+		stop:    make(chan struct{}),
+		done:    make(chan struct{}),
+		enabled: true,
+		flows: map[string]*flowRun{
+			"partial": {packets: []*sniffer.Packet{{ID: 1}}, lastSeen: time.Now()},
+		},
+		baseline: make(map[string]map[string]map[int]struct{}),
+		overflow: make(map[string]map[string]map[int]struct{}),
+		excluded: make(map[string]uint64),
+		scored:   make(map[string]uint64),
+	}
+	engine.in <- &sniffer.Packet{ID: 2, ServiceID: "svc", SessionID: "session"}
+	go engine.run()
+	defer engine.Close()
+
+	engine.SetEnabled(false)
+	if engine.IsEnabled() {
+		t.Fatal("scorer still reports enabled")
+	}
+	if engine.Status().Enabled {
+		t.Fatal("status still reports scoring enabled")
+	}
+	if got := len(engine.in); got != 0 {
+		t.Fatalf("disable left %d queued packets", got)
+	}
+	if got := len(engine.flows); got != 0 {
+		t.Fatalf("disable left %d partial flows", got)
+	}
+
+	engine.Submit(&sniffer.Packet{ID: 3, Body: []byte("do not copy")})
+	if got := len(engine.in); got != 0 {
+		t.Fatalf("disabled scorer admitted %d new packets", got)
+	}
+
+	engine.SetEnabled(true)
+	if !engine.IsEnabled() || !engine.Status().Enabled {
+		t.Fatal("scorer did not report re-enabled")
+	}
+	engine.SetEnabled(false)
+}
+
+func TestNewWithEnabledFalseSkipsBaselineStorage(t *testing.T) {
+	// A nil store makes any baseline discovery/replay call panic, so reaching a
+	// clean disabled engine proves startup did not touch persistence.
+	engine := NewWithEnabled(nil, NewBaselineConfig(time.Unix(1, 0), 120, 1, 5, nil), false)
+	defer engine.Close()
+	if engine.IsEnabled() {
+		t.Fatal("scorer started enabled")
+	}
+}
+
 func testScoreEngine() *Engine {
 	config := NewBaselineConfig(time.Unix(1, 0), 120, 1, 5, nil)
 	return &Engine{

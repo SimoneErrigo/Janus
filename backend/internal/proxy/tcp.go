@@ -278,7 +278,6 @@ func (m *Manager) sniffCopyWithRules(dst io.Writer, src *framing.Reader, svc *st
 // the exact bytes that may be forwarded.
 func (m *Manager) inspectTransportMessage(svc *storage.Service, sessionID, srcIP string, srcPort int, dstIP string, dstPort int, dir sniffer.Direction, wire []byte) ([]byte, bool) {
 	observedAt := time.Now()
-	pyEventID := sniffer.MakePyFilterEventID(sessionID, dir, observedAt)
 	message := flowmodel.NewMessage(wire)
 	message.Decoded = appdecode.Decode(svc.RuntimeSpec(), message.Payload)
 	flagRegex, flagScanner := m.currentFlagMatchers()
@@ -307,8 +306,10 @@ func (m *Manager) inspectTransportMessage(svc *storage.Service, sessionID, srcIP
 	var pyAlerts []*sniffer.Alert
 	var pyFlow map[string]any
 	var pyResult sniffer.PyResult
+	var pyEventID string
 	rewritten := false
-	if pyBlock := m.currentPyBlockFn(); pyBlock != nil {
+	if pyBlock := m.pyBlockForMessage(svc.ID, string(svc.Protocol)); pyBlock != nil {
+		pyEventID = sniffer.MakePyFilterEventID(sessionID, dir, observedAt)
 		pyFlow = map[string]any{
 			"service": svc.ID, "session": sessionID, "event_id": pyEventID, "direction": string(dir), "src": srcIP, "dst": dstIP,
 			"sport": srcPort, "dport": dstPort, "protocol": string(svc.Protocol), "body": string(message.Payload),
