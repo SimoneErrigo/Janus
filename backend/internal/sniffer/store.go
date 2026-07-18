@@ -2592,6 +2592,13 @@ func (s *PacketStore) SmartBackfillFlagIDs(checker FlagIDChecker, currentRound i
 // BackfillFlagIDsWindow applies flag-ID matching to packets captured in [from, to].
 // Used by static mode to avoid periodic backfills.
 func (s *PacketStore) BackfillFlagIDsWindow(checker FlagIDChecker, currentRound int, from, to time.Time) (int64, error) {
+	return s.BackfillFlagIDsWindowForServices(checker, currentRound, from, to, nil)
+}
+
+// BackfillFlagIDsWindowForServices applies flag-ID matching to packets captured
+// in [from, to] for the requested services. An empty serviceIDs slice preserves
+// the legacy behavior and scans every service in the window.
+func (s *PacketStore) BackfillFlagIDsWindowForServices(checker FlagIDChecker, currentRound int, from, to time.Time, serviceIDs []string) (int64, error) {
 	if checker == nil || currentRound == 0 {
 		return 0, nil
 	}
@@ -2607,13 +2614,23 @@ func (s *PacketStore) BackfillFlagIDsWindow(checker FlagIDChecker, currentRound 
 
 	var lastID int64
 	for {
-		rows, err := s.rdb.Query(
-			`SELECT id, body, body_string, url, headers
+		query := `SELECT id, body, body_string, url, headers
 			 FROM packets
-			 WHERE id > ? AND timestamp >= ? AND timestamp <= ?
-			 ORDER BY id ASC LIMIT ?`,
-			lastID, fromTS, toTS, batchSize,
-		)
+			 WHERE id > ? AND timestamp >= ? AND timestamp <= ?`
+		args := make([]interface{}, 0, len(serviceIDs)+4)
+		args = append(args, lastID, fromTS, toTS)
+		if len(serviceIDs) > 0 {
+			placeholders := make([]string, len(serviceIDs))
+			for i, serviceID := range serviceIDs {
+				placeholders[i] = "?"
+				args = append(args, serviceID)
+			}
+			query += " AND service_id IN (" + strings.Join(placeholders, ",") + ")"
+		}
+		query += " ORDER BY id ASC LIMIT ?"
+		args = append(args, batchSize)
+
+		rows, err := s.rdb.Query(query, args...)
 		if err != nil {
 			return total, fmt.Errorf("window backfill select: %w", err)
 		}
@@ -3242,6 +3259,14 @@ func buildWhere(q PacketQuery) (string, []interface{}) {
 	if q.ServiceID != "" {
 		conditions = append(conditions, "service_id = ?")
 		args = append(args, q.ServiceID)
+	}
+	if len(q.ServiceIDs) > 0 {
+		placeholders := make([]string, len(q.ServiceIDs))
+		for i, serviceID := range q.ServiceIDs {
+			placeholders[i] = "?"
+			args = append(args, serviceID)
+		}
+		conditions = append(conditions, "service_id IN ("+strings.Join(placeholders, ",")+")")
 	}
 	if q.SessionID != "" {
 		conditions = append(conditions, "session_id = ?")

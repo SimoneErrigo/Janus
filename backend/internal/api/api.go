@@ -11,6 +11,7 @@ import (
 
 	"github.com/SimoneErrigo/Janus/backend/internal/cache"
 	"github.com/SimoneErrigo/Janus/backend/internal/cleanup"
+	"github.com/SimoneErrigo/Janus/backend/internal/config"
 	"github.com/SimoneErrigo/Janus/backend/internal/dropper"
 	"github.com/SimoneErrigo/Janus/backend/internal/flagids"
 	"github.com/SimoneErrigo/Janus/backend/internal/protodecode"
@@ -486,6 +487,35 @@ func (s *Server) deleteService(w http.ResponseWriter, r *http.Request, id string
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if s.captureCtrl != nil {
+		s.captureCtrl.RemoveService(id)
+	}
+	// A deleted ID must not remain armed for a later service recreated with the
+	// same slug. Keep the active capture's historical scope in the controller,
+	// but prune the persisted preset used by the next Start.
+	s.configMu.Lock()
+	needsPrune := false
+	for _, serviceID := range config.Get().StaticCaptureServiceIDs {
+		if serviceID == id {
+			needsPrune = true
+			break
+		}
+	}
+	if needsPrune {
+		if _, err := config.Update(func(next *config.Config) error {
+			kept := make([]string, 0, len(next.StaticCaptureServiceIDs))
+			for _, serviceID := range next.StaticCaptureServiceIDs {
+				if serviceID != id {
+					kept = append(kept, serviceID)
+				}
+			}
+			next.StaticCaptureServiceIDs = kept
+			return nil
+		}); err != nil {
+			log.Printf("Warning: service %s was deleted but static capture preset could not be pruned: %v", id, err)
+		}
+	}
+	s.configMu.Unlock()
 	s.proxy.StopService(id)
 
 	s.protoCache.Invalidate(id)

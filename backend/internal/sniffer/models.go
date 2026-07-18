@@ -257,7 +257,8 @@ type SavedFlow struct {
 // PacketQuery defines filters for retrieving packets.
 type PacketQuery struct {
 	ServiceID       string
-	ServiceName     string // resolved to ServiceID(s) by the API layer
+	ServiceIDs      []string // optional multi-service filter; empty means all services
+	ServiceName     string   // resolved to ServiceID(s) by the API layer
 	SrcIP           string
 	DstIP           string
 	Protocol        string

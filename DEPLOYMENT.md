@@ -108,6 +108,8 @@ PCAP_EXPORT_DIR=./data/pcap
 PCAP_AUTO_SAVE=false
 
 TRAFFIC_MODE=live
+# Comma-separated static-capture preset; ignored while TRAFFIC_MODE=live.
+STATIC_CAPTURE_SERVICE_IDS=
 FLOW_CORRELATION_WINDOW_SECONDS=120
 CLEANUP_MAX_AGE_MINUTES=20
 CLEANUP_MAX_DB_SIZE_MB=250
@@ -367,9 +369,17 @@ The **Config** page can update and persist these settings immediately in
 - cleanup limits;
 - Flag ID integration;
 - competition timing, retained rounds, and baseline rounds;
-- traffic mode and correlation window;
+- traffic mode, static-capture service preset, and correlation window;
 - deterministic scoring and Python-filter live processing;
 - PCAP directory and automatic export.
+
+In `static` mode, choose one or more services before starting capture; an empty
+`STATIC_CAPTURE_SERVICE_IDS` value means no service and keeps **Start Capture**
+disabled. Janus snapshots the selection at start, so later preset changes apply
+to the next capture. Ordinary traffic from unselected services does not enter
+the packet queue or database, while proxying and native/inline rules remain
+active for all services. Security `drop` or `alert` events outside the selected
+scope can still be retained. In `live` mode the preset is ignored.
 
 On the first save from the UI, Janus writes the complete set of UI-managed
 fields to `runtime_config.json`. From then on, all fields in that set override

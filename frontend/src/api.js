@@ -253,7 +253,10 @@ export const api = {
 
   // Static capture mode
   getCaptureStatus: () => request('/traffic/capture'),
-  startCapture: () => request('/traffic/capture/start', { method: 'POST' }),
+  startCapture: (serviceIds) => request('/traffic/capture/start', {
+    method: 'POST',
+    ...(Array.isArray(serviceIds) ? { body: { service_ids: serviceIds } } : {}),
+  }),
   stopCapture: () => request('/traffic/capture/stop', { method: 'POST' }),
   applyCaptureFlagIDs: () => request('/traffic/capture/apply-flagids', { method: 'POST' }),
 

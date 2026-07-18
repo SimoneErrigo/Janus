@@ -337,7 +337,7 @@ func (m *Manager) inspectTransportMessage(svc *storage.Service, sessionID, srcIP
 		}
 	}
 
-	mustPersist := m.packetStore != nil && (m.shouldCapture() || shouldDrop || len(alertRules) > 0 || len(pyAlerts) > 0)
+	mustPersist := m.packetStore != nil && (m.shouldCaptureService(svc.ID) || shouldDrop || len(alertRules) > 0 || len(pyAlerts) > 0)
 	if mustPersist || rewritten {
 		flagRegex, flagScanner = m.currentFlagMatchers()
 		flagged := sniffer.CheckFlagged(flagRegex, flagScanner, "", "", message.Payload)

@@ -11,12 +11,16 @@ function configForForm(data) {
     team_password: '',
     scoring_enabled: data?.scoring_enabled ?? true,
     pyfilter_enabled: data?.pyfilter_enabled ?? true,
+    static_capture_service_ids: Array.isArray(data?.static_capture_service_ids)
+      ? [...new Set(data.static_capture_service_ids.map(String))]
+      : [],
   }
 }
 
 const GENERAL_CONFIG_FIELDS = [
   'team_password', 'team_password_set', 'flag_regex', 'traffic_mode',
-  'scoring_enabled', 'pyfilter_enabled', 'flow_correlation_window_seconds',
+  'static_capture_service_ids', 'scoring_enabled', 'pyfilter_enabled',
+  'flow_correlation_window_seconds',
 ]
 
 const FLAGID_CONFIG_FIELDS = [
@@ -288,6 +292,29 @@ export default function Config() {
     setFlagIDSaved(false)
   }
 
+  function toggleStaticCaptureService(serviceID) {
+    setForm((current) => {
+      const selected = new Set(current.static_capture_service_ids || [])
+      if (selected.has(serviceID)) selected.delete(serviceID)
+      else selected.add(serviceID)
+      return { ...current, static_capture_service_ids: Array.from(selected) }
+    })
+    setSaved(false)
+  }
+
+  const staticCaptureServices = (services || [])
+    .filter((service) => service.enabled)
+    .sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)))
+  const staticCaptureServiceIDs = new Set(form.static_capture_service_ids || [])
+  const knownStaticCaptureServiceIDs = new Set((services || []).map((service) => service.id))
+  const missingStaticCaptureIDs = Array.from(staticCaptureServiceIDs).filter(
+    (serviceID) => !knownStaticCaptureServiceIDs.has(serviceID),
+  )
+  const disabledStaticCaptureIDs = Array.from(staticCaptureServiceIDs).filter(
+    (serviceID) => knownStaticCaptureServiceIDs.has(serviceID)
+      && !staticCaptureServices.some((service) => service.id === serviceID),
+  )
+
   const baselineServices = (() => {
     const byID = new Map((services || []).map((service) => [service.id, service]))
     for (const serviceID of Object.keys(form.baseline_service_rounds || {})) {
@@ -320,6 +347,7 @@ export default function Config() {
         team_password: form.team_password,
         flag_regex: form.flag_regex,
         traffic_mode: form.traffic_mode || 'live',
+        static_capture_service_ids: Array.from(new Set(form.static_capture_service_ids || [])),
         scoring_enabled: !!form.scoring_enabled,
         pyfilter_enabled: !!form.pyfilter_enabled,
         flow_correlation_window_seconds: parseInt(form.flow_correlation_window_seconds, 10) || 120,
@@ -496,6 +524,86 @@ export default function Config() {
             <option value="static">Static (manual start/stop + manual apply flagIds)</option>
           </select>
           <p className="text-xs text-gray-600 mt-1">Switching to static mode disables periodic backfill and auto-cleanup policies.</p>
+
+          {(form.traffic_mode || 'live') === 'static' && (
+            <div className="mt-3 rounded border border-indigo-900/60 bg-indigo-950/20 p-3 space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="text-xs font-medium text-indigo-200">Default static capture scope</div>
+                  <div className="mt-0.5 text-[11px] text-gray-500">
+                    {staticCaptureServiceIDs.size === 0
+                      ? 'No service selected. Static capture cannot start until you choose at least one.'
+                      : `${staticCaptureServiceIDs.size} service${staticCaptureServiceIDs.size === 1 ? '' : 's'} selected for the next capture.`}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setForm((current) => ({
+                      ...current,
+                      static_capture_service_ids: staticCaptureServices.map((service) => service.id),
+                    }))
+                    setSaved(false)
+                  }}
+                  disabled={staticCaptureServices.length === 0}
+                  className="text-[11px] text-indigo-300 hover:text-indigo-200 disabled:text-gray-700"
+                >
+                  Select enabled
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setForm((current) => ({ ...current, static_capture_service_ids: [] }))
+                    setSaved(false)
+                  }}
+                  disabled={staticCaptureServiceIDs.size === 0}
+                  className="text-[11px] text-gray-500 hover:text-gray-300 disabled:text-gray-700"
+                >
+                  Clear
+                </button>
+              </div>
+
+              {staticCaptureServices.length > 0 ? (
+                <div className="flex flex-wrap gap-1.5">
+                  {staticCaptureServices.map((service) => {
+                    const selected = staticCaptureServiceIDs.has(service.id)
+                    return (
+                      <button
+                        key={service.id}
+                        type="button"
+                        onClick={() => toggleStaticCaptureService(service.id)}
+                        aria-pressed={selected}
+                        className={`rounded border px-2 py-1 text-xs transition-colors ${
+                          selected
+                            ? 'border-indigo-600 bg-indigo-900/60 text-indigo-100'
+                            : 'border-gray-700 bg-gray-900 text-gray-500 hover:border-gray-600 hover:text-gray-300'
+                        }`}
+                        title={`${selected ? 'Remove' : 'Add'} ${service.name || service.id} from the static capture scope`}
+                      >
+                        {selected ? '✓ ' : ''}{service.name || service.id}
+                      </button>
+                    )
+                  })}
+                </div>
+              ) : (
+                <div className="text-xs text-amber-400">No enabled proxy services are available.</div>
+              )}
+
+              {missingStaticCaptureIDs.length > 0 && (
+                <div className="text-[11px] text-amber-400">
+                  Unknown selections: {missingStaticCaptureIDs.join(', ')}. Remove them before saving.
+                </div>
+              )}
+              {disabledStaticCaptureIDs.length > 0 && (
+                <div className="text-[11px] text-amber-400">
+                  Disabled selections: {disabledStaticCaptureIDs.join(', ')}. Enable or remove them before starting a capture.
+                </div>
+              )}
+              <p className="text-[11px] leading-relaxed text-gray-500">
+                Only ordinary traffic from these services is stored during a static capture. Proxying and fast native Go drop/alert rules remain active for every service; matching security events may still be recorded.
+              </p>
+            </div>
+          )}
         </div>
 
         <div>

@@ -587,6 +587,11 @@ function initialScoreVisibility() {
 	try { return localStorage.getItem(SCORE_VISIBILITY_KEY) !== 'false' } catch { return true }
 }
 
+function normalizeServiceIDs(serviceIDs) {
+  if (!Array.isArray(serviceIDs)) return []
+  return [...new Set(serviceIDs.map((serviceID) => String(serviceID).trim()).filter(Boolean))]
+}
+
 function ScoreBadge({ packet, detailed = false, baselineStart, baselineEnd }) {
   const classification = packet?.classification
   if (!classification) return <span className="text-gray-700">—</span>
@@ -653,6 +658,10 @@ export default function Traffic() {
   const [paused, setPaused] = useState(false)
   const [trafficMode, setTrafficMode] = useState('live')
   const [captureStatus, setCaptureStatus] = useState(null)
+  // Capture scope is intentionally separate from selectedServiceIDs, which
+  // only filters the packet table and must never alter data-plane capture.
+  const [captureServiceIDs, setCaptureServiceIDs] = useState(() => new Set())
+  const captureScopeTouchedRef = useRef(false)
   const [captureBusy, setCaptureBusy] = useState(false)
   const captureBusyRef = useRef(false)
   const captureRequestRef = useRef(0)
@@ -706,6 +715,34 @@ export default function Traffic() {
   const [sessionFilter, setSessionFilter] = useState('')
   const [sortOrder, setSortOrder] = useState('desc')
   const [pageLimit] = useState(50)
+
+  const captureServices = useMemo(() => (
+    services
+      .filter((service) => service.enabled)
+      .sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)))
+  ), [services])
+  const selectedCaptureServiceIDs = useMemo(() => (
+    captureServices
+      .filter((service) => captureServiceIDs.has(service.id))
+      .map((service) => service.id)
+  ), [captureServiceIDs, captureServices])
+  const activeCaptureServiceIDs = useMemo(
+    () => normalizeServiceIDs(captureStatus?.service_ids),
+    [captureStatus],
+  )
+  const activeCaptureServiceIDSet = useMemo(
+    () => new Set(activeCaptureServiceIDs),
+    [activeCaptureServiceIDs],
+  )
+  const displayedCaptureServiceIDSet = captureStatus?.capturing
+    ? activeCaptureServiceIDSet
+    : captureServiceIDs
+  const displayedCaptureServiceIDs = captureStatus?.capturing
+    ? activeCaptureServiceIDs
+    : Array.from(captureServiceIDs)
+  const unlistedCaptureServiceIDs = displayedCaptureServiceIDs.filter(
+    (serviceID) => !captureServices.some((service) => service.id === serviceID),
+  )
 
   // Resizable detail panel
   const [detailWidth, setDetailWidth] = useState(450)
@@ -780,7 +817,12 @@ export default function Traffic() {
     const request = ++captureRequestRef.current
     try {
       const status = await api.getCaptureStatus()
-      if (request === captureRequestRef.current) setCaptureStatus(status)
+      if (request === captureRequestRef.current) {
+        setCaptureStatus(status)
+        if (!captureScopeTouchedRef.current && Array.isArray(status?.configured_service_ids)) {
+          setCaptureServiceIDs(new Set(normalizeServiceIDs(status.configured_service_ids)))
+        }
+      }
     } catch { /* capture status is optional; the next poll retries */ }
   }, [])
 
@@ -805,6 +847,9 @@ export default function Traffic() {
       setFlagRegexCaseInsensitive(!!cfg?.flag_regex_case_insensitive)
       setFlagIDEnabled(!!cfg?.flagid_enabled)
       setTrafficMode(cfg?.traffic_mode || 'live')
+      if (!captureScopeTouchedRef.current) {
+        setCaptureServiceIDs(new Set(normalizeServiceIDs(cfg?.static_capture_service_ids)))
+      }
     }).catch(() => {})
     loadCaptureStatus()
     api.getFlagIDStatus().then(setFlagIDStatus).catch(() => {})
@@ -1290,6 +1335,9 @@ export default function Traffic() {
     try {
       const cfg = await api.updateConfig({ traffic_mode: newMode })
       setTrafficMode(cfg?.traffic_mode || newMode)
+      if (!captureScopeTouchedRef.current && Array.isArray(cfg?.static_capture_service_ids)) {
+        setCaptureServiceIDs(new Set(normalizeServiceIDs(cfg.static_capture_service_ids)))
+      }
       loadCaptureStatus()
       if (newMode === 'live') resetPackets()
     } catch (err) {
@@ -1297,15 +1345,52 @@ export default function Traffic() {
     }
   }
 
+  function toggleCaptureService(serviceID) {
+    if (captureBusy || captureStatus?.capturing) return
+    captureScopeTouchedRef.current = true
+    setCaptureServiceIDs((current) => {
+      const next = new Set(current)
+      if (next.has(serviceID)) next.delete(serviceID)
+      else next.add(serviceID)
+      return next
+    })
+    setSelectionError('')
+  }
+
+  function selectAllCaptureServices() {
+    if (captureBusy || captureStatus?.capturing) return
+    captureScopeTouchedRef.current = true
+    setCaptureServiceIDs(new Set(captureServices.map((service) => service.id)))
+    setSelectionError('')
+  }
+
+  function clearCaptureServices() {
+    if (captureBusy || captureStatus?.capturing) return
+    captureScopeTouchedRef.current = true
+    setCaptureServiceIDs(new Set())
+    setSelectionError('')
+  }
+
   async function handleStartCapture() {
     if (captureBusyRef.current) return
+    if (selectedCaptureServiceIDs.length === 0) {
+      setSelectionError('Select at least one enabled service before starting a static capture.')
+      return
+    }
     captureBusyRef.current = true
     const request = ++captureRequestRef.current
     setCaptureBusy(true)
     setSelectionError('')
     try {
-      const status = await api.startCapture()
-      if (request === captureRequestRef.current) setCaptureStatus(status)
+      const status = await api.startCapture(selectedCaptureServiceIDs)
+      if (request === captureRequestRef.current) {
+        setCaptureStatus(status)
+        captureScopeTouchedRef.current = false
+        const configured = Array.isArray(status?.configured_service_ids)
+          ? status.configured_service_ids
+          : selectedCaptureServiceIDs
+        setCaptureServiceIDs(new Set(normalizeServiceIDs(configured)))
+      }
       resetPackets()
     } catch (err) {
       if (request === captureRequestRef.current) setSelectionError(`Unable to start capture: ${err?.message || err}`)
@@ -1323,7 +1408,13 @@ export default function Traffic() {
     setSelectionError('')
     try {
       const status = await api.stopCapture()
-      if (request === captureRequestRef.current) setCaptureStatus(status)
+      if (request === captureRequestRef.current) {
+        setCaptureStatus(status)
+        captureScopeTouchedRef.current = false
+        if (Array.isArray(status?.configured_service_ids)) {
+          setCaptureServiceIDs(new Set(normalizeServiceIDs(status.configured_service_ids)))
+        }
+      }
       resetPackets()
     } catch (err) {
       if (request === captureRequestRef.current) setSelectionError(`Unable to stop capture: ${err?.message || err}`)
@@ -1888,40 +1979,113 @@ export default function Traffic() {
 
       {/* Filters — collapsible */}
       {trafficMode === 'static' && (
-        <div className="mb-3 bg-gray-900 border border-gray-800 rounded-lg p-3 flex items-center gap-2 flex-wrap">
-          <span className="text-xs px-2 py-1 rounded bg-indigo-900/40 text-indigo-300 border border-indigo-700/50">Static mode</span>
-          <button
-            onClick={handleStartCapture}
-            disabled={captureBusy || captureStatus?.capturing}
-            className="text-xs px-3 py-1.5 rounded bg-green-800/60 hover:bg-green-700/60 disabled:bg-gray-800 disabled:text-gray-600 text-green-200 cursor-pointer"
-          >
-            {captureBusy && !captureStatus?.capturing ? 'Starting...' : 'Start Capture'}
-          </button>
-          <button
-            onClick={handleStopCapture}
-            disabled={captureBusy || !captureStatus?.capturing}
-            className="text-xs px-3 py-1.5 rounded bg-yellow-800/60 hover:bg-yellow-700/60 disabled:bg-gray-800 disabled:text-gray-600 text-yellow-200 cursor-pointer"
-          >
-            {captureBusy && captureStatus?.capturing ? 'Stopping...' : 'Stop Capture'}
-          </button>
-          <button
-            onClick={handleApplyFlagIDs}
-            disabled={applyBusy || captureStatus?.capturing || !captureStatus?.capture_start}
-            className="text-xs px-3 py-1.5 rounded bg-teal-800/60 hover:bg-teal-700/60 disabled:bg-gray-800 disabled:text-gray-600 text-teal-200 cursor-pointer"
-          >
-            {applyBusy ? 'Applying...' : 'Apply Flag IDs'}
-          </button>
-          <button
-            onClick={handleClearPackets}
-            disabled={clearBusy}
-            title="Hide all current packets from your view (per-user; teammates unaffected)"
-            className="text-xs px-3 py-1.5 rounded bg-red-800/60 hover:bg-red-700/60 disabled:bg-gray-800 disabled:text-gray-600 text-red-200 cursor-pointer"
-          >
-            {clearBusy ? 'Clearing...' : 'Clear my view'}
-          </button>
-          <span className="text-xs text-gray-500 ml-auto">
-            {captureStatus?.capturing ? 'Capturing traffic...' : 'Capture stopped'}
-          </span>
+        <div className="mb-3 space-y-3 rounded-lg border border-gray-800 bg-gray-900 p-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="rounded border border-indigo-700/50 bg-indigo-900/40 px-2 py-1 text-xs text-indigo-300">Static mode</span>
+            <button
+              onClick={handleStartCapture}
+              disabled={captureBusy || captureStatus?.capturing || selectedCaptureServiceIDs.length === 0}
+              title={selectedCaptureServiceIDs.length === 0 ? 'Select at least one enabled service first' : 'Start a capture for the selected services'}
+              className="cursor-pointer rounded bg-green-800/60 px-3 py-1.5 text-xs text-green-200 hover:bg-green-700/60 disabled:cursor-not-allowed disabled:bg-gray-800 disabled:text-gray-600"
+            >
+              {captureBusy && !captureStatus?.capturing ? 'Starting...' : 'Start Capture'}
+            </button>
+            <button
+              onClick={handleStopCapture}
+              disabled={captureBusy || !captureStatus?.capturing}
+              className="cursor-pointer rounded bg-yellow-800/60 px-3 py-1.5 text-xs text-yellow-200 hover:bg-yellow-700/60 disabled:cursor-not-allowed disabled:bg-gray-800 disabled:text-gray-600"
+            >
+              {captureBusy && captureStatus?.capturing ? 'Stopping...' : 'Stop Capture'}
+            </button>
+            <button
+              onClick={handleApplyFlagIDs}
+              disabled={applyBusy || captureStatus?.capturing || !captureStatus?.capture_start}
+              className="cursor-pointer rounded bg-teal-800/60 px-3 py-1.5 text-xs text-teal-200 hover:bg-teal-700/60 disabled:cursor-not-allowed disabled:bg-gray-800 disabled:text-gray-600"
+            >
+              {applyBusy ? 'Applying...' : 'Apply Flag IDs'}
+            </button>
+            <button
+              onClick={handleClearPackets}
+              disabled={clearBusy}
+              title="Hide all current packets from your view (per-user; teammates unaffected)"
+              className="cursor-pointer rounded bg-red-800/60 px-3 py-1.5 text-xs text-red-200 hover:bg-red-700/60 disabled:cursor-not-allowed disabled:bg-gray-800 disabled:text-gray-600"
+            >
+              {clearBusy ? 'Clearing...' : 'Clear my view'}
+            </button>
+            <span className={`ml-auto text-xs ${captureStatus?.capturing ? 'text-green-400' : 'text-gray-500'}`}>
+              {captureStatus?.capturing
+                ? `Capturing ${activeCaptureServiceIDs.length} service${activeCaptureServiceIDs.length === 1 ? '' : 's'}...`
+                : 'Capture stopped'}
+            </span>
+          </div>
+
+          <div className="border-t border-gray-800 pt-3">
+            <div className="mb-2 flex flex-wrap items-center gap-2">
+              <div className="min-w-0 flex-1">
+                <span className="text-xs font-medium text-gray-300">
+                  {captureStatus?.capturing ? 'Active capture scope' : 'Capture scope'}
+                </span>
+                <span className="ml-2 text-[11px] text-gray-600">
+                  {displayedCaptureServiceIDs.length} selected
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={selectAllCaptureServices}
+                disabled={captureBusy || captureStatus?.capturing || captureServices.length === 0}
+                className="text-[11px] text-indigo-300 hover:text-indigo-200 disabled:cursor-not-allowed disabled:text-gray-700"
+              >
+                Select enabled
+              </button>
+              <button
+                type="button"
+                onClick={clearCaptureServices}
+                disabled={captureBusy || captureStatus?.capturing || captureServiceIDs.size === 0}
+                className="text-[11px] text-gray-500 hover:text-gray-300 disabled:cursor-not-allowed disabled:text-gray-700"
+              >
+                Clear
+              </button>
+            </div>
+
+            {captureServices.length > 0 ? (
+              <div className="flex flex-wrap gap-1.5">
+                {captureServices.map((service) => {
+                  const selectedForCapture = displayedCaptureServiceIDSet.has(service.id)
+                  return (
+                    <button
+                      key={service.id}
+                      type="button"
+                      onClick={() => toggleCaptureService(service.id)}
+                      disabled={captureBusy || captureStatus?.capturing}
+                      aria-pressed={selectedForCapture}
+                      className={`rounded border px-2 py-1 text-xs transition-colors disabled:cursor-not-allowed ${
+                        selectedForCapture
+                          ? 'border-indigo-600 bg-indigo-900/60 text-indigo-100'
+                          : 'border-gray-700 bg-gray-950/50 text-gray-500 hover:border-gray-600 hover:text-gray-300 disabled:hover:border-gray-700 disabled:hover:text-gray-500'
+                      }`}
+                      title={`${selectedForCapture ? 'Remove' : 'Add'} ${service.name || service.id} ${captureStatus?.capturing ? '(scope is locked while capturing)' : ''}`}
+                    >
+                      {selectedForCapture ? '✓ ' : ''}{service.name || service.id}
+                    </button>
+                  )
+                })}
+                {unlistedCaptureServiceIDs.map((serviceID) => (
+                  <span key={serviceID} className="rounded border border-amber-800/60 bg-amber-950/30 px-2 py-1 text-xs text-amber-300" title="This selected service is no longer enabled or configured">
+                    {serviceID} (unavailable)
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <div className="text-xs text-amber-400">No enabled proxy services are available.</div>
+            )}
+
+            {!captureStatus?.capturing && selectedCaptureServiceIDs.length === 0 && captureServices.length > 0 && (
+              <div className="mt-2 text-xs text-amber-400">Select one or more services before starting. Nothing is selected by default.</div>
+            )}
+            <p className="mt-2 text-[11px] leading-relaxed text-gray-600">
+              Only ordinary traffic from the selected services is stored. Proxying and fast native Go drop/alert rules remain active for every service; matching security events may still be recorded.
+            </p>
+          </div>
         </div>
       )}
       <div className="mb-3">

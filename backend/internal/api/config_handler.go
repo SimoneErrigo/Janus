@@ -44,6 +44,7 @@ type configResponse struct {
 	BaselineServiceRounds    map[string]config.BaselineRoundRange `json:"baseline_service_rounds"`
 	CurrentRound             int                                  `json:"current_round"`
 	TrafficMode              string                               `json:"traffic_mode"`
+	StaticCaptureServiceIDs  []string                             `json:"static_capture_service_ids"`
 	ScoringEnabled           bool                                 `json:"scoring_enabled"`
 	PyFilterEnabled          bool                                 `json:"pyfilter_enabled"`
 	FlowCorrelationWindowSec int                                  `json:"flow_correlation_window_seconds"`
@@ -68,6 +69,7 @@ type configUpdateRequest struct {
 	BaselineEndRound         *int                                 `json:"baseline_end_round,omitempty"`
 	BaselineServiceRounds    map[string]config.BaselineRoundRange `json:"baseline_service_rounds,omitempty"`
 	TrafficMode              *string                              `json:"traffic_mode,omitempty"`
+	StaticCaptureServiceIDs  *[]string                            `json:"static_capture_service_ids,omitempty"`
 	ScoringEnabled           *bool                                `json:"scoring_enabled,omitempty"`
 	PyFilterEnabled          *bool                                `json:"pyfilter_enabled,omitempty"`
 	FlowCorrelationWindowSec *int                                 `json:"flow_correlation_window_seconds,omitempty"`
@@ -111,6 +113,12 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 	if err := applyConfigUpdate(&candidate, req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+	if req.StaticCaptureServiceIDs != nil {
+		if err := s.validateCaptureServiceIDs(candidate.StaticCaptureServiceIDs, false); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 	next, err := config.Update(func(next *config.Config) error {
 		*next = candidate
@@ -355,6 +363,13 @@ func applyConfigUpdate(cfg *config.Config, req configUpdateRequest) error {
 	if cfg.TrafficMode != sniffer.TrafficModeLive && cfg.TrafficMode != sniffer.TrafficModeStatic {
 		return fmt.Errorf("traffic_mode must be one of: live, static")
 	}
+	if req.StaticCaptureServiceIDs != nil {
+		serviceIDs, err := normalizeCaptureServiceIDs(*req.StaticCaptureServiceIDs)
+		if err != nil {
+			return err
+		}
+		cfg.StaticCaptureServiceIDs = serviceIDs
+	}
 	if req.ScoringEnabled != nil {
 		cfg.ScoringEnabled = *req.ScoringEnabled
 	}
@@ -435,6 +450,7 @@ func (s *Server) configResponse(cfg *config.Config) configResponse {
 		BaselineStartRound: cfg.BaselineStartRound, BaselineEndRound: cfg.BaselineEndRound,
 		BaselineServiceRounds:    cfg.BaselineServiceRounds,
 		TrafficMode:              cfg.TrafficMode,
+		StaticCaptureServiceIDs:  append([]string{}, cfg.StaticCaptureServiceIDs...),
 		ScoringEnabled:           cfg.ScoringEnabled,
 		PyFilterEnabled:          cfg.PyFilterEnabled,
 		FlowCorrelationWindowSec: cfg.FlowCorrelationWindowSec,

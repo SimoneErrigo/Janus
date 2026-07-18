@@ -351,7 +351,7 @@ func (m *Manager) processWebSocketMessage(svc *storage.Service, meta websocketCa
 	pyResult.Reconcile(pyFlow, body, !shouldDrop, false, flagged, containsFlagID,
 		matchedFlagIDs, flagCountBody, 0, 0)
 
-	captureEnabled := m.packetStore != nil && m.shouldCapture()
+	captureEnabled := m.packetStore != nil && m.shouldCaptureService(svc.ID)
 	mustPersist := captureEnabled || shouldDrop || len(alertRules) > 0 || len(pyBlockAlerts) > 0
 	if m.packetStore != nil && mustPersist {
 		if matchedRules == nil {
@@ -418,7 +418,7 @@ func (m *Manager) recordOversizedWebSocketMessage(svc *storage.Service, meta web
 	srcIP, srcPort, dstIP, dstPort := websocketEndpoints(meta, dir)
 	message := fmt.Sprintf("WebSocket %s message forwarded without filtering: %d bytes exceeds %d-byte capture limit", opcodeName, size, maxWebSocketMessageCapture)
 
-	if m.packetStore != nil && m.shouldCapture() {
+	if m.packetStore != nil && m.shouldCaptureService(svc.ID) {
 		pkt := &sniffer.Packet{
 			ServiceID: svc.ID, SessionID: meta.sessionID, Timestamp: time.Now(),
 			SrcIP: srcIP, SrcPort: srcPort, DstIP: dstIP, DstPort: dstPort,
