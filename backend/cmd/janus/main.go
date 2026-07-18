@@ -121,7 +121,7 @@ func main() {
 	baselineConfig := scoring.NewBaselineConfig(
 		competitionStart, cfg.RoundDurationSec, cfg.BaselineStartRound, cfg.BaselineEndRound, serviceBaselineRanges,
 	)
-	scoreEngine := scoring.New(packetStore, baselineConfig)
+	scoreEngine := scoring.NewWithEnabled(packetStore, baselineConfig, cfg.ScoringEnabled)
 	defer scoreEngine.Close()
 
 	// Hub created after the poller so streamed packets carry their round
@@ -134,78 +134,78 @@ func main() {
 	// Python filter engine (mitmproxy-style scriptable filtering). Matches are
 	// recorded as alerts (rule_id "pyfilter:<script>"), evaluated asynchronously
 	// off the proxy hot path. Inert until the operator enables a script.
-	var pyMgr *pyfilter.Manager
-	if cfg.PyFilterEnabled {
-		pyMgr = pyfilter.NewManager(pyfilter.Config{
-			DataDir:    cfg.DataDir,
-			PythonPath: cfg.PyFilterPython,
-			OnMatch: func(flow pyfilter.Flow, m pyfilter.Match) {
-				pid, _ := flow["id"].(int64)
-				svcID, _ := flow["service"].(string)
-				srcIP, _ := flow["src"].(string)
-				reason := m.Name
-				if m.Reason != "" {
-					reason = m.Name + ": " + m.Reason
-				}
-				alert := &sniffer.Alert{
-					PacketID:       pid,
-					RuleID:         "pyfilter:" + m.Script,
-					ServiceID:      svcID,
-					SrcIP:          srcIP,
-					Timestamp:      time.Now(),
-					PatternMatched: reason,
-				}
-				if err := packetStore.InsertAlert(alert); err != nil {
-					log.Printf("pyfilter: failed to record alert: %v", err)
-					return
-				}
-				packetHub.Notify()
-			},
-		})
-		defer pyMgr.Close()
-		st := pyMgr.Status()
-		if st.Available {
-			log.Printf("Python filters enabled (interpreter: %s)", st.PythonPath)
-		} else {
-			log.Printf("Python filters enabled but no python3 interpreter found — scripts will not run")
-		}
-
-		// Inline filters run synchronously before forwarding so drop, close, and
-		// rewrite decisions can affect the current message. Evaluation is bounded
-		// and fail-open inside EvaluateBlocking.
-		reconcilePyFlow := func(flow map[string]any) { pyMgr.ReconcileBlocking(pyfilter.Flow(flow)) }
-		proxyMgr.SetPyBlockFn(func(flow map[string]any) sniffer.PyResult {
-			matches, newBody := pyMgr.EvaluateBlocking(flow)
-			res := sniffer.PyResult{Finalize: reconcilePyFlow}
-			for _, mt := range matches {
-				if mt.Error {
-					continue
-				}
-				reason := mt.Name
-				if mt.Reason != "" {
-					reason = mt.Name + ": " + mt.Reason
-				}
-				match := sniffer.PyBlockMatch{Script: mt.Script, Reason: reason, Close: mt.Close}
-				if mt.Block {
-					res.Blocks = append(res.Blocks, match)
-				} else {
-					res.Alerts = append(res.Alerts, match)
-				}
+	pyMgr := pyfilter.NewManager(pyfilter.Config{
+		DataDir:    cfg.DataDir,
+		PythonPath: cfg.PyFilterPython,
+		OnMatch: func(flow pyfilter.Flow, m pyfilter.Match) {
+			pid, _ := flow["id"].(int64)
+			svcID, _ := flow["service"].(string)
+			srcIP, _ := flow["src"].(string)
+			reason := m.Name
+			if m.Reason != "" {
+				reason = m.Name + ": " + m.Reason
 			}
-			if newBody != nil {
-				res.NewBody = newBody
-				res.Rewritten = true
+			alert := &sniffer.Alert{
+				PacketID:       pid,
+				RuleID:         "pyfilter:" + m.Script,
+				ServiceID:      svcID,
+				SrcIP:          srcIP,
+				Timestamp:      time.Now(),
+				PatternMatched: reason,
 			}
-			return res
-		})
-		proxyMgr.SetPyShouldEvaluateFn(pyMgr.ShouldEvaluateBlocking)
+			if err := packetStore.InsertAlert(alert); err != nil {
+				log.Printf("pyfilter: failed to record alert: %v", err)
+				return
+			}
+			packetHub.Notify()
+		},
+	})
+	pyMgr.SetRuntimeEnabled(cfg.PyFilterEnabled)
+	defer pyMgr.Close()
+	st := pyMgr.Status()
+	if !st.Enabled {
+		log.Printf("Python filters paused (native Go drop/alert rules remain active)")
+	} else if st.Available {
+		log.Printf("Python filters enabled (interpreter: %s)", st.PythonPath)
+	} else {
+		log.Printf("Python filters enabled but no python3 interpreter found — scripts will not run")
 	}
+
+	// Inline filters run synchronously before forwarding so drop, close, and
+	// rewrite decisions can affect the current message. Evaluation is bounded
+	// and fail-open inside EvaluateBlocking.
+	reconcilePyFlow := func(flow map[string]any) { pyMgr.ReconcileBlocking(pyfilter.Flow(flow)) }
+	proxyMgr.SetPyBlockFn(func(flow map[string]any) sniffer.PyResult {
+		matches, newBody := pyMgr.EvaluateBlocking(flow)
+		res := sniffer.PyResult{Finalize: reconcilePyFlow}
+		for _, mt := range matches {
+			if mt.Error {
+				continue
+			}
+			reason := mt.Name
+			if mt.Reason != "" {
+				reason = mt.Name + ": " + mt.Reason
+			}
+			match := sniffer.PyBlockMatch{Script: mt.Script, Reason: reason, Close: mt.Close}
+			if mt.Block {
+				res.Blocks = append(res.Blocks, match)
+			} else {
+				res.Alerts = append(res.Alerts, match)
+			}
+		}
+		if newBody != nil {
+			res.NewBody = newBody
+			res.Rewritten = true
+		}
+		return res
+	})
+	proxyMgr.SetPyShouldEvaluateFn(pyMgr.ShouldEvaluateBlocking)
 
 	packetStore.SetPacketChangeListener(func(kind sniffer.PacketChangeKind, pkt *sniffer.Packet) {
 		if kind == sniffer.PacketChangeInsert && pkt != nil {
 			packetHub.PushPacket(pkt)
 			scoreEngine.Submit(pkt)
-			if pyMgr != nil {
+			if pyMgr != nil && pyMgr.ShouldSubmitAsync(pkt.ServiceID, pkt.Protocol) {
 				pyMgr.Submit(api.FlowFromPacket(pkt))
 			}
 		} else {

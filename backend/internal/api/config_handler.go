@@ -44,6 +44,8 @@ type configResponse struct {
 	BaselineServiceRounds    map[string]config.BaselineRoundRange `json:"baseline_service_rounds"`
 	CurrentRound             int                                  `json:"current_round"`
 	TrafficMode              string                               `json:"traffic_mode"`
+	ScoringEnabled           bool                                 `json:"scoring_enabled"`
+	PyFilterEnabled          bool                                 `json:"pyfilter_enabled"`
 	FlowCorrelationWindowSec int                                  `json:"flow_correlation_window_seconds"`
 	PcapExportDir            string                               `json:"pcap_export_dir"`
 	PcapAutoSave             bool                                 `json:"pcap_auto_save"`
@@ -66,6 +68,8 @@ type configUpdateRequest struct {
 	BaselineEndRound         *int                                 `json:"baseline_end_round,omitempty"`
 	BaselineServiceRounds    map[string]config.BaselineRoundRange `json:"baseline_service_rounds,omitempty"`
 	TrafficMode              *string                              `json:"traffic_mode,omitempty"`
+	ScoringEnabled           *bool                                `json:"scoring_enabled,omitempty"`
+	PyFilterEnabled          *bool                                `json:"pyfilter_enabled,omitempty"`
 	FlowCorrelationWindowSec *int                                 `json:"flow_correlation_window_seconds,omitempty"`
 	PcapExportDir            *string                              `json:"pcap_export_dir,omitempty"`
 	PcapAutoSave             *bool                                `json:"pcap_auto_save,omitempty"`
@@ -118,6 +122,16 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Apply side effects only after the configuration has been durably saved.
+	// Stop admission before doing any other potentially expensive reconfiguration.
+	// Enabling is deferred until the selected baseline has been loaded below.
+	scoringChanged := previous.ScoringEnabled != next.ScoringEnabled
+	if s.scoring != nil && scoringChanged && !next.ScoringEnabled {
+		s.scoring.SetEnabled(false)
+	}
+	if s.pyfilter != nil && previous.PyFilterEnabled != next.PyFilterEnabled {
+		s.pyfilter.SetRuntimeEnabled(next.PyFilterEnabled)
+	}
+
 	flagMatcherChanged := previous.FlagRegex != next.FlagRegex || req.FlagRegex != nil
 	if flagMatcherChanged {
 		if err := s.proxy.SetFlagPattern(next.FlagRegex, next.FlagRegexCaseInsensitive, next.FlagDecodeURL); err != nil {
@@ -148,12 +162,15 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 	baselineChanged := previous.CompetitionStart != next.CompetitionStart || previous.RoundDurationSec != next.RoundDurationSec ||
 		previous.BaselineStartRound != next.BaselineStartRound || previous.BaselineEndRound != next.BaselineEndRound ||
 		!maps.Equal(previous.BaselineServiceRounds, next.BaselineServiceRounds)
-	if s.scoring != nil && baselineChanged {
+	if s.scoring != nil && next.ScoringEnabled && (baselineChanged || scoringChanged) {
 		if err := s.scoring.ConfigureBaseline(scoringBaselineConfig(next)); err != nil {
 			rollbackErr := s.rollbackConfig(previous)
 			http.Error(w, configApplyError("reset scoring baseline", err, rollbackErr), http.StatusInternalServerError)
 			return
 		}
+	}
+	if s.scoring != nil && scoringChanged && next.ScoringEnabled {
+		s.scoring.SetEnabled(true)
 	}
 
 	writeJSON(w, http.StatusOK, s.configResponse(next))
@@ -191,9 +208,20 @@ func (s *Server) rollbackConfig(previous *config.Config) error {
 	if s.cleanupMgr != nil {
 		s.cleanupMgr.UpdateSettings(effectiveCleanupSettings(previous))
 	}
+	if s.pyfilter != nil {
+		s.pyfilter.SetRuntimeEnabled(previous.PyFilterEnabled)
+	}
 	if s.scoring != nil {
-		if err := s.scoring.ConfigureBaseline(scoringBaselineConfig(previous)); err != nil {
-			rollbackErrors = append(rollbackErrors, fmt.Errorf("scoring baseline: %w", err))
+		// Reconcile from a quiescent scorer. If restoring the baseline fails, keep
+		// scoring off and report an incomplete rollback instead of running with a
+		// configuration different from the one persisted on disk.
+		s.scoring.SetEnabled(false)
+		if previous.ScoringEnabled {
+			if err := s.scoring.ConfigureBaseline(scoringBaselineConfig(previous)); err != nil {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("scoring baseline: %w", err))
+			} else {
+				s.scoring.SetEnabled(true)
+			}
 		}
 	}
 	return errors.Join(rollbackErrors...)
@@ -327,6 +355,12 @@ func applyConfigUpdate(cfg *config.Config, req configUpdateRequest) error {
 	if cfg.TrafficMode != sniffer.TrafficModeLive && cfg.TrafficMode != sniffer.TrafficModeStatic {
 		return fmt.Errorf("traffic_mode must be one of: live, static")
 	}
+	if req.ScoringEnabled != nil {
+		cfg.ScoringEnabled = *req.ScoringEnabled
+	}
+	if req.PyFilterEnabled != nil {
+		cfg.PyFilterEnabled = *req.PyFilterEnabled
+	}
 	if req.FlowCorrelationWindowSec != nil {
 		cfg.FlowCorrelationWindowSec = *req.FlowCorrelationWindowSec
 	}
@@ -399,8 +433,11 @@ func (s *Server) configResponse(cfg *config.Config) configResponse {
 		RoundDurationSec: cfg.RoundDurationSec, CompetitionStart: cfg.CompetitionStart,
 		KeepRounds: cfg.KeepRounds, CurrentRound: currentRound,
 		BaselineStartRound: cfg.BaselineStartRound, BaselineEndRound: cfg.BaselineEndRound,
-		BaselineServiceRounds: cfg.BaselineServiceRounds,
-		TrafficMode:           cfg.TrafficMode, FlowCorrelationWindowSec: cfg.FlowCorrelationWindowSec,
-		PcapExportDir: cfg.PcapExportDir, PcapAutoSave: cfg.PcapAutoSave,
+		BaselineServiceRounds:    cfg.BaselineServiceRounds,
+		TrafficMode:              cfg.TrafficMode,
+		ScoringEnabled:           cfg.ScoringEnabled,
+		PyFilterEnabled:          cfg.PyFilterEnabled,
+		FlowCorrelationWindowSec: cfg.FlowCorrelationWindowSec,
+		PcapExportDir:            cfg.PcapExportDir, PcapAutoSave: cfg.PcapAutoSave,
 	}
 }

@@ -647,6 +647,187 @@ def match(flow):
 	}
 }
 
+func TestRuntimeDisableBypassesAllLiveEvaluation(t *testing.T) {
+	m := NewManager(Config{DataDir: t.TempDir(), EvalTimeout: time.Second})
+	defer m.Close()
+
+	if !m.RuntimeEnabled() {
+		t.Fatal("live Python evaluation should be enabled by default")
+	}
+	m.SetRuntimeEnabled(false)
+	if m.RuntimeEnabled() {
+		t.Fatal("runtime master switch remained enabled")
+	}
+	if m.Status().Enabled {
+		t.Fatal("status should report the runtime master switch as disabled")
+	}
+
+	// Script management remains usable while paused, but must not prewarm or
+	// make an inline scope eligible for evaluation.
+	if _, err := m.CreateScript("paused", `
+def match(flow):
+    return {"drop": True}
+`, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if m.ShouldEvaluateBlocking("svc", "request", "http") {
+		t.Fatal("disabled runtime must make every inline scope ineligible")
+	}
+	if err := m.PrewarmServices([]string{"svc"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, registered := m.serviceIDs["svc"]; !registered {
+		t.Fatal("paused prewarm did not retain the running service for re-enable")
+	}
+
+	flow := Flow{
+		"service": "svc", "session": "conn", "event_id": "paused/1",
+		"direction": "request", "protocol": "http", "body": "large payload",
+	}
+	m.Submit(flow)
+	if got := m.Evaluate(flow); len(got) != 0 {
+		t.Fatalf("disabled async evaluation returned matches: %+v", got)
+	}
+	if got, rewrite := m.EvaluateBlocking(flow); len(got) != 0 || rewrite != nil {
+		t.Fatalf("disabled blocking evaluation returned matches=%+v rewrite=%q", got, rewrite)
+	}
+	m.ReconcileBlocking(flow)
+
+	if depth := len(m.queue); depth != 0 {
+		t.Fatalf("disabled runtime queued %d flow(s)", depth)
+	}
+	if evaluated := m.evaluated.Load(); evaluated != 0 {
+		t.Fatalf("disabled runtime evaluated %d flow(s)", evaluated)
+	}
+	m.tracker.mu.Lock()
+	connections, events := len(m.tracker.connections), len(m.tracker.events)
+	m.tracker.mu.Unlock()
+	if connections != 0 || events != 0 {
+		t.Fatalf("disabled runtime retained tracker state: connections=%d events=%d", connections, events)
+	}
+}
+
+func TestRuntimeToggleStopsAndRestartsBothLanes(t *testing.T) {
+	m := newTestManager(t)
+	if _, err := m.CreateScript("inline", `
+def match(flow):
+    return {"match": True, "drop": True}
+`, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.CreateScript("async", `
+def match(flow):
+    return "seen"
+`, true, false); err != nil {
+		t.Fatal(err)
+	}
+
+	flow := Flow{"service": "svc", "direction": "request", "protocol": "http"}
+	if got, _ := m.EvaluateBlocking(flow); len(got) != 1 {
+		t.Fatalf("blocking lane did not start: %+v", got)
+	}
+	if got := m.Evaluate(flow); len(got) != 1 {
+		t.Fatalf("async lane did not start: %+v", got)
+	}
+	if !m.ShouldSubmitAsync("svc", "http") {
+		t.Fatal("async preflight should accept an applicable live packet")
+	}
+	before := m.evaluated.Load()
+
+	m.SetRuntimeEnabled(false)
+	if m.async.healthy() {
+		t.Fatal("async worker remained alive after runtime disable")
+	}
+	m.blockMu.Lock()
+	for service, lane := range m.blockByService {
+		if lane.healthy() {
+			m.blockMu.Unlock()
+			t.Fatalf("blocking worker %q remained alive after runtime disable", service)
+		}
+	}
+	m.blockMu.Unlock()
+	if got, _ := m.EvaluateBlocking(flow); len(got) != 0 {
+		t.Fatalf("blocking evaluation ran while disabled: %+v", got)
+	}
+	if got := m.Evaluate(flow); len(got) != 0 {
+		t.Fatalf("async evaluation ran while disabled: %+v", got)
+	}
+	if m.ShouldSubmitAsync("svc", "http") {
+		t.Fatal("async preflight remained enabled while runtime was disabled")
+	}
+	if after := m.evaluated.Load(); after != before {
+		t.Fatalf("evaluation counter changed while disabled: before=%d after=%d", before, after)
+	}
+
+	m.SetRuntimeEnabled(true)
+	if !m.RuntimeEnabled() || !m.Status().Enabled {
+		t.Fatal("runtime master switch did not re-enable")
+	}
+	if got, _ := m.EvaluateBlocking(flow); len(got) != 1 {
+		t.Fatalf("blocking lane did not restart: %+v", got)
+	}
+	if got := m.Evaluate(flow); len(got) != 1 {
+		t.Fatalf("async lane did not restart: %+v", got)
+	}
+	if !m.ShouldSubmitAsync("svc", "http") {
+		t.Fatal("async preflight did not restart")
+	}
+}
+
+func TestBlockingPreflightEmptyDirectionPreservesConnectionTracking(t *testing.T) {
+	m := newTestManager(t)
+	if _, err := m.CreateScriptWith("response-only", `
+def match(flow):
+    return False
+`, ScriptOptions{
+		Enabled: true, Mode: "block", ServiceIDs: []string{"svc"},
+		Directions: []string{"response"}, Protocols: []string{"http"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if m.ShouldEvaluateBlocking("svc", "request", "http") {
+		t.Fatal("request must not be directly evaluated by a response-only script")
+	}
+	if !m.ShouldEvaluateBlocking("svc", "response", "http") {
+		t.Fatal("response should be eligible for its scoped script")
+	}
+	if !m.ShouldEvaluateBlocking("svc", "", "http") {
+		t.Fatal("empty-direction allocation preflight must retain whole-connection tracking")
+	}
+	if m.ShouldEvaluateBlocking("other", "", "http") {
+		t.Fatal("allocation preflight ignored service scope")
+	}
+	if m.ShouldEvaluateBlocking("svc", "", "tcp") {
+		t.Fatal("allocation preflight ignored protocol scope")
+	}
+}
+
+func TestRuntimeToggleIsConcurrentSafe(t *testing.T) {
+	m := NewManager(Config{DataDir: t.TempDir()})
+	// Keep this a pure Go synchronization test, independent of the host's
+	// Python installation and process startup timing.
+	m.available = false
+	defer m.Close()
+
+	var wg sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				m.SetRuntimeEnabled((i+worker)%3 != 0)
+				flow := Flow{"event_id": "race", "session": "conn", "direction": "request"}
+				m.Submit(flow)
+				_, _ = m.EvaluateBlocking(flow)
+				_ = m.RuntimeEnabled()
+				_ = m.Status()
+			}
+		}(worker)
+	}
+	wg.Wait()
+}
+
 func TestScriptsPersistAcrossReload(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(Config{DataDir: dir, EvalTimeout: 5 * time.Second})

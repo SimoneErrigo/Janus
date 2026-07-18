@@ -204,16 +204,18 @@ type flowRun struct {
 // Engine serializes scoring off the proxy hot path. Submit is non-blocking;
 // failure or overload can only omit metadata and can never affect forwarding.
 type Engine struct {
-	store  Store
-	epoch  string
-	config BaselineConfig
-	in     chan *sniffer.Packet
-	reset  chan resetRequest
-	stop   chan struct{}
-	done   chan struct{}
-	once   sync.Once
-	admit  sync.RWMutex
-	closed bool
+	store   Store
+	epoch   string
+	config  BaselineConfig
+	in      chan *sniffer.Packet
+	reset   chan resetRequest
+	disable chan chan struct{}
+	stop    chan struct{}
+	done    chan struct{}
+	once    sync.Once
+	admit   sync.RWMutex
+	enabled bool
+	closed  bool
 
 	flows        map[string]*flowRun
 	stateMu      sync.RWMutex
@@ -235,6 +237,7 @@ type resetRequest struct {
 }
 
 type Status struct {
+	Enabled         bool             `json:"enabled"`
 	Epoch           string           `json:"epoch,omitempty"`
 	OpeningRounds   int              `json:"opening_rounds"`
 	StartRound      int              `json:"baseline_start_round"`
@@ -278,17 +281,26 @@ type ServiceStatus struct {
 }
 
 func New(store Store, config BaselineConfig) *Engine {
+	return NewWithEnabled(store, config, true)
+}
+
+// NewWithEnabled creates a scorer with the requested initial admission state.
+// Starting disabled deliberately skips baseline discovery and packet replay;
+// the API config transaction loads the current baseline before enabling it.
+func NewWithEnabled(store Store, config BaselineConfig, enabled bool) *Engine {
 	config = config.normalized()
 	e := &Engine{
 		store: store, epoch: BaselineEpoch(config), config: config, in: make(chan *sniffer.Packet, maxPendingFlows),
-		reset: make(chan resetRequest),
-		stop:  make(chan struct{}), done: make(chan struct{}),
+		reset:   make(chan resetRequest),
+		disable: make(chan chan struct{}), stop: make(chan struct{}), done: make(chan struct{}), enabled: enabled,
 		flows: make(map[string]*flowRun), baseline: make(map[string]map[string]map[int]struct{}),
 		overflow: make(map[string]map[string]map[int]struct{}),
 		excluded: make(map[string]uint64), scored: make(map[string]uint64),
 	}
-	if err := e.configureBaseline(config, false); err != nil {
-		e.recordStoreError(err)
+	if enabled {
+		if err := e.configureBaseline(config, false); err != nil {
+			e.recordStoreError(err)
+		}
 	}
 	go e.run()
 	return e
@@ -300,7 +312,7 @@ func (e *Engine) Submit(packet *sniffer.Packet) {
 	}
 	e.admit.RLock()
 	defer e.admit.RUnlock()
-	if e.closed {
+	if e.closed || !e.enabled {
 		return
 	}
 	copyPacket := *packet
@@ -314,6 +326,34 @@ func (e *Engine) Submit(packet *sniffer.Packet) {
 		e.queueDropped++
 		e.stateMu.Unlock()
 	}
+}
+
+// SetEnabled controls admission to the scorer without affecting packet
+// capture, forwarding, or the inline rule engine. Disabling is synchronous:
+// once it returns, no submitted or partially assembled flow remains queued for
+// scoring. Enabling starts from an empty flow set so traffic from before and
+// after a disabled interval can never be combined.
+func (e *Engine) SetEnabled(enabled bool) {
+	e.admit.Lock()
+	defer e.admit.Unlock()
+	if e.closed || e.enabled == enabled {
+		return
+	}
+	e.enabled = enabled
+	if enabled {
+		return
+	}
+	done := make(chan struct{})
+	e.disable <- done
+	<-done
+}
+
+// IsEnabled reports whether new packets are admitted to deterministic
+// scoring. A closed engine is never reported as enabled.
+func (e *Engine) IsEnabled() bool {
+	e.admit.RLock()
+	defer e.admit.RUnlock()
+	return e.enabled && !e.closed
 }
 
 func (e *Engine) Close() {
@@ -362,6 +402,7 @@ func (e *Engine) requestBaseline(req resetRequest) error {
 
 // Status returns a stable, read-only snapshot for the operator UI.
 func (e *Engine) Status() Status {
+	enabled := e.IsEnabled()
 	var storedSnapshots []sniffer.BaselineSnapshot
 	var snapshotErr error
 	if e.store != nil {
@@ -438,7 +479,7 @@ func (e *Engine) Status() Status {
 		lastError = snapshotErr.Error()
 	}
 	return Status{
-		Epoch: e.epoch, OpeningRounds: config.RequiredRounds(),
+		Enabled: enabled, Epoch: e.epoch, OpeningRounds: config.RequiredRounds(),
 		StartRound: config.StartRound, EndRound: config.EndRound,
 		RequiredRounds: config.RequiredRounds(), Rebuilding: e.rebuilding, ReplayedPackets: e.replayed,
 		QueueDropped: e.queueDropped, StoreErrors: e.storeErrors, LastError: lastError,
@@ -455,9 +496,19 @@ func (e *Engine) run() {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		// Give runtime disable requests priority over an overloaded input queue.
+		// At most the packet already being handled can precede the toggle.
+		select {
+		case done := <-e.disable:
+			e.applyDisable(done)
+			continue
+		default:
+		}
 		select {
 		case packet := <-e.in:
 			e.accept(packet)
+		case done := <-e.disable:
+			e.applyDisable(done)
 		case req := <-e.reset:
 			e.flushAll()
 			req.done <- e.configureBaseline(req.config, req.force)
@@ -473,6 +524,19 @@ func (e *Engine) run() {
 					return
 				}
 			}
+		}
+	}
+}
+
+func (e *Engine) applyDisable(done chan struct{}) {
+	clear(e.flows)
+	for {
+		select {
+		case <-e.in:
+			continue
+		default:
+			close(done)
+			return
 		}
 	}
 }

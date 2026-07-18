@@ -127,6 +127,7 @@ COMPETITION_START=
 KEEP_ROUNDS=5
 BASELINE_START_ROUND=1
 BASELINE_END_ROUND=5
+SCORING_ENABLED=true
 
 REDIS_ADDR=
 REDIS_PASSWORD=
@@ -175,9 +176,9 @@ After changing a startup setting in `.env`, stop Janus and run the same command
 again. The file is not embedded in the binary and startup settings are not
 hot-reloaded.
 
-Python 3 is only required when `PYFILTER_ENABLED=true`. Keeping Python filters
-disabled saves memory and avoids executing filter workers when they are not
-needed.
+Python 3 is only required when Python-filter processing is enabled. The initial
+state comes from `PYFILTER_ENABLED`, and both Python filters and scoring can be
+paused or resumed immediately from **Config** without changing live capture.
 
 ### Leaving Janus running
 
@@ -354,7 +355,7 @@ These infrastructure settings are applied at startup only:
 - `FLAG_REGEX_CASE_INSENSITIVE`, `FLAG_DECODE_URL`;
 - `REDIS_ADDR`, `REDIS_PASSWORD`;
 - `PROTO_DIR`;
-- `PYFILTER_ENABLED`, `PYFILTER_PYTHON`.
+- `PYFILTER_PYTHON`.
 
 `GOMEMLIMIT` and `GOGC` are read directly by the Go runtime and must be process
 or container environment variables.
@@ -367,6 +368,7 @@ The **Config** page can update and persist these settings immediately in
 - Flag ID integration;
 - competition timing, retained rounds, and baseline rounds;
 - traffic mode and correlation window;
+- deterministic scoring and Python-filter live processing;
 - PCAP directory and automatic export.
 
 On the first save from the UI, Janus writes the complete set of UI-managed

@@ -22,11 +22,13 @@ func (s *Server) handleScoringStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	result := map[string]any{
 		"available":     s.scoring != nil,
+		"enabled":       false,
 		"current_round": currentRound,
 		"counts":        counts,
 	}
 	if s.scoring != nil {
 		status := s.scoring.Status()
+		result["enabled"] = status.Enabled
 		result["epoch"] = status.Epoch
 		result["opening_rounds"] = status.OpeningRounds
 		result["baseline_start_round"] = status.StartRound
@@ -56,6 +58,10 @@ func (s *Server) handleScoringBaselineRebuild(w http.ResponseWriter, r *http.Req
 	// can never restore the previous start/end range after new values persist.
 	s.configMu.Lock()
 	defer s.configMu.Unlock()
+	if !s.scoring.IsEnabled() {
+		http.Error(w, "scoring is disabled", http.StatusConflict)
+		return
+	}
 	if err := s.scoring.RebuildBaseline(); err != nil {
 		http.Error(w, "rebuilding scoring baseline: "+err.Error(), http.StatusInternalServerError)
 		return

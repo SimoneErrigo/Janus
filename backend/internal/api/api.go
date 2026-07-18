@@ -51,6 +51,8 @@ type Server struct {
 
 type scoringProvider interface {
 	Status() scoring.Status
+	SetEnabled(bool)
+	IsEnabled() bool
 	ConfigureBaseline(scoring.BaselineConfig) error
 	RebuildBaseline() error
 }

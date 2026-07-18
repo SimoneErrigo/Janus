@@ -73,6 +73,9 @@ type Config struct {
 
 	// Traffic capture mode
 	TrafficMode string // "live" | "static"
+	// Optional processing pipelines. These can be disabled independently from
+	// live capture; the native Go drop/alert rule engine is always active.
+	ScoringEnabled bool
 
 	// Flow reconstruction
 	FlowCorrelationWindowSec int // correlation time window in seconds
@@ -85,7 +88,7 @@ type Config struct {
 	ProtoDir string // directory scanned at runtime for .proto files (default /protos)
 
 	// Python filters (mitmproxy-style scriptable filtering)
-	PyFilterEnabled bool   // master switch (default true)
+	PyFilterEnabled bool   // live Python-filter processing switch (default true)
 	PyFilterPython  string // interpreter path override (default: auto-detect python3)
 }
 
@@ -118,6 +121,8 @@ type runtimeConfig struct {
 	BaselineEndRound         *int                          `json:"baseline_end_round,omitempty"`
 	BaselineServiceRounds    map[string]BaselineRoundRange `json:"baseline_service_rounds,omitempty"`
 	TrafficMode              *string                       `json:"traffic_mode,omitempty"`
+	ScoringEnabled           *bool                         `json:"scoring_enabled,omitempty"`
+	PyFilterEnabled          *bool                         `json:"pyfilter_enabled,omitempty"`
 	FlowCorrelationWindowSec *int                          `json:"flow_correlation_window_seconds,omitempty"`
 	PcapExportDir            *string                       `json:"pcap_export_dir,omitempty"`
 	PcapAutoSave             *bool                         `json:"pcap_auto_save,omitempty"`
@@ -135,6 +140,7 @@ func Load(envPath string) (*Config, error) {
 			APIPort:                  "8080",
 			APIBind:                  "0.0.0.0",
 			TrafficMode:              "live",
+			ScoringEnabled:           true,
 			FlowCorrelationWindowSec: 120,
 			FlagIDPollInterval:       5,
 			FlagIDFormat:             "cyberchallenge",
@@ -229,6 +235,9 @@ func Load(envPath string) (*Config, error) {
 		if v, ok := env["TRAFFIC_MODE"]; ok && v != "" {
 			cfg.TrafficMode = strings.ToLower(v)
 		}
+		if v, ok := env["SCORING_ENABLED"]; ok {
+			cfg.ScoringEnabled = boolVal(v)
+		}
 		if v, ok := env["FLOW_CORRELATION_WINDOW_SECONDS"]; ok && v != "" {
 			cfg.FlowCorrelationWindowSec, _ = strconv.Atoi(v)
 		}
@@ -320,6 +329,9 @@ func Load(envPath string) (*Config, error) {
 		}
 		if v := os.Getenv("TRAFFIC_MODE"); v != "" {
 			cfg.TrafficMode = strings.ToLower(v)
+		}
+		if v := os.Getenv("SCORING_ENABLED"); v != "" {
+			cfg.ScoringEnabled = boolVal(v)
 		}
 		if v := os.Getenv("FLOW_CORRELATION_WINDOW_SECONDS"); v != "" {
 			cfg.FlowCorrelationWindowSec, _ = strconv.Atoi(v)
@@ -534,6 +546,12 @@ func applyRuntimeConfig(cfg *Config, saved runtimeConfig) {
 	if saved.TrafficMode != nil {
 		cfg.TrafficMode = *saved.TrafficMode
 	}
+	if saved.ScoringEnabled != nil {
+		cfg.ScoringEnabled = *saved.ScoringEnabled
+	}
+	if saved.PyFilterEnabled != nil {
+		cfg.PyFilterEnabled = *saved.PyFilterEnabled
+	}
 	if saved.FlowCorrelationWindowSec != nil {
 		cfg.FlowCorrelationWindowSec = *saved.FlowCorrelationWindowSec
 	}
@@ -554,9 +572,12 @@ func saveRuntimeConfig(cfg *Config) error {
 		FlagIDFormat: &cfg.FlagIDFormat, RoundDurationSec: &cfg.RoundDurationSec,
 		CompetitionStart: &cfg.CompetitionStart, KeepRounds: &cfg.KeepRounds,
 		BaselineStartRound: &cfg.BaselineStartRound, BaselineEndRound: &cfg.BaselineEndRound,
-		BaselineServiceRounds: cloneBaselineServiceRounds(cfg.BaselineServiceRounds),
-		TrafficMode:           &cfg.TrafficMode, FlowCorrelationWindowSec: &cfg.FlowCorrelationWindowSec,
-		PcapExportDir: &cfg.PcapExportDir, PcapAutoSave: &cfg.PcapAutoSave,
+		BaselineServiceRounds:    cloneBaselineServiceRounds(cfg.BaselineServiceRounds),
+		TrafficMode:              &cfg.TrafficMode,
+		ScoringEnabled:           &cfg.ScoringEnabled,
+		PyFilterEnabled:          &cfg.PyFilterEnabled,
+		FlowCorrelationWindowSec: &cfg.FlowCorrelationWindowSec,
+		PcapExportDir:            &cfg.PcapExportDir, PcapAutoSave: &cfg.PcapAutoSave,
 	}
 	data, err := json.MarshalIndent(saved, "", "  ")
 	if err != nil {

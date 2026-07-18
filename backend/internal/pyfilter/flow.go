@@ -73,6 +73,17 @@ type trackedRecord struct {
 	committed, admitted     bool
 }
 
+// reset releases all live-traffic history when the Python engine is disabled.
+// In-flight trackedFlow values may still commit into their detached stats
+// objects, but can no longer retain or repopulate the manager's maps.
+func (t *flowTracker) reset() {
+	t.mu.Lock()
+	t.connections = nil
+	t.events = nil
+	t.sequence = 0
+	t.mu.Unlock()
+}
+
 func (t *flowTracker) prepare(raw Flow) (Flow, trackedFlow) {
 	now := flowTimestamp(raw)
 	flow := canonicalFlow(raw, now)

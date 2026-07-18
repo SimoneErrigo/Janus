@@ -48,9 +48,10 @@ type PyResult struct {
 // open. A nil func disables inline blocking/rewriting.
 type PyBlockFunc func(flow map[string]any) PyResult
 
-// PyShouldEvaluateFunc is a cheap scope preflight. HTTP needs it before the
-// backend runs so ordinary responses are buffered only when an enabled inline
-// response filter could actually inspect them.
+// PyShouldEvaluateFunc is a cheap scope preflight. An empty direction asks
+// whether any inline script needs the message for evaluation or connection
+// tracking; an exact direction asks whether that direction can directly match.
+// HTTP uses the exact response query before deciding to buffer a response.
 type PyShouldEvaluateFunc func(service, direction, protocol string) bool
 
 func roundFromFlagIDMatches(matches []flagids.FlagMatch, fallback int) int {
@@ -130,7 +131,6 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store PacketSink, d
 			// retain the legacy, deterministic fallback for compatibility.
 			sessionID = MakeSessionID(svc.ID, srcIP, srcPort)
 		}
-		pyEventID := MakePyFilterEventID(sessionID, DirectionRequest, start)
 		reqView := flowmodel.PacketView{
 			Service: svc.ID, Session: sessionID, OccurredAt: start,
 			Source:       flowmodel.Endpoint{IP: srcIP, Port: srcPort},
@@ -167,10 +167,12 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store PacketSink, d
 		var pyBlockAlerts []*Alert
 		var requestPyFlow map[string]any
 		var requestPyResult PyResult
+		var pyEventID string
 		bodyComplete := streamingCapture == nil && !reqBodyTruncated
 		requestRewritten := false
 		forceClose := false
-		if pyBlock != nil {
+		if shouldProcessPythonMessage(svc, pyBlock, pyShouldEvaluate) {
+			pyEventID = MakePyFilterEventID(sessionID, DirectionRequest, start)
 			flow := map[string]any{
 				"service":            svc.ID,
 				"session":            sessionID,
@@ -356,7 +358,6 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store PacketSink, d
 		// responseCapture retained the complete ordinary HTTP/1 body.
 		responseEnforceable := rw.canEnforce()
 		respTime := time.Now()
-		respEventID := MakePyFilterEventID(sessionID, DirectionResponse, respTime)
 		respStatus := rw.statusCode
 		respHeaders := flattenHeaders(rw.Header())
 		respBody := append([]byte(nil), rw.body.Bytes()...)
@@ -398,12 +399,14 @@ func HTTPMiddleware(next http.Handler, svc *storage.Service, store PacketSink, d
 		var respPyAlerts []*Alert
 		var responsePyFlow map[string]any
 		var responsePyResult PyResult
+		var respEventID string
 		respDropped, respRewritten, respForceClose := false, false, false
-		// Every response reaches the Go-side connection tracker, even when no
-		// response-scoped script can run. This keeps flags/rates/fingerprints
-		// complete for a later request-side filter on the same keep-alive
-		// connection. The manager exits before Python when scope cannot match.
-		if pyBlock != nil {
+		// While any applicable inline script is live, every response reaches the
+		// Go-side connection tracker even when no response-scoped script can run.
+		// This keeps flags/rates/fingerprints complete for a later request-side
+		// filter. Runtime-disabled Python bypasses this allocation path entirely.
+		if shouldProcessPythonMessage(svc, pyBlock, pyShouldEvaluate) {
+			respEventID = MakePyFilterEventID(sessionID, DirectionResponse, respTime)
 			responsePyFlow = map[string]any{
 				"service":            svc.ID,
 				"session":            sessionID,
@@ -667,6 +670,17 @@ func shouldEvaluatePythonResponse(svc *storage.Service, pyBlock PyBlockFunc, sho
 		return false
 	}
 	return shouldEvaluate == nil || shouldEvaluate(svc.ID, string(DirectionResponse), string(svc.Protocol))
+}
+
+// shouldProcessPythonMessage is the allocation gate for live Python work. The
+// empty direction asks the manager whether any inline script for this
+// service/protocol needs the connection message, including for state tracking.
+// A nil preflight preserves compatibility with direct/custom PyBlock callers.
+func shouldProcessPythonMessage(svc *storage.Service, pyBlock PyBlockFunc, shouldEvaluate PyShouldEvaluateFunc) bool {
+	if pyBlock == nil || svc == nil {
+		return false
+	}
+	return shouldEvaluate == nil || shouldEvaluate(svc.ID, "", string(svc.Protocol))
 }
 
 func shouldBufferHTTPResponse(r *http.Request, svc *storage.Service, evaluate bool) bool {

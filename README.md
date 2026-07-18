@@ -49,7 +49,8 @@ Useful settings:
 | `FLAG_REGEX` | Flag detector used for highlighting and filters |
 | `FLAG_REGEX_CASE_INSENSITIVE` | Make flag matching ASCII case-insensitive |
 | `FLAG_DECODE_URL` | Also scan a percent-decoded copy of traffic |
-| `PYFILTER_ENABLED` | Enable the Python-filter engine (default `true`) |
+| `PYFILTER_ENABLED` | Initial Python-filter processing state; also switchable live from Config (default `true`) |
+| `SCORING_ENABLED` | Initial deterministic scoring state; also switchable live from Config (default `true`) |
 | `BASELINE_START_ROUND` / `BASELINE_END_ROUND` | Default inclusive rounds used by the deterministic checker baseline (`1`–`5`); Config can override them per service |
 | `TRAFFIC_MODE` | `live` (normal operation) or `static` (manual capture) |
 
