@@ -57,7 +57,7 @@ jobs:
           tar -C "${RUNNER_TEMP}" -czf "${RUNNER_TEMP}/${package}.tar.gz" "${package}"
           test -s "${RUNNER_TEMP}/${package}.tar.gz"
       - name: Upload backend archive
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-backend-${{ matrix.goarch }}
           path: ${{ runner.temp }}/janus-backend-${{ github.ref_name }}-linux-${{ matrix.goarch }}.tar.gz
@@ -93,7 +93,7 @@ jobs:
           tar -C "${RUNNER_TEMP}" -czf "${RUNNER_TEMP}/${package}.tar.gz" "${package}"
           test -s "${RUNNER_TEMP}/${package}.tar.gz"
       - name: Upload frontend archive
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-frontend
           path: ${{ runner.temp }}/janus-frontend-${{ github.ref_name }}.tar.gz
